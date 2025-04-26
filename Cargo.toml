@@ -1,0 +1,20 @@
+[package]
+name    = "lzr"
+version = "0.0.0"
+edition = "2024"
+
+authors         = ["Chris Reynolds chris@reynolds.guru"]
+description     = "LZ77-based Compression Program/Library written in Rust."
+license         = "MIT OR Apache-2.0"
+readme          = "README.md"
+repository      = "https://github.com/ckmjreynolds/lzr"
+keywords        = ["LZ77", "compression", "compress"]
+categories      = ["compression"]
+documentation   = "https://docs.rs/lzr"
+
+include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
+
+[dependencies]
+
+[dev-dependencies]
+pretty_assertions = ">=1.4.1"
