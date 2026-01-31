@@ -1,9 +1,10 @@
 [package]
-name    = "lzr"
-version = "0.0.0"
-edition = "2024"
+name            = "lzr"
+version         = "0.1.0"
+edition         = "2024"
+rust-version    = "1.87"
 
-authors         = ["Chris Reynolds chris@reynolds.guru"]
+authors         = ["Chris Reynolds <chris@reynolds.guru>"]
 description     = "LZ77-based Compression Program/Library written in Rust."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
@@ -17,4 +18,10 @@ include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 [dependencies]
 
 [dev-dependencies]
-pretty_assertions = ">=1.4.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+
+[profile.samply]
+inherits = "release"
+debug = true
