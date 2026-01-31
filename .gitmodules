@@ -1,0 +1,3 @@
+[submodule "third_party/corpora"]
+	path = third_party/corpora
+	url = https://github.com/zlib-ng/corpora.git
