@@ -93,9 +93,8 @@ A decoder must reject any stream whose magic bytes do not match or whose version
 |-----|-------------|
 | 0   | 512 B       |
 | 1   | 1 KiB       |
-| 5   | 16 KiB      |
-| 7   | 64 KiB      |
-| 11  | 1 MiB       |
+| ... |             |
+| 14  |  8 MiB      |
 | 15  | 16 MiB      |
 
 ## Sliding Window

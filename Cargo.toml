@@ -5,7 +5,7 @@ edition         = "2024"
 rust-version    = "1.85"
 
 authors         = ["Chris Reynolds <chris@reynolds.guru>"]
-description     = "LZ77-based Compression Program/Library written in Rust."
+description     = "LZ77-based compression library and CLI."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
 repository      = "https://github.com/ckmjreynolds/lzr"
@@ -13,7 +13,7 @@ keywords        = ["LZ77", "compression", "compress"]
 categories      = ["compression"]
 documentation   = "https://docs.rs/lzr"
 
-include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
+include         = ["src/**", "build.rs", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
 clap = { version = "=4.5.58", features = ["derive"] }
