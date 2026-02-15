@@ -53,6 +53,27 @@ struct Args {
     #[arg(short = '1', long = "fast")]
     fast: bool,
 
+    #[arg(short = '2', hide = true)]
+    level_2: bool,
+
+    #[arg(short = '3', hide = true)]
+    level_3: bool,
+
+    #[arg(short = '4', hide = true)]
+    level_4: bool,
+
+    #[arg(short = '5', hide = true)]
+    level_5: bool,
+
+    #[arg(short = '6', hide = true)]
+    level_6: bool,
+
+    #[arg(short = '7', hide = true)]
+    level_7: bool,
+
+    #[arg(short = '8', hide = true)]
+    level_8: bool,
+
     /// Compress best.
     #[arg(short = '9', long = "best")]
     best: bool,
@@ -63,6 +84,26 @@ struct Args {
 
     /// Files to process (stdin if none).
     files: Vec<PathBuf>,
+}
+
+fn compression_level(args: &Args) -> u8 {
+    let levels = [
+        (args.fast, 1),
+        (args.level_2, 2),
+        (args.level_3, 3),
+        (args.level_4, 4),
+        (args.level_5, 5),
+        (args.level_6, 6),
+        (args.level_7, 7),
+        (args.level_8, 8),
+        (args.best, 9),
+    ];
+    for &(flag, level) in levels.iter().rev() {
+        if flag {
+            return level;
+        }
+    }
+    9 // default = fast
 }
 
 fn main() -> ExitCode {
@@ -105,7 +146,7 @@ fn filter_mode(decompress: bool, args: &Args) -> io::Result<()> {
     let bytes = if decompress {
         lzr::decode(&mut stdin, &mut stdout)?
     } else {
-        lzr::encode(&mut stdin, &mut stdout)?
+        lzr::encode_with_level(&mut stdin, &mut stdout, compression_level(args))?
     };
 
     if args.verbose {
@@ -148,6 +189,7 @@ fn process_file(path: &Path, decompress: bool, args: &Args) -> io::Result<()> {
         }
     }
 
+    let level = compression_level(args);
     let input = File::open(path)?;
     let input_len = input.metadata()?.len();
     let mut reader = BufReader::new(input);
@@ -164,7 +206,7 @@ fn process_file(path: &Path, decompress: bool, args: &Args) -> io::Result<()> {
         if decompress {
             lzr::decode(&mut reader, &mut stdout)?
         } else {
-            lzr::encode(&mut reader, &mut stdout)?
+            lzr::encode_with_level(&mut reader, &mut stdout, level)?
         }
     } else {
         let out = output_path.as_ref().expect("output path must be set");
@@ -173,7 +215,7 @@ fn process_file(path: &Path, decompress: bool, args: &Args) -> io::Result<()> {
         let result = if decompress {
             lzr::decode(&mut reader, &mut writer)
         } else {
-            lzr::encode(&mut reader, &mut writer)
+            lzr::encode_with_level(&mut reader, &mut writer, level)
         };
 
         if let Err(err) = result {

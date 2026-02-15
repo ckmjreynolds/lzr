@@ -223,7 +223,9 @@ fn stdout_flag() {
     let output = lzr_cmd().arg("-c").arg(&input).output().unwrap();
     assert!(output.status.success());
     assert!(input.exists(), "original should be kept with -c");
-    assert_eq!(output.stdout, b"to stdout", "stdout should contain compressed data");
+    // Output is compressed LZR data — verify it starts with the magic bytes.
+    assert!(output.stdout.len() >= 5, "compressed output too short");
+    assert_eq!(&output.stdout[..3], b"LZR", "stdout should contain LZR compressed data");
 }
 
 #[test]
@@ -338,7 +340,17 @@ fn unknown_suffix_with_stdout() {
     let input = dir.join("data.txt");
     fs::write(&input, b"suffix irrelevant").unwrap();
 
-    let output = lzr_cmd().arg("-dc").arg(&input).output().unwrap();
+    // Compress first so we have valid LZR data to decompress.
+    let compressed = dir.join("data.txt.lzr");
+    let output = lzr_cmd().arg("-k").arg(&input).output().unwrap();
+    assert!(output.status.success(), "compress failed: {}", String::from_utf8_lossy(&output.stderr));
+
+    // Rename to a non-standard suffix.
+    let renamed = dir.join("data.weird");
+    fs::rename(&compressed, &renamed).unwrap();
+
+    // -dc should decompress to stdout regardless of suffix.
+    let output = lzr_cmd().arg("-dc").arg(&renamed).output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"suffix irrelevant");
 }

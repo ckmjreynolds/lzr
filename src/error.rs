@@ -33,6 +33,10 @@ impl std::error::Error for Error {
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
+        // Recover wrapped LZR errors that round-tripped through io::Error.
+        if err.get_ref().is_some_and(<dyn std::error::Error + Send + Sync>::is::<Self>) {
+            return *err.into_inner().expect("checked above").downcast::<Self>().expect("checked above");
+        }
         Self::Io(err)
     }
 }
@@ -41,7 +45,7 @@ impl From<Error> for io::Error {
     fn from(err: Error) -> Self {
         match err {
             Error::Io(e) => e,
-            Error::InvalidFormat | Error::ChecksumMismatch => Self::new(io::ErrorKind::InvalidData, err.to_string()),
+            other => Self::new(io::ErrorKind::InvalidData, other),
         }
     }
 }

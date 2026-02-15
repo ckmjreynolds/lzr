@@ -22,7 +22,8 @@
 mod decoder;
 mod encoder;
 mod error;
+mod format;
 
 pub use decoder::{Decoder, decode};
-pub use encoder::{Encoder, encode};
+pub use encoder::{Encoder, encode, encode_with_level};
 pub use error::{Error, Result};
