@@ -1,5 +1,9 @@
 #!/bin/bash
-clear
+export TERM="${TERM:-dumb}"
+if [[ "${TERM}" != "dumb" ]]; then
+  clear
+fi
+
 cargo +stable fmt || exit
 cargo +stable clippy --all-targets -- -Dwarnings || exit
 
