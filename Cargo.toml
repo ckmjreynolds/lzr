@@ -16,11 +16,14 @@ documentation   = "https://docs.rs/lzr"
 include         = ["src/**", "build.rs", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
-clap = { version = "=4.5.58", features = ["derive"] }
+clap = { version = "=4.5.59", features = ["derive"] }
+rayon = "=1.11.0"
+simd-adler32 = "=0.3.8"
 
 [dev-dependencies]
 assert_cmd = "=2.1.2"
 pretty_assertions = "=1.4.1"
+proptest = "=1.10.0"
 
 [lints.rust]
 keyword_idents = { level = "forbid", priority = -1 }
@@ -32,7 +35,7 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 unreachable_pub = "deny"
 unsafe_code = "forbid"
-# Too many false positives between binary and lib.
+# Too many false positives in a crate with both a library and executable.
 # unused_crate_dependencies = "warn"
 unused_lifetimes = "warn"
 unused_qualifications = "warn"

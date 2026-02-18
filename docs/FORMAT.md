@@ -1,201 +1,263 @@
 # LZR Format Specification
 
-**Version:** 1.0
+**Version:** 1.0 \
 **File Extension:** `.lzr`
 
 ## Overview
 
-LZR is a byte-oriented compression format based on the LZ77 sliding-window algorithm. A compressed stream consists of a **header**, a sequence of **frames**, an **end-of-stream sentinel**, and a **footer**.
-
-> **Note:** A file may contain more than one stream (i.e. files can be concatenated). If a file does not end at the footer, a decoder should continue to process any additional streams.
+LZR is a byte-oriented LZ77 compression format. A compressed stream consists of a header, a sequence of frames, and a footer:
 
 ```
-┌─────────────────────────────Stream─────────────────────────────┐
-│┌──────────────Header───────────────┐                           │
-││┌─Magic─┐ ┌Version┐ ┌────Flags────┐│                           │
-│││  LZR  │ │ 0x00  │ │ RRRR | WWWW ││                           │
-││└───────┘ └───────┘ └─────────────┘│                           │
-│└───────────────────────────────────┘                           │
-│┌────────────────────────────Frame─────────────────────────────┐│
-││┌────Token────┐ ┌ ─Length ─ ┐ ┌ Distance─ ┐ ┌ ─ ─Literals ─ ─ ││
-│││ LLL | DDDDD │   0-2 bytes     0-3 bytes     0-Length bytes │││
-││└─────────────┘ └ ─ ─ ─ ─ ─ ┘ └ ─ ─ ─ ─ ─ ┘ └ ─ ─ ─ ─ ─ ─ ─ ─ ││
-│└──────────────────────────────────────────────────────────────┘│
-│                                                                │
-│ ...                                                            │
-│                                                                │
-│┌─EOS──┐                                                        │
-││ 0x00 │                                                        │
-│└──────┘                                                        │
-│┌───────────────────Footer────────────────────┐                 │
-││┌─Uncompressed Length─┐┌──────Checksum──────┐│                 │
-│││  1-9 bytes ULEB128  ││ Adler-32 (4-bytes) ││                 │
-││└─────────────────────┘└────────────────────┘│                 │
-│└─────────────────────────────────────────────┘                 │
-└────────────────────────────────────────────────────────────────┘
+ Header      Frames                          EOS    Footer
+┌─────────┐ ┌───────┬───────┬─────┬───────┐ ┌──────┐ ┌───────────────────┐
+│ 4 bytes │ │ frame │ frame │ ... │ frame │ │ 0x00 │ │ length + checksum │
+└─────────┘ └───────┴───────┴─────┴───────┘ └──────┘ └───────────────────┘
 ```
 
-## Byte Order
+The encoder compresses data by replacing repeated byte sequences with back-references into a sliding window of prior output. Each frame either carries literal (uncompressed) bytes or a back-reference described by a *distance* (how far back to look) and a *length* (how many bytes to copy). Lengths are signed: positive means copy forward, negative means copy in reverse.
 
-All multi-byte integer values are stored in **little-endian** byte order.
+## Conventions
 
-## ULEB128 Encoding
-
-LZR uses a bounded variant of ULEB128 in the **footer** (for the uncompressed length field). It is identical to standard, unbounded ULEB128 except that the **final byte** uses all 8 bits for data with no continuation bit.
-
-**Decoding procedure** (given a maximum of *N* bytes):
-
-1. Read a byte.
-2. If fewer than *N* bytes have been read and bit 7 is set, accumulate bits 0-6 as data and read another byte.
-3. If fewer than *N* bytes have been read and bit 7 is clear, accumulate bits 0-6 as data and stop.
-4. If this is the *N*th byte, accumulate **all 8 bits** as data and stop.
-
-Data bits are accumulated from least-significant to most-significant (standard ULEB128 order).
+All multi-byte integers are **little-endian**. Bit numbering is LSB-0 (bit 0 is the least significant).
 
 ## Header
 
-The header is **5 bytes** and must appear at the start of every LZR stream.
+Every stream begins with a 4-byte header:
 
-| Offset | Size    | Value                      | Description    |
-|--------|---------|----------------------------|----------------|
-| 0      | 3 bytes | `LZR` (`0x4C 0x5A 0x52`)   | Magic bytes    |
-| 3      | 1 byte  | `0x00`                     | Format version |
-| 4      | 1 byte  | See below                  | Flags          |
+| Offset | Size | Value | Description |
+|-|-|-|-|
+| 0 | 3 bytes | `0x4C 0x5A 0x52` (`LZR`) | Magic number |
+| 3 | 1 byte | `0x00` | Format version |
 
-A decoder must reject any stream whose magic bytes do not match or whose version is unrecognized.
-
-### Format Version
-
-| Value         | Version  |
-| ------------- | -------- |
-| `0x00`        | 1.0      |
-| `0x01 - 0xFF` | Reserved |
-
-### Flags Byte
-
-```
-   Flags Byte
-┌──────────┬──────────┐
-│ Reserved │  Window  │
-│  bit 7   │  bit 3   │
-│   to 4   │   to 0   │
-└──────────┴──────────┘
-```
-
-| Field    | Bits | Description                                                              |
-|----------|------|--------------------------------------------------------------------------|
-| Reserved | 7-4  | Reserved for future use. A decoder must ignore what's written here.      |
-| Window   | 3-0  | Window size exponent *N*. The sliding window size is 2^(*N*+9) bytes.    |
-
-**Window sizes:**
-
-| N   | Window Size |
-|-----|-------------|
-| 0   | 512 B       |
-| 1   | 1 KiB       |
-| ... |             |
-| 14  |  8 MiB      |
-| 15  | 16 MiB      |
+Version `0x00` indicates format version 1.0. All other values are reserved. A decoder **must** reject streams with an unrecognized magic number or version.
 
 ## Sliding Window
 
-The decoder maintains a sliding window of the most recent *W* bytes of output, where *W* = 2^(*N*+9) and *N* is the window exponent from the header flags byte. The window is logically initialized to **0x00** at the start of each stream. Any read that references a position before the start of the window (or before any output has been produced) returns `0x00`.
+The decoder maintains the most recent **1,048,576 bytes** (1 MiB) of decompressed output as its sliding window. The window is logically filled with `0x00` before any output is produced. Match distances reference positions within this window. An encoder may exploit this to match into the zero-initialized region.
 
-> **Note:** An encoder may take advantage of this, it is not an error to encode a distance outside of the declared window.
+## Token Byte
 
-## Frames
-
-Each frame begins with a **token byte** followed by optional extension fields:
+Every frame begins with a single token byte:
 
 ```
-   Token Byte
-┌───────┬────────┐
-│  LLL  │ DDDDD  │
-│ bit 7 │ bit 4  │
-│  to 5 │  to 0  │
-└───────┴────────┘
+  7   6   5   4   3   2   1   0
+┌───┬───┬───┬───┬───┬───┬───┬───┐
+│ T   T │ L   L   L   L   L   L │
+└───┴───┴───┴───┴───┴───┴───┴───┘
+  type          length field
 ```
 
-- **LLL** (bits 7-5): 3-bit length code (0-7).
-- **DDDDD** (bits 4-0): 5-bit distance code (0-31).
+**TT** (bits 7-6) selects the frame type. **LLLLLL** (bits 5-0) is a 6-bit length field whose interpretation depends on the frame type.
 
-The token value is computed as: `token = (LLL << 5) | DDDDD`
+The special token `0x00` (TT=00, LLLLLL=0) is the **end-of-stream** (EOS) marker. It carries no data; the decoder proceeds directly to the footer.
 
-**Length decoding:**
+## Frame Types
 
-| LLL | Meaning                                                                           |
-|-----|-----------------------------------------------------------------------------------|
-| 0-5 | Length is LLL (direct).                                                           |
-| 6   | A 1-byte **signed** extension follows; its value is the length (-128 to 127).     |
-| 7   | A 2-byte **signed** (little-endian) extension follows; its value is the length (-32,768 to 32,767). |
+| TT | Type | Payload | Total Size |
+|-|-|-|-|
+| 00 | Literal | LLLLLL raw bytes | 1 + LLLLLL |
+| 01 | Short match | 1 byte distance | 2 |
+| 10 | Medium match | 2 byte distance | 3 |
+| 11 | Extended match | 3 bytes (packed length + distance) | 4 |
 
-**Distance decoding:**
+### Literal Frame (TT = 00)
 
-| DDDDD | Meaning                                                                                             |
-|-------|-----------------------------------------------------------------------------------------------------|
-| 0-28  | Distance is DDDDD (direct).                                                                        |
-| 29    | A 1-byte unsigned extension follows; distance = stored value + 1 (1-256).                          |
-| 30    | A 2-byte unsigned (little-endian) extension follows; distance = stored value + 1 (1-65,536).       |
-| 31    | A 3-byte unsigned (little-endian) extension follows; distance = stored value + 1 (1-16,777,216).   |
+LLLLLL gives the byte count (1-63). That many uncompressed bytes follow the token. The decoder appends them directly to output.
 
-### Frame Field Order
+### Short Match Frame (TT = 01)
 
-1. **Token** (1 byte) — always present.
-2. **Length extension** (0, 1, or 2 bytes) — present only when LLL = 6 (1 byte) or LLL = 7 (2 bytes).
-3. **Distance extension** (0, 1, 2, or 3 bytes) — present only when DDDDD = 29 (1 byte), 30 (2 bytes), or 31 (3 bytes).
-4. **Literals** (0 or more bytes) — present only in literal frames.
+```
+ byte 0        byte 1
+┌───────────┐ ┌──────────┐
+│ 01 LLLLLL │ │ dist_raw │
+└───────────┘ └──────────┘
+```
 
-### End-of-Stream (EOS)
+- **Length:** Decoded from the 6-bit LLLLLL field with minimum magnitude **2** (see [Signed Length Encoding](#signed-length-encoding)). Range: **+2 to +33** or **-2 to -33**.
+- **Distance:** `dist_raw + 1`. Range: **1 to 256**.
 
-A token byte of **0x00** (LLL = 0, DDDDD = 0) signals the end of the frame sequence. No extension or literal
-fields follow. The decoder must then read the footer.
+### Medium Match Frame (TT = 10)
 
-### Literal Frame (DDDDD = 0, LLL > 0)
+```
+ byte 0        byte 1         byte 2
+┌───────────┐ ┌──────────────────────┐
+│ 10 LLLLLL │ │ dist_raw (16-bit LE) │
+└───────────┘ └──────────────────────┘
+```
 
-When DDDDD = 0 the frame carries raw uncompressed bytes.
+- **Length:** Decoded from the 6-bit LLLLLL field with minimum magnitude **3**. Range: **+3 to +34** or **-3 to -34**.
+- **Distance:** `dist_raw + 1` where dist_raw is a 16-bit little-endian unsigned integer. Range: **1 to 65,536**.
 
-| Field    | Description                                                |
-|----------|------------------------------------------------------------|
-| Length   | Decoded from LLL (see length decoding table above).        |
-| Literals | Exactly |*length*| bytes of uncompressed data.             |
+### Extended Match Frame (TT = 11)
 
-If the decoded length is negative, the absolute value is used as the byte count. The decoder appends the literal bytes directly to the output.
+The extended frame packs a 10-bit length and a 20-bit distance across all 4 bytes:
 
-### Match Frame (DDDDD > 0)
+```
+ byte 0        byte 1          byte 2       byte 3
+┌───────────┐ ┌─────────────┐ ┌──────────┐ ┌──────────┐
+│ 11 LLLLLL │ │ LLLL | DDDD │ │ DDDDDDDD │ │ DDDDDDDD │
+└───────────┘ └─────────────┘ └──────────┘ └──────────┘
+```
 
-When DDDDD > 0 the frame describes a back-reference copy.
+**Decode:**
 
-| Field    | Description                                                  |
-|----------|--------------------------------------------------------------|
-| Length   | Decoded from LLL (see length decoding table above).          |
-| Distance | Decoded from DDDDD (see distance decoding table above).     |
+```
+length_raw   = (byte0 & 0x3F) | ((byte1 >> 4) << 6)
+distance_raw = (byte1 & 0x0F) | (byte2 << 4) | (byte3 << 12)
+distance     = distance_raw + 1
+```
 
-No literal bytes follow a match frame. A length of zero is a no-op (no bytes are copied). Otherwise, the sign of the length determines the copy direction:
+**Encode:**
 
-**Forward copy** (length > 0): The decoder copies *length* bytes starting from *distance* bytes back in the output buffer, reading forward: `output[pos-D], output[pos-D+1], ..., output[pos-D+L-1]`.
+```
+byte0 = 0xC0 | (length_raw & 0x3F)
+byte1 = ((length_raw >> 6) << 4) | (distance_raw & 0x0F)
+byte2 = (distance_raw >> 4) & 0xFF
+byte3 = (distance_raw >> 12) & 0xFF
+```
 
-**Reverse copy** (length < 0): The decoder copies |*length*| bytes starting from *distance* bytes back in the output buffer, reading backward: `output[pos-D], output[pos-D-1], ..., output[pos-D-|L|+1]`. This enables matching reversed patterns (e.g., encoding "desserts" by referencing an earlier occurrence of "stressed"). If any position falls before the start of the sliding window, it reads as 0x00 (see [Sliding Window](#sliding-window)).
+- **Length:** Decoded from the 10-bit field with minimum magnitude **4**. Range: **+4 to +515** or **-4 to -515**.
+- **Distance:** `distance_raw + 1`. Range: **1 to 1,048,576**.
 
-> **Note (forward copy):** When *length* exceeds *distance*, the copy wraps forward into bytes produced earlier in the same operation. This is well-defined, occurs one byte at a time, and enables run-length encoding (e.g., distance = 1, length = 100 repeats the last byte 100 times).
+## Signed Length Encoding
 
-### Extension Frame (LLL = 0, DDDDD > 0)
+Match lengths are signed. Positive lengths copy forward; negative lengths copy in reverse. Each match frame type encodes its length as a **sign bit** followed by a **magnitude offset**:
 
-When LLL = 0 and DDDDD > 0 this is an extension frame reserved for future use. The distance field encodes a skip count using the normal distance decoding rules (see distance decoding table above). The decoder must skip the next *distance* bytes in the **input stream** and continue to the next frame. The contents of the skipped bytes are undefined.
+```
+ MSB                  LSB
+┌──────┬──────────────────┐
+│ sign │ magnitude offset │
+└──────┴──────────────────┘
+  0 = forward (+)      offset = |length| - M
+  1 = reverse (-)
+```
 
-### Encoding Ranges
+The sign bit is the most significant bit of the length field (bit 5 for short/medium, bit 9 for extended). The remaining bits encode `|length| - M`, where **M** is the frame type's minimum magnitude.
 
-| Value    | Inline Range | 1-byte Extension       | 2-byte Extension          | 3-byte Extension     |
-|----------|--------------|------------------------|---------------------------|----------------------|
-| Length   | 0 - 5        | -128 - 127             | -32,768 - 32,767          | —                    |
-| Distance | 0 - 28       | 1 - 256                | 1 - 65,536                | 1 - 16,777,216       |
+**Decode:**
+
+```
+sign      = length_raw >> (bits - 1)
+offset    = length_raw & ((1 << (bits - 1)) - 1)
+magnitude = offset + M
+length    = if sign == 0 then +magnitude else -magnitude
+```
+
+**Encode:**
+
+```
+offset     = |length| - M
+length_raw = if length > 0 then offset else offset | (1 << (bits - 1))
+```
+
+### Parameters by Frame Type
+
+| Frame | Field Width | Sign Bit | Offset Bits | M | Forward Range | Reverse Range |
+|-|-|-|-|-|
+| Short | 6 bits | bit 5 | bits 4-0 | 2 | +2 to +33 | -2 to -33 |
+| Medium | 6 bits | bit 5 | bits 4-0 | 3 | +3 to +34 | -3 to -34 |
+| Extended | 10 bits | bit 9 | bits 8-0 | 4 | +4 to +515 | -4 to -515 |
+
+### Worked Example
+
+Encoding length **+10** as a short match (6-bit field, M=2):
+
+```
+offset     = 10 - 2 = 8
+sign       = 0 (positive)
+length_raw = 8           → 0b001000
+```
+
+Encoding length **-5** as a short match:
+
+```
+offset     = 5 - 2 = 3
+sign       = 1 (negative)
+length_raw = 3 | 0b100000 = 35   → 0b100011
+```
+
+## Copy Semantics
+
+A match frame tells the decoder to copy `|length|` bytes from a position `distance` bytes back in the output buffer. The sign of the length controls the copy direction.
+
+### Forward Copy (length > 0)
+
+Copy `length` bytes starting at `output[pos - distance]`, reading forward:
+
+```
+for i in 0..length:
+    output[pos + i] = output[pos - distance + i]
+```
+
+When length exceeds distance, the copy overlaps with its own output. This is intentional and well-defined — each byte is copied individually. It enables run-length encoding: for example, distance=1 and length=100 repeats the most recent byte 100 times.
+
+### Reverse Copy (length < 0)
+
+Copy `|length|` bytes starting at `output[pos - distance]`, reading backward:
+
+```
+count = |length|
+for i in 0..count:
+    output[pos + i] = output[pos - distance - i]
+```
+
+This enables matching reversed patterns. For example, if the output contains `stressed`, a reverse match can produce `desserts` by referencing it backward.
+
+If any source index falls before the start of the sliding window, the byte reads as `0x00`.
+
+## Distance Encoding
+
+All match frame types store distance as an unsigned integer minus one:
+
+```
+stored_value = distance - 1
+distance     = stored_value + 1
+```
+
+This encoding is lossless for the full distance range of each frame type and avoids wasting a code point on the meaningless value distance=0.
 
 ## Footer
 
-The footer immediately follows the EOS token.
+The footer immediately follows the EOS token:
 
-| Field               | Size       | Description                                       |
-|---------------------|------------|---------------------------------------------------|
-| Uncompressed length | 1-9 bytes  | ULEB128-encoded original data size (u64, N=9).    |
-| Checksum            | 4 bytes    | Adler-32 of the uncompressed data, little-endian. |
+| Field | Size | Description |
+|-|-|-|
+| Uncompressed length | 1-10 bytes | ULEB128-encoded byte count of the original data (unsigned 64-bit). |
+| Checksum | 4 bytes | Adler-32 of the uncompressed data, little-endian. |
 
-The **Adler-32** checksum is computed over the original uncompressed data. The decoder should verify it after decompression and report an error on mismatch.
+The decoder **must** verify that the decompressed byte count matches the stored length and that the Adler-32 checksum matches. A mismatch indicates corruption.
+
+### ULEB128
+
+Unsigned integers are encoded in [ULEB128](https://en.wikipedia.org/wiki/LEB128#Unsigned_LEB128) (Unsigned Little-Endian Base 128). Each byte stores 7 data bits; bit 7 is a continuation flag (1 = more bytes follow, 0 = final byte). A conforming implementation must support values up to 2^64 - 1, requiring at most 10 bytes.
+
+### Adler-32
+
+The checksum is a standard [Adler-32](https://en.wikipedia.org/wiki/Adler-32) computed over the entire uncompressed output, stored as a 4-byte little-endian integer.
+
+## Stream Concatenation
+
+A file may contain multiple concatenated streams. If data remains after a footer, the decoder should treat it as the beginning of a new stream (starting with a header). This allows compressed files to be concatenated with `cat`.
+
+## Quick Reference
+
+### Encoding Ranges
+
+| Frame | Length | Distance | Frame Size |
+|-|-|-|-|
+| Literal | 1-63 bytes | -- | 1 + length |
+| Short match | ±(2-33) | 1-256 | 2 bytes |
+| Medium match | ±(3-34) | 1-65,536 | 3 bytes |
+| Extended match | ±(4-515) | 1-1,048,576 | 4 bytes |
+
+Each match frame's minimum `|length|` equals its size in bytes, so every match is at least as compact as the equivalent literal bytes.
+
+### Token Byte Map
+
+| Byte Value | Meaning |
+|-|-|
+| `0x00` | End of stream |
+| `0x01-0x3F` | Literal (1-63 bytes follow) |
+| `0x40-0x7F` | Short match (1 distance byte follows) |
+| `0x80-0xBF` | Medium match (2 distance bytes follow) |
+| `0xC0-0xFF` | Extended match (3 extension bytes follow) |
