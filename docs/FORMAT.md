@@ -222,14 +222,14 @@ The footer immediately follows the EOS token:
 
 | Field | Size | Description |
 |-|-|-|
-| Uncompressed length | 1-10 bytes | ULEB128-encoded byte count of the original data (unsigned 64-bit). |
+| Uncompressed length | 1-9 bytes | ULEB128-encoded byte count of the original data (unsigned 64-bit). |
 | Checksum | 4 bytes | Adler-32 of the uncompressed data, little-endian. |
 
 The decoder **must** verify that the decompressed byte count matches the stored length and that the Adler-32 checksum matches. A mismatch indicates corruption.
 
 ### ULEB128
 
-Unsigned integers are encoded in [ULEB128](https://en.wikipedia.org/wiki/LEB128#Unsigned_LEB128) (Unsigned Little-Endian Base 128). Each byte stores 7 data bits; bit 7 is a continuation flag (1 = more bytes follow, 0 = final byte). A conforming implementation must support values up to 2^64 - 1, requiring at most 10 bytes.
+Unsigned integers use a modified [ULEB128](https://en.wikipedia.org/wiki/LEB128#Unsigned_LEB128) encoding. Bytes 1–8 each store 7 data bits in bits 6–0, with bit 7 as a continuation flag (1 = more bytes follow, 0 = final byte). If all 8 of those bytes have the continuation flag set, a 9th byte follows that carries 8 data bits with no continuation flag (8 × 7 + 8 = 64 bits). A conforming implementation must support values up to 2^64 − 1, requiring at most 9 bytes.
 
 ### Adler-32
 

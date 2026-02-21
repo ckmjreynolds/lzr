@@ -13,15 +13,16 @@ keywords        = ["LZ77", "compression", "compress"]
 categories      = ["compression"]
 documentation   = "https://docs.rs/lzr"
 
-include         = ["src/**", "build.rs", "Cargo.toml", "README.md", "LICENSE*"]
+include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
-clap = { version = "=4.5.59", features = ["derive"] }
+clap = { version = "=4.5.60", features = ["derive"] }
 rayon = "=1.11.0"
 simd-adler32 = "=0.3.8"
 
 [dev-dependencies]
 assert_cmd = "=2.1.2"
+criterion = "=0.8.2"
 pretty_assertions = "=1.4.1"
 proptest = "=1.10.0"
 
