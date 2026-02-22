@@ -1,16 +1,14 @@
-use tinyvec::ArrayVec;
-
 const MAX_ULEB128_LEN: usize = 9;
 
 // This is a bounded version of ULEB128 (see docs/FORMAT.md).
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn encode(mut value: u64) -> ArrayVec<[u8; MAX_ULEB128_LEN]> {
-    let mut output = ArrayVec::<[u8; MAX_ULEB128_LEN]>::default();
+pub(crate) fn encode(mut value: u64, buf: &mut Vec<u8>) -> usize {
     let mut byte;
+    let mut count = 0usize;
 
     loop {
         // Consume the lower 7 or 8 bits
-        if output.len() < (MAX_ULEB128_LEN - 1) {
+        if count < (MAX_ULEB128_LEN - 1) {
             byte = (value & 0x7f) as u8;
             value >>= 7;
         } else {
@@ -23,18 +21,19 @@ pub(crate) fn encode(mut value: u64) -> ArrayVec<[u8; MAX_ULEB128_LEN]> {
             byte |= 0x80;
         }
 
-        output.push(byte);
+        buf.push(byte);
+        count += 1;
 
         if value == 0 {
             break;
         }
     }
 
-    output
+    count
 }
 
 // This is a bounded version of ULEB128 (see docs/FORMAT.md).
-pub(crate) fn decode(input: &[u8]) -> u64 {
+pub(crate) fn decode(input: &[u8]) -> (u64, usize) {
     let mut result = 0u64;
     let mut shift = 0u32;
     let mut i = 0usize;
@@ -55,7 +54,7 @@ pub(crate) fn decode(input: &[u8]) -> u64 {
         }
     }
 
-    result
+    (result, i + 1)
 }
 
 #[cfg(test)]
@@ -63,36 +62,46 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
-    use tinyvec::array_vec;
 
     #[test]
     fn encode_zero() {
-        let expected = array_vec!([u8; 9] => 0x00);
-        assert_eq!(encode(0), expected);
+        let mut buf = Vec::new();
+        let n = encode(0, &mut buf);
+
+        assert_eq!(buf, vec![0x00]);
+        assert_eq!(n, 1);
     }
 
     #[test]
     fn decode_zero() {
-        let data = array_vec!([u8; 9] => 0x00);
-        assert_eq!(decode(data.as_slice()), 0);
+        assert_eq!(decode(&[0x00]), (0, 1));
     }
 
     #[test]
     fn encode_max() {
-        let expected = array_vec!([u8; 9] => 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
-        assert_eq!(encode(u64::MAX), expected);
+        let mut buf = Vec::new();
+        let n = encode(u64::MAX, &mut buf);
+
+        assert_eq!(buf, vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(n, 9);
     }
 
     #[test]
     fn decode_max() {
-        let data = array_vec!([u8; 9] => 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
-        assert_eq!(decode(data.as_slice()), u64::MAX);
+        assert_eq!(decode(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), (u64::MAX, 9));
     }
 
     proptest! {
         #[test]
         fn roundtrip_any_u64(val: u64) {
-            prop_assert_eq!(val, decode(encode(val).as_slice()));
+            let mut buf = Vec::new();
+
+            encode(val, &mut buf);
+
+            let (decoded, bytes_consumed) = decode(&buf);
+
+            prop_assert_eq!(val, decoded);
+            prop_assert_eq!(buf.len(), bytes_consumed);
         }
     }
 }

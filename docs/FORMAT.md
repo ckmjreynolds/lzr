@@ -42,12 +42,12 @@ Every frame begins with a single token byte:
 ```
   7   6   5   4   3   2   1   0
 ┌───┬───┬───┬───┬───┬───┬───┬───┐
-│ T   T │ L   L   L   L   L   L │
+│ L   L   L   L   L   L │ T   T │
 └───┴───┴───┴───┴───┴───┴───┴───┘
-  type          length field
+      length field         type
 ```
 
-**TT** (bits 7-6) selects the frame type. **LLLLLL** (bits 5-0) is a 6-bit length field whose interpretation depends on the frame type.
+**TT** (bits 1-0) selects the frame type. **LLLLLL** (bits 7-2) is a 6-bit length field whose interpretation depends on the frame type.
 
 The special token `0x00` (TT=00, LLLLLL=0) is the **end-of-stream** (EOS) marker. It carries no data; the decoder proceeds directly to the footer.
 
@@ -62,31 +62,35 @@ The special token `0x00` (TT=00, LLLLLL=0) is the **end-of-stream** (EOS) marker
 
 ### Literal Frame (TT = 00)
 
-LLLLLL gives the byte count (1-63). That many uncompressed bytes follow the token. The decoder appends them directly to output.
+LLLLLL (`token >> 2`) gives the byte count (1-63). That many uncompressed bytes follow the token. The decoder appends them directly to output.
 
 ### Short Match Frame (TT = 01)
 
 ```
  byte 0        byte 1
 ┌───────────┐ ┌──────────┐
-│ 01 LLLLLL │ │ dist_raw │
+│ LLLLLL 01 │ │ dist_raw │
 └───────────┘ └──────────┘
 ```
 
-- **Length:** Decoded from the 6-bit LLLLLL field with minimum magnitude **2** (see [Signed Length Encoding](#signed-length-encoding)). Range: **+2 to +33** or **-2 to -33**.
+- **Length:** Decoded from the 6-bit LLLLLL field (`token >> 2`) with minimum magnitude **2** (see [Signed Length Encoding](#signed-length-encoding)). Range: **+2 to +33** or **-2 to -33**.
 - **Distance:** `dist_raw + 1`. Range: **1 to 256**.
+
+As a little-endian `u16`: `raw = 0x01 | (length_raw << 2) | (dist_raw << 8)`.
 
 ### Medium Match Frame (TT = 10)
 
 ```
  byte 0        byte 1         byte 2
 ┌───────────┐ ┌──────────────────────┐
-│ 10 LLLLLL │ │ dist_raw (16-bit LE) │
+│ LLLLLL 10 │ │ dist_raw (16-bit LE) │
 └───────────┘ └──────────────────────┘
 ```
 
-- **Length:** Decoded from the 6-bit LLLLLL field with minimum magnitude **3**. Range: **+3 to +34** or **-3 to -34**.
+- **Length:** Decoded from the 6-bit LLLLLL field (`token >> 2`) with minimum magnitude **3**. Range: **+3 to +34** or **-3 to -34**.
 - **Distance:** `dist_raw + 1` where dist_raw is a 16-bit little-endian unsigned integer. Range: **1 to 65,536**.
+
+As the first 3 bytes of a little-endian `u32`: `raw = 0x02 | (length_raw << 2) | (dist_raw << 8)`.
 
 ### Extended Match Frame (TT = 11)
 
@@ -95,25 +99,25 @@ The extended frame packs a 10-bit length and a 20-bit distance across all 4 byte
 ```
  byte 0        byte 1          byte 2       byte 3
 ┌───────────┐ ┌─────────────┐ ┌──────────┐ ┌──────────┐
-│ 11 LLLLLL │ │ LLLL | DDDD │ │ DDDDDDDD │ │ DDDDDDDD │
+│ LLLLLL 11 │ │ DDDD | LLLL │ │ DDDDDDDD │ │ DDDDDDDD │
 └───────────┘ └─────────────┘ └──────────┘ └──────────┘
 ```
+
+When read as a little-endian `u32`, `length_raw` occupies the contiguous 10-bit field at bits `[11:2]` and `distance_raw` occupies the contiguous 20-bit field at bits `[31:12]`.
 
 **Decode:**
 
 ```
-length_raw   = (byte0 & 0x3F) | ((byte1 >> 4) << 6)
-distance_raw = (byte1 & 0x0F) | (byte2 << 4) | (byte3 << 12)
+raw          = u32 from bytes 0–3 (little-endian)
+length_raw   = (raw >> 2) & 0x3FF
+distance_raw = raw >> 12
 distance     = distance_raw + 1
 ```
 
 **Encode:**
 
 ```
-byte0 = 0xC0 | (length_raw & 0x3F)
-byte1 = ((length_raw >> 6) << 4) | (distance_raw & 0x0F)
-byte2 = (distance_raw >> 4) & 0xFF
-byte3 = (distance_raw >> 12) & 0xFF
+raw = 0x03 | (length_raw << 2) | (distance_raw << 12)
 ```
 
 - **Length:** Decoded from the 10-bit field with minimum magnitude **4**. Range: **+4 to +515** or **-4 to -515**.
@@ -165,7 +169,8 @@ Encoding length **+10** as a short match (6-bit field, M=2):
 ```
 offset     = 10 - 2 = 8
 sign       = 0 (positive)
-length_raw = 8           → 0b001000
+length_raw = 8             → 0b001000
+token      = (8 << 2) | 1 → 0x21
 ```
 
 Encoding length **-5** as a short match:
@@ -174,6 +179,7 @@ Encoding length **-5** as a short match:
 offset     = 5 - 2 = 3
 sign       = 1 (negative)
 length_raw = 3 | 0b100000 = 35   → 0b100011
+token      = (35 << 2) | 1       → 0x8D
 ```
 
 ## Copy Semantics
@@ -254,10 +260,11 @@ Each match frame's minimum `|length|` equals its size in bytes, so every match i
 
 ### Token Byte Map
 
-| Byte Value | Meaning |
+The frame type is determined by the two least-significant bits (`token & 0x03`):
+
+| TT (bits 1-0) | Meaning |
 |-|-|
-| `0x00` | End of stream |
-| `0x01-0x3F` | Literal (1-63 bytes follow) |
-| `0x40-0x7F` | Short match (1 distance byte follows) |
-| `0x80-0xBF` | Medium match (2 distance bytes follow) |
-| `0xC0-0xFF` | Extended match (3 extension bytes follow) |
+| `0b00` | Literal (1-63 bytes follow) or **EOS** if byte = `0x00` |
+| `0b01` | Short match (1 distance byte follows) |
+| `0b10` | Medium match (2 distance bytes follow) |
+| `0b11` | Extended match (3 extension bytes follow) |
