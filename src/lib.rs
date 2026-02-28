@@ -4,3 +4,7 @@
 
 // #[cfg(not(target_pointer_width = "64"))]
 // compile_error!("lzr requires a 64-bit target!");
+
+mod bleb8;
+mod error;
+mod nibble;

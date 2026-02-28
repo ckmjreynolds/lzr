@@ -18,6 +18,7 @@ include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 [dependencies]
 # clap = { version = "=4.5.60", features = ["derive"] }
 # rayon = "=1.11.0"
+thiserror = "=2.0.18"
 
 [dev-dependencies]
 # assert_cmd = "=2.1.2"
