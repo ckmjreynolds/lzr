@@ -1,5 +1,4 @@
-use crate::error::Result;
-use crate::nibble::{NibbleReader, NibbleWriter};
+use crate::nibble::{NibbleWriter, ReadNibble};
 
 /// BLEB8 requires `type_bits = 3N + 1`; returns N (the max nibble count).
 #[allow(dead_code)]
@@ -18,7 +17,7 @@ pub(crate) trait Ubleb8: Sized {
     fn encode_ubleb8(self, w: &mut NibbleWriter);
 
     /// Decodes a UBLEB8 value from `r`.
-    fn decode_ubleb8(r: &mut NibbleReader<'_>) -> Result<Self>;
+    fn decode_ubleb8<R: ReadNibble>(r: &mut R) -> Result<Self, R::Error>;
 }
 
 /// Trait for types that can be encoded/decoded as signed BLEB8.
@@ -31,7 +30,7 @@ pub(crate) trait Sleb8: Sized {
     fn encode_sleb8(self, w: &mut NibbleWriter);
 
     /// Decodes an SLEB8 value from `r`.
-    fn decode_sleb8(r: &mut NibbleReader<'_>) -> Result<Self>;
+    fn decode_sleb8<R: ReadNibble>(r: &mut R) -> Result<Self, R::Error>;
 }
 
 macro_rules! impl_ubleb8 {
@@ -55,18 +54,18 @@ macro_rules! impl_ubleb8 {
                 w.push((self & 0xF) as u8);
             }
 
-            fn decode_ubleb8(r: &mut NibbleReader<'_>) -> Result<Self> {
+            fn decode_ubleb8<R: ReadNibble>(r: &mut R) -> Result<Self, R::Error> {
                 let mut value: Self = 0;
                 let mut shift: u32 = 0;
                 for _ in 0..Self::MAX_NIBBLES - 1 {
-                    let nibble = r.read()?;
+                    let nibble = r.read_nibble()?;
                     value |= Self::from(nibble & 0x7) << shift;
                     shift += 3;
                     if nibble & 0x8 == 0 {
                         return Ok(value);
                     }
                 }
-                let nibble = r.read()?;
+                let nibble = r.read_nibble()?;
                 value |= Self::from(nibble) << shift;
                 Ok(value)
             }
@@ -100,12 +99,12 @@ macro_rules! impl_sleb8 {
             }
 
             #[allow(clippy::cast_possible_wrap)]
-            fn decode_sleb8(r: &mut NibbleReader<'_>) -> Result<Self> {
+            fn decode_sleb8<R: ReadNibble>(r: &mut R) -> Result<Self, R::Error> {
                 let mut value: $U = 0;
                 let mut shift: u32 = 0;
                 let mut done = false;
                 for _ in 0..Self::MAX_NIBBLES - 1 {
-                    let nibble = r.read()?;
+                    let nibble = r.read_nibble()?;
                     value |= <$U>::from(nibble & 0x7) << shift;
                     shift += 3;
                     if nibble & 0x8 == 0 {
@@ -114,7 +113,7 @@ macro_rules! impl_sleb8 {
                     }
                 }
                 if !done {
-                    let nibble = r.read()?;
+                    let nibble = r.read_nibble()?;
                     value |= <$U>::from(nibble) << shift;
                     shift += 4;
                 }
@@ -138,6 +137,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::nibble::NibbleReader;
 
     // ── Helpers ──────────────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-use crate::error::{Error, Result};
+use crate::error::Error;
 
 /// Writes a stream of 4-bit nibbles, packing two per byte.
 ///
@@ -102,7 +102,7 @@ impl<'a> NibbleReader<'a> {
     }
 
     /// Reads the next nibble, or returns `Err(UnexpectedEnd)`.
-    pub(crate) fn read(&mut self) -> Result<u8> {
+    pub(crate) fn read(&mut self) -> Result<u8, Error> {
         let byte = *self.data.get(self.pos / 2).ok_or(Error::UnexpectedEnd)?;
         let nibble = if self.pos.is_multiple_of(2) {
             byte >> 4
@@ -112,12 +112,29 @@ impl<'a> NibbleReader<'a> {
         self.pos += 1;
         Ok(nibble)
     }
+}
+
+/// Trait for types that can produce nibbles one at a time.
+pub(crate) trait ReadNibble {
+    /// The error type returned on failure.
+    type Error;
+
+    /// Reads the next 4-bit nibble (0x0–0xF).
+    fn read_nibble(&mut self) -> Result<u8, Self::Error>;
 
     /// Reads two nibbles and reassembles them into a byte (low nibble first).
-    pub(crate) fn read_byte(&mut self) -> Result<u8> {
-        let lo = self.read()?;
-        let hi = self.read()?;
+    fn read_byte(&mut self) -> Result<u8, Self::Error> {
+        let lo = self.read_nibble()?;
+        let hi = self.read_nibble()?;
         Ok((hi << 4) | lo)
+    }
+}
+
+impl ReadNibble for NibbleReader<'_> {
+    type Error = Error;
+
+    fn read_nibble(&mut self) -> Result<u8, Error> {
+        self.read()
     }
 }
 

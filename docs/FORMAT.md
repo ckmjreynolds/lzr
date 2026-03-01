@@ -28,7 +28,7 @@ Version `0x00` is format version 1.0. All other values are reserved. A decoder m
 
 ## Bitstream
 
-The bitstream between the header and footer is a sequence of nibbles encoding frames. Nibbles pack into bytes as defined in [BLEB8](BLEB8.md#nibble-stream): first nibble in bits 7–4, second in bits 3–0. If the total number of nibbles is odd, the final byte's low nibble is zero padding.
+The bitstream between the header and footer is a sequence of nibbles encoding frames. Nibbles pack into bytes as defined in [BLEB8](BLEB8.md#nibble-stream): first nibble in bits 7–4, second in bits 3–0. The bitstream must contain an even number of nibbles (byte-aligned).
 
 ## Frames
 
@@ -46,7 +46,7 @@ Each frame is a distance (D) followed by a length (L), optionally followed by li
 
 ### End of Stream
 
-D = 0 and L = 0. Both encode as a single UBLEB8 nibble `0x0`, totaling two zero nibbles. After EOS, zero nibbles are appended as needed to reach a byte boundary.
+D = 0 and L = 0. Both encode as a single UBLEB8 nibble `0x0`, totaling two zero nibbles.
 
 ### Literal
 
@@ -78,7 +78,7 @@ This matches reversed patterns. For example, `stressed` in the output can produc
 
 ### No-op
 
-D > 0, L = 0. Valid; the decoder emits nothing and advances to the next frame.
+D > 0, L = 0. Valid; the decoder emits nothing and advances to the next frame. Encoders use no-op frames to pad the nibble stream to a byte boundary.
 
 ## Sliding Window
 
