@@ -26,7 +26,6 @@ const MOD: u32 = 65521;
 /// constant used by zlib.
 const NMAX: usize = 5552;
 
-#[allow(dead_code)]
 impl Adler32 {
     /// Creates a new checksum initialized to the Adler-32 starting value (1).
     pub(crate) const fn new() -> Self {

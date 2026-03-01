@@ -34,7 +34,6 @@ proptest! {
 // ── Corpus Round-Trip (CRC32) ────────────────────────────────────
 
 #[test]
-#[ignore = "slow"]
 fn corpus_round_trip() {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpora");
     let mut count = 0;

@@ -1,5 +1,3 @@
-use crate::error::Error;
-
 /// Writes a stream of 4-bit nibbles, packing two per byte.
 ///
 /// Packing convention (high-first):
@@ -7,13 +5,11 @@ use crate::error::Error;
 /// - Nibble 2K+1 → byte K, bits 3–0
 /// - Odd total   → final byte's low nibble is zero padding
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct NibbleWriter {
     buf: Vec<u8>,
     len: usize,
 }
 
-#[allow(dead_code)]
 impl NibbleWriter {
     /// Creates a new, empty writer.
     pub(crate) const fn new() -> Self {
@@ -36,11 +32,6 @@ impl NibbleWriter {
         self.len
     }
 
-    /// Returns `true` if no nibbles have been written.
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     /// Appends a single nibble (must be 0x0–0xF).
     pub(crate) fn push(&mut self, nibble: u8) {
         debug_assert!(nibble <= 0xF, "nibble out of range: {nibble:#X}");
@@ -58,59 +49,35 @@ impl NibbleWriter {
 
     /// Appends a full byte as two nibbles: low nibble first, then high nibble.
     pub(crate) fn push_byte(&mut self, byte: u8) {
-        self.push(byte & 0xF);
-        self.push(byte >> 4);
+        if self.len.is_multiple_of(2) {
+            // Byte-aligned: pack both nibbles directly (nibble-swap).
+            self.buf.push(byte.rotate_left(4));
+            self.len += 2;
+        } else {
+            self.push(byte & 0xF);
+            self.push(byte >> 4);
+        }
+    }
+
+    /// Appends a slice of bytes, each as two nibbles: low nibble first, then high.
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
+        if self.len.is_multiple_of(2) {
+            // Byte-aligned: nibble-swap each byte and extend directly.
+            self.buf.reserve(bytes.len());
+            for &b in bytes {
+                self.buf.push(b.rotate_left(4));
+            }
+            self.len += bytes.len() * 2;
+        } else {
+            for &b in bytes {
+                self.push_byte(b);
+            }
+        }
     }
 
     /// Consumes the writer and returns the packed byte buffer.
     pub(crate) fn finish(self) -> Vec<u8> {
         self.buf
-    }
-}
-
-/// Reads a stream of 4-bit nibbles from a packed byte slice.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub(crate) struct NibbleReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-#[allow(dead_code)]
-impl<'a> NibbleReader<'a> {
-    /// Creates a reader over the given byte slice.
-    pub(crate) const fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-        }
-    }
-
-    /// Returns the current nibble position.
-    pub(crate) const fn position(&self) -> usize {
-        self.pos
-    }
-
-    /// Returns the number of nibbles remaining (may include a padding nibble).
-    pub(crate) const fn remaining(&self) -> usize {
-        self.data.len() * 2 - self.pos
-    }
-
-    /// Returns `true` if all nibbles have been consumed.
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.remaining() == 0
-    }
-
-    /// Reads the next nibble, or returns `Err(UnexpectedEnd)`.
-    pub(crate) fn read(&mut self) -> Result<u8, Error> {
-        let byte = *self.data.get(self.pos / 2).ok_or(Error::UnexpectedEnd)?;
-        let nibble = if self.pos.is_multiple_of(2) {
-            byte >> 4
-        } else {
-            byte & 0xF
-        };
-        self.pos += 1;
-        Ok(nibble)
     }
 }
 
@@ -130,10 +97,42 @@ pub(crate) trait ReadNibble {
     }
 }
 
-impl ReadNibble for NibbleReader<'_> {
-    type Error = Error;
+/// Reads a stream of 4-bit nibbles from a packed byte slice (test-only).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NibbleReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
 
-    fn read_nibble(&mut self) -> Result<u8, Error> {
+#[cfg(test)]
+impl<'a> NibbleReader<'a> {
+    /// Creates a reader over the given byte slice.
+    pub(crate) const fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+        }
+    }
+
+    /// Reads the next nibble, or returns `Err(UnexpectedEnd)`.
+    pub(crate) fn read(&mut self) -> Result<u8, crate::error::Error> {
+        let byte = *self.data.get(self.pos / 2).ok_or(crate::error::Error::UnexpectedEnd)?;
+        let nibble = if self.pos.is_multiple_of(2) {
+            byte >> 4
+        } else {
+            byte & 0xF
+        };
+        self.pos += 1;
+        Ok(nibble)
+    }
+}
+
+#[cfg(test)]
+impl ReadNibble for NibbleReader<'_> {
+    type Error = crate::error::Error;
+
+    fn read_nibble(&mut self) -> Result<u8, crate::error::Error> {
         self.read()
     }
 }

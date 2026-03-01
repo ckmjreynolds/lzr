@@ -112,6 +112,7 @@ struct Encoder<R: Read, W: Write> {
     writer: BufWriter<W>,
     adler: Adler32,
     uncompressed_len: u64,
+    chains: HashChains,
 }
 
 impl<R: Read, W: Write> Encoder<R, W> {
@@ -121,6 +122,7 @@ impl<R: Read, W: Write> Encoder<R, W> {
             writer: BufWriter::new(output),
             adler: Adler32::new(),
             uncompressed_len: 0,
+            chains: HashChains::new(RING_SIZE),
         }
     }
 
@@ -138,12 +140,18 @@ impl<R: Read, W: Write> Encoder<R, W> {
             self.adler.update(&ring[WINDOW_SIZE..WINDOW_SIZE + bytes_read]);
             self.uncompressed_len += bytes_read as u64;
 
-            let compressed_jobs = compress_batch(&ring, bytes_read);
+            let active_end = WINDOW_SIZE + bytes_read;
+            self.chains.rebuild(&ring, active_end);
+            let compressed_jobs = compress_batch(&ring[..active_end], &self.chains, bytes_read);
             for job_bytes in &compressed_jobs {
                 self.writer.write_all(job_bytes)?;
             }
 
-            ring.copy_within(bytes_read..bytes_read + WINDOW_SIZE, 0);
+            // Only slide the window if this was a full batch (more data may follow).
+            let batch_capacity = RING_SIZE - WINDOW_SIZE;
+            if bytes_read == batch_capacity {
+                ring.copy_within(bytes_read..bytes_read + WINDOW_SIZE, 0);
+            }
         }
 
         self.write_eos()?;
@@ -192,14 +200,10 @@ fn read_batch(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 
 /// Divides `bytes_read` bytes (starting at `ring[WINDOW_SIZE]`) into 64 KiB
 /// jobs, compresses each in parallel, and returns the byte-aligned output.
-fn compress_batch(ring: &[u8], bytes_read: usize) -> Vec<Vec<u8>> {
+fn compress_batch(ring: &[u8], chains: &HashChains, bytes_read: usize) -> Vec<Vec<u8>> {
     let full_jobs = bytes_read / WINDOW_SIZE;
     let remainder = bytes_read % WINDOW_SIZE;
     let job_count = full_jobs + usize::from(remainder > 0);
-
-    let active_end = WINDOW_SIZE + bytes_read;
-    let chains = HashChains::build(ring, active_end);
-    let ring_slice = &ring[..active_end];
 
     (0..job_count)
         .into_par_iter()
@@ -211,7 +215,7 @@ fn compress_batch(ring: &[u8], bytes_read: usize) -> Vec<Vec<u8>> {
             };
             let data_start = WINDOW_SIZE + i * WINDOW_SIZE;
             let data_end = data_start + data_len;
-            compress_job(ring_slice, &chains, data_start, data_end)
+            compress_job(ring, chains, data_start, data_end)
         })
         .collect()
 }
@@ -255,22 +259,44 @@ fn compress_job(buf: &[u8], chains: &HashChains, data_start: usize, data_end: us
 
 /// Extends a forward match: counts how many bytes match starting at
 /// `buf[candidate]` vs `buf[pos]`, up to `max_len`.
+///
+/// Compares in 8-byte chunks via XOR to avoid per-byte bounds checks.
 fn extend_forward(buf: &[u8], candidate: usize, pos: usize, max_len: usize) -> usize {
+    let a = &buf[candidate..candidate + max_len];
+    let b = &buf[pos..pos + max_len];
     let mut len = 0;
-    while len < max_len && buf[candidate + len] == buf[pos + len] {
-        len += 1;
+
+    // Compare 8 bytes at a time.
+    let chunks = max_len / 8;
+    for i in 0..chunks {
+        let off = i * 8;
+        let xa = u64::from_ne_bytes(a[off..off + 8].try_into().expect("8 bytes"));
+        let xb = u64::from_ne_bytes(b[off..off + 8].try_into().expect("8 bytes"));
+        let diff = xa ^ xb;
+        if diff != 0 {
+            return len + (diff.trailing_zeros() as usize / 8);
+        }
+        len += 8;
     }
-    len
+
+    // Byte-by-byte tail for the final <8 bytes.
+    for i in len..max_len {
+        if a[i] != b[i] {
+            return i;
+        }
+    }
+    max_len
 }
 
 /// Extends a reverse match: counts how many bytes match with `candidate`
 /// decrementing and `pos` incrementing, up to `max_len`.
 fn extend_reverse(buf: &[u8], candidate: usize, pos: usize, max_len: usize) -> usize {
-    let mut len = 0;
-    while len < max_len && buf[candidate - len] == buf[pos + len] {
-        len += 1;
-    }
-    len
+    buf[candidate + 1 - max_len..=candidate]
+        .iter()
+        .rev()
+        .zip(&buf[pos..pos + max_len])
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 // ── Hash Chains ──────────────────────────────────────────────────────
@@ -290,33 +316,34 @@ struct HashChains {
 }
 
 impl HashChains {
-    fn new(len: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             fwd_head: vec![NIL; HASH_TABLE_SIZE],
-            fwd_prev: vec![NIL; len],
+            fwd_prev: vec![NIL; capacity],
             rev_head: vec![NIL; HASH_TABLE_SIZE],
-            rev_prev: vec![NIL; len],
+            rev_prev: vec![NIL; capacity],
         }
     }
 
+    /// Resets heads and rebuilds chains for `ring[0..end]`.
     #[allow(clippy::cast_possible_truncation)]
-    fn build(ring: &[u8], end: usize) -> Self {
-        let mut chains = Self::new(end);
+    fn rebuild(&mut self, ring: &[u8], end: usize) {
+        self.fwd_head.fill(NIL);
+        self.rev_head.fill(NIL);
         for pos in 0..end {
             // Forward: hash(buf[p], buf[p+1], buf[p+2])
             if pos + 2 < end {
                 let h = hash3(ring[pos], ring[pos + 1], ring[pos + 2]);
-                chains.fwd_prev[pos] = chains.fwd_head[h];
-                chains.fwd_head[h] = pos as u32;
+                self.fwd_prev[pos] = self.fwd_head[h];
+                self.fwd_head[h] = pos as u32;
             }
             // Reverse: hash(buf[p], buf[p-1], buf[p-2])
             if pos >= 2 {
                 let h = hash3(ring[pos], ring[pos - 1], ring[pos - 2]);
-                chains.rev_prev[pos] = chains.rev_head[h];
-                chains.rev_head[h] = pos as u32;
+                self.rev_prev[pos] = self.rev_head[h];
+                self.rev_head[h] = pos as u32;
             }
         }
-        chains
     }
 }
 
@@ -338,6 +365,32 @@ fn find_best_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize)
     hash_best
 }
 
+/// Walks a hash chain, calling `visitor(candidate, distance)` for each valid candidate.
+fn walk_chain(
+    head: &[u32],
+    prev: &[u32],
+    h: usize,
+    pos: usize,
+    max_dist: usize,
+    mut visitor: impl FnMut(usize, usize),
+) {
+    let mut entry = head[h];
+    let mut depth = 0;
+    while entry != NIL && depth < MAX_CHAIN_DEPTH {
+        let candidate = entry as usize;
+        entry = prev[candidate];
+        depth += 1;
+        if candidate >= pos {
+            continue;
+        }
+        let d = pos - candidate;
+        if d > max_dist {
+            break;
+        }
+        visitor(candidate, d);
+    }
+}
+
 /// Walks both forward and reverse hash chains to find the best 3+ byte match.
 #[allow(clippy::cast_possible_truncation)]
 fn find_hash_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize) -> Option<Match> {
@@ -352,60 +405,30 @@ fn find_hash_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize)
     let max_fwd = (data_end - pos).min(MAX_MATCH_FWD);
 
     // Forward chain: find positions sharing hash3(buf[pos], buf[pos+1], buf[pos+2]).
-    {
-        let mut entry = chains.fwd_head[h];
-        let mut depth = 0;
-        while entry != NIL && depth < MAX_CHAIN_DEPTH {
-            let candidate = entry as usize;
-            entry = chains.fwd_prev[candidate];
-            depth += 1;
-            if candidate >= pos {
-                continue;
-            }
-            let d = pos - candidate;
-            if d > max_dist {
-                break;
-            }
-            let fwd_len = extend_forward(buf, candidate, pos, max_fwd);
-            if fwd_len > 0 {
-                tracker.consider(Match {
-                    distance: d as u16,
-                    length: fwd_len,
-                    is_reverse: false,
-                });
-            }
+    walk_chain(&chains.fwd_head, &chains.fwd_prev, h, pos, max_dist, |candidate, d| {
+        let fwd_len = extend_forward(buf, candidate, pos, max_fwd);
+        if fwd_len > 0 {
+            tracker.consider(Match {
+                distance: d as u16,
+                length: fwd_len,
+                is_reverse: false,
+            });
         }
-    }
+    });
 
     // Reverse chain: entry at position C has hash3(buf[C], buf[C-1], buf[C-2]).
-    // We want C where buf[C..C-2] matches buf[pos..pos+2] reversed,
-    // so we look up hash3(buf[pos], buf[pos+1], buf[pos+2]) in rev_head.
-    {
-        let mut entry = chains.rev_head[h];
-        let mut depth = 0;
-        while entry != NIL && depth < MAX_CHAIN_DEPTH {
-            let candidate = entry as usize;
-            entry = chains.rev_prev[candidate];
-            depth += 1;
-            if candidate >= pos {
-                continue;
-            }
-            let d = pos - candidate;
-            if d > max_dist {
-                break;
-            }
-            // Cap length so the decoder's converging write/read pointers never collide.
-            let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(candidate + 1).min((WINDOW_SIZE - d) / 2 + 1);
-            let rev_len = extend_reverse(buf, candidate, pos, max_rev);
-            if rev_len > 0 {
-                tracker.consider(Match {
-                    distance: d as u16,
-                    length: rev_len,
-                    is_reverse: true,
-                });
-            }
+    walk_chain(&chains.rev_head, &chains.rev_prev, h, pos, max_dist, |candidate, d| {
+        // Cap length so the decoder's converging write/read pointers never collide.
+        let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(candidate + 1).min((WINDOW_SIZE - d) / 2 + 1);
+        let rev_len = extend_reverse(buf, candidate, pos, max_rev);
+        if rev_len > 0 {
+            tracker.consider(Match {
+                distance: d as u16,
+                length: rev_len,
+                is_reverse: true,
+            });
         }
-    }
+    });
 
     tracker.finish()
 }
@@ -428,6 +451,9 @@ fn find_short_match(buf: &[u8], pos: usize, data_end: usize) -> Option<Match> {
                 length: fwd_len,
                 is_reverse: false,
             });
+            if tracker.savings >= SHORT_SEARCH_THRESHOLD {
+                break;
+            }
         }
 
         // Reverse match: cap length so the decoder's converging write/read
@@ -440,6 +466,9 @@ fn find_short_match(buf: &[u8], pos: usize, data_end: usize) -> Option<Match> {
                 length: rev_len,
                 is_reverse: true,
             });
+            if tracker.savings >= SHORT_SEARCH_THRESHOLD {
+                break;
+            }
         }
     }
 
@@ -449,16 +478,12 @@ fn find_short_match(buf: &[u8], pos: usize, data_end: usize) -> Option<Match> {
 /// Picks the match with higher nibble savings, or `a` on tie.
 fn pick_best(a: Option<Match>, b: Option<Match>) -> Option<Match> {
     match (a, b) {
-        (Some(am), Some(bm)) => {
-            if bm.savings() > am.savings() {
-                Some(bm)
-            } else {
-                Some(am)
-            }
-        }
-        (Some(_), None) => a,
-        (None, Some(_)) => b,
-        (None, None) => None,
+        (Some(a), Some(b)) => Some(if b.savings() > a.savings() {
+            b
+        } else {
+            a
+        }),
+        (a, b) => a.or(b),
     }
 }
 
@@ -472,9 +497,7 @@ fn emit_literals(nw: &mut NibbleWriter, bytes: &[u8]) {
         0u16.encode_ubleb8(nw);
         // L = count (UBLEB8); chunk.len() <= MAX_LITERAL_LEN = u16::MAX.
         (chunk.len() as u16).encode_ubleb8(nw);
-        for &b in chunk {
-            nw.push_byte(b);
-        }
+        nw.push_bytes(chunk);
     }
 }
 

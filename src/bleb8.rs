@@ -1,14 +1,12 @@
 use crate::nibble::{NibbleWriter, ReadNibble};
 
 /// BLEB8 requires `type_bits = 3N + 1`; returns N (the max nibble count).
-#[allow(dead_code)]
 const fn max_nibbles(bits: u32) -> usize {
     assert!((bits - 1).is_multiple_of(3), "bit width must equal 3N+1");
     (bits as usize - 1) / 3
 }
 
 /// Trait for types that can be encoded/decoded as unsigned BLEB8.
-#[allow(dead_code)]
 pub(crate) trait Ubleb8: Sized {
     /// Maximum number of nibbles this type can occupy.
     const MAX_NIBBLES: usize;
@@ -21,7 +19,6 @@ pub(crate) trait Ubleb8: Sized {
 }
 
 /// Trait for types that can be encoded/decoded as signed BLEB8.
-#[allow(dead_code)]
 pub(crate) trait Sleb8: Sized {
     /// Maximum number of nibbles this type can occupy.
     const MAX_NIBBLES: usize;
@@ -132,30 +129,37 @@ impl_ubleb8!(u64);
 impl_sleb8!(i16, u16);
 
 /// Returns the number of nibbles needed to encode `value` as UBLEB8.
-pub(crate) fn ubleb8_len(mut value: u16) -> usize {
-    let mut count = 1;
-    for _ in 0..<u16 as Ubleb8>::MAX_NIBBLES - 1 {
-        value >>= 3;
-        if value == 0 {
-            return count;
-        }
-        count += 1;
+///
+/// UBLEB8 encodes 3 bits per nibble; thresholds at 2^3, 2^6, 2^9, 2^12.
+pub(crate) const fn ubleb8_len(value: u16) -> usize {
+    if value < 8 {
+        1
+    } else if value < 64 {
+        2
+    } else if value < 512 {
+        3
+    } else if value < 4096 {
+        4
+    } else {
+        5
     }
-    count
 }
 
 /// Returns the number of nibbles needed to encode `value` as SLEB8.
-pub(crate) fn sleb8_len(mut value: i16) -> usize {
-    let mut count = 1;
-    for _ in 0..<i16 as Sleb8>::MAX_NIBBLES - 1 {
-        let nibble = value & 0x7;
-        value >>= 3;
-        if (value == 0 && nibble & 0x4 == 0) || (value == -1 && nibble & 0x4 != 0) {
-            return count;
-        }
-        count += 1;
+///
+/// SLEB8 signed thresholds at +/-4, +/-32, +/-256, +/-2048.
+pub(crate) const fn sleb8_len(value: i16) -> usize {
+    if value >= -4 && value < 4 {
+        1
+    } else if value >= -32 && value < 32 {
+        2
+    } else if value >= -256 && value < 256 {
+        3
+    } else if value >= -2048 && value < 2048 {
+        4
+    } else {
+        5
     }
-    count
 }
 
 #[cfg(test)]

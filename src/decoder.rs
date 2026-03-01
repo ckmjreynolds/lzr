@@ -108,10 +108,18 @@ impl<R: Read, W: Write> Decoder<R, W> {
     }
 
     fn read_literals(&mut self, count: u16) -> io::Result<()> {
-        for _ in 0..count {
-            let byte = self.read_byte()?;
-            self.emit(byte)?;
+        let count = usize::from(count);
+        let mut buf = vec![0u8; count];
+        for b in &mut buf {
+            *b = self.read_byte()?;
         }
+        for &byte in &buf {
+            self.window[self.window_pos] = byte;
+            self.window_pos = (self.window_pos + 1) & (WINDOW_SIZE - 1);
+        }
+        self.writer.write_all(&buf)?;
+        self.adler.update(&buf);
+        self.output_len += count as u64;
         Ok(())
     }
 
