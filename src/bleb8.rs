@@ -131,6 +131,33 @@ impl_ubleb8!(u16);
 impl_ubleb8!(u64);
 impl_sleb8!(i16, u16);
 
+/// Returns the number of nibbles needed to encode `value` as UBLEB8.
+pub(crate) fn ubleb8_len(mut value: u16) -> usize {
+    let mut count = 1;
+    for _ in 0..<u16 as Ubleb8>::MAX_NIBBLES - 1 {
+        value >>= 3;
+        if value == 0 {
+            return count;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Returns the number of nibbles needed to encode `value` as SLEB8.
+pub(crate) fn sleb8_len(mut value: i16) -> usize {
+    let mut count = 1;
+    for _ in 0..<i16 as Sleb8>::MAX_NIBBLES - 1 {
+        let nibble = value & 0x7;
+        value >>= 3;
+        if (value == 0 && nibble & 0x4 == 0) || (value == -1 && nibble & 0x4 != 0) {
+            return count;
+        }
+        count += 1;
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -338,5 +365,59 @@ mod tests {
             let count = w.len();
             prop_assert!((1..=<i16 as Sleb8>::MAX_NIBBLES).contains(&count));
         }
+
+        #[test]
+        fn ubleb8_len_matches_encode(value in any::<u16>()) {
+            let mut w = NibbleWriter::new();
+            value.encode_ubleb8(&mut w);
+            prop_assert_eq!(ubleb8_len(value), w.len());
+        }
+
+        #[test]
+        fn sleb8_len_matches_encode(value in any::<i16>()) {
+            let mut w = NibbleWriter::new();
+            value.encode_sleb8(&mut w);
+            prop_assert_eq!(sleb8_len(value), w.len());
+        }
+    }
+
+    // ── BLEB8 Length Functions ────────────────────────────────────────
+
+    #[test]
+    fn ubleb8_len_boundary_values() {
+        // 1 nibble: 0-7
+        assert_eq!(ubleb8_len(0), 1);
+        assert_eq!(ubleb8_len(7), 1);
+        // 2 nibbles: 8-63
+        assert_eq!(ubleb8_len(8), 2);
+        assert_eq!(ubleb8_len(63), 2);
+        // 3 nibbles: 64-511
+        assert_eq!(ubleb8_len(64), 3);
+        assert_eq!(ubleb8_len(511), 3);
+        // 4 nibbles: 512-4095
+        assert_eq!(ubleb8_len(512), 4);
+        assert_eq!(ubleb8_len(4095), 4);
+        // 5 nibbles: 4096-65535
+        assert_eq!(ubleb8_len(4096), 5);
+        assert_eq!(ubleb8_len(u16::MAX), 5);
+    }
+
+    #[test]
+    fn sleb8_len_boundary_values() {
+        // 1 nibble: -4 to +3
+        assert_eq!(sleb8_len(0), 1);
+        assert_eq!(sleb8_len(3), 1);
+        assert_eq!(sleb8_len(-1), 1);
+        assert_eq!(sleb8_len(-4), 1);
+        // 2 nibbles: -32 to -5, +4 to +31
+        assert_eq!(sleb8_len(4), 2);
+        assert_eq!(sleb8_len(31), 2);
+        assert_eq!(sleb8_len(-5), 2);
+        assert_eq!(sleb8_len(-32), 2);
+        // 3 nibbles: -256 to -33, +32 to +255
+        assert_eq!(sleb8_len(32), 3);
+        assert_eq!(sleb8_len(255), 3);
+        assert_eq!(sleb8_len(-33), 3);
+        assert_eq!(sleb8_len(-256), 3);
     }
 }
