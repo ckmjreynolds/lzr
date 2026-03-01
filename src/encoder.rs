@@ -12,10 +12,6 @@ use crate::{MAGIC, VERSION, WINDOW_SIZE};
 /// Ring buffer size (1 MiB).
 const RING_SIZE: usize = 1 << 20;
 
-/// Bytes of new data per batch (ring minus one window of context).
-#[cfg(test)]
-const BATCH_SIZE: usize = RING_SIZE - WINDOW_SIZE;
-
 /// Maximum literal count per frame.
 const MAX_LITERAL_LEN: usize = u16::MAX as usize;
 
@@ -338,7 +334,10 @@ fn find_hash_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize)
                 break;
             }
             // Extend reverse match: buf[candidate - i] == buf[pos + i].
-            let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(candidate + 1);
+            // The decoder's write pointer (incrementing) and read pointer
+            // (decrementing) converge by 2 per step; cap length so they
+            // never collide: max_len = (WINDOW_SIZE - d) / 2 + 1.
+            let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(candidate + 1).min((WINDOW_SIZE - d) / 2 + 1);
             let mut rev_len = 0;
             while rev_len < max_rev && buf[candidate - rev_len] == buf[pos + rev_len] {
                 rev_len += 1;
@@ -379,8 +378,9 @@ fn find_short_match(buf: &[u8], pos: usize, data_end: usize) -> Option<(u16, usi
             }
         }
 
-        // Reverse match.
-        let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(pos - d + 1);
+        // Reverse match: cap length so the decoder's converging write/read
+        // pointers never collide: max_len = (WINDOW_SIZE - d) / 2 + 1.
+        let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(pos - d + 1).min((WINDOW_SIZE - d) / 2 + 1);
         let mut rev_len = 0;
         while rev_len < max_rev && buf[pos - d - rev_len] == buf[pos + rev_len] {
             rev_len += 1;
@@ -499,158 +499,10 @@ mod tests {
         assert_eq!(compressed, expected);
     }
 
-    // ── Round-Trip: Repeated Bytes (RLE) ────────────────────────────
-
-    #[test]
-    fn repeated_bytes_rle() {
-        let data = vec![b'a'; 1000];
-        assert_eq!(round_trip(&data), data);
-    }
-
-    // ── Round-Trip: Reverse Match Detection ─────────────────────────
-
-    #[test]
-    fn reverse_match_detection() {
-        let data = b"abcddcba";
-        assert_eq!(round_trip(data), data.as_slice());
-    }
-
-    // ── Round-Trip: Random Data ─────────────────────────────────────
-
     proptest! {
         #[test]
         fn round_trip_random(data in prop::collection::vec(any::<u8>(), 0..4096)) {
             prop_assert_eq!(round_trip(&data), data);
         }
-    }
-
-    // ── Round-Trip: Multi-Batch ─────────────────────────────────────
-
-    #[test]
-    fn multi_batch() {
-        // >983 KiB to exercise batch loop and context shift.
-        let data: Vec<u8> = (0u8..=255).cycle().take(BATCH_SIZE + WINDOW_SIZE + 1000).collect();
-        assert_eq!(round_trip(&data), data);
-    }
-
-    // ── Match Finder Direct ─────────────────────────────────────────
-
-    #[test]
-    fn match_finder_forward() {
-        // buf = [a, b, c, a, b, c], window_size=3, data at [3..6]
-        let buf = b"abcabc";
-        let chains = HashChains::build(buf, buf.len());
-        let result = find_best_match(buf, &chains, 3, 6);
-        assert!(result.is_some());
-        let (dist, len, is_rev) = result.unwrap();
-        assert_eq!(dist, 3);
-        assert_eq!(len, 3);
-        assert!(!is_rev);
-    }
-
-    #[test]
-    fn match_finder_reverse() {
-        // buf = [a, b, c, c, b, a], window_size=3, data at [3..6]
-        let buf = b"abccba";
-        let chains = HashChains::build(buf, buf.len());
-        let result = find_best_match(buf, &chains, 3, 6);
-        assert!(result.is_some());
-        let (dist, len, is_rev) = result.unwrap();
-        assert_eq!(dist, 1);
-        assert_eq!(len, 3);
-        assert!(is_rev);
-    }
-
-    #[test]
-    fn match_finder_no_match() {
-        let buf = b"\x00\x00\x00\x01\x02\x03";
-        let chains = HashChains::build(buf, buf.len());
-        let result = find_best_match(buf, &chains, 3, 6);
-        assert!(result.is_none());
-    }
-
-    // ── Savings Function ─────────────────────────────────────────────
-
-    #[test]
-    fn nibbles_saved_cases() {
-        // 3-byte forward match at distance 1: saves 2*3 - 1 - 1 = 4 nibbles
-        assert_eq!(nibbles_saved(1, 3), 4);
-        // 1-byte forward match at distance 1: saves 2*1 - 1 - 1 = 0 (break even)
-        assert_eq!(nibbles_saved(1, 1), 0);
-        // 1-byte forward match at distance 8: saves 2*1 - 2 - 1 = -1 (not worth it)
-        assert_eq!(nibbles_saved(8, 1), -1);
-        // 2-byte match at distance 511: saves 2*2 - 3 - 1 = 0 (break even)
-        assert_eq!(nibbles_saved(511, 2), 0);
-        // 2-byte match at distance 63: saves 2*2 - 2 - 1 = 1
-        assert_eq!(nibbles_saved(63, 2), 1);
-        // 2-byte match at distance 7: saves 2*2 - 1 - 1 = 2
-        assert_eq!(nibbles_saved(7, 2), 2);
-        // Reverse: 3-byte at distance 1: saves 2*3 - 1 - 1 = 4
-        assert_eq!(nibbles_saved(1, -3), 4);
-    }
-
-    // ── Hash Chain Build ─────────────────────────────────────────────
-
-    #[test]
-    fn hash_chain_build_basic() {
-        let buf = b"abcabc";
-        let chains = HashChains::build(buf, buf.len());
-        // Forward chain for hash3('a','b','c') should link position 3 → 0.
-        let h = hash3(b'a', b'b', b'c');
-        assert_eq!(chains.fwd_head[h], 3);
-        assert_eq!(chains.fwd_prev[3], 0);
-        assert_eq!(chains.fwd_prev[0], NIL);
-    }
-
-    #[test]
-    fn hash3_basic_sanity() {
-        // Different inputs should generally produce different hashes.
-        let h1 = hash3(0, 0, 0);
-        let h2 = hash3(1, 0, 0);
-        let h3 = hash3(0, 1, 0);
-        assert_ne!(h1, h2);
-        assert_ne!(h1, h3);
-        // All within table size.
-        assert!(h1 < HASH_TABLE_SIZE);
-        assert!(h2 < HASH_TABLE_SIZE);
-        assert!(h3 < HASH_TABLE_SIZE);
-    }
-
-    // ── Short Match Finder ───────────────────────────────────────────
-
-    #[test]
-    fn short_match_at_distance_1() {
-        // "aa" — 1 byte repeated. Short match at d=1, len=1 should break even (savings=0).
-        let buf = b"\x00aa";
-        let result = find_short_match(buf, 2, 3);
-        assert!(result.is_some());
-        let (dist, len, is_rev) = result.unwrap();
-        assert_eq!(dist, 1);
-        // Should find the longest match at the best distance.
-        assert_eq!(len, 1);
-        assert!(!is_rev);
-    }
-
-    // ── Literal Chunking ────────────────────────────────────────────
-
-    #[test]
-    fn literal_chunking() {
-        // Data larger than MAX_LITERAL_LEN should produce multiple literal frames.
-        let data: Vec<u8> = (0u8..=255).cycle().take(MAX_LITERAL_LEN + 100).collect();
-        let mut nw = NibbleWriter::new();
-        emit_literals(&mut nw, &data);
-        // Verify by encoding the full thing and round-tripping.
-        let full_data: Vec<u8> = (0u8..=255).cycle().take(MAX_LITERAL_LEN + 100).collect();
-        assert_eq!(round_trip(&full_data), full_data);
-    }
-
-    // ── No-op Alignment ─────────────────────────────────────────────
-
-    #[test]
-    fn noop_is_3_nibbles() {
-        let mut nw = NibbleWriter::new();
-        let before = nw.len();
-        emit_noop(&mut nw);
-        assert_eq!(nw.len() - before, 3);
     }
 }

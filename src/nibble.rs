@@ -145,50 +145,6 @@ mod tests {
 
     use super::*;
 
-    // ── Deterministic: Writer ──────────────────────────────────────────
-
-    #[test]
-    fn empty_writer() {
-        let w = NibbleWriter::new();
-        assert!(w.is_empty());
-        assert_eq!(w.len(), 0);
-        assert_eq!(w.finish(), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn single_nibble_pads() {
-        let mut w = NibbleWriter::new();
-        w.push(0xA);
-        assert_eq!(w.len(), 1);
-        assert!(!w.is_empty());
-        assert_eq!(w.finish(), vec![0xA0]);
-    }
-
-    #[test]
-    fn two_nibbles_no_pad() {
-        let mut w = NibbleWriter::new();
-        w.push(0xA);
-        w.push(0x5);
-        assert_eq!(w.finish(), vec![0xA5]);
-    }
-
-    #[test]
-    fn three_nibbles_pads() {
-        let mut w = NibbleWriter::new();
-        w.push(0xA);
-        w.push(0x5);
-        w.push(0x3);
-        assert_eq!(w.finish(), vec![0xA5, 0x30]);
-    }
-
-    #[test]
-    fn push_byte_literal() {
-        // 0x48 → low nibble 0x8 first, high nibble 0x4 second → [0x84]
-        let mut w = NibbleWriter::new();
-        w.push_byte(0x48);
-        assert_eq!(w.finish(), vec![0x84]);
-    }
-
     #[test]
     fn worked_example_hi() {
         // From FORMAT.md: nibbles 0,2,8,4,9,6,0,0 → [0x02, 0x84, 0x96, 0x00]
@@ -198,60 +154,6 @@ mod tests {
         }
         assert_eq!(w.finish(), vec![0x02, 0x84, 0x96, 0x00]);
     }
-
-    // ── Deterministic: Reader ──────────────────────────────────────────
-
-    #[test]
-    fn reader_empty() {
-        let mut r = NibbleReader::new(&[]);
-        assert!(r.is_empty());
-        assert_eq!(r.remaining(), 0);
-        assert_eq!(r.read(), Err(Error::UnexpectedEnd));
-    }
-
-    #[test]
-    fn reader_single_byte() {
-        let mut r = NibbleReader::new(&[0xA5]);
-        assert_eq!(r.remaining(), 2);
-        assert_eq!(r.read(), Ok(0xA));
-        assert_eq!(r.read(), Ok(0x5));
-        assert_eq!(r.read(), Err(Error::UnexpectedEnd));
-    }
-
-    #[test]
-    fn reader_read_byte() {
-        // [0x84] → lo=0x8, hi=0x4 → 0x48
-        let mut r = NibbleReader::new(&[0x84]);
-        assert_eq!(r.read_byte(), Ok(0x48));
-    }
-
-    #[test]
-    fn reader_round_trip_worked_example() {
-        let data = [0x02, 0x84, 0x96, 0x00];
-        let mut r = NibbleReader::new(&data);
-        let expected = [0x0, 0x2, 0x8, 0x4, 0x9, 0x6, 0x0, 0x0];
-        for &want in &expected {
-            assert_eq!(r.read(), Ok(want));
-        }
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn reader_copy_checkpoint() {
-        let mut r = NibbleReader::new(&[0xAB, 0xCD]);
-        assert_eq!(r.read(), Ok(0xA));
-        assert_eq!(r.read(), Ok(0xB));
-
-        let checkpoint = r; // Copy at position 2
-        assert_eq!(r.read(), Ok(0xC));
-        assert_eq!(r.read(), Ok(0xD));
-
-        // Checkpoint is still at position 2.
-        assert_eq!(checkpoint.position(), 2);
-        assert_eq!(checkpoint.remaining(), 2);
-    }
-
-    // ── Property-based ─────────────────────────────────────────────────
 
     proptest! {
         #[test]

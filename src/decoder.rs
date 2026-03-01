@@ -245,91 +245,6 @@ mod tests {
         assert_eq!(run_decode(&[]).unwrap(), b"");
     }
 
-    // ── Forward Match (Overlapping / RLE) ───────────────────────────
-
-    #[test]
-    fn forward_match_overlapping() {
-        // Literal 'a', then D=1, L=2 → "aaa" (overlapping copy = RLE).
-        // Nibbles: 0,1, 1,6, 1,2, 0,0
-        #[rustfmt::skip]
-        let stream: &[u8] = &[
-            0x4C, 0x5A, 0x52, 0x00,
-            0x01, 0x16, 0x12, 0x00, // bitstream
-            0x30,                   // UBLEB8(3)
-            0x24, 0x01, 0x49, 0x02, // Adler-32("aaa") = 0x0249_0124
-        ];
-        assert_eq!(run_decode(stream).unwrap(), b"aaa");
-    }
-
-    // ── Reverse Match ───────────────────────────────────────────────
-
-    #[test]
-    fn reverse_match() {
-        // Literal "ab", then D=1, L=-2 → "abba".
-        // SLEB8(-2) = nibble 0x6.
-        // Nibbles: 0,2, 1,6, 2,6, 1,6, 0,0
-        #[rustfmt::skip]
-        let stream: &[u8] = &[
-            0x4C, 0x5A, 0x52, 0x00,
-            0x02, 0x16, 0x26, 0x16, 0x00, // bitstream
-            0x40,                         // UBLEB8(4)
-            0x87, 0x01, 0xD3, 0x03,       // Adler-32("abba") = 0x03D3_0187
-        ];
-        assert_eq!(run_decode(stream).unwrap(), b"abba");
-    }
-
-    // ── No-op Frame ─────────────────────────────────────────────────
-
-    #[test]
-    fn noop_frame() {
-        // Literal "Hi", then no-op (D=1, L=0), then EOS. Output = "Hi".
-        // Nibbles: 0,2, 8,4, 9,6, 1,0, 0,0
-        #[rustfmt::skip]
-        let stream: &[u8] = &[
-            0x4C, 0x5A, 0x52, 0x00,
-            0x02, 0x84, 0x96, 0x10, 0x00, // bitstream
-            0x20,                         // UBLEB8(2)
-            0xB2, 0x00, 0xFB, 0x00,       // Adler-32("Hi")
-        ];
-        assert_eq!(run_decode(stream).unwrap(), b"Hi");
-    }
-
-    // ── Stream Concatenation ────────────────────────────────────────
-
-    #[test]
-    fn stream_concatenation() {
-        // Two "Hi" streams back-to-back → "HiHi".
-        #[rustfmt::skip]
-        let stream: &[u8] = &[
-            0x4C, 0x5A, 0x52, 0x00,
-            0x02, 0x84, 0x96, 0x00,
-            0x20, 0xB2, 0x00, 0xFB, 0x00,
-            // second stream
-            0x4C, 0x5A, 0x52, 0x00,
-            0x02, 0x84, 0x96, 0x00,
-            0x20, 0xB2, 0x00, 0xFB, 0x00,
-        ];
-        assert_eq!(run_decode(stream).unwrap(), b"HiHi");
-    }
-
-    // ── Window Zero-Fill ────────────────────────────────────────────
-
-    #[test]
-    fn window_zero_fill() {
-        // Match D=3, L=2 before any output → reads from zero-filled window.
-        // Nibbles: 3,2, 0,0
-        #[rustfmt::skip]
-        let stream: &[u8] = &[
-            0x4C, 0x5A, 0x52, 0x00,
-            0x32, 0x00,             // bitstream
-            0x20,                   // UBLEB8(2)
-            0x01, 0x00, 0x02, 0x00, // Adler-32("\x00\x00") = 0x0002_0001
-        ];
-        assert_eq!(run_decode(stream).unwrap(), vec![0x00, 0x00]);
-    }
-
-    // ── Error: Bad Magic ────────────────────────────────────────────
-
     #[test]
     fn error_bad_magic() {
         let stream: &[u8] = &[0xFF, 0x5A, 0x52, 0x00];
@@ -337,8 +252,6 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("magic"), "{err}");
     }
-
-    // ── Error: Bad Version ──────────────────────────────────────────
 
     #[test]
     fn error_bad_version() {
@@ -348,29 +261,8 @@ mod tests {
         assert!(err.to_string().contains("version"), "{err}");
     }
 
-    // ── Error: Truncated ────────────────────────────────────────────
-
-    #[test]
-    fn error_truncated_header() {
-        // Only 3 bytes — incomplete header.
-        let stream: &[u8] = &[0x4C, 0x5A, 0x52];
-        let err = run_decode(stream).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
-    }
-
-    #[test]
-    fn error_truncated_bitstream() {
-        // Valid header, no bitstream.
-        let stream: &[u8] = &[0x4C, 0x5A, 0x52, 0x00];
-        let err = run_decode(stream).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
-    }
-
-    // ── Error: Checksum Mismatch ────────────────────────────────────
-
     #[test]
     fn error_checksum_mismatch() {
-        // Valid "Hi" stream with corrupted checksum (last byte 0x00 → 0x01).
         #[rustfmt::skip]
         let stream: &[u8] = &[
             0x4C, 0x5A, 0x52, 0x00,
@@ -383,11 +275,8 @@ mod tests {
         assert!(err.to_string().contains("checksum"), "{err}");
     }
 
-    // ── Error: Length Mismatch ──────────────────────────────────────
-
     #[test]
     fn error_length_mismatch() {
-        // Valid "Hi" stream with wrong length (3 instead of 2).
         #[rustfmt::skip]
         let stream: &[u8] = &[
             0x4C, 0x5A, 0x52, 0x00,

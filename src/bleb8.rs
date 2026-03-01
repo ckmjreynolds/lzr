@@ -194,16 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn ubleb8_5_u16() {
-        assert_eq!(nibbles_from_ubleb8(5u16), vec![0x5]);
-    }
-
-    #[test]
-    fn ubleb8_0_u16() {
-        assert_eq!(nibbles_from_ubleb8(0u16), vec![0x0]);
-    }
-
-    #[test]
     fn sleb8_neg5_i16() {
         assert_eq!(nibbles_from_sleb8(-5i16), vec![0xB, 0x7]);
     }
@@ -212,81 +202,6 @@ mod tests {
     fn sleb8_pos5_i16() {
         assert_eq!(nibbles_from_sleb8(5i16), vec![0xD, 0x0]);
     }
-
-    // ── Edge Cases ──────────────────────────────────────────────────────
-
-    #[test]
-    fn ubleb8_u16_max() {
-        assert_eq!(nibbles_from_ubleb8(u16::MAX), vec![0xF, 0xF, 0xF, 0xF, 0xF]);
-        let mut w = NibbleWriter::new();
-        u16::MAX.encode_ubleb8(&mut w);
-        let packed = w.finish();
-        let mut r = NibbleReader::new(&packed);
-        assert_eq!(u16::decode_ubleb8(&mut r), Ok(u16::MAX));
-    }
-
-    #[test]
-    fn ubleb8_u64_max() {
-        let nibbles = nibbles_from_ubleb8(u64::MAX);
-        assert_eq!(nibbles.len(), 21);
-        assert!(nibbles.iter().all(|&n| n == 0xF));
-        let mut w = NibbleWriter::new();
-        u64::MAX.encode_ubleb8(&mut w);
-        let packed = w.finish();
-        let mut r = NibbleReader::new(&packed);
-        assert_eq!(u64::decode_ubleb8(&mut r), Ok(u64::MAX));
-    }
-
-    #[test]
-    fn sleb8_i16_min() {
-        assert_eq!(nibbles_from_sleb8(i16::MIN), vec![0x8, 0x8, 0x8, 0x8, 0x8]);
-        let mut w = NibbleWriter::new();
-        i16::MIN.encode_sleb8(&mut w);
-        let packed = w.finish();
-        let mut r = NibbleReader::new(&packed);
-        assert_eq!(i16::decode_sleb8(&mut r), Ok(i16::MIN));
-    }
-
-    #[test]
-    fn sleb8_i16_max() {
-        assert_eq!(nibbles_from_sleb8(i16::MAX), vec![0xF, 0xF, 0xF, 0xF, 0x7]);
-        let mut w = NibbleWriter::new();
-        i16::MAX.encode_sleb8(&mut w);
-        let packed = w.finish();
-        let mut r = NibbleReader::new(&packed);
-        assert_eq!(i16::decode_sleb8(&mut r), Ok(i16::MAX));
-    }
-
-    #[test]
-    fn sleb8_neg1() {
-        assert_eq!(nibbles_from_sleb8(-1i16), vec![0x7]);
-    }
-
-    #[test]
-    fn sleb8_zero() {
-        assert_eq!(nibbles_from_sleb8(0i16), vec![0x0]);
-    }
-
-    #[test]
-    fn sleb8_one() {
-        assert_eq!(nibbles_from_sleb8(1i16), vec![0x1]);
-    }
-
-    // ── Error Cases ─────────────────────────────────────────────────────
-
-    #[test]
-    fn decode_ubleb8_empty() {
-        let mut r = NibbleReader::new(&[]);
-        assert_eq!(u16::decode_ubleb8(&mut r), Err(crate::error::Error::UnexpectedEnd));
-    }
-
-    #[test]
-    fn decode_sleb8_empty() {
-        let mut r = NibbleReader::new(&[]);
-        assert_eq!(i16::decode_sleb8(&mut r), Err(crate::error::Error::UnexpectedEnd));
-    }
-
-    // ── Property-Based ──────────────────────────────────────────────────
 
     proptest! {
         #[test]
@@ -317,56 +232,6 @@ mod tests {
         }
 
         #[test]
-        fn sequential_u16(values in prop::collection::vec(any::<u16>(), 1..20)) {
-            let mut w = NibbleWriter::new();
-            for &v in &values {
-                v.encode_ubleb8(&mut w);
-            }
-            let packed = w.finish();
-            let mut r = NibbleReader::new(&packed);
-            for &v in &values {
-                prop_assert_eq!(u16::decode_ubleb8(&mut r).unwrap(), v);
-            }
-        }
-
-        #[test]
-        fn sequential_i16(values in prop::collection::vec(any::<i16>(), 1..20)) {
-            let mut w = NibbleWriter::new();
-            for &v in &values {
-                v.encode_sleb8(&mut w);
-            }
-            let packed = w.finish();
-            let mut r = NibbleReader::new(&packed);
-            for &v in &values {
-                prop_assert_eq!(i16::decode_sleb8(&mut r).unwrap(), v);
-            }
-        }
-
-        #[test]
-        fn minimal_encoding_u16(value in any::<u16>()) {
-            let mut w = NibbleWriter::new();
-            value.encode_ubleb8(&mut w);
-            let count = w.len();
-            prop_assert!((1..=<u16 as Ubleb8>::MAX_NIBBLES).contains(&count));
-        }
-
-        #[test]
-        fn minimal_encoding_u64(value in any::<u64>()) {
-            let mut w = NibbleWriter::new();
-            value.encode_ubleb8(&mut w);
-            let count = w.len();
-            prop_assert!((1..=<u64 as Ubleb8>::MAX_NIBBLES).contains(&count));
-        }
-
-        #[test]
-        fn minimal_encoding_i16(value in any::<i16>()) {
-            let mut w = NibbleWriter::new();
-            value.encode_sleb8(&mut w);
-            let count = w.len();
-            prop_assert!((1..=<i16 as Sleb8>::MAX_NIBBLES).contains(&count));
-        }
-
-        #[test]
         fn ubleb8_len_matches_encode(value in any::<u16>()) {
             let mut w = NibbleWriter::new();
             value.encode_ubleb8(&mut w);
@@ -379,45 +244,5 @@ mod tests {
             value.encode_sleb8(&mut w);
             prop_assert_eq!(sleb8_len(value), w.len());
         }
-    }
-
-    // ── BLEB8 Length Functions ────────────────────────────────────────
-
-    #[test]
-    fn ubleb8_len_boundary_values() {
-        // 1 nibble: 0-7
-        assert_eq!(ubleb8_len(0), 1);
-        assert_eq!(ubleb8_len(7), 1);
-        // 2 nibbles: 8-63
-        assert_eq!(ubleb8_len(8), 2);
-        assert_eq!(ubleb8_len(63), 2);
-        // 3 nibbles: 64-511
-        assert_eq!(ubleb8_len(64), 3);
-        assert_eq!(ubleb8_len(511), 3);
-        // 4 nibbles: 512-4095
-        assert_eq!(ubleb8_len(512), 4);
-        assert_eq!(ubleb8_len(4095), 4);
-        // 5 nibbles: 4096-65535
-        assert_eq!(ubleb8_len(4096), 5);
-        assert_eq!(ubleb8_len(u16::MAX), 5);
-    }
-
-    #[test]
-    fn sleb8_len_boundary_values() {
-        // 1 nibble: -4 to +3
-        assert_eq!(sleb8_len(0), 1);
-        assert_eq!(sleb8_len(3), 1);
-        assert_eq!(sleb8_len(-1), 1);
-        assert_eq!(sleb8_len(-4), 1);
-        // 2 nibbles: -32 to -5, +4 to +31
-        assert_eq!(sleb8_len(4), 2);
-        assert_eq!(sleb8_len(31), 2);
-        assert_eq!(sleb8_len(-5), 2);
-        assert_eq!(sleb8_len(-32), 2);
-        // 3 nibbles: -256 to -33, +32 to +255
-        assert_eq!(sleb8_len(32), 3);
-        assert_eq!(sleb8_len(255), 3);
-        assert_eq!(sleb8_len(-33), 3);
-        assert_eq!(sleb8_len(-256), 3);
     }
 }

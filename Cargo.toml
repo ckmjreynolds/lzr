@@ -21,7 +21,8 @@ rayon = "=1.11.0"
 thiserror = "=2.0.18"
 
 [dev-dependencies]
-# assert_cmd = "=2.1.2"
+assert_cmd = "=2.1.2"
+crc32fast = "=1.5.0"
 criterion = "=0.8.2"
 pretty_assertions = "=1.4.1"
 proptest = "=1.10.0"
@@ -47,3 +48,7 @@ cargo = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 redundant_pub_crate = "allow"
+
+[[bench]]
+name = "codec"
+harness = false

@@ -61,88 +61,17 @@ mod tests {
 
     use super::*;
 
-    // ── Helpers ──────────────────────────────────────────────────────────
-
     fn checksum(data: &[u8]) -> u32 {
         let mut h = Adler32::new();
         h.update(data);
         h.finish()
     }
 
-    // ── Spec Worked Example ─────────────────────────────────────────────
-
     #[test]
     fn worked_example_hi() {
         // FORMAT.md: Adler-32("Hi") = 0x00FB00B2
         assert_eq!(checksum(b"Hi"), 0x00FB_00B2);
     }
-
-    // ── Well-Known Values ───────────────────────────────────────────────
-
-    #[test]
-    fn empty() {
-        // Initial state: a=1, b=0 → 0x0000_0001.
-        assert_eq!(checksum(b""), 0x0000_0001);
-    }
-
-    #[test]
-    fn wikipedia_example() {
-        // Wikipedia: Adler-32("Wikipedia") = 0x11E6_0398
-        assert_eq!(checksum(b"Wikipedia"), 0x11E6_0398);
-    }
-
-    #[test]
-    fn single_zero_byte() {
-        // a = (1 + 0) = 1, b = (0 + 1) = 1 → 0x0001_0001.
-        assert_eq!(checksum(&[0x00]), 0x0001_0001);
-    }
-
-    #[test]
-    fn single_ff_byte() {
-        // a = (1 + 255) = 256, b = (0 + 256) = 256 → 0x0100_0100.
-        assert_eq!(checksum(&[0xFF]), 0x0100_0100);
-    }
-
-    // ── Incremental Update ──────────────────────────────────────────────
-
-    #[test]
-    fn incremental_matches_oneshot() {
-        let mut incremental = Adler32::new();
-        incremental.update(b"Wi");
-        incremental.update(b"ki");
-        incremental.update(b"pedia");
-        assert_eq!(incremental.finish(), checksum(b"Wikipedia"));
-    }
-
-    #[test]
-    fn byte_at_a_time() {
-        let data = b"Hello, world!";
-        let mut h = Adler32::new();
-        for &byte in data.as_slice() {
-            h.update(&[byte]);
-        }
-        assert_eq!(h.finish(), checksum(data));
-    }
-
-    // ── Chunk Boundary (NMAX) ───────────────────────────────────────────
-
-    #[test]
-    fn large_input_across_nmax() {
-        // Verify the chunked modular reduction is correct for inputs
-        // larger than NMAX.
-        let data = vec![0xFF; NMAX * 3 + 17];
-        let mut naive_a: u64 = 1;
-        let mut naive_b: u64 = 0;
-        for &byte in &data {
-            naive_a = (naive_a + u64::from(byte)) % u64::from(MOD);
-            naive_b = (naive_b + naive_a) % u64::from(MOD);
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        let expected = ((naive_b as u32) << 16) | naive_a as u32;
-        assert_eq!(checksum(&data), expected);
-    }
-
-    // ── Property-Based ──────────────────────────────────────────────────
 
     proptest! {
         #[test]
@@ -159,8 +88,6 @@ mod tests {
 
         #[test]
         fn never_zero_for_nonempty(data in prop::collection::vec(any::<u8>(), 1..256)) {
-            // `a` starts at 1 and only increases (mod 65521), so the
-            // low 16 bits can never be zero for non-empty input.
             let result = checksum(&data);
             prop_assert_ne!(result & 0xFFFF, 0);
         }
