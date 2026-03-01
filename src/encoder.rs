@@ -34,6 +34,67 @@ const SHORT_MATCH_RANGE: usize = 511;
 /// Minimum savings from hash chains to skip the short-range linear search.
 const SHORT_SEARCH_THRESHOLD: i32 = 2;
 
+// ── Match Representation ─────────────────────────────────────────────
+
+/// A back-reference match found by the match finder.
+#[derive(Debug, Clone, Copy)]
+struct Match {
+    distance: u16,
+    length: usize,
+    is_reverse: bool,
+}
+
+impl Match {
+    /// Encodes the match length as the signed i16 used in the format.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    const fn encoded_length(&self) -> i16 {
+        if self.is_reverse {
+            (-(self.length as i32)) as i16
+        } else {
+            self.length as i16
+        }
+    }
+
+    /// Nibbles saved by encoding this match instead of literals.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn savings(&self) -> i32 {
+        let literal_cost = 2 * i32::from(self.encoded_length().unsigned_abs());
+        let match_cost = bleb8::ubleb8_len(self.distance) as i32 + bleb8::sleb8_len(self.encoded_length()) as i32;
+        literal_cost - match_cost
+    }
+}
+
+// ── Best Match Tracker ───────────────────────────────────────────────
+
+/// Tracks the best match found during a search, keeping only profitable matches.
+struct BestTracker {
+    best: Option<Match>,
+    savings: i32,
+}
+
+impl BestTracker {
+    const fn new() -> Self {
+        Self {
+            best: None,
+            savings: -1,
+        }
+    }
+
+    /// Considers a candidate match, keeping it if it improves on the current best.
+    fn consider(&mut self, m: Match) {
+        let s = m.savings();
+        if s > self.savings {
+            self.savings = s;
+            self.best = Some(m);
+        }
+    }
+
+    /// Returns the best match, if it at least breaks even (savings >= 0).
+    fn finish(self) -> Option<Match> {
+        self.best.filter(|_| self.savings >= 0)
+    }
+}
+
 /// Encodes data from `input` as an LZR stream written to `output`.
 ///
 /// # Errors
@@ -158,18 +219,19 @@ fn compress_batch(ring: &[u8], bytes_read: usize) -> Vec<Vec<u8>> {
 /// Compresses one job: `buf` is the full active ring, data to encode spans
 /// `buf[data_start..data_end]`. Returns byte-aligned packed nibbles.
 fn compress_job(buf: &[u8], chains: &HashChains, data_start: usize, data_end: usize) -> Vec<u8> {
-    let mut nw = NibbleWriter::new();
+    let data_len = data_end - data_start;
+    let mut nw = NibbleWriter::with_capacity(2 * data_len);
     let mut pos = data_start;
     let mut literal_start = pos;
 
     while pos < data_end {
-        if let Some((distance, length, is_reverse)) = find_best_match(buf, chains, pos, data_end) {
+        if let Some(m) = find_best_match(buf, chains, pos, data_end) {
             // Flush pending literals.
             if literal_start < pos {
                 emit_literals(&mut nw, &buf[literal_start..pos]);
             }
-            emit_match(&mut nw, distance, length, is_reverse);
-            pos += length;
+            emit_match(&mut nw, &m);
+            pos += m.length;
             literal_start = pos;
         } else {
             pos += 1;
@@ -189,25 +251,26 @@ fn compress_job(buf: &[u8], chains: &HashChains, data_start: usize, data_end: us
     nw.finish()
 }
 
-// ── Savings Function ──────────────────────────────────────────────────
+// ── Match Extension ──────────────────────────────────────────────────
 
-/// Nibbles saved by encoding `length` bytes at `distance` as a match
-/// instead of literals. Negative means the match costs more.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn nibbles_saved(distance: u16, length: i16) -> i32 {
-    let literal_cost = 2 * i32::from(length.unsigned_abs());
-    let match_cost = bleb8::ubleb8_len(distance) as i32 + bleb8::sleb8_len(length) as i32;
-    literal_cost - match_cost
+/// Extends a forward match: counts how many bytes match starting at
+/// `buf[candidate]` vs `buf[pos]`, up to `max_len`.
+fn extend_forward(buf: &[u8], candidate: usize, pos: usize, max_len: usize) -> usize {
+    let mut len = 0;
+    while len < max_len && buf[candidate + len] == buf[pos + len] {
+        len += 1;
+    }
+    len
 }
 
-/// Encodes match length as the signed i16 used in the format.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-const fn encode_length(length: usize, is_reverse: bool) -> i16 {
-    if is_reverse {
-        (-(length as i32)) as i16
-    } else {
-        length as i16
+/// Extends a reverse match: counts how many bytes match with `candidate`
+/// decrementing and `pos` incrementing, up to `max_len`.
+fn extend_reverse(buf: &[u8], candidate: usize, pos: usize, max_len: usize) -> usize {
+    let mut len = 0;
+    while len < max_len && buf[candidate - len] == buf[pos + len] {
+        len += 1;
     }
+    len
 }
 
 // ── Hash Chains ──────────────────────────────────────────────────────
@@ -227,18 +290,18 @@ struct HashChains {
 }
 
 impl HashChains {
-    fn new(ring_len: usize) -> Self {
+    fn new(len: usize) -> Self {
         Self {
             fwd_head: vec![NIL; HASH_TABLE_SIZE],
-            fwd_prev: vec![NIL; ring_len],
+            fwd_prev: vec![NIL; len],
             rev_head: vec![NIL; HASH_TABLE_SIZE],
-            rev_prev: vec![NIL; ring_len],
+            rev_prev: vec![NIL; len],
         }
     }
 
     #[allow(clippy::cast_possible_truncation)]
     fn build(ring: &[u8], end: usize) -> Self {
-        let mut chains = Self::new(ring.len());
+        let mut chains = Self::new(end);
         for pos in 0..end {
             // Forward: hash(buf[p], buf[p+1], buf[p+2])
             if pos + 2 < end {
@@ -260,32 +323,36 @@ impl HashChains {
 // ── Match Finder ──────────────────────────────────────────────────────
 
 /// Two-phase match finder: hash chains first, then short-range linear fallback.
-#[allow(clippy::cast_possible_truncation)]
-fn find_best_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize) -> Option<(u16, usize, bool)> {
+fn find_best_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize) -> Option<Match> {
     // Phase 1: Hash chain lookup (3+ byte matches).
-    let best = find_hash_match(buf, chains, pos, data_end);
+    let hash_best = find_hash_match(buf, chains, pos, data_end);
 
-    let best_savings = best.map_or(0, |(d, l, r)| nibbles_saved(d, encode_length(l, r)));
+    let hash_savings = hash_best.as_ref().map_or(0, Match::savings);
 
     // Phase 2: If hash chain result < threshold, try linear short-range search.
-    if best_savings < SHORT_SEARCH_THRESHOLD {
-        let linear = find_short_match(buf, pos, data_end);
-        return pick_best(best, linear);
+    if hash_savings < SHORT_SEARCH_THRESHOLD {
+        let linear_best = find_short_match(buf, pos, data_end);
+        return pick_best(hash_best, linear_best);
     }
 
-    best
+    hash_best
 }
 
 /// Walks both forward and reverse hash chains to find the best 3+ byte match.
 #[allow(clippy::cast_possible_truncation)]
-fn find_hash_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize) -> Option<(u16, usize, bool)> {
-    let mut best: Option<(u16, usize, bool)> = None;
-    let mut best_savings: i32 = -1;
+fn find_hash_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize) -> Option<Match> {
+    let mut tracker = BestTracker::new();
     let max_dist = pos.min(usize::from(u16::MAX));
 
+    if pos + 2 >= data_end {
+        return None;
+    }
+
+    let h = hash3(buf[pos], buf[pos + 1], buf[pos + 2]);
+    let max_fwd = (data_end - pos).min(MAX_MATCH_FWD);
+
     // Forward chain: find positions sharing hash3(buf[pos], buf[pos+1], buf[pos+2]).
-    if pos + 2 < data_end {
-        let h = hash3(buf[pos], buf[pos + 1], buf[pos + 2]);
+    {
         let mut entry = chains.fwd_head[h];
         let mut depth = 0;
         while entry != NIL && depth < MAX_CHAIN_DEPTH {
@@ -299,18 +366,13 @@ fn find_hash_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize)
             if d > max_dist {
                 break;
             }
-            // Extend forward match.
-            let max_fwd = (data_end - pos).min(MAX_MATCH_FWD);
-            let mut fwd_len = 0;
-            while fwd_len < max_fwd && buf[candidate + fwd_len] == buf[pos + fwd_len] {
-                fwd_len += 1;
-            }
+            let fwd_len = extend_forward(buf, candidate, pos, max_fwd);
             if fwd_len > 0 {
-                let s = nibbles_saved(d as u16, encode_length(fwd_len, false));
-                if s > best_savings {
-                    best_savings = s;
-                    best = Some((d as u16, fwd_len, false));
-                }
+                tracker.consider(Match {
+                    distance: d as u16,
+                    length: fwd_len,
+                    is_reverse: false,
+                });
             }
         }
     }
@@ -318,8 +380,7 @@ fn find_hash_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize)
     // Reverse chain: entry at position C has hash3(buf[C], buf[C-1], buf[C-2]).
     // We want C where buf[C..C-2] matches buf[pos..pos+2] reversed,
     // so we look up hash3(buf[pos], buf[pos+1], buf[pos+2]) in rev_head.
-    if pos + 2 < data_end {
-        let h = hash3(buf[pos], buf[pos + 1], buf[pos + 2]);
+    {
         let mut entry = chains.rev_head[h];
         let mut depth = 0;
         while entry != NIL && depth < MAX_CHAIN_DEPTH {
@@ -333,78 +394,63 @@ fn find_hash_match(buf: &[u8], chains: &HashChains, pos: usize, data_end: usize)
             if d > max_dist {
                 break;
             }
-            // Extend reverse match: buf[candidate - i] == buf[pos + i].
-            // The decoder's write pointer (incrementing) and read pointer
-            // (decrementing) converge by 2 per step; cap length so they
-            // never collide: max_len = (WINDOW_SIZE - d) / 2 + 1.
+            // Cap length so the decoder's converging write/read pointers never collide.
             let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(candidate + 1).min((WINDOW_SIZE - d) / 2 + 1);
-            let mut rev_len = 0;
-            while rev_len < max_rev && buf[candidate - rev_len] == buf[pos + rev_len] {
-                rev_len += 1;
-            }
+            let rev_len = extend_reverse(buf, candidate, pos, max_rev);
             if rev_len > 0 {
-                let s = nibbles_saved(d as u16, encode_length(rev_len, true));
-                if s > best_savings {
-                    best_savings = s;
-                    best = Some((d as u16, rev_len, true));
-                }
+                tracker.consider(Match {
+                    distance: d as u16,
+                    length: rev_len,
+                    is_reverse: true,
+                });
             }
         }
     }
 
-    // Only return matches that at least break even.
-    best.filter(|_| best_savings >= 0)
+    tracker.finish()
 }
 
 /// Linear scan of distances `1..=SHORT_MATCH_RANGE`, trying all match lengths.
 #[allow(clippy::cast_possible_truncation)]
-fn find_short_match(buf: &[u8], pos: usize, data_end: usize) -> Option<(u16, usize, bool)> {
+fn find_short_match(buf: &[u8], pos: usize, data_end: usize) -> Option<Match> {
     let max_dist = pos.min(SHORT_MATCH_RANGE).min(usize::from(u16::MAX));
-    let mut best: Option<(u16, usize, bool)> = None;
-    let mut best_savings: i32 = -1;
+    let mut tracker = BestTracker::new();
+    let max_fwd = (data_end - pos).min(MAX_MATCH_FWD);
 
     for d in 1..=max_dist {
+        let candidate = pos - d;
+
         // Forward match.
-        let max_fwd = (data_end - pos).min(MAX_MATCH_FWD);
-        let mut fwd_len = 0;
-        while fwd_len < max_fwd && buf[pos - d + fwd_len] == buf[pos + fwd_len] {
-            fwd_len += 1;
-        }
+        let fwd_len = extend_forward(buf, candidate, pos, max_fwd);
         if fwd_len > 0 {
-            let s = nibbles_saved(d as u16, encode_length(fwd_len, false));
-            if s > best_savings {
-                best_savings = s;
-                best = Some((d as u16, fwd_len, false));
-            }
+            tracker.consider(Match {
+                distance: d as u16,
+                length: fwd_len,
+                is_reverse: false,
+            });
         }
 
         // Reverse match: cap length so the decoder's converging write/read
         // pointers never collide: max_len = (WINDOW_SIZE - d) / 2 + 1.
-        let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(pos - d + 1).min((WINDOW_SIZE - d) / 2 + 1);
-        let mut rev_len = 0;
-        while rev_len < max_rev && buf[pos - d - rev_len] == buf[pos + rev_len] {
-            rev_len += 1;
-        }
+        let max_rev = (data_end - pos).min(MAX_MATCH_REV).min(candidate + 1).min((WINDOW_SIZE - d) / 2 + 1);
+        let rev_len = extend_reverse(buf, candidate, pos, max_rev);
         if rev_len > 0 {
-            let s = nibbles_saved(d as u16, encode_length(rev_len, true));
-            if s > best_savings {
-                best_savings = s;
-                best = Some((d as u16, rev_len, true));
-            }
+            tracker.consider(Match {
+                distance: d as u16,
+                length: rev_len,
+                is_reverse: true,
+            });
         }
     }
 
-    // Only return matches that at least break even.
-    best.filter(|_| best_savings >= 0)
+    tracker.finish()
 }
 
 /// Picks the match with higher nibble savings, or `a` on tie.
-fn pick_best(a: Option<(u16, usize, bool)>, b: Option<(u16, usize, bool)>) -> Option<(u16, usize, bool)> {
+fn pick_best(a: Option<Match>, b: Option<Match>) -> Option<Match> {
     match (a, b) {
         (Some(am), Some(bm)) => {
-            let sa = nibbles_saved(am.0, encode_length(am.1, am.2));
-            let sb = nibbles_saved(bm.0, encode_length(bm.1, bm.2));
-            if sb > sa {
+            if bm.savings() > am.savings() {
                 Some(bm)
             } else {
                 Some(am)
@@ -433,9 +479,9 @@ fn emit_literals(nw: &mut NibbleWriter, bytes: &[u8]) {
 }
 
 /// Emits a match frame.
-fn emit_match(nw: &mut NibbleWriter, distance: u16, length: usize, is_reverse: bool) {
-    distance.encode_ubleb8(nw);
-    encode_length(length, is_reverse).encode_sleb8(nw);
+fn emit_match(nw: &mut NibbleWriter, m: &Match) {
+    m.distance.encode_ubleb8(nw);
+    m.encoded_length().encode_sleb8(nw);
 }
 
 /// Emits an end-of-stream marker (D=0, L=0).
