@@ -394,6 +394,7 @@ dependencies = [
  "criterion",
  "pretty_assertions",
  "proptest",
+ "rayon",
  "thiserror",
 ]
 

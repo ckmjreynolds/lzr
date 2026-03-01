@@ -5,15 +5,7 @@ use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
 use crate::adler32::Adler32;
 use crate::bleb8::{Sleb8, Ubleb8};
 use crate::nibble::ReadNibble;
-
-/// Magic bytes: `LZR`.
-const MAGIC: [u8; 3] = [0x4C, 0x5A, 0x52];
-
-/// Format version byte.
-const VERSION: u8 = 0x00;
-
-/// Sliding window size (64 KiB).
-const WINDOW_SIZE: usize = 65_536;
+use crate::{MAGIC, VERSION, WINDOW_SIZE};
 
 /// Decodes one or more concatenated LZR streams from `input` into `output`.
 ///
