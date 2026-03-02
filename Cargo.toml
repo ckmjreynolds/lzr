@@ -16,7 +16,7 @@ documentation   = "https://docs.rs/lzr"
 include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
-# clap = { version = "=4.5.60", features = ["derive"] }
+clap = { version = "=4.5.60", features = ["derive"] }
 rayon = "=1.11.0"
 thiserror = "=2.0.18"
 
