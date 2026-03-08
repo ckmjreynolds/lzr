@@ -3,11 +3,13 @@
 #![allow(unused_features)]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-pub(crate) const HEADER: &[u8; 4] = b"LZR\0";
+// pub(crate) const HEADER: &[u8; 4] = b"LZR\0";
 
-mod adler32;
-mod nibble;
-mod ring;
+// mod adler32;
+// mod nibble;
+// mod ring;
 
-pub mod decoder;
-pub mod encoder;
+pub mod adler32;
+
+// pub mod decoder;
+// pub mod encoder;

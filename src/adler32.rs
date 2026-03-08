@@ -1,31 +1,77 @@
 //! Adler-32 checksum implementation.
+//!
+//! Adler-32 is a fast, non-cryptographic checksum used by zlib and other compression formats. It trades a small
+//! amount of collision resistance compared to CRC-32 for significantly faster computation.
+//!
+//! # Examples
+//!
+//! ```
+//! use lzr::adler32::Adler32;
+//!
+//! let mut checksum = Adler32::new();
+//! checksum.update(b"Wikipedia");
+//! assert_eq!(checksum.checksum(), 0x11E6_0398);
+//! ```
+//!
+//! Multiple calls to [`Adler32::update`] are equivalent to a single call with the concatenated input:
+//!
+//! ```
+//! use lzr::adler32::Adler32;
+//!
+//! let mut incremental = Adler32::new();
+//! incremental.update(b"Wiki");
+//! incremental.update(b"pedia");
+//!
+//! let mut whole = Adler32::new();
+//! whole.update(b"Wikipedia");
+//!
+//! assert_eq!(incremental.checksum(), whole.checksum());
+//! ```
+//!
+//! See <https://en.wikipedia.org/wiki/Adler-32> for details on the algorithm.
 
-const MOD_ADLER: u64 = 65521;
-const BLOCK: usize = 128;
+use static_assertions::const_assert;
 
-// Maximum safe input length for a single `update` call. With u64 accumulators,
-// worst-case `b` grows as ~255·n²/2. This limit keeps b below `u64::MAX`.
-static_assertions::const_assert!((((MAX_UPDATE_LEN as u128).pow(2) * 255) / 2) < u64::MAX as u128);
-const MAX_UPDATE_LEN: usize = 380_368_697;
+const MOD_ADLER: u32 = 65521; // The largest prime number smaller than 2^16.
+const NMAX: usize = 5552; // The largest N such that: 255·N·(N+1)/2 + (N+1)·(BASE-1) ≤ 2³² − 1
+const FAST_NMAX: usize = 128; // Faster due to auto-vectorization.
+
+const_assert!(255 * NMAX * (NMAX + 1) / 2 + (NMAX + 1) * (MOD_ADLER as usize - 1) < u32::MAX as usize);
+const_assert!(FAST_NMAX < NMAX);
 
 /// Rolling Adler-32 checksum.
+///
+/// Create a new instance with [`Adler32::new`], feed data with [`Adler32::update`], and retrieve the final value
+/// with [`Adler32::checksum`].
+///
+/// # Examples
+///
+/// ```
+/// use lzr::adler32::Adler32;
+///
+/// let mut adler = Adler32::new();
+/// adler.update(b"Hello, world!");
+/// let sum = adler.checksum();
+/// ```
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Adler32 {
+pub struct Adler32 {
     a: u32,
     b: u32,
-    len: u64,
-}
-
-impl Default for Adler32 {
-    fn default() -> Self {
-        Self::new()
-    }
+    len: usize,
 }
 
 impl Adler32 {
-    /// Creates a new Adler-32 checksum with the initial value.
+    /// Creates a new Adler-32 checksum initialized to `1` (the Adler-32 identity value).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lzr::adler32::Adler32;
+    ///
+    /// let adler = Adler32::new();
+    /// ```
     #[must_use]
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             a: 1,
             b: 0,
@@ -33,76 +79,99 @@ impl Adler32 {
         }
     }
 
-    // Adler-32 is defined as two running sums reduced modulo 65521:
-    //
-    //     a = 1 + d[0] + d[1] + ... + d[n-1]
-    //     b = (1) + (1+d[0]) + (1+d[0]+d[1]) + ... + (1+d[0]+...+d[n-1])
-    //
-    // Two optimizations are applied here:
-    //
-    // 1. DEFERRED REDUCTION — Using u64 accumulators instead of u32 lets us
-    //    defer the modulo reduction to the very end of the call, eliminating
-    //    the periodic reduction loop that u32 requires every 5,552 bytes.
-    //    This is safe for inputs up to MAX_UPDATE_LEN (~362 MiB).
-    //
-    // 2. BLOCK DECOMPOSITION — The naive inner loop has a serial dependency:
-    //    each `b += a` depends on the just-updated a, which prevents SIMD
-    //    vectorization. We can reformulate the update over a block of n bytes:
-    //
-    //        a_new = a + s1              where s1 = sum of bytes
-    //        b_new = b + n*a + s2        where s2 = n*d[0] + (n-1)*d[1] + ... + 1*d[n-1]
-    //
-    //    Both s1 and s2 are independent per-element reductions with no loop-
-    //    carried dependency, so LLVM can auto-vectorize them.
     /// Feeds `data` into the running checksum.
+    ///
+    /// Can be called multiple times to incrementally process data. The result is identical to a single call with
+    /// the concatenated input.
+    ///
+    /// The underlying sums are defined as:
+    /// - `A = 1 + D1 + D2 + ... + Dn (mod 65521)`
+    /// - `B = (1 + D1) + (1 + D1 + D2) + ... + (1 + D1 + D2 + ... + Dn) (mod 65521)`
+    /// - `  = n×D1 + (n−1)×D2 + (n−2)×D3 + ... + Dn + n (mod 65521)`
+    /// - `Adler-32(D) = B × 65536 + A`
+    ///
+    /// where D is the byte sequence being checksummed and n is its length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lzr::adler32::Adler32;
+    ///
+    /// let mut adler = Adler32::new();
+    /// adler.update(b"hello ");
+    /// adler.update(b"world");
+    /// ```
+    #[allow(clippy::cast_lossless)]
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn update(&mut self, data: &[u8]) {
-        debug_assert!(data.len() <= MAX_UPDATE_LEN, "Adler32::update - Buffer too large!");
+    pub fn update(&mut self, data: &[u8]) {
+        // FAST_NMAX represents the value I've found that performs the best. ~12GB/s vs ~7GB/s
+        // checksum/compute        time:   [309.80 µs 310.32 µs 310.83 µs]
+        //                         thrpt:  [12.127 GiB/s 12.147 GiB/s 12.167 GiB/s]
+        for chunk in data.chunks(FAST_NMAX) {
+            let mut a = 0u32;
+            let mut b = 0u32;
+            let n = chunk.len();
 
-        let (mut a, mut b) = (u64::from(self.a), u64::from(self.b));
-
-        for block in data.chunks(BLOCK) {
-            let n = block.len() as u32;
-            let mut s1 = 0u32;
-            let mut s2 = 0u32;
-
-            for (i, &byte) in block.iter().enumerate() {
-                let val = u32::from(byte);
-                s1 += val;
-                s2 += val * (n - i as u32);
+            for (i, &d) in chunk.iter().enumerate() {
+                a += d as u32;
+                b += d as u32 * ((n - i) as u32);
             }
 
-            b += a * u64::from(n) + u64::from(s2);
-            a += u64::from(s1);
+            self.b = (self.b + (self.a * (n as u32) + b)) % MOD_ADLER;
+            self.a = (self.a + a) % MOD_ADLER;
         }
 
-        self.a = (a % MOD_ADLER) as u32;
-        self.b = (b % MOD_ADLER) as u32;
-        self.len += data.len() as u64;
+        self.len += data.len();
     }
 
-    // Combine two independently computed checksums for adjacent blocks.
-    //
-    // If block 1 has checksum (a1, b1) over len1 bytes, and block 2 has
-    // checksum (a2, b2) over len2 bytes, the combined checksum is:
-    //
-    //     a = a1 + a2 - 1              (mod 65521)
-    //     b = b1 + b2 + (a1 - 1) * len2   (mod 65521)
-    //
-    // The -1 adjustments account for the initial a=1 in each independent
-    // computation.
-    /// Combines two independently computed checksums for adjacent blocks.
+    /// Combines two independently computed checksums for adjacent data blocks.
+    ///
+    /// If `self` is the checksum of block 1 and `other` is the checksum of block 2,
+    /// the returned value is the checksum of block 1 concatenated with block 2.
+    ///
+    /// This is useful for parallel checksum computation: split the input, checksum each
+    /// piece independently, then combine the results.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lzr::adler32::Adler32;
+    ///
+    /// let data = b"Hello, world!";
+    /// let split = 5;
+    ///
+    /// let mut whole = Adler32::new();
+    /// whole.update(data);
+    ///
+    /// let mut first = Adler32::new();
+    /// first.update(&data[..split]);
+    /// let mut second = Adler32::new();
+    /// second.update(&data[split..]);
+    ///
+    /// assert_eq!(first.combine(&second).checksum(), whole.checksum());
+    /// ```
+    ///
+    /// # Algorithm
+    ///
+    /// Given block 1 with checksum `(a1, b1)` over `len1` bytes, and block 2 with
+    /// checksum `(a2, b2)` over `len2` bytes, the combined checksum is:
+    ///
+    /// - `a = a1 + a2 - 1 (mod 65521)`
+    /// - `b = b1 + b2 + (a1 - 1) × len2 (mod 65521)`
+    ///
+    /// The `- 1` adjustments cancel the initial `a = 1` baked into each independent
+    /// computation.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn combine(self, other: &Self) -> Self {
+    pub fn combine(self, other: &Self) -> Self {
         let a1 = u64::from(self.a);
         let b1 = u64::from(self.b);
         let a2 = u64::from(other.a);
         let b2 = u64::from(other.b);
-        let len2 = other.len % MOD_ADLER;
+        let len2 = other.len as u64 % u64::from(MOD_ADLER);
 
-        let a = (a1 + a2 - 1) % MOD_ADLER;
-        let b = (b1 + b2 + (a1 - 1) * len2) % MOD_ADLER;
+        let a = (a1 + a2 - 1) % u64::from(MOD_ADLER);
+        let b = (b1 + b2 + (a1 - 1) * len2) % u64::from(MOD_ADLER);
 
         Self {
             a: a as u32,
@@ -111,24 +180,42 @@ impl Adler32 {
         }
     }
 
-    /// Returns the computed Adler-32 checksum.
+    /// Returns the computed Adler-32 checksum as a `u32`.
+    ///
+    /// The value is `(B << 16) | A` where A and B are the two running sums reduced modulo 65521.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lzr::adler32::Adler32;
+    ///
+    /// let mut adler = Adler32::new();
+    /// adler.update(b"Wikipedia");
+    /// assert_eq!(adler.checksum(), 0x11E6_0398);
+    /// ```
     #[must_use]
-    pub(crate) const fn checksum(&self) -> u32 {
+    pub const fn checksum(&self) -> u32 {
         (self.b << 16) | self.a
+    }
+}
+
+impl Default for Adler32 {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 impl Adler32 {
-    // Naive per-byte implementation. Used as a reference for testing.
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn update_naive(&mut self, data: &[u8]) {
+    /// Naive per-byte implementation. Used as a reference for testing.
+    #[allow(clippy::cast_lossless)]
+    fn update_naive(&mut self, data: &[u8]) {
         for byte in data {
-            self.a = (self.a + u32::from(*byte)) % MOD_ADLER as u32;
-            self.b = (self.b + self.a) % MOD_ADLER as u32;
+            self.a = (self.a + *byte as u32) % MOD_ADLER;
+            self.b = (self.b + self.a) % MOD_ADLER;
         }
-        self.len += data.len() as u64;
+        self.len += data.len();
     }
 }
 

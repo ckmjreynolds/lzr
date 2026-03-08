@@ -49,8 +49,12 @@ nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 redundant_pub_crate = "allow"
 
+# [[bench]]
+# name = "codec"
+# harness = false
+
 [[bench]]
-name = "codec"
+name = "adler32"
 harness = false
 
 [profile.samply]
