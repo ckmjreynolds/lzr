@@ -6,6 +6,7 @@ use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 
 use crate::adler32::Adler32;
+use crate::nibble::NibbleWriter;
 use crate::ring::RingBuffer;
 
 /// Encode an input stream into an LZR compressed stream.
@@ -53,5 +54,7 @@ fn compress_block(ring: &RingBuffer, start: usize, len: usize) -> (Vec<u8>, Adle
     let block = &ring[start..start + len];
     let mut checksum = Adler32::new();
     checksum.update(block);
-    (block.to_vec(), checksum)
+    let mut nw = NibbleWriter::with_capacity(len);
+    nw.write_bytes(block);
+    (nw.into_bytes(), checksum)
 }

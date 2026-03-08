@@ -6,6 +6,7 @@
 pub(crate) const HEADER: &[u8; 4] = b"LZR\0";
 
 mod adler32;
+mod nibble;
 mod ring;
 
 pub mod decoder;
