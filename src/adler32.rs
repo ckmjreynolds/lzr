@@ -240,31 +240,31 @@ mod test {
 
     proptest! {
         #[test]
-          fn test_random_vectors(data in prop::collection::vec(any::<u8>(), 0..65536)) {
-              let mut naive = super::Adler32::new();
-              naive.update_naive(&data);
+        fn test_random_vectors(data in prop::collection::vec(any::<u8>(), 0..65536)) {
+          let mut naive = super::Adler32::new();
+          naive.update_naive(&data);
 
-              let mut optimized = super::Adler32::new();
-              optimized.update(&data);
+          let mut optimized = super::Adler32::new();
+          optimized.update(&data);
 
-              prop_assert_eq!(optimized.checksum(), naive.checksum());
-          }
+          prop_assert_eq!(optimized.checksum(), naive.checksum());
+        }
 
         #[test]
-          fn test_combine(data in prop::collection::vec(any::<u8>(), 2..65536)) {
-              let split = data.len() / 2;
+        fn test_combine(data in prop::collection::vec(any::<u8>(), 2..65536)) {
+          let split = data.len() / 2;
 
-              let mut whole = super::Adler32::new();
-              whole.update(&data);
+          let mut whole = super::Adler32::new();
+          whole.update(&data);
 
-              let mut first = super::Adler32::new();
-              first.update(&data[..split]);
-              let mut second = super::Adler32::new();
-              second.update(&data[split..]);
+          let mut first = super::Adler32::new();
+          first.update(&data[..split]);
+          let mut second = super::Adler32::new();
+          second.update(&data[split..]);
 
-              let combined = first.combine(&second);
+          let combined = first.combine(&second);
 
-              prop_assert_eq!(combined.checksum(), whole.checksum());
-          }
+          prop_assert_eq!(combined.checksum(), whole.checksum());
+        }
     }
 }

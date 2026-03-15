@@ -35,7 +35,7 @@ The bitstream between the header and footer is a sequence of nibbles encoding fr
 Each frame is a distance (D) followed by a length (L), optionally followed by literal bytes:
 
 - **D** — [UBLEB8](BLEB8.md#ubleb8-unsigned)-encoded u16 (max 5 nibbles).
-- **L** — [UBLEB8](BLEB8.md#ubleb8-unsigned)-encoded u16 when D = 0; [SLEB8](BLEB8.md#sleb8-signed)-encoded i16 when D > 0 (max 5 nibbles).
+- **L** — [UBLEB8](BLEB8.md#ubleb8-unsigned)-encoded u16 when D = 0; [SBLEB8](BLEB8.md#sleb8-signed)-encoded i16 when D > 0 (max 5 nibbles).
 
 | D | L | Type |
 |-|-|-|

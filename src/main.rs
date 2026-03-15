@@ -5,6 +5,8 @@
 
 use std::process::ExitCode;
 
-const fn main() -> ExitCode {
-    ExitCode::SUCCESS
+mod cli;
+
+fn main() -> ExitCode {
+    cli::run()
 }

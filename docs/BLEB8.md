@@ -10,7 +10,7 @@ Because the maximum number of nibbles is always known from the data type being e
 
 BLEB8 has two variants:
 - **UBLEB8** — unsigned (analogous to unsigned LEB128)
-- **SLEB8** — signed (analogous to signed LEB128)
+- **SBLEB8** — signed (analogous to signed LEB128)
 
 ## Nibble Stream
 
@@ -100,7 +100,7 @@ encode_ubleb8(value, max_nibbles N):
 
 **Minimal encoding:** the encoder must stop at the earliest nibble where the remaining value is zero. This is the natural behavior of the algorithm above — it returns as soon as `value == 0`.
 
-## SLEB8 (Signed)
+## SBLEB8 (Signed)
 
 Same as UBLEB8 but the decoded value is sign-extended from the number of data bits actually read. Analogous to signed LEB128.
 

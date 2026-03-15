@@ -5,3 +5,9 @@
 #![allow(dead_code)]
 
 pub mod adler32;
+pub mod decode;
+pub mod encode;
+pub mod error;
+pub(crate) mod frame;
+pub(crate) mod nibble;
+pub mod options;

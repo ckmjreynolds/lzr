@@ -54,6 +54,14 @@ redundant_pub_crate = "allow"
 name = "adler32"
 harness = false
 
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "decode"
+harness = false
+
 [profile.samply]
 inherits = "release"
 debug = true
