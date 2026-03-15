@@ -1,7 +1,5 @@
 //! LZR frame encoding and decoding.
 
-#![allow(unused_variables, clippy::needless_pass_by_ref_mut)]
-
 use std::io::{Read, Write};
 
 use crate::error::Result;
@@ -13,20 +11,12 @@ pub(crate) enum Frame {
     /// Literal bytes (D=0, L>0).
     Literal(Vec<u8>),
 
-    /// Forward copy: copy `length` bytes from `distance` back (D>0, L>0).
-    ForwardMatch {
+    /// Match copy (D>0): positive L = forward, negative L = reverse, L=0 = no-op.
+    Match {
         /// Distance back into the output buffer (1 = most recent byte).
         distance: u16,
-        /// Number of bytes to copy.
-        length: u16,
-    },
-
-    /// Reverse copy: copy `length` bytes in reverse from `distance` back (D>0, L<0).
-    ReverseMatch {
-        /// Distance back into the output buffer (1 = most recent byte).
-        distance: u16,
-        /// Number of bytes to copy (absolute value of the negative length).
-        length: u16,
+        /// Signed length: positive for forward copy, negative for reverse copy.
+        length: i16,
     },
 
     /// End of stream (D=0, L=0).
@@ -35,12 +25,53 @@ pub(crate) enum Frame {
 
 impl Frame {
     /// Encodes this frame into the nibble stream.
+    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn encode<W: Write>(&self, writer: &mut NibbleWriter<W>) -> Result<()> {
-        todo!()
+        match self {
+            Self::EndOfStream => {
+                writer.write_ubleb8_u16(0)?;
+                writer.write_ubleb8_u16(0)?;
+            }
+            Self::Literal(bytes) => {
+                writer.write_ubleb8_u16(0)?;
+                writer.write_ubleb8_u16(bytes.len() as u16)?;
+                for &b in bytes {
+                    writer.write_literal_byte(b)?;
+                }
+            }
+            Self::Match {
+                distance,
+                length,
+            } => {
+                writer.write_ubleb8_u16(*distance)?;
+                writer.write_sbleb8_i16(*length)?;
+            }
+        }
+        Ok(())
     }
 
     /// Decodes the next frame from the nibble stream.
     pub(crate) fn decode<R: Read>(reader: &mut NibbleReader<R>) -> Result<Self> {
-        todo!()
+        let distance = reader.read_ubleb8_u16()?;
+        if distance == 0 {
+            let length = reader.read_ubleb8_u16()?;
+            if length == 0 {
+                return Ok(Self::EndOfStream);
+            }
+            let mut bytes = Vec::with_capacity(length as usize);
+            for _ in 0..length {
+                bytes.push(reader.read_literal_byte()?);
+            }
+            Ok(Self::Literal(bytes))
+        } else {
+            let length = reader.read_sbleb8_i16()?;
+            if length == 0 {
+                return Self::decode(reader);
+            }
+            Ok(Self::Match {
+                distance,
+                length,
+            })
+        }
     }
 }
