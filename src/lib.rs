@@ -4,10 +4,12 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(dead_code)]
 
+pub(crate) mod frame;
+pub(crate) mod nibble;
+pub(crate) mod ringbuf;
+
 pub mod adler32;
 pub mod decode;
 pub mod encode;
 pub mod error;
-pub(crate) mod frame;
-pub(crate) mod nibble;
 pub mod options;
