@@ -170,8 +170,9 @@ impl Adler32 {
         let b2 = u64::from(other.b);
         let len2 = other.len as u64 % u64::from(MOD_ADLER);
 
-        let a = (a1 + a2 - 1) % u64::from(MOD_ADLER);
-        let b = (b1 + b2 + (a1 - 1) * len2) % u64::from(MOD_ADLER);
+        let m = u64::from(MOD_ADLER);
+        let a = (a1 + a2 + m - 1) % m;
+        let b = (b1 + b2 + (a1 + m - 1) * len2) % m;
 
         Self {
             a: a as u32,

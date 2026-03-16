@@ -25,6 +25,12 @@ impl<W: Write> NibbleWriter<W> {
         }
     }
 
+    /// Returns `true` if a high nibble is buffered awaiting its pair.
+    #[must_use]
+    pub(crate) const fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// Writes a single nibble (0x0..=0xF).
     #[inline]
     pub(crate) fn write_nibble(&mut self, nibble: u8) -> Result<()> {

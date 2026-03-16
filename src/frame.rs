@@ -75,3 +75,58 @@ impl Frame {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::nibble::{NibbleReader, NibbleWriter};
+
+    fn frame_strategy() -> impl Strategy<Value = Frame> {
+        prop_oneof![
+            10 => prop::collection::vec(any::<u8>(), 1..=64usize)
+                .prop_map(Frame::Literal),
+            90 => (1..=u16::MAX, any::<i16>())
+                .prop_map(|(distance, length)| Frame::Match { distance, length }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn round_trip_frame_sequence(frames in prop::collection::vec(frame_strategy(), 0..=32)) {
+            let mut writer = NibbleWriter::new(Vec::new());
+
+            // Expected: only frames the decoder will actually return
+            // (excludes Match with length=0, which the decoder skips).
+            let expected: Vec<&Frame> = frames.iter()
+                .filter(|f| !matches!(f, Frame::Match { length: 0, .. }))
+                .collect();
+
+            for frame in &frames {
+                frame.encode(&mut writer).unwrap();
+            }
+
+            // Pad to byte alignment before EOS if needed.
+            if writer.has_pending() {
+                let noop = Frame::Match { distance: 8, length: 0 };
+                noop.encode(&mut writer).unwrap();
+            }
+
+            Frame::EndOfStream.encode(&mut writer).unwrap();
+            let buf = writer.finish().unwrap();
+
+            let mut reader = NibbleReader::new(buf.as_slice());
+            let mut decoded: Vec<Frame> = Vec::new();
+
+            loop {
+                match Frame::decode(&mut reader).unwrap() {
+                    Frame::EndOfStream => break,
+                    frame => decoded.push(frame),
+                }
+            }
+
+            prop_assert_eq!(decoded.iter().collect::<Vec<_>>(), expected);
+        }
+    }
+}
