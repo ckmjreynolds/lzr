@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use smallvec::SmallVec;
 
 use crate::error::Result;
-use crate::nibble::{NibbleReader, NibbleWriter};
+use crate::nibble::{NibbleReader, NibbleWriter, sbleb8_i16_nibbles, ubleb8_u16_nibbles};
 
 /// Inline capacity for literal frames. Literals up to this size avoid heap allocation.
 const LITERAL_INLINE: usize = 32;
@@ -38,6 +38,23 @@ impl Frame {
             distance: 8,
             length: 0,
         }
+    }
+
+    /// Returns the nibble savings of a match versus emitting the same bytes as literals.
+    ///
+    /// Each literal byte costs 2 nibbles in the stream. A match frame costs
+    /// `UBLEB8(distance) + SBLEB8(length)` nibbles and replaces `|length|` literal bytes.
+    ///
+    /// - `> 0` — the match saves nibbles (net compression).
+    /// - `= 0` — break-even: same nibble count as literals, but avoids literal
+    ///   frame overhead, so still a win.
+    /// - `< 0` — the match costs more nibbles than the literals it replaces.
+    #[inline]
+    #[allow(clippy::cast_possible_wrap)]
+    pub(crate) fn match_gain(distance: u16, length: i16) -> isize {
+        let literal_nibbles = 2 * length.unsigned_abs() as isize;
+        let match_nibbles = ubleb8_u16_nibbles(distance) as isize + sbleb8_i16_nibbles(length) as isize;
+        literal_nibbles - match_nibbles
     }
 
     /// Encodes a literal frame from a borrowed slice, avoiding allocation.
@@ -110,6 +127,76 @@ mod tests {
 
     use super::*;
     use crate::nibble::{NibbleReader, NibbleWriter};
+
+    #[test]
+    fn match_gain_1byte_short_distance() {
+        // D=1..7 (1 nibble), L=1 (1 nibble) → 2 - 1 - 1 = 0 (break-even = win)
+        assert_eq!(Frame::match_gain(1, 1), 0);
+        assert_eq!(Frame::match_gain(7, 1), 0);
+        // D=8 (2 nibbles), L=1 → 2 - 2 - 1 = -1 (loss)
+        assert_eq!(Frame::match_gain(8, 1), -1);
+    }
+
+    #[test]
+    fn match_gain_2byte_distances() {
+        // L=2 (1 nibble SBLEB8: 2 is in -4..3 → wait, 2 is in range -4..3? No.
+        // SBLEB8: 1 nibble = -4..=3. L=2 → 1 nibble.
+        // D=1..7: 4 - 1 - 1 = 2
+        assert_eq!(Frame::match_gain(1, 2), 2);
+        assert_eq!(Frame::match_gain(7, 2), 2);
+        // D=8..63: 4 - 2 - 1 = 1
+        assert_eq!(Frame::match_gain(8, 2), 1);
+        assert_eq!(Frame::match_gain(63, 2), 1);
+        // D=64..511: 4 - 3 - 1 = 0 (break-even)
+        assert_eq!(Frame::match_gain(64, 2), 0);
+        assert_eq!(Frame::match_gain(511, 2), 0);
+        // D=512+: loss
+        assert_eq!(Frame::match_gain(512, 2), -1);
+    }
+
+    #[test]
+    fn match_gain_3byte_full_range() {
+        // L=3 (1 nibble), saves 6 literal nibbles
+        // D=1..7: 6 - 1 - 1 = 4
+        assert_eq!(Frame::match_gain(1, 3), 4);
+        // D=4096..65535: 6 - 5 - 1 = 0 (break-even at max distance)
+        assert_eq!(Frame::match_gain(4096, 3), 0);
+        assert_eq!(Frame::match_gain(u16::MAX, 3), 0);
+    }
+
+    #[test]
+    fn match_gain_length_boundary() {
+        // L=3 costs 1 SBLEB8 nibble, L=4 costs 2 SBLEB8 nibbles
+        // D=1: gain(L=3) = 6 - 1 - 1 = 4, gain(L=4) = 8 - 1 - 2 = 5
+        assert_eq!(Frame::match_gain(1, 3), 4);
+        assert_eq!(Frame::match_gain(1, 4), 5);
+    }
+
+    #[test]
+    fn match_gain_reverse_matches() {
+        // L=-1 (1 nibble SBLEB8), same gain as L=1
+        assert_eq!(Frame::match_gain(1, -1), 0);
+        assert_eq!(Frame::match_gain(7, -1), 0);
+        assert_eq!(Frame::match_gain(8, -1), -1);
+
+        // L=-4 (1 nibble), L=-5 (2 nibbles) — discontinuity
+        // D=1, L=-4: 8 - 1 - 1 = 6
+        assert_eq!(Frame::match_gain(1, -4), 6);
+        // D=1, L=-5: 10 - 1 - 2 = 7
+        assert_eq!(Frame::match_gain(1, -5), 7);
+    }
+
+    #[test]
+    fn match_gain_symmetry() {
+        // Forward and reverse of same absolute length should have same gain
+        // when SBLEB8 nibble counts match.
+        // L=1 and L=-1 both cost 1 nibble
+        assert_eq!(Frame::match_gain(100, 1), Frame::match_gain(100, -1));
+        // L=3 and L=-3 both cost 1 nibble
+        assert_eq!(Frame::match_gain(100, 3), Frame::match_gain(100, -3));
+        // L=4 costs 2 nibbles, L=-4 costs 1 nibble — asymmetric!
+        assert!(Frame::match_gain(100, -4) > Frame::match_gain(100, 4));
+    }
 
     fn frame_strategy() -> impl Strategy<Value = Frame> {
         prop_oneof![

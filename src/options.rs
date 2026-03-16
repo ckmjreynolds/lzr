@@ -63,6 +63,16 @@ impl EncodeOptions {
         self.threads = threads.clamp(0, current_num_threads());
         self
     }
+
+    /// Returns the compression level.
+    pub(crate) const fn get_level(&self) -> usize {
+        self.level
+    }
+
+    /// Returns the thread count.
+    pub(crate) const fn get_threads(&self) -> usize {
+        self.threads
+    }
 }
 
 impl Default for EncodeOptions {

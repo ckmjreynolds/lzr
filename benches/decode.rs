@@ -13,6 +13,7 @@ fn decode(c: &mut Criterion) {
     lzr::encode::encode(&mut data.as_slice(), &mut compressed, &EncodeOptions::default()).unwrap();
 
     let mut group = c.benchmark_group("decode");
+    group.sample_size(10);
     group.throughput(Throughput::Bytes(compressed.len() as u64));
     group.bench_function("decode", |b| {
         b.iter(|| {

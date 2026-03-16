@@ -10,6 +10,7 @@ fn encode(c: &mut Criterion) {
     let data = std::fs::read(CORPUS).unwrap();
 
     let mut group = c.benchmark_group("encode");
+    group.sample_size(10);
     group.throughput(Throughput::Bytes(data.len() as u64));
     group.bench_function("encode", |b| {
         b.iter(|| {

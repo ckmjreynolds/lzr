@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod frame;
+pub(crate) mod matchfinder;
 pub(crate) mod nibble;
 pub(crate) mod ringbuf;
 

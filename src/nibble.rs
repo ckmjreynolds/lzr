@@ -4,6 +4,21 @@ use std::io::{Read, Write};
 
 use crate::error::Result;
 
+/// Returns the number of nibbles needed to encode `value` as UBLEB8.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn ubleb8_u16_nibbles(value: u16) -> usize {
+    (16 - value.leading_zeros()).div_ceil(3).clamp(1, 5) as usize
+}
+
+/// Returns the number of nibbles needed to encode `value` as SBLEB8.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_sign_loss)]
+pub(crate) fn sbleb8_i16_nibbles(value: i16) -> usize {
+    (16 - ((value ^ (value >> 15)) as u16).leading_zeros() + 1).div_ceil(3).clamp(1, 5) as usize
+}
+
 /// Writes nibbles to an inner byte-oriented writer.
 ///
 /// Nibbles pack into bytes high-first: nibble 2K occupies bits 7–4,
@@ -58,7 +73,7 @@ impl<W: Write> NibbleWriter<W> {
     /// Encodes a `u16` as UBLEB8 (max 5 nibbles).
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn write_ubleb8_u16(&mut self, mut value: u16) -> Result<()> {
-        let nibbles = (16 - value.leading_zeros()).div_ceil(3).clamp(1, 5) as usize;
+        let nibbles = ubleb8_u16_nibbles(value);
 
         for _ in 1..nibbles {
             self.write_nibble((value & 0x7) as u8 | 0x8)?;
@@ -85,7 +100,7 @@ impl<W: Write> NibbleWriter<W> {
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
     pub(crate) fn write_sbleb8_i16(&mut self, mut value: i16) -> Result<()> {
-        let nibbles = (16 - ((value ^ (value >> 15)) as u16).leading_zeros() + 1).div_ceil(3).clamp(1, 5) as usize;
+        let nibbles = sbleb8_i16_nibbles(value);
         let mask = if nibbles == 5 {
             0xF
         } else {
@@ -267,5 +282,76 @@ mod tests {
             let result = reader.read_sbleb8_i16().unwrap();
             prop_assert_eq!(result, value);
         }
+
+        #[test]
+        fn ubleb8_nibbles_matches_encoded_size(value: u16) {
+            let mut writer = NibbleWriter::new(Vec::new());
+            writer.write_ubleb8_u16(value).unwrap();
+            // Each nibble pair = 1 byte; odd nibble count pads to next byte.
+            let buf = writer.finish().unwrap();
+            let expected_bytes = ubleb8_u16_nibbles(value).div_ceil(2);
+            prop_assert_eq!(buf.len(), expected_bytes);
+        }
+
+        #[test]
+        fn sbleb8_nibbles_matches_encoded_size(value: i16) {
+            let mut writer = NibbleWriter::new(Vec::new());
+            writer.write_sbleb8_i16(value).unwrap();
+            let buf = writer.finish().unwrap();
+            let expected_bytes = sbleb8_i16_nibbles(value).div_ceil(2);
+            prop_assert_eq!(buf.len(), expected_bytes);
+        }
+    }
+
+    #[test]
+    fn ubleb8_nibble_boundaries() {
+        use pretty_assertions::assert_eq;
+
+        // 1 nibble: 0..=7
+        assert_eq!(ubleb8_u16_nibbles(0), 1);
+        assert_eq!(ubleb8_u16_nibbles(7), 1);
+        // 2 nibbles: 8..=63
+        assert_eq!(ubleb8_u16_nibbles(8), 2);
+        assert_eq!(ubleb8_u16_nibbles(63), 2);
+        // 3 nibbles: 64..=511
+        assert_eq!(ubleb8_u16_nibbles(64), 3);
+        assert_eq!(ubleb8_u16_nibbles(511), 3);
+        // 4 nibbles: 512..=4095
+        assert_eq!(ubleb8_u16_nibbles(512), 4);
+        assert_eq!(ubleb8_u16_nibbles(4095), 4);
+        // 5 nibbles: 4096..=65535
+        assert_eq!(ubleb8_u16_nibbles(4096), 5);
+        assert_eq!(ubleb8_u16_nibbles(u16::MAX), 5);
+    }
+
+    #[test]
+    fn sbleb8_nibble_boundaries() {
+        use pretty_assertions::assert_eq;
+
+        // 1 nibble: -4..=3
+        assert_eq!(sbleb8_i16_nibbles(0), 1);
+        assert_eq!(sbleb8_i16_nibbles(3), 1);
+        assert_eq!(sbleb8_i16_nibbles(-1), 1);
+        assert_eq!(sbleb8_i16_nibbles(-4), 1);
+        // 2 nibbles: -32..=-5, 4..=31
+        assert_eq!(sbleb8_i16_nibbles(4), 2);
+        assert_eq!(sbleb8_i16_nibbles(31), 2);
+        assert_eq!(sbleb8_i16_nibbles(-5), 2);
+        assert_eq!(sbleb8_i16_nibbles(-32), 2);
+        // 3 nibbles: -256..=-33, 32..=255
+        assert_eq!(sbleb8_i16_nibbles(32), 3);
+        assert_eq!(sbleb8_i16_nibbles(255), 3);
+        assert_eq!(sbleb8_i16_nibbles(-33), 3);
+        assert_eq!(sbleb8_i16_nibbles(-256), 3);
+        // 4 nibbles: -2048..=-257, 256..=2047
+        assert_eq!(sbleb8_i16_nibbles(256), 4);
+        assert_eq!(sbleb8_i16_nibbles(2047), 4);
+        assert_eq!(sbleb8_i16_nibbles(-257), 4);
+        assert_eq!(sbleb8_i16_nibbles(-2048), 4);
+        // 5 nibbles: rest
+        assert_eq!(sbleb8_i16_nibbles(2048), 5);
+        assert_eq!(sbleb8_i16_nibbles(i16::MAX), 5);
+        assert_eq!(sbleb8_i16_nibbles(-2049), 5);
+        assert_eq!(sbleb8_i16_nibbles(i16::MIN), 5);
     }
 }
