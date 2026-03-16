@@ -49,6 +49,21 @@ impl RingBuf {
         self.write_pos += 1;
     }
 
+    /// Returns 1–2 contiguous slices covering the given position range.
+    ///
+    /// If the range doesn't wrap around the buffer, the second slice is empty.
+    /// This mirrors [`VecDeque::as_slices`] — callers iterate both slices for
+    /// `write_all` / `adler.update`.
+    pub(crate) fn slices(&self, range: Range<isize>) -> (&[u8], &[u8]) {
+        let start = range.start.cast_unsigned() & self.mask;
+        let end = range.end.cast_unsigned() & self.mask;
+        if start <= end {
+            (&self.buf[start..end], &[])
+        } else {
+            (&self.buf[start..], &self.buf[..end])
+        }
+    }
+
     /// Bulk-fills the buffer from `reader`, reading up to `len` bytes.
     ///
     /// Internally splits at the wrap boundary so each `read` call targets a
@@ -197,6 +212,41 @@ mod tests {
     #[should_panic(expected = "capacity must be a power of two")]
     fn non_power_of_two_panics() {
         let _ = RingBuf::new(7);
+    }
+
+    #[test]
+    fn slices_no_wrap() {
+        let mut buf = RingBuf::new(16);
+        for b in 0..10_u8 {
+            buf.push(b);
+        }
+        let (s1, s2) = buf.slices(2..6);
+        assert_eq!(s1, &[2, 3, 4, 5]);
+        assert!(s2.is_empty());
+    }
+
+    #[test]
+    fn slices_with_wrap() {
+        let mut buf = RingBuf::new(8);
+        // Push 6 bytes, then 4 more → write_pos = 10, wraps around
+        for b in 0..10_u8 {
+            buf.push(b);
+        }
+        // Positions 6..10 map to indices 6,7,0,1
+        let (s1, s2) = buf.slices(6..10);
+        assert_eq!(s1, &[6, 7]);
+        assert_eq!(s2, &[8, 9]);
+    }
+
+    #[test]
+    fn slices_empty_range() {
+        let mut buf = RingBuf::new(16);
+        for b in 0..5_u8 {
+            buf.push(b);
+        }
+        let (s1, s2) = buf.slices(3..3);
+        assert!(s1.is_empty());
+        assert!(s2.is_empty());
     }
 
     proptest! {

@@ -2,14 +2,19 @@
 
 use std::io::{Read, Write};
 
+use smallvec::SmallVec;
+
 use crate::error::Result;
 use crate::nibble::{NibbleReader, NibbleWriter};
+
+/// Inline capacity for literal frames. Literals up to this size avoid heap allocation.
+const LITERAL_INLINE: usize = 32;
 
 /// A single LZR frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Frame {
     /// Literal bytes (D=0, L>0).
-    Literal(Vec<u8>),
+    Literal(SmallVec<[u8; LITERAL_INLINE]>),
 
     /// Match copy (D>0): positive L = forward, negative L = reverse, L=0 = no-op.
     Match {
@@ -24,6 +29,31 @@ pub(crate) enum Frame {
 }
 
 impl Frame {
+    /// Creates a no-op frame that pads the nibble stream by 3 nibbles.
+    ///
+    /// D=8 (2 UBLEB8 nibbles) + L=0 (1 SBLEB8 nibble) = 3 nibbles total,
+    /// which flips the byte-alignment parity.
+    pub(crate) const fn noop() -> Self {
+        Self::Match {
+            distance: 8,
+            length: 0,
+        }
+    }
+
+    /// Encodes a literal frame from a borrowed slice, avoiding allocation.
+    ///
+    /// This is the preferred encode path when the caller already has the bytes
+    /// in a buffer (e.g. the encoder's read buffer).
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn encode_literal<W: Write>(bytes: &[u8], writer: &mut NibbleWriter<W>) -> Result<()> {
+        writer.write_ubleb8_u16(0)?;
+        writer.write_ubleb8_u16(bytes.len() as u16)?;
+        for &b in bytes {
+            writer.write_literal_byte(b)?;
+        }
+        Ok(())
+    }
+
     /// Encodes this frame into the nibble stream.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn encode<W: Write>(&self, writer: &mut NibbleWriter<W>) -> Result<()> {
@@ -33,11 +63,7 @@ impl Frame {
                 writer.write_ubleb8_u16(0)?;
             }
             Self::Literal(bytes) => {
-                writer.write_ubleb8_u16(0)?;
-                writer.write_ubleb8_u16(bytes.len() as u16)?;
-                for &b in bytes {
-                    writer.write_literal_byte(b)?;
-                }
+                Self::encode_literal(bytes, writer)?;
             }
             Self::Match {
                 distance,
@@ -58,7 +84,7 @@ impl Frame {
             if length == 0 {
                 return Ok(Self::EndOfStream);
             }
-            let mut bytes = Vec::with_capacity(length as usize);
+            let mut bytes = SmallVec::with_capacity(length as usize);
             for _ in 0..length {
                 bytes.push(reader.read_literal_byte()?);
             }
@@ -80,13 +106,15 @@ impl Frame {
 mod tests {
     use proptest::prelude::*;
 
+    use smallvec::SmallVec;
+
     use super::*;
     use crate::nibble::{NibbleReader, NibbleWriter};
 
     fn frame_strategy() -> impl Strategy<Value = Frame> {
         prop_oneof![
             10 => prop::collection::vec(any::<u8>(), 1..=64usize)
-                .prop_map(Frame::Literal),
+                .prop_map(|v| Frame::Literal(SmallVec::from_vec(v))),
             90 => (1..=u16::MAX, any::<i16>())
                 .prop_map(|(distance, length)| Frame::Match { distance, length }),
         ]
@@ -109,8 +137,7 @@ mod tests {
 
             // Pad to byte alignment before EOS if needed.
             if writer.has_pending() {
-                let noop = Frame::Match { distance: 8, length: 0 };
-                noop.encode(&mut writer).unwrap();
+                Frame::noop().encode(&mut writer).unwrap();
             }
 
             Frame::EndOfStream.encode(&mut writer).unwrap();
