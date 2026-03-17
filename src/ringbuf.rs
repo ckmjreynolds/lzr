@@ -91,6 +91,124 @@ impl RingBuf {
 
         Ok(total)
     }
+
+    /// Returns the number of contiguous bytes available from `pos` before
+    /// hitting the physical end of the buffer (wrap point).
+    #[inline]
+    pub(crate) const fn contiguous_len(&self, pos: isize) -> usize {
+        self.buf.len() - (pos.cast_unsigned() & self.mask)
+    }
+
+    /// Reads up to 4 bytes at `pos` as a big-endian `u32`.
+    ///
+    /// Uses direct slice access when the bytes are contiguous in the buffer.
+    #[inline]
+    #[allow(clippy::cast_possible_wrap)]
+    pub(crate) fn read_u32_be(&self, pos: isize, bytes_available: usize) -> u32 {
+        let len = bytes_available.min(4);
+        let start = pos.cast_unsigned() & self.mask;
+
+        if start + 4 <= self.buf.len() && len == 4 {
+            let bytes: [u8; 4] = self.buf[start..start + 4].try_into().unwrap();
+            u32::from_be_bytes(bytes)
+        } else if start + len <= self.buf.len() {
+            let mut key: u32 = 0;
+            for (i, &b) in self.buf[start..start + len].iter().enumerate() {
+                key |= u32::from(b) << (24 - 8 * i);
+            }
+            key
+        } else {
+            let mut key: u32 = 0;
+            for i in 0..len {
+                key |= u32::from(self.buf[(start + i) & self.mask]) << (24 - 8 * i);
+            }
+            key
+        }
+    }
+
+    /// Reads up to 8 bytes at `pos` as a big-endian `u64`.
+    ///
+    /// Uses direct slice access when the bytes are contiguous in the buffer.
+    #[inline]
+    #[allow(clippy::cast_possible_wrap)]
+    pub(crate) fn read_u64_be(&self, pos: isize, bytes_available: usize) -> u64 {
+        let len = bytes_available.min(8);
+        let start = pos.cast_unsigned() & self.mask;
+
+        if start + 8 <= self.buf.len() && len == 8 {
+            let bytes: [u8; 8] = self.buf[start..start + 8].try_into().unwrap();
+            u64::from_be_bytes(bytes)
+        } else if start + len <= self.buf.len() {
+            let mut key: u64 = 0;
+            for (i, &b) in self.buf[start..start + len].iter().enumerate() {
+                key |= u64::from(b) << (56 - 8 * i);
+            }
+            key
+        } else {
+            let mut key: u64 = 0;
+            for i in 0..len {
+                key |= u64::from(self.buf[(start + i) & self.mask]) << (56 - 8 * i);
+            }
+            key
+        }
+    }
+
+    /// Reads up to 16 bytes at `pos` as a big-endian `u128`.
+    ///
+    /// Uses direct slice access when the bytes are contiguous in the buffer
+    /// (99.97% of positions). Falls back to per-byte reads at the wrap point.
+    #[inline]
+    #[allow(clippy::cast_possible_wrap)]
+    pub(crate) fn read_u128_be(&self, pos: isize, bytes_available: usize) -> u128 {
+        let len = bytes_available.min(16);
+        let start = pos.cast_unsigned() & self.mask;
+
+        if start + 16 <= self.buf.len() && len == 16 {
+            // Fast path: 16 contiguous bytes — single slice read.
+            let bytes: [u8; 16] = self.buf[start..start + 16].try_into().unwrap();
+            u128::from_be_bytes(bytes)
+        } else if start + len <= self.buf.len() {
+            // Contiguous but fewer than 16 bytes (near end of input).
+            let mut key: u128 = 0;
+            for (i, &b) in self.buf[start..start + len].iter().enumerate() {
+                key |= u128::from(b) << (120 - 8 * i);
+            }
+            key
+        } else {
+            // Slow path: wraps around the buffer boundary.
+            let mut key: u128 = 0;
+            for i in 0..len {
+                key |= u128::from(self.buf[(start + i) & self.mask]) << (120 - 8 * i);
+            }
+            key
+        }
+    }
+
+    /// Returns the number of matching bytes between two positions (both going forward), up to `max_len`.
+    ///
+    /// Compares using contiguous slices for speed, avoiding per-byte index lookups.
+    #[inline]
+    #[allow(clippy::cast_possible_wrap)]
+    pub(crate) fn match_length(&self, pos1: isize, pos2: isize, max_len: usize) -> usize {
+        let mut matched = 0;
+        let mut remaining = max_len;
+
+        while remaining > 0 {
+            let idx1 = (pos1 + matched as isize).cast_unsigned() & self.mask;
+            let idx2 = (pos2 + matched as isize).cast_unsigned() & self.mask;
+            let chunk = remaining.min(self.buf.len() - idx1).min(self.buf.len() - idx2);
+            let s1 = &self.buf[idx1..idx1 + chunk];
+            let s2 = &self.buf[idx2..idx2 + chunk];
+            let n = s1.iter().zip(s2).take_while(|(a, b)| a == b).count();
+            matched += n;
+            if n < chunk {
+                break;
+            }
+            remaining -= chunk;
+        }
+
+        matched
+    }
 }
 
 impl Index<isize> for RingBuf {

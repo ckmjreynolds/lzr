@@ -17,12 +17,12 @@
 
 use std::io::{Read, Write};
 
-use crate::HEADER;
 use crate::adler32::Adler32;
 use crate::error::{Error, Result};
 use crate::frame::Frame;
 use crate::nibble::NibbleReader;
 use crate::ringbuf::RingBuf;
+use crate::{HEADER, WINDOW_SIZE};
 
 /// Reads and validates a 4-byte LZR header.
 fn read_header(reader: &mut impl Read) -> Result<()> {
@@ -40,7 +40,7 @@ fn read_header(reader: &mut impl Read) -> Result<()> {
 /// Decodes a single LZR stream (header already consumed).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn decode_stream(reader: &mut impl Read, output: &mut impl Write) -> Result<()> {
-    let mut window = RingBuf::new(65_536);
+    let mut window = RingBuf::new(WINDOW_SIZE);
     let mut nibble_reader = NibbleReader::new(&mut *reader);
     let mut adler = Adler32::new();
     let mut total_len: u64 = 0;
@@ -211,7 +211,7 @@ mod tests {
     /// Replays frames to get the expected decompressed output.
     fn replay_frames(frames: &[Frame]) -> Vec<u8> {
         let mut output = Vec::new();
-        let mut window = RingBuf::new(65_536);
+        let mut window = RingBuf::new(WINDOW_SIZE);
 
         for frame in frames {
             match frame {
