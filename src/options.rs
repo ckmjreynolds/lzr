@@ -34,6 +34,7 @@ pub const DEFAULT_LEVEL: usize = 9;
 pub struct EncodeOptions {
     level: usize,
     threads: usize,
+    verbose: bool,
 }
 
 impl EncodeOptions {
@@ -43,6 +44,7 @@ impl EncodeOptions {
         Self {
             level: DEFAULT_LEVEL,
             threads: 0,
+            verbose: false,
         }
     }
 
@@ -64,6 +66,13 @@ impl EncodeOptions {
         self
     }
 
+    /// Enables verbose diagnostic output to stderr.
+    #[must_use]
+    pub const fn verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
     /// Returns the compression level.
     pub(crate) const fn get_level(&self) -> usize {
         self.level
@@ -72,6 +81,11 @@ impl EncodeOptions {
     /// Returns the thread count.
     pub(crate) const fn get_threads(&self) -> usize {
         self.threads
+    }
+
+    /// Returns whether verbose output is enabled.
+    pub(crate) const fn get_verbose(&self) -> bool {
+        self.verbose
     }
 }
 

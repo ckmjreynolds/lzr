@@ -103,7 +103,7 @@ fn output_path(input: &Path, decompress: bool) -> Option<PathBuf> {
 }
 
 fn execute(args: &Args) -> Result<()> {
-    let options = EncodeOptions::new().level(effective_level(args)).threads(args.threads);
+    let options = EncodeOptions::new().level(effective_level(args)).threads(args.threads).verbose(args.verbose);
 
     if is_stdin(&args.files) {
         process_stdin(args, &options)

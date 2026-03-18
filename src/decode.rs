@@ -7,8 +7,8 @@
 //!
 //! // The 13-byte "Hi" stream from the FORMAT.md worked example.
 //! let compressed = [
-//!     0x4C, 0x5A, 0x52, 0x00, 0x02, 0x84, 0x96, 0x00,
-//!     0x20, 0xB2, 0x00, 0xFB, 0x00,
+//!     0x4C, 0x5A, 0x52, 0x00, 0xC4, 0x48, 0x69, 0xC0,
+//!     0x02, 0xB2, 0x00, 0xFB, 0x00,
 //! ];
 //! let mut output = Vec::new();
 //! decode(&mut &compressed[..], &mut output).unwrap();
@@ -19,8 +19,7 @@ use std::io::{Read, Write};
 
 use crate::adler32::Adler32;
 use crate::error::{Error, Result};
-use crate::frame::Frame;
-use crate::nibble::NibbleReader;
+use crate::frame::{Frame, decode_uleb128_u64};
 use crate::ringbuf::RingBuf;
 use crate::{HEADER, WINDOW_SIZE};
 
@@ -41,12 +40,11 @@ fn read_header(reader: &mut impl Read) -> Result<()> {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn decode_stream(reader: &mut impl Read, output: &mut impl Write) -> Result<()> {
     let mut window = RingBuf::new(WINDOW_SIZE);
-    let mut nibble_reader = NibbleReader::new(&mut *reader);
     let mut adler = Adler32::new();
     let mut total_len: u64 = 0;
 
     loop {
-        match Frame::decode(&mut nibble_reader)? {
+        match Frame::decode(reader)? {
             Frame::Literal(bytes) => {
                 for &b in &bytes {
                     window.push(b);
@@ -59,7 +57,7 @@ fn decode_stream(reader: &mut impl Read, output: &mut impl Write) -> Result<()> 
                 distance,
                 length,
             } => {
-                let abs_len = usize::from(length.unsigned_abs());
+                let abs_len = length.unsigned_abs() as usize;
                 let start = window.write_pos();
                 let d = distance as isize;
                 let dir: isize = if length > 0 {
@@ -87,11 +85,8 @@ fn decode_stream(reader: &mut impl Read, output: &mut impl Write) -> Result<()> 
         }
     }
 
-    // Footer: discard padding nibble, read UBLEB8 u64 length, then raw 4-byte Adler-32.
-    let reader = nibble_reader.into_inner();
-    let mut footer_reader = NibbleReader::new(&mut *reader);
-    let expected_len = footer_reader.read_ubleb8_u64()?;
-    let reader = footer_reader.into_inner();
+    // Footer: ULEB128 u64 length + 4-byte LE Adler-32.
+    let expected_len = decode_uleb128_u64(reader)?;
     let mut checksum_buf = [0u8; 4];
     reader.read_exact(&mut checksum_buf)?;
     let expected_checksum = u32::from_le_bytes(checksum_buf);
@@ -135,11 +130,11 @@ fn decode_stream(reader: &mut impl Read, output: &mut impl Write) -> Result<()> 
 /// use lzr::decode::decode;
 ///
 /// let compressed = [
-///     0x4C, 0x5A, 0x52, 0x00, 0x02, 0x84, 0x96, 0x00,
-///     0x20, 0xB2, 0x00, 0xFB, 0x00,
+///     0x4C, 0x5A, 0x52, 0x00, 0xC4, 0x48, 0x69, 0xC0,
+///     0x02, 0xB2, 0x00, 0xFB, 0x00,
 /// ];
 /// let mut output = Vec::new();
-/// decode(&mut &compressed[..], &mut output).unwrap();
+/// decode(&mut compressed.as_slice(), &mut output).unwrap();
 /// assert_eq!(&output, b"Hi");
 /// ```
 pub fn decode(input: &mut impl Read, output: &mut impl Write) -> Result<()> {
@@ -173,8 +168,7 @@ mod tests {
     use super::*;
     use crate::HEADER;
     use crate::adler32::Adler32;
-    use crate::frame::Frame;
-    use crate::nibble::NibbleWriter;
+    use crate::frame::{Frame, encode_uleb128_u64};
 
     /// Helper: builds a complete LZR stream from frames and returns the bytes.
     fn build_stream(frames: &[Frame]) -> Vec<u8> {
@@ -183,16 +177,11 @@ mod tests {
         // Header.
         buf.extend_from_slice(&HEADER);
 
-        // Bitstream.
-        let mut writer = NibbleWriter::new(Vec::new());
+        // Frames.
         for frame in frames {
-            frame.encode(&mut writer).unwrap();
+            frame.encode(&mut buf).unwrap();
         }
-        if writer.has_pending() {
-            Frame::noop().encode(&mut writer).unwrap();
-        }
-        Frame::EndOfStream.encode(&mut writer).unwrap();
-        buf.extend_from_slice(&writer.finish().unwrap());
+        Frame::EndOfStream.encode(&mut buf).unwrap();
 
         // Footer: compute expected output to get length and checksum.
         let expected_output = replay_frames(frames);
@@ -200,9 +189,7 @@ mod tests {
         let mut adler = Adler32::new();
         adler.update(&expected_output);
 
-        let mut footer_writer = NibbleWriter::new(Vec::new());
-        footer_writer.write_ubleb8_u64(len).unwrap();
-        buf.extend_from_slice(&footer_writer.finish().unwrap());
+        encode_uleb128_u64(len, &mut buf).unwrap();
         buf.extend_from_slice(&adler.checksum().to_le_bytes());
 
         buf
@@ -225,7 +212,7 @@ mod tests {
                     distance,
                     length,
                 } => {
-                    let abs_len = usize::from(length.unsigned_abs());
+                    let abs_len = length.unsigned_abs() as usize;
                     let start = window.write_pos();
                     let d = *distance as isize;
                     let dir: isize = if *length > 0 {
@@ -249,7 +236,7 @@ mod tests {
     #[test]
     fn decode_worked_example() {
         // The 13-byte "Hi" stream from FORMAT.md.
-        let data: &[u8] = &[0x4C, 0x5A, 0x52, 0x00, 0x02, 0x84, 0x96, 0x00, 0x20, 0xB2, 0x00, 0xFB, 0x00];
+        let data: &[u8] = &[0x4C, 0x5A, 0x52, 0x00, 0xC4, 0x48, 0x69, 0xC0, 0x02, 0xB2, 0x00, 0xFB, 0x00];
         let mut output = Vec::new();
         decode(&mut &data[..], &mut output).unwrap();
         assert_eq!(&output, b"Hi");
@@ -290,8 +277,6 @@ mod tests {
         let stream = build_stream(&frames);
         let mut output = Vec::new();
         decode(&mut stream.as_slice(), &mut output).unwrap();
-        // Reverse from pos 3, D=1: pos 2 (c), pos 1 (b), pos 0 (a)
-        // Wait: D=1 means pos - 1. For i=0: pos-1-0=2 → c. i=1: pos-1-1=1 → b. i=2: pos-1-2=0 → a.
         assert_eq!(&output, b"abccba");
     }
 
@@ -309,6 +294,23 @@ mod tests {
         let mut output = Vec::new();
         decode(&mut stream.as_slice(), &mut output).unwrap();
         assert_eq!(&output, b"xxxxxxxxxxx");
+    }
+
+    #[test]
+    fn decode_extended_length_match() {
+        // D=1, L=100: RLE via length extension.
+        let frames = vec![
+            Frame::Literal(SmallVec::from_slice(b"x")),
+            Frame::Match {
+                distance: 1,
+                length: 100,
+            },
+        ];
+        let stream = build_stream(&frames);
+        let mut output = Vec::new();
+        decode(&mut stream.as_slice(), &mut output).unwrap();
+        assert_eq!(output.len(), 101);
+        assert!(output.iter().all(|&b| b == b'x'));
     }
 
     #[test]
@@ -358,17 +360,11 @@ mod tests {
     #[test]
     fn length_mismatch() {
         let mut stream = build_stream(&[Frame::Literal(SmallVec::from_slice(b"test"))]);
-        // The footer length is right after the bitstream. Find it and corrupt it.
-        // Header (4) + bitstream + footer_length + checksum (4).
-        // Corrupt the footer length byte (which is right after the bitstream, before checksum).
-        let checksum_start = stream.len() - 4;
-        let footer_len_pos = checksum_start - 1; // UBLEB8(4) = 1 byte
-        stream[footer_len_pos] = 0x90; // Change length to something wrong
+        // Footer length is a single ULEB128 byte (value 4). It sits 5 bytes from the end.
+        let footer_len_pos = stream.len() - 5;
+        stream[footer_len_pos] = 0x05; // Change length from 4 to 5
 
         let err = decode(&mut stream.as_slice(), &mut Vec::new()).unwrap_err();
-        assert!(
-            matches!(err, Error::LengthMismatch { .. } | Error::ChecksumMismatch { .. }),
-            "expected LengthMismatch or ChecksumMismatch, got {err:?}"
-        );
+        assert!(matches!(err, Error::LengthMismatch { .. }), "expected LengthMismatch, got {err:?}");
     }
 }

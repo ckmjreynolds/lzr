@@ -8,14 +8,14 @@
 LZR is an LZ77-based compression format. A stream has three parts:
 
 ```
-┌────Header────┐┌────────Frame────────┐┌────────Frame────────┐     ┌────────Footer────────┐
-│┌────────────┐││┌───────┐┌ ─ ─ ─ ─ ─ ││┌───────┐┌ ─ ─ ─ ─ ─ │     │┌────────┐┌──────────┐│
-││ LZR | 0x00 ││││ D | L │  Literals ││││ D | L │  Literals ││ ... ││ Length ││ Adler-32 ││
-│└────────────┘││└───────┘└ ─ ─ ─ ─ ─ ││└───────┘└ ─ ─ ─ ─ ─ │     │└────────┘└──────────┘│
-└──────────────┘└─────────────────────┘└─────────────────────┘     └──────────────────────┘
+┌────Header────┐┌────Frame────┐┌────Frame────┐     ┌────────Footer────────┐
+│┌────────────┐││┌───────────┐││┌───────────┐│     │┌────────┐┌──────────┐│
+││ LZR | 0x00 ││││ 1-3 bytes ││││ 1-3 bytes ││ ... ││ Length ││ Adler-32 ││
+│└────────────┘││└───────────┘││└───────────┘│     │└────────┘└──────────┘│
+└──────────────┘└─────────────┘└─────────────┘     └──────────────────────┘
 ```
 
-All multi-byte integers are little-endian. The bitstream between the header and footer is nibble-oriented; see [BLEB8](BLEB8.md#nibble-stream) for nibble packing conventions.
+All multi-byte integers are little-endian unless noted otherwise. All frames are byte-aligned.
 
 ## Header
 
@@ -26,59 +26,124 @@ All multi-byte integers are little-endian. The bitstream between the header and 
 
 Version `0x00` is format version 1.0. All other values are reserved. A decoder must reject unrecognized magic numbers or versions.
 
-## Bitstream
-
-The bitstream between the header and footer is a sequence of nibbles encoding frames. Nibbles pack into bytes as defined in [BLEB8](BLEB8.md#nibble-stream): first nibble in bits 7–4, second in bits 3–0. The bitstream must contain an even number of nibbles (byte-aligned).
-
 ## Frames
 
-Each frame is a distance (D) followed by a length (L), optionally followed by literal bytes:
+There are three frame types, identified by the tag bits of the first byte:
 
-- **D** — [UBLEB8](BLEB8.md#ubleb8-unsigned)-encoded u16 (max 5 nibbles).
-- **L** — [UBLEB8](BLEB8.md#ubleb8-unsigned)-encoded u16 when D = 0; [SBLEB8](BLEB8.md#sleb8-signed)-encoded i16 when D > 0 (max 5 nibbles).
+```
+Short  (1B):  110LLLLD                          L  = 0..=15,   D = 0/1
+Medium (2B):  SLLLLDDD | DDDDDDDD              |L| = 2..=17/9, D = 1..=2,048
+Long   (3B):  111SLLLL | DDDDDDDD | DDDDDDDD   |L| = 3..=18,   D = 1..=65,536
+```
 
-| D | L | Type |
-|-|-|-|
-| 0 | 0 | **End of stream** |
-| 0 | > 0 | **Literal** — L raw bytes follow in the nibble stream |
-| > 0 | ≠ 0 | **Match** — copy \|L\| bytes from distance D |
-| > 0 | 0 | **No-op** — decoder does nothing |
+- The format is most easily understood if the Medium frame type is considered the baseline.
+- When the magnitude of L is the maximum permitted value, a length extension chain follows (see below), allowing arbitrarily long matches and literals.
+
+### Frame Type Dispatch
+
+The decoder determines the frame type from the first byte `b`:
+
+| Condition | Frame type |
+| - | - |
+| `b = 0xC0` | End of Stream |
+| `b & 0xE0 = 0xC0` | Short (`110xxxxx`, excluding EOS) |
+| `b & 0xE0 = 0xE0` | Long (`111xxxxx`) |
+| otherwise | Medium (`0x00`–`0xBF`) |
 
 ### End of Stream
 
-D = 0 and L = 0. Both encode as a single UBLEB8 nibble `0x0`, totaling two zero nibbles.
+A single `0xC0` byte. This is the Short frame encoding with L=0, D=0, reserved as the end-of-stream marker.
 
-### Literal
+### Medium Frame (2 bytes)
 
-D = 0, L > 0. The next L uncompressed bytes follow in the nibble stream. Each byte is stored as two nibbles in little-endian order (low nibble first, high nibble second).
-
-### Match
-
-D > 0, L ≠ 0. Copy |L| bytes from `output[pos - D]`. Distance 1 refers to the most recently emitted byte. The stored distance is the raw value (not distance-minus-one).
-
-The sign of L determines the copy direction:
-
-**Forward copy (L > 0):**
+The default/most common frame type. Bits 7–6 of byte 0 determine whether this is a forward match, reverse match, or an escape to Short/Long:
 
 ```
-for i in 0..|L|:
-    output[pos + i] = output[pos - D + i]
+  Byte 0                              Byte 1
+  7   6   5   4   3   2   1   0       7   6   5   4   3   2   1   0
+┌───┬───┬───┬───┬───┬───┬───┬───┐   ┌───┬───┬───┬───┬───┬───┬───┬───┐
+│ S │ L   L   L   L │ D   D   D │   │ D   D   D   D   D   D   D   D │
+└───┴───┴───┴───┴───┴───┴───┴───┘   └───┴───┴───┴───┴───┴───┴───┴───┘
 ```
 
-When L > D, the copy overlaps its own output. Each byte is copied individually — this enables run-length encoding (e.g., D=1, L=100 repeats the last byte 100 times).
+- **S** (bit 7): sign bit, 0/1 => positive/negative length => forward/reverse match.
+- **L** (bits 6–3): length magnitude, encoding -9..=-2,2..=17 (LLLL + 2).
+- **D** (bits 2–0 of byte 0 : byte 1): 11-bits, encoding 1..=2,048. The 3 bits from byte 0 are the low bits (little-endian): (byte1 << 3) | (byte0 & 0x07)
 
-**Reverse copy (L < 0):**
+A length of -9 or 17 triggers a length extension. A Medium frame cannot have bits 7 and 6 of byte 0 set.
+
+### Short Frame (1 byte)
+
+Short frames are used to encode literals and for RLE.
 
 ```
-for i in 0..|L|:
-    output[pos + i] = output[pos - D - i]
+  7   6   5   4   3   2   1   0
+┌───┬───┬───┬───┬───┬───┬───┬───┐
+│ 1   1   0 │ L   L   L   L │ D │
+└───┴───┴───┴───┴───┴───┴───┴───┘
+```
+
+- **L** (bits 4–1): length/count encoding 0..=15.
+- **D** (bit 0): 0 = literal, 1 = RLE of the last byte.
+- **EOS**: L=0, D=0 (`0xC0`).
+- **Reserved**: L=0, D=1 (`0xC1`).
+
+**When D=0 (literal):** L raw bytes follow. L is the number of literal bytes (1..=15).
+
+**When D=1 (RLE):** Repeats the last output byte L times (1..=15). L=0 with D=1 (`0xC1`) is reserved.
+
+A length of 15 triggers a length extension.
+
+### Long Frame (3 bytes)
+
+Long frames are the simplest to understand.
+
+```
+  Byte 0                           Byte 1     Byte 2
+  7  6  5  4  3  2  1  0           7 ───── 0  7 ────── 0
+┌───┬───┬───┬───┬───┬───┬───┬───┐ ┌─────────┐┌──────────┐
+│ 1   1   1 │ S │ L   L   L   L │ │ D (low) ││ D (high) │
+└───┴───┴───┴───┴───┴───┴───┴───┘ └─────────┘└──────────┘
+```
+
+- **S** (bit 7): sign bit, 0/1 => positive/negative length => forward/reverse match.
+- **L** (bits 3–0): encoding |L| = 3..=18
+- **D** (bytes 1–2): 16-bit little-endian, encoding 1..=65,536.
+
+A length of +/- 18 triggers a length extension.
+
+### Length Extension
+
+When the L field is the maximum magnitude, one or more extension bytes follow immediately after the frame's base bytes. The extension chain adds to the base magnitude:
+
+1. Read one byte.
+2. Add its value to the magnitude.
+3. If the byte equals 255, repeat from step 1.
+4. If the byte is less than 255, the chain is complete.
+
+`total = original_magnitude + sum(ext_bytes)`
+
+For literals, the extension chain appears after the frame byte and before the literal bytes.
+
+## Copy Semantics
+
+**Forward copy (positive length):**
+
+```
+for i in 0..length:
+    output[pos + i] = output[pos - distance + i]
+```
+
+When length > distance, the copy overlaps its own output. Each byte is copied individually — this enables run-length encoding (e.g., distance 1, length 33 repeats the last byte 33 times).
+
+**Reverse copy (negative length):**
+
+```
+for i in 0..|length|:
+    output[pos + i] = output[pos - distance - i]
 ```
 
 This matches reversed patterns. For example, `stressed` in the output can produce `desserts` via a reverse copy.
-
-### No-op
-
-D > 0, L = 0. Valid; the decoder emits nothing and advances to the next frame. Encoders use no-op frames to pad the nibble stream to a byte boundary.
 
 ## Sliding Window
 
@@ -86,14 +151,20 @@ The decoder maintains a **65,536 byte** (64 KiB) sliding window of decompressed 
 
 ## Footer
 
-Byte-aligned, immediately after the padded bitstream.
+Immediately after the end-of-stream marker.
 
 | Field | Encoding | Description |
 |-|-|-|
-| Uncompressed length | [UBLEB8](BLEB8.md#ubleb8-unsigned)-encoded u64 (max 21 nibbles) | Original byte count |
+| Uncompressed length | [ULEB128](https://en.wikipedia.org/wiki/LEB128)-encoded u64 (max 9 bytes) | Original byte count |
 | Checksum | 4 bytes, little-endian | [Adler-32](https://en.wikipedia.org/wiki/Adler-32) of uncompressed data |
 
-The UBLEB8 length packs nibbles into bytes the same way as the bitstream. The nibbles are padded to a byte boundary; at most 21 nibbles = 11 bytes.
+### ULEB128 Encoding
+
+The uncompressed length uses ULEB128 (Unsigned Little-Endian Base 128) encoding, bounded to 9 bytes maximum:
+
+- Bytes 1–8 use standard ULEB128: 7 payload bits (bits 6–0) and 1 continuation bit (bit 7). If the continuation bit is set, another byte follows.
+- If a 9th byte is needed, all 8 bits are payload (no continuation bit).
+- Total capacity: 8 × 7 + 8 = 64 bits, sufficient for a full u64.
 
 The decoder must verify that the decompressed byte count matches the stored length and that the Adler-32 matches. A mismatch indicates corruption.
 
@@ -105,27 +176,23 @@ A file may contain multiple concatenated streams. If data remains after a footer
 
 Compressing `Hi` (0x48 0x69):
 
-**Nibble stream:**
+**Frames:**
 
-| Frame | Field | Value | Nibbles |
-|-|-|-|-|
-| 1 | D | 0 (literal) | `0` |
-| 1 | L | 2 (byte count) | `2` |
-| 1 | Byte 0x48 | | `8 4` |
-| 1 | Byte 0x69 | | `9 6` |
-| 2 | D | 0 (EOS) | `0` |
-| 2 | L | 0 (EOS) | `0` |
+| Frame | Type | Header Byte | Payload | Description |
+|-|-|-|-|-|
+| 1 | Short Literal | `0xC4` (L=2, D=0) | `0x48 0x69` | 2 literal bytes |
+| 2 | EOS | `0xC0` | — | End of stream |
 
-Eight nibbles = four bytes. Packed: `0x02 0x84 0x96 0x00`.
+`0xC4` = `1100_0100`: tag `110`, LLLL=0010 (2), D=0 → literal, 2 bytes follow.
 
 **Footer:**
 
-- UBLEB8(2) = nibble `0x2`, padded to byte: `0x20`.
+- ULEB128(2) = `0x02` (1 byte, no continuation needed).
 - Adler-32("Hi"): A = 1 + 72 + 105 = 178 (0xB2), B = 0 + 73 + 178 = 251 (0xFB). Checksum = 0x00FB00B2, little-endian: `B2 00 FB 00`.
 
 **Complete stream (13 bytes):**
 
 ```
-4C 5A 52 00  02 84 96 00  20 B2 00 FB 00
-├─ Header ─┤ ├ Bitstream ┤ ├── Footer ──┤
+4C 5A 52 00  C4 48 69 C0  02 B2 00 FB 00
+├─ Header ─┤ ├─ Frames ─┤ ├── Footer ──┤
 ```

@@ -1,99 +1,75 @@
 #!/usr/bin/env bash
+# bench_compare.sh — Compare LZR against lz4 and gzip.
+# Usage: bash bench_compare.sh <file>
+
 set -euo pipefail
 
-# Benchmark three match finder implementations + gzip + lz4
-# Usage: bash bench_compare.sh
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <file>" >&2
+    exit 1
+fi
 
-TESTFILE="corpora/large/bible.txt"
-ORIGINAL_SIZE=$(wc -c < "$TESTFILE")
-ORIGINAL_SHA=$(shasum < "$TESTFILE" | awk '{print $1}')
-TMPOUT=$(mktemp)
-trap 'rm -f "$TMPOUT"' EXIT
+FILE="$1"
+if [ ! -f "$FILE" ]; then
+    echo "Error: file not found: $FILE" >&2
+    exit 1
+fi
 
-printf "Input: %s (%s bytes)\n\n" "$TESTFILE" "$ORIGINAL_SIZE"
+ORIG_SIZE=$(wc -c < "$FILE")
+TMPDIR="${TMPDIR:-/tmp}"
+BASENAME=$(basename "$FILE")
 
-# ── Helper ──────────────────────────────────────────────────────────────────
-bench_lzr() {
-    local label="$1" level="$2"
-    # Compress: measure time and size
-    local t0 t1 elapsed size speed
-    t0=$(python3 -c 'import time; print(time.monotonic())')
-    cargo run --release -q -- --level "$level" < "$TESTFILE" > "$TMPOUT" 2>/dev/null
-    t1=$(python3 -c 'import time; print(time.monotonic())')
-    elapsed=$(python3 -c "print(f'{$t1 - $t0:.3f}')")
-    size=$(wc -c < "$TMPOUT")
-    speed=$(python3 -c "t=$t1-$t0; print(f'{$ORIGINAL_SIZE/t/1048576:.1f}') if t>0 else print('inf')")
-    ratio=$(python3 -c "print(f'{$size/$ORIGINAL_SIZE*100:.1f}')")
+# Build LZR in release mode.
+cargo build --release --quiet 2>/dev/null
+LZR=./target/release/lzr
 
-    # Verify roundtrip
-    local rt_sha
-    rt_sha=$(cargo run --release -q -- -d < "$TMPOUT" 2>/dev/null | shasum | awk '{print $1}')
-    local ok="OK"
-    [[ "$rt_sha" == "$ORIGINAL_SHA" ]] || ok="FAIL"
+# Format an integer with comma separators.
+commas() { printf "%'d" "$1"; }
 
-    printf "%-28s  %8d  %5s%%  %6s MiB/s  [%s]\n" "$label" "$size" "$ratio" "$speed" "$ok"
+printf "%-20s %14s %14s %8s %16s %16s\n" "Tool" "Original" "Compressed" "Ratio" "Compress" "Decompress"
+printf "%-20s %14s %14s %8s %16s %16s\n" "----" "--------" "----------" "-----" "--------" "----------"
+
+bench() {
+    local label="$1"
+    local compress_cmd="$2"
+    local decompress_cmd="$3"
+
+    local comp_file="$TMPDIR/bench_${BASENAME}.compressed"
+
+    # Compress and time.
+    local t0 t1 comp_time comp_size decomp_time
+    t0=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
+    eval "$compress_cmd" < "$FILE" > "$comp_file"
+    t1=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
+    comp_time=$(perl -e "printf '%.6f', $t1 - $t0")
+    comp_size=$(wc -c < "$comp_file")
+
+    # Decompress and time.
+    t0=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
+    eval "$decompress_cmd" < "$comp_file" > /dev/null
+    t1=$(perl -MTime::HiRes=time -e 'printf "%.6f", time')
+    decomp_time=$(perl -e "printf '%.6f', $t1 - $t0")
+
+    local ratio comp_mbs decomp_mbs
+    ratio=$(perl -e "printf '%.1f', (1 - $comp_size / $ORIG_SIZE) * 100")
+    comp_mbs=$(perl -e "printf '%.1f', $ORIG_SIZE / (1024*1024) / ($comp_time > 0 ? $comp_time : 0.001)")
+    decomp_mbs=$(perl -e "printf '%.1f', $ORIG_SIZE / (1024*1024) / ($decomp_time > 0 ? $decomp_time : 0.001)")
+
+    printf "%-20s %14s %14s %7s%% %10s MiB/s %10s MiB/s\n" \
+        "$label" "$(commas "$ORIG_SIZE")" "$(commas "$comp_size")" \
+        "$ratio" "$comp_mbs" "$decomp_mbs"
+    rm -f "$comp_file"
 }
 
-bench_ext() {
-    local label="$1" compress_cmd="$2" decompress_cmd="$3"
-    local t0 t1 elapsed size speed
-    t0=$(python3 -c 'import time; print(time.monotonic())')
-    eval "$compress_cmd" > "$TMPOUT"
-    t1=$(python3 -c 'import time; print(time.monotonic())')
-    size=$(wc -c < "$TMPOUT")
-    speed=$(python3 -c "t=$t1-$t0; print(f'{$ORIGINAL_SIZE/t/1048576:.1f}') if t>0 else print('inf')")
-    ratio=$(python3 -c "print(f'{$size/$ORIGINAL_SIZE*100:.1f}')")
+bench "lzr -1"    "$LZR -l 1"        "$LZR -d"
+bench "lzr -9"    "$LZR -l 9"        "$LZR -d"
 
-    # Verify roundtrip
-    local rt_sha
-    rt_sha=$(eval "$decompress_cmd" < "$TMPOUT" | shasum | awk '{print $1}')
-    local ok="OK"
-    [[ "$rt_sha" == "$ORIGINAL_SHA" ]] || ok="FAIL"
+if command -v lz4 &>/dev/null; then
+    bench "lz4 -1"    "lz4 -1 -c"       "lz4 -d -c"
+    bench "lz4 -9"    "lz4 -9 -c"       "lz4 -d -c"
+fi
 
-    printf "%-28s  %8d  %5s%%  %6s MiB/s  [%s]\n" "$label" "$size" "$ratio" "$speed" "$ok"
-}
-
-# ── Patch helper ────────────────────────────────────────────────────────────
-set_finder() {
-    local finder="$1"
-    case "$finder" in
-        MatchFinder)
-            sed -i '' 's/use crate::matchfinder::[A-Za-z]*;/use crate::matchfinder::MatchFinder;/' src/encode.rs
-            sed -i '' 's/let mut mf = [A-Za-z]*::new(options);/let mut mf = MatchFinder::new(options);/' src/encode.rs
-            ;;
-        BTreeMatchFinder)
-            sed -i '' 's/use crate::matchfinder::[A-Za-z]*;/use crate::matchfinder::BTreeMatchFinder;/' src/encode.rs
-            sed -i '' 's/let mut mf = [A-Za-z]*::new(options);/let mut mf = BTreeMatchFinder::new(options);/' src/encode.rs
-            ;;
-        HashMapMatchFinder)
-            sed -i '' 's/use crate::matchfinder::[A-Za-z]*;/use crate::matchfinder::HashMapMatchFinder;/' src/encode.rs
-            sed -i '' 's/let mut mf = [A-Za-z]*::new(options);/let mut mf = HashMapMatchFinder::new(options);/' src/encode.rs
-            ;;
-    esac
-}
-
-# ── Build all three variants (release) ──────────────────────────────────────
-printf "%-28s  %8s  %5s   %6s         %s\n" "Implementation" "Size" "Ratio" "Speed" "Check"
-printf "%s\n" "--------------------------------------------------------------------------"
-
-for finder in HashMapMatchFinder BTreeMatchFinder MatchFinder; do
-    set_finder "$finder"
-    cargo build --release -q 2>/dev/null
-    for level in 1 5 9; do
-        bench_lzr "lzr $finder L$level" "$level"
-    done
-    echo
-done
-
-# ── External tools ──────────────────────────────────────────────────────────
-for level in 1 9; do
-    bench_ext "gzip -$level" "gzip -${level}c < $TESTFILE" "gzip -dc"
-done
-echo
-
-for level in 1 9; do
-    bench_ext "lz4 -$level" "lz4 -${level}c --no-frame-crc < $TESTFILE" "lz4 -dc"
-done
-
-# ── Restore to HashMap ─────────────────────────────────────────────────────
-set_finder HashMapMatchFinder
+if command -v gzip &>/dev/null; then
+    bench "gzip -1"   "gzip -1 -c"      "gzip -d -c"
+    bench "gzip -9"   "gzip -9 -c"      "gzip -d -c"
+fi

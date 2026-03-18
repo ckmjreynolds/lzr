@@ -20,43 +20,42 @@ use std::io::{Read, Write};
 
 use crate::adler32::Adler32;
 use crate::error::Result;
-use crate::frame::Frame;
-use crate::matchfinder::HashMapMatchFinder;
-use crate::nibble::{NibbleWriter, sbleb8_i16_nibbles, ubleb8_u16_nibbles};
+use crate::frame::{Frame, encode_uleb128_u64};
+use crate::matchfinder::MatchFinder;
 use crate::options::EncodeOptions;
 use crate::ringbuf::RingBuf;
 use crate::{HEADER, WINDOW_SIZE};
 
-/// Maximum literal chunk size per frame.
+/// Maximum literal buffer size before flushing.
 const CHUNK_SIZE: usize = 4096;
 
 /// How many bytes to read into the ring buffer at a time.
 const FILL_SIZE: usize = 32_768;
 
-/// Flushes the literal buffer as literal frames and updates the Adler-32 checksum.
+/// Flushes the literal buffer as a single literal frame and updates the Adler-32 checksum.
 fn flush_literals<W: Write>(
     lit_buf: &mut Vec<u8>,
-    writer: &mut NibbleWriter<W>,
+    output: &mut W,
     adler: &mut Adler32,
     total_len: &mut u64,
+    frame_count: &mut u64,
 ) -> Result<()> {
     if lit_buf.is_empty() {
         return Ok(());
     }
     adler.update(lit_buf);
     *total_len += lit_buf.len() as u64;
-    for chunk in lit_buf.chunks(CHUNK_SIZE) {
-        Frame::encode_literal(chunk, writer)?;
-    }
+    Frame::encode_literal(lit_buf, output)?;
+    *frame_count += 1;
     lit_buf.clear();
     Ok(())
 }
 
 /// Compresses data from `input` and writes it to `output`.
 ///
-/// Uses an LZ77 hash-chain match finder to find back-references in the sliding
-/// window. The compression level (from `options`) controls chain depth, minimum
-/// match length, and lazy matching behavior.
+/// Uses a brute-force match finder to find back-references in the sliding
+/// window. The compression level (from `options`) controls lazy matching
+/// behavior and whether reverse matches are attempted.
 ///
 /// # Errors
 ///
@@ -83,50 +82,86 @@ fn flush_literals<W: Write>(
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
     clippy::too_many_lines,
-    clippy::manual_div_ceil,
-    clippy::uninlined_format_args
+    unused_assignments
 )]
 pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOptions) -> Result<()> {
     // Header.
     output.write_all(&HEADER)?;
 
-    let mut writer = NibbleWriter::new(&mut *output);
     let mut adler = Adler32::new();
     let mut total_len: u64 = 0;
 
     let mut window = RingBuf::new(WINDOW_SIZE);
-    let mut mf = HashMapMatchFinder::new(options);
+    let mf = MatchFinder::new(options);
     let mut lit_buf: Vec<u8> = Vec::with_capacity(CHUNK_SIZE);
 
-    // `pos` is the current encoding position.
-    // `batch_end` marks the end of the current indexed batch.
     let mut pos: isize = 0;
     let mut batch_end: isize = 0;
     let mut eof = false;
 
     // Diagnostics.
-    let mut stat_literals: u64 = 0;
-    let mut stat_matches: u64 = 0;
-    let mut stat_match_bytes: u64 = 0;
-    let mut stat_match_len_hist: [u64; 8] = [0; 8]; // 1-2, 3, 4-7, 8-15, 16-31, 32-63, 64-127, 128+
-    let mut stat_match_gain_total: i64 = 0;
-    let mut stat_lit_frame_overhead_nibbles: u64 = 0;
-    let mut stat_max_fwd_match: i16 = 0;
-    let mut stat_max_rev_match: i16 = 0;
-    let mut stat_dist_nibbles_total: u64 = 0;
-    let mut stat_len_nibbles_total: u64 = 0;
-    let mut stat_dist_hist: [u64; 5] = [0; 5]; // 1-7, 8-63, 64-511, 512-4095, 4096+
-    let mut stat_lit_runs: u64 = 0;
-    let mut stat_repeat_dist_count: u64 = 0;
-    let mut stat_last_dist: u16 = 0;
+    let mut stat_literal_bytes: u64 = 0;
+    let mut stat_short_literal_frames: u64 = 0;
+    let mut stat_short_rle_frames: u64 = 0;
+    let mut stat_medium_frames: u64 = 0;
+    let mut stat_long_frames: u64 = 0;
+    let mut stat_fwd_matches: u64 = 0;
+    let mut stat_rev_matches: u64 = 0;
+    let mut stat_match_bytes: f64 = 0.0;
+    let mut stat_lazy_wins: u64 = 0;
+    // Cross-tabulation: distance bins × length bins.
+    // Distance: [1, 2-256, 257-1024, 1025-2048, 2049-4096, 4097-16384, 16385+]
+    // Length:   [1-5, 6-15,  16-17,     18-270,    271+]
+    #[allow(clippy::items_after_statements)]
+    const D_BINS: usize = 7;
+    #[allow(clippy::items_after_statements)]
+    const L_BINS: usize = 5;
+    let mut cross_tab: [[u64; L_BINS]; D_BINS] = [[0; L_BINS]; D_BINS];
+
+    /// Record a match in the stats.
+    macro_rules! record_match {
+        ($dist:expr, $len:expr) => {{
+            let d: u32 = $dist;
+            let l: i32 = $len;
+            let abs = l.unsigned_abs();
+            let is_fwd = l > 0;
+            stat_match_bytes += f64::from(abs);
+            if is_fwd {
+                stat_fwd_matches += 1;
+            } else {
+                stat_rev_matches += 1;
+            }
+            match Frame::match_type(d, abs, is_fwd) {
+                0 => stat_short_rle_frames += 1,
+                1 => stat_medium_frames += 1,
+                _ => stat_long_frames += 1,
+            }
+            let dbin = match d {
+                1 => 0,
+                2..=256 => 1,
+                257..=1024 => 2,
+                1025..=2048 => 3,
+                2049..=4096 => 4,
+                4097..=16384 => 5,
+                _ => 6,
+            };
+            let lbin = match abs {
+                1..=5 => 0,
+                6..=15 => 1,
+                16..=17 => 2,
+                18..=270 => 3,
+                _ => 4,
+            };
+            cross_tab[dbin][lbin] += 1;
+        }};
+    }
 
     loop {
-        // When we've consumed the current batch, load and index a new one.
+        // Fill the ring buffer when we've consumed the current batch.
         if pos >= batch_end {
             if eof {
                 break;
             }
-            // Fill the ring buffer.
             while !eof && window.write_pos() - pos < FILL_SIZE as isize {
                 let n = window.fill_from_reader(input, FILL_SIZE)?;
                 if n == 0 {
@@ -137,10 +172,6 @@ pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOp
             if pos >= batch_end {
                 break;
             }
-            // Build index for all positions that are live in the window.
-            // The earliest valid position is write_pos - WINDOW_SIZE.
-            let index_start = (batch_end - WINDOW_SIZE as isize).max(0);
-            mf.build(&window, index_start, batch_end);
         }
 
         let remaining = (batch_end - pos) as usize;
@@ -149,10 +180,8 @@ pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOp
             let abs_len = len.unsigned_abs() as isize;
 
             // Lazy matching: check if pos+1 yields a better match.
-            // Skip for long matches — the gain from a slightly better match is negligible.
             let lazy_thresh = mf.lazy_threshold();
             if lazy_thresh > 0 && abs_len < 32 && remaining > 1 {
-                mf.insert(&window, pos + 1);
                 let remaining_next = remaining - 1;
                 if let Some((dist2, len2)) = mf.find_best_match(&window, pos + 1, remaining_next) {
                     let gain1 = Frame::match_gain(dist, len);
@@ -160,68 +189,41 @@ pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOp
                     if gain2 > gain1 + lazy_thresh {
                         // Emit current byte as literal, use the pos+1 match instead.
                         lit_buf.push(window[pos]);
-                        stat_literals += 1;
+                        stat_literal_bytes += 1;
                         if lit_buf.len() >= CHUNK_SIZE {
-                            stat_lit_frame_overhead_nibbles += 1 + ubleb8_u16_nibbles(CHUNK_SIZE as u16) as u64;
-                            flush_literals(&mut lit_buf, &mut writer, &mut adler, &mut total_len)?;
+                            flush_literals(
+                                &mut lit_buf,
+                                output,
+                                &mut adler,
+                                &mut total_len,
+                                &mut stat_short_literal_frames,
+                            )?;
                         }
                         pos += 1;
 
-                        // Emit the better match at pos (which is now the old pos+1).
-                        if !lit_buf.is_empty() {
-                            stat_lit_frame_overhead_nibbles += 1 + ubleb8_u16_nibbles(lit_buf.len() as u16) as u64;
-                        }
-                        flush_literals(&mut lit_buf, &mut writer, &mut adler, &mut total_len)?;
+                        flush_literals(
+                            &mut lit_buf,
+                            output,
+                            &mut adler,
+                            &mut total_len,
+                            &mut stat_short_literal_frames,
+                        )?;
+
                         let abs_len2 = len2.unsigned_abs() as isize;
-
-                        stat_matches += 1;
-                        stat_match_bytes += abs_len2 as u64;
-                        stat_match_gain_total += Frame::match_gain(dist2, len2) as i64;
-                        if len2 > 0 { stat_max_fwd_match = stat_max_fwd_match.max(len2); }
-                        else { stat_max_rev_match = stat_max_rev_match.min(len2); }
-                        stat_dist_nibbles_total += ubleb8_u16_nibbles(dist2) as u64;
-                        stat_len_nibbles_total += sbleb8_i16_nibbles(len2) as u64;
-                        let dbucket = match dist2 {
-                            1..=7 => 0,
-                            8..=63 => 1,
-                            64..=511 => 2,
-                            512..=4095 => 3,
-                            _ => 4,
-                        };
-                        stat_dist_hist[dbucket] += 1;
-                        if dist2 == stat_last_dist {
-                            stat_repeat_dist_count += 1;
-                        }
-                        stat_last_dist = dist2;
-                        if !lit_buf.is_empty() {
-                            stat_lit_runs += 1;
-                        }
-                        let bucket = match abs_len2 as usize {
-                            0..=2 => 0,
-                            3 => 1,
-                            4..=7 => 2,
-                            8..=15 => 3,
-                            16..=31 => 4,
-                            32..=63 => 5,
-                            64..=127 => 6,
-                            _ => 7,
-                        };
-                        stat_match_len_hist[bucket] += 1;
-
                         Frame::Match {
                             distance: dist2,
                             length: len2,
                         }
-                        .encode(&mut writer)?;
+                        .encode(output)?;
 
-                        // Update adler with matched bytes.
+                        record_match!(dist2, len2);
+                        stat_lazy_wins += 1;
+
                         let (s1, s2) = window.slices(pos..pos + abs_len2);
                         adler.update(s1);
                         adler.update(s2);
                         total_len += abs_len2 as u64;
 
-                        // Bulk insert skipped positions (pos+1 through pos+abs_len2-1).
-                        mf.bulk_insert(&window, pos + 1, pos + abs_len2);
                         pos += abs_len2;
                         continue;
                     }
@@ -229,136 +231,87 @@ pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOp
             }
 
             // Emit the match.
-            if !lit_buf.is_empty() {
-                stat_lit_frame_overhead_nibbles += 1 + ubleb8_u16_nibbles(lit_buf.len() as u16) as u64;
-            }
-            flush_literals(&mut lit_buf, &mut writer, &mut adler, &mut total_len)?;
-
-            stat_matches += 1;
-            stat_match_bytes += abs_len as u64;
-            stat_match_gain_total += Frame::match_gain(dist, len) as i64;
-            if len > 0 { stat_max_fwd_match = stat_max_fwd_match.max(len); }
-            else { stat_max_rev_match = stat_max_rev_match.min(len); }
-            stat_dist_nibbles_total += ubleb8_u16_nibbles(dist) as u64;
-            stat_len_nibbles_total += sbleb8_i16_nibbles(len) as u64;
-            let dbucket = match dist {
-                1..=7 => 0,
-                8..=63 => 1,
-                64..=511 => 2,
-                512..=4095 => 3,
-                _ => 4,
-            };
-            stat_dist_hist[dbucket] += 1;
-            if dist == stat_last_dist {
-                stat_repeat_dist_count += 1;
-            }
-            stat_last_dist = dist;
-            if !lit_buf.is_empty() {
-                stat_lit_runs += 1;
-            }
-            let bucket = match abs_len as usize {
-                0..=2 => 0,
-                3 => 1,
-                4..=7 => 2,
-                8..=15 => 3,
-                16..=31 => 4,
-                32..=63 => 5,
-                64..=127 => 6,
-                _ => 7,
-            };
-            stat_match_len_hist[bucket] += 1;
+            flush_literals(&mut lit_buf, output, &mut adler, &mut total_len, &mut stat_short_literal_frames)?;
 
             Frame::Match {
                 distance: dist,
                 length: len,
             }
-            .encode(&mut writer)?;
+            .encode(output)?;
 
-            // Update adler with matched bytes.
+            record_match!(dist, len);
+
             let (s1, s2) = window.slices(pos..pos + abs_len);
             adler.update(s1);
             adler.update(s2);
             total_len += abs_len as u64;
 
-            // Bulk insert skipped positions.
-            mf.bulk_insert(&window, pos + 1, pos + abs_len);
             pos += abs_len;
         } else {
             // No profitable match — accumulate literal.
-            stat_literals += 1;
             lit_buf.push(window[pos]);
+            stat_literal_bytes += 1;
             if lit_buf.len() >= CHUNK_SIZE {
-                stat_lit_frame_overhead_nibbles += 1 + ubleb8_u16_nibbles(CHUNK_SIZE as u16) as u64;
-                flush_literals(&mut lit_buf, &mut writer, &mut adler, &mut total_len)?;
+                flush_literals(&mut lit_buf, output, &mut adler, &mut total_len, &mut stat_short_literal_frames)?;
             }
             pos += 1;
         }
     }
 
     // Flush remaining literals.
-    flush_literals(&mut lit_buf, &mut writer, &mut adler, &mut total_len)?;
+    flush_literals(&mut lit_buf, output, &mut adler, &mut total_len, &mut stat_short_literal_frames)?;
 
-    // Pad to byte boundary if needed, then emit EOS.
-    if writer.has_pending() {
-        Frame::noop().encode(&mut writer)?;
-    }
-    Frame::EndOfStream.encode(&mut writer)?;
-    let output = writer.finish()?;
+    // End of stream.
+    Frame::EndOfStream.encode(output)?;
 
-    // Footer: UBLEB8 u64 length + 4-byte LE Adler-32.
-    let mut footer_writer = NibbleWriter::new(&mut *output);
-    footer_writer.write_ubleb8_u64(total_len)?;
-    let output = footer_writer.finish()?;
+    // Footer: ULEB128 u64 length + 4-byte LE Adler-32.
+    encode_uleb128_u64(total_len, output)?;
     output.write_all(&adler.checksum().to_le_bytes())?;
 
-    // Log peak SmallVec lengths for tuning.
-    let (max_fwd, max_rev) = mf.max_positions_used();
-    eprintln!("lzr: max SmallVec lengths: forward={max_fwd}, reverse={max_rev}");
+    // ── Diagnostics (verbose only) ──────────────────────────────────────
+    if options.get_verbose() {
+        let total_matches: u64 = cross_tab.iter().flat_map(|r| r.iter()).sum();
 
-    // Remaining literal frame overhead.
-    if !lit_buf.is_empty() {
-        stat_lit_frame_overhead_nibbles += 1 + ubleb8_u16_nibbles(lit_buf.len() as u16) as u64;
+        eprintln!();
+        eprintln!("── summary ─────────────────────────────────────────────────");
+        eprintln!("input:       {total_len:>10} bytes");
+        eprintln!(
+            "literals:    {:>10} bytes  ({stat_short_literal_frames} frames, {:.1}% of input)",
+            stat_literal_bytes,
+            stat_literal_bytes as f64 / total_len.max(1) as f64 * 100.0
+        );
+        eprintln!(
+            "matches:     {total_matches:>10}       (fwd={stat_fwd_matches}, rev={stat_rev_matches}, lazy={stat_lazy_wins})"
+        );
+        eprintln!("avg |len|:   {:>10.1}", stat_match_bytes / total_matches.max(1) as f64);
+        eprintln!(
+            "frames:      short-lit={stat_short_literal_frames} rle={stat_short_rle_frames} medium={stat_medium_frames} long={stat_long_frames}"
+        );
+        eprintln!();
+
+        // ── Cross-tabulation ─────────────────────────────────────────────────
+        let dist_labels = ["d=1     ", "d≤256   ", "d≤1024  ", "d≤2048  ", "d≤4096  ", "d≤16384 ", "d>16384 "];
+        let len_labels = ["|L|≤5", "|L|≤15", "|L|≤17", "|L|≤270", "|L|>270"];
+
+        eprintln!("── distance × length cross-tab ─────────────────────────────");
+        eprint!("            ");
+        for ll in &len_labels {
+            eprint!("{ll:>8}");
+        }
+        eprint!("    total");
+        eprintln!();
+
+        for (di, dl) in dist_labels.iter().enumerate() {
+            eprint!("  {dl}");
+            let row_total: u64 = cross_tab[di].iter().sum();
+            for &cell in &cross_tab[di] {
+                eprint!("{cell:>8}");
+            }
+            let pct = row_total as f64 / total_matches.max(1) as f64 * 100.0;
+            eprintln!("  {row_total:>7} ({pct:>5.1}%)");
+        }
+        eprintln!();
     }
-
-    let matched_pct = stat_match_bytes as f64 / total_len as f64 * 100.0;
-    let literal_pct = stat_literals as f64 / total_len as f64 * 100.0;
-    let lit_overhead_bytes = (stat_lit_frame_overhead_nibbles + 1) / 2;
-    eprintln!(
-        "lzr: {total_len} bytes: {stat_match_bytes} matched ({matched_pct:.1}%), {stat_literals} literal ({literal_pct:.1}%)"
-    );
-    eprintln!(
-        "lzr: {stat_matches} matches, avg len {:.1}, total gain {stat_match_gain_total} nibbles ({:.0} bytes)",
-        stat_match_bytes as f64 / stat_matches.max(1) as f64,
-        stat_match_gain_total as f64 / 2.0
-    );
-    eprintln!(
-        "lzr: match len histogram: 1-2={} 3={} 4-7={} 8-15={} 16-31={} 32-63={} 64-127={} 128+={}",
-        stat_match_len_hist[0],
-        stat_match_len_hist[1],
-        stat_match_len_hist[2],
-        stat_match_len_hist[3],
-        stat_match_len_hist[4],
-        stat_match_len_hist[5],
-        stat_match_len_hist[6],
-        stat_match_len_hist[7]
-    );
-    eprintln!(
-        "lzr: literal frame overhead: {lit_overhead_bytes} bytes ({stat_lit_runs} runs, {stat_lit_frame_overhead_nibbles} nibbles)"
-    );
-    eprintln!(
-        "lzr: distance nibbles: {stat_dist_nibbles_total} ({:.0} bytes), length nibbles: {stat_len_nibbles_total} ({:.0} bytes)",
-        stat_dist_nibbles_total as f64 / 2.0,
-        stat_len_nibbles_total as f64 / 2.0
-    );
-    eprintln!(
-        "lzr: dist histogram: 1-7={} 8-63={} 64-511={} 512-4095={} 4096+={}",
-        stat_dist_hist[0], stat_dist_hist[1], stat_dist_hist[2], stat_dist_hist[3], stat_dist_hist[4]
-    );
-    eprintln!(
-        "lzr: repeat-distance matches: {stat_repeat_dist_count} ({:.1}%)",
-        stat_repeat_dist_count as f64 / stat_matches.max(1) as f64 * 100.0
-    );
-    eprintln!("lzr: max match lengths: forward={stat_max_fwd_match}, reverse={stat_max_rev_match}");
 
     Ok(())
 }

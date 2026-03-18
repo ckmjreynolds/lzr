@@ -6,7 +6,6 @@
 
 pub(crate) mod frame;
 pub(crate) mod matchfinder;
-pub(crate) mod nibble;
 pub(crate) mod ringbuf;
 
 /// LZR stream header: magic bytes (`LZR`) + format version (`0x00`).
