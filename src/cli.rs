@@ -11,6 +11,9 @@ use lzr::error::Result;
 use lzr::options::{DEFAULT_LEVEL, EncodeOptions, MAX_LEVEL, MIN_LEVEL};
 use lzr::{decode, encode};
 
+/// I/O buffer capacity (64 KiB, matching the decoder window size).
+const IO_BUF_CAP: usize = 65_536;
+
 /// Fast LZ77-based compression.
 #[derive(Parser, Debug)]
 #[command(name = "lzr", version)]
@@ -116,17 +119,18 @@ fn execute(args: &Args) -> Result<()> {
 }
 
 fn process_stdin(args: &Args, options: &EncodeOptions) -> Result<()> {
-    let mut stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
+    let mut reader = io::BufReader::with_capacity(IO_BUF_CAP, io::stdin().lock());
 
     if args.decompress || args.test {
         if args.test {
-            decode::decode(&mut stdin, &mut io::sink())?;
+            decode::decode(&mut reader, &mut io::sink())?;
         } else {
-            decode::decode(&mut stdin, &mut stdout)?;
+            let mut writer = io::BufWriter::with_capacity(IO_BUF_CAP, io::stdout().lock());
+            decode::decode(&mut reader, &mut writer)?;
         }
     } else {
-        encode::encode(&mut stdin, &mut stdout, options)?;
+        let mut writer = io::BufWriter::with_capacity(IO_BUF_CAP, io::stdout().lock());
+        encode::encode(&mut reader, &mut writer, options)?;
     }
 
     Ok(())
@@ -135,7 +139,8 @@ fn process_stdin(args: &Args, options: &EncodeOptions) -> Result<()> {
 #[allow(clippy::cast_precision_loss)]
 fn process_file(args: &Args, options: &EncodeOptions, input_path: &Path) -> Result<()> {
     if args.test {
-        let mut input = fs::File::open(input_path)?;
+        let file = fs::File::open(input_path)?;
+        let mut input = io::BufReader::new(file);
         decode::decode(&mut input, &mut io::sink())?;
         if args.verbose {
             eprintln!("{}: ok", input_path.display());
@@ -144,12 +149,14 @@ fn process_file(args: &Args, options: &EncodeOptions, input_path: &Path) -> Resu
     }
 
     if args.stdout {
-        let mut input = fs::File::open(input_path)?;
-        let mut stdout = io::stdout().lock();
+        let file = fs::File::open(input_path)?;
+        let mut input = io::BufReader::new(file);
+        let stdout = io::stdout().lock();
+        let mut output = io::BufWriter::new(stdout);
         if args.decompress {
-            decode::decode(&mut input, &mut stdout)?;
+            decode::decode(&mut input, &mut output)?;
         } else {
-            encode::encode(&mut input, &mut stdout, options)?;
+            encode::encode(&mut input, &mut output, options)?;
         }
         return Ok(());
     }
@@ -167,8 +174,10 @@ fn process_file(args: &Args, options: &EncodeOptions, input_path: &Path) -> Resu
     }
 
     let input_len = fs::metadata(input_path)?.len();
-    let mut input = fs::File::open(input_path)?;
-    let mut output = fs::File::create(&out_path)?;
+    let file_in = fs::File::open(input_path)?;
+    let mut input = io::BufReader::new(file_in);
+    let file_out = fs::File::create(&out_path)?;
+    let mut output = io::BufWriter::new(file_out);
 
     if args.decompress {
         decode::decode(&mut input, &mut output)?;

@@ -10,16 +10,16 @@ use crate::error::{Error, Result};
 const LITERAL_INLINE: usize = 32;
 
 /// Maximum magnitude for Short frames before extension (4-bit field, offset 0).
-const SHORT_BASE_MAX: u32 = 15;
+pub(crate) const SHORT_BASE_MAX: u32 = 15;
 
 /// Maximum magnitude for Medium forward frames before extension (4-bit field, offset 2).
-const MEDIUM_FWD_BASE_MAX: u32 = 17;
+pub(crate) const MEDIUM_FWD_BASE_MAX: u32 = 17;
 
 /// Maximum magnitude for Medium reverse frames before extension (3-bit effective field, offset 2).
-const MEDIUM_REV_BASE_MAX: u32 = 9;
+pub(crate) const MEDIUM_REV_BASE_MAX: u32 = 9;
 
 /// Maximum magnitude for Long frames before extension (4-bit field, offset 3).
-const LONG_BASE_MAX: u32 = 18;
+pub(crate) const LONG_BASE_MAX: u32 = 18;
 
 /// Returns the number of extension bytes needed for `extra` additional magnitude.
 const fn ext_byte_count(extra: u32) -> usize {
@@ -41,7 +41,8 @@ fn encode_extension<W: Write>(magnitude: u32, base_max: u32, w: &mut W) -> Resul
 }
 
 /// Reads an extension chain if `base_magnitude == base_max`, adding to the magnitude.
-fn decode_extension<R: Read>(base_magnitude: u32, base_max: u32, r: &mut R) -> Result<u32> {
+#[inline]
+pub(crate) fn decode_extension<R: Read>(base_magnitude: u32, base_max: u32, r: &mut R) -> Result<u32> {
     if base_magnitude < base_max {
         return Ok(base_magnitude);
     }

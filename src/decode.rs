@@ -19,9 +19,15 @@ use std::io::{Read, Write};
 
 use crate::adler32::Adler32;
 use crate::error::{Error, Result};
-use crate::frame::{Frame, decode_uleb128_u64};
+use crate::frame::{
+    LONG_BASE_MAX, MEDIUM_FWD_BASE_MAX, MEDIUM_REV_BASE_MAX, SHORT_BASE_MAX, decode_extension, decode_uleb128_u64,
+};
+#[cfg(test)]
 use crate::ringbuf::RingBuf;
 use crate::{HEADER, WINDOW_SIZE};
+
+/// Flat decode buffer: `[0..WINDOW_SIZE]` = history, `[WINDOW_SIZE..BUF_LEN]` = decode area.
+const BUF_LEN: usize = WINDOW_SIZE * 2;
 
 /// Reads and validates a 4-byte LZR header.
 fn read_header(reader: &mut impl Read) -> Result<()> {
@@ -36,54 +42,117 @@ fn read_header(reader: &mut impl Read) -> Result<()> {
     Ok(())
 }
 
+/// Flushes decoded data from the flat buffer and shifts the window.
+#[inline(never)]
+fn flush_decode(buf: &mut [u8], pos: &mut usize, adler: &mut Adler32, output: &mut impl Write) -> Result<()> {
+    if *pos > WINDOW_SIZE {
+        adler.update(&buf[WINDOW_SIZE..*pos]);
+        output.write_all(&buf[WINDOW_SIZE..*pos])?;
+        buf.copy_within(*pos - WINDOW_SIZE..*pos, 0);
+        *pos = WINDOW_SIZE;
+    }
+    Ok(())
+}
+
+/// Replays a forward match in the flat decode buffer. Handles overlapping via
+/// seed-and-double.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn replay_forward(buf: &mut [u8], pos: &mut usize, distance: u32, len: usize) {
+    let dist = distance as usize;
+    let src = *pos - dist;
+    if dist >= len {
+        buf.copy_within(src..src + len, *pos);
+    } else {
+        buf.copy_within(src..src + dist, *pos);
+        let mut copied = dist;
+        while copied < len {
+            let chunk = copied.min(len - copied);
+            buf.copy_within(*pos..*pos + chunk, *pos + copied);
+            copied += chunk;
+        }
+    }
+    *pos += len;
+}
+
+/// Replays a reverse match in the flat decode buffer (per-byte, rare path).
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn replay_reverse(buf: &mut [u8], pos: &mut usize, distance: u32, len: usize) {
+    let start = *pos - distance as usize;
+    for i in 0..len {
+        buf[*pos + i] = buf[start - i];
+    }
+    *pos += len;
+}
+
 /// Decodes a single LZR stream (header already consumed).
+///
+/// Uses a flat 128 KiB buffer: the first 64 KiB is the history window and the
+/// second 64 KiB is the active decode area. Literals read directly into the
+/// buffer; matches resolve via `copy_within` on the same buffer — eliminating
+/// the ring-buffer and output-buffer double copy.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 fn decode_stream(reader: &mut impl Read, output: &mut impl Write) -> Result<()> {
-    let mut window = RingBuf::new(WINDOW_SIZE);
+    let mut buf = vec![0u8; BUF_LEN];
+    let mut pos = WINDOW_SIZE;
     let mut adler = Adler32::new();
     let mut total_len: u64 = 0;
 
     loop {
-        match Frame::decode(reader)? {
-            Frame::Literal(bytes) => {
-                for &b in &bytes {
-                    window.push(b);
-                }
-                adler.update(&bytes);
-                output.write_all(&bytes)?;
-                total_len += bytes.len() as u64;
-            }
-            Frame::Match {
-                distance,
-                length,
-            } => {
-                let abs_len = length.unsigned_abs() as usize;
-                let start = window.write_pos();
-                let d = distance as isize;
-                let dir: isize = if length > 0 {
-                    1
-                } else {
-                    -1
-                };
+        let mut hdr = [0u8];
+        reader.read_exact(&mut hdr)?;
+        let b = hdr[0];
 
-                for i in 0..abs_len {
-                    let b = window[start - d + dir * i as isize];
-                    window.push(b);
-                }
+        // Medium frames (0x00–0xBF) are most common — check first.
+        if b < 0xC0 {
+            // Medium frame: SLLLLDDD
+            let s = (b >> 7) & 1;
+            let l_field = u32::from((b >> 3) & 0x0F);
+            let d_low3 = u32::from(b & 0x07);
+            let mut ext = [0u8];
+            reader.read_exact(&mut ext)?;
+            let distance = (u32::from(ext[0]) << 3 | d_low3) + 1;
+            let base_max = if s == 0 {
+                MEDIUM_FWD_BASE_MAX
+            } else {
+                MEDIUM_REV_BASE_MAX
+            };
+            let magnitude = decode_extension(l_field + 2, base_max, reader)? as usize;
+            decode_dir(&mut buf, &mut pos, distance, s == 0, magnitude, &mut adler, output)?;
+            total_len += magnitude as u64;
+        } else if b == 0xC0 {
+            break; // EOS
+        } else if b < 0xE0 {
+            // Short frame: 110LLLLD (0xC1–0xDF)
+            let l_field = u32::from((b >> 1) & 0x0F);
+            let d_flag = b & 0x01;
+            let magnitude = decode_extension(l_field, SHORT_BASE_MAX, reader)? as usize;
 
-                let end = window.write_pos();
-                let (s1, s2) = window.slices(start..end);
-                output.write_all(s1)?;
-                adler.update(s1);
-                if !s2.is_empty() {
-                    output.write_all(s2)?;
-                    adler.update(s2);
-                }
-                total_len += abs_len as u64;
+            if d_flag == 0 {
+                decode_literal(reader, &mut buf, &mut pos, magnitude, &mut adler, output)?;
+                total_len += magnitude as u64;
+            } else if magnitude == 0 {
+                return Err(Error::InvalidFormat("reserved Short frame (L=0, D=1)".into()));
+            } else {
+                decode_dir(&mut buf, &mut pos, 1, true, magnitude, &mut adler, output)?;
+                total_len += magnitude as u64;
             }
-            Frame::EndOfStream => break,
+        } else {
+            // Long frame: 111SLLLL (0xE0–0xFF)
+            let s = (b >> 4) & 1;
+            let l_field = u32::from(b & 0x0F);
+            let mut dist_buf = [0u8; 2];
+            reader.read_exact(&mut dist_buf)?;
+            let distance = u32::from(u16::from_le_bytes(dist_buf)) + 1;
+            let magnitude = decode_extension(l_field + 3, LONG_BASE_MAX, reader)? as usize;
+            decode_dir(&mut buf, &mut pos, distance, s == 0, magnitude, &mut adler, output)?;
+            total_len += magnitude as u64;
         }
     }
+
+    // Flush remaining decoded data.
+    flush_decode(&mut buf, &mut pos, &mut adler, output)?;
 
     // Footer: ULEB128 u64 length + 4-byte LE Adler-32.
     let expected_len = decode_uleb128_u64(reader)?;
@@ -106,6 +175,100 @@ fn decode_stream(reader: &mut impl Read, output: &mut impl Write) -> Result<()> 
         });
     }
 
+    Ok(())
+}
+
+/// Reads a literal of `len` bytes into the flat buffer, flushing as needed.
+#[inline]
+fn decode_literal(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    pos: &mut usize,
+    len: usize,
+    adler: &mut Adler32,
+    output: &mut impl Write,
+) -> Result<()> {
+    if *pos + len <= BUF_LEN {
+        reader.read_exact(&mut buf[*pos..*pos + len])?;
+        *pos += len;
+    } else {
+        decode_literal_large(reader, buf, pos, len, adler, output)?;
+    }
+    Ok(())
+}
+
+/// Slow path for literals that don't fit in the remaining decode area.
+#[cold]
+#[inline(never)]
+fn decode_literal_large(
+    reader: &mut impl Read,
+    buf: &mut [u8],
+    pos: &mut usize,
+    len: usize,
+    adler: &mut Adler32,
+    output: &mut impl Write,
+) -> Result<()> {
+    let mut remaining = len;
+    while remaining > 0 {
+        if *pos >= BUF_LEN {
+            flush_decode(buf, pos, adler, output)?;
+        }
+        let chunk = remaining.min(BUF_LEN - *pos);
+        reader.read_exact(&mut buf[*pos..*pos + chunk])?;
+        *pos += chunk;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
+/// Replays a match in either direction, flushing as needed.
+#[inline]
+fn decode_dir(
+    buf: &mut [u8],
+    pos: &mut usize,
+    distance: u32,
+    is_forward: bool,
+    len: usize,
+    adler: &mut Adler32,
+    output: &mut impl Write,
+) -> Result<()> {
+    if *pos + len <= BUF_LEN {
+        if is_forward {
+            replay_forward(buf, pos, distance, len);
+        } else {
+            replay_reverse(buf, pos, distance, len);
+        }
+    } else {
+        decode_match_large(buf, pos, distance, is_forward, len, adler, output)?;
+    }
+    Ok(())
+}
+
+/// Slow path for matches that don't fit in the remaining decode area.
+#[cold]
+#[inline(never)]
+fn decode_match_large(
+    buf: &mut [u8],
+    pos: &mut usize,
+    distance: u32,
+    is_forward: bool,
+    len: usize,
+    adler: &mut Adler32,
+    output: &mut impl Write,
+) -> Result<()> {
+    let mut remaining = len;
+    while remaining > 0 {
+        if *pos >= BUF_LEN {
+            flush_decode(buf, pos, adler, output)?;
+        }
+        let chunk = remaining.min(BUF_LEN - *pos);
+        if is_forward {
+            replay_forward(buf, pos, distance, chunk);
+        } else {
+            replay_reverse(buf, pos, distance, chunk);
+        }
+        remaining -= chunk;
+    }
     Ok(())
 }
 
