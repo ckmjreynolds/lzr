@@ -37,7 +37,8 @@ Long   (3B):  111SLLLL | DDDDDDDD | DDDDDDDD   |L| = 3..=18,   D = 1..=65,536
 ```
 
 - The format is most easily understood if the Medium frame type is considered the baseline.
-- When the magnitude of L is the maximum permitted value, a length extension chain follows (see below), allowing arbitrarily long matches and literals.
+- Length is a signed 16-bit integer (i16). Distance is an unsigned 16-bit integer (u16).
+- When the magnitude of L is the maximum permitted value, a length extension chain follows (see below).
 
 ### Frame Type Dispatch
 
@@ -86,11 +87,11 @@ Short frames are used to encode literals and for RLE.
 - **L** (bits 4–1): length/count encoding 0..=15.
 - **D** (bit 0): 0 = literal, 1 = RLE of the last byte.
 - **EOS**: L=0, D=0 (`0xC0`).
-- **Reserved**: L=0, D=1 (`0xC1`).
+- **Reserved**: L=0, D=1 (`0xC1`). Encoders must not emit this byte. Decoder behavior is undefined.
 
 **When D=0 (literal):** L raw bytes follow. L is the number of literal bytes (1..=15).
 
-**When D=1 (RLE):** Repeats the last output byte L times (1..=15). L=0 with D=1 (`0xC1`) is reserved.
+**When D=1 (RLE):** Repeats the last output byte L times (1..=15).
 
 A length of 15 triggers a length extension.
 
@@ -123,6 +124,8 @@ When the L field is the maximum magnitude, one or more extension bytes follow im
 
 `total = original_magnitude + sum(ext_bytes)`
 
+The total length (base + extensions) is a signed 16-bit quantity. Lengths must fall within -32,768..=32,767 (i16). Encoders must not produce lengths outside this range; decoder behavior for out-of-range lengths is undefined.
+
 For literals, the extension chain appears after the frame byte and before the literal bytes.
 
 ## Copy Semantics
@@ -149,6 +152,14 @@ This matches reversed patterns. For example, `stressed` in the output can produc
 
 The decoder maintains a **65,536 byte** (64 KiB) sliding window of decompressed output. The window must be filled with `0x00` before decompression begins. Any read from a position before the start of decompressed output returns `0x00` (from the zero-initialized window).
 
+Encoders must not emit copies whose read range falls outside the window. Decoder behavior for such copies is undefined.
+
+## Conformance
+
+Encoders are the gatekeepers of validity. Where this specification states an encoder "must not" produce a particular encoding, that encoding is **malformed**. Decoder behavior when processing malformed input is undefined unless explicitly stated otherwise.
+
+The footer (uncompressed length + Adler-32 checksum) is the authoritative integrity check. A decoder that processes a malformed encoding and produces incorrect output will detect the corruption at footer verification. Decoders are not required to validate individual frames beyond what is necessary to decode them.
+
 ## Footer
 
 Immediately after the end-of-stream marker.
@@ -167,6 +178,8 @@ The uncompressed length uses ULEB128 (Unsigned Little-Endian Base 128) encoding,
 - Total capacity: 8 × 7 + 8 = 64 bits, sufficient for a full u64.
 
 The decoder must verify that the decompressed byte count matches the stored length and that the Adler-32 matches. A mismatch indicates corruption.
+
+**Note:** The uncompressed length is not authenticated until the checksum is verified. Decoders that use it for pre-allocation or space checks should treat it as untrusted input.
 
 ## Stream Concatenation
 

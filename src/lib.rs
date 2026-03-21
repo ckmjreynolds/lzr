@@ -4,6 +4,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(dead_code)]
 
+pub(crate) mod buffer;
 pub(crate) mod frame;
 pub(crate) mod matchfinder;
 pub(crate) mod ringbuf;
