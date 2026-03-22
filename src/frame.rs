@@ -254,11 +254,11 @@ impl Frame {
         // Medium: SLLLLDDD (0x00–0xBF)
         let s = (b >> 7) & 1;
         let l_field = u32::from((b >> 3) & 0x0F);
-        let d_low3 = u32::from(b & 0x07);
+        let d_high3 = u32::from(b & 0x07);
         let mut buf = [0u8];
         r.read_exact(&mut buf)?;
-        let d_high8 = u32::from(buf[0]);
-        let distance = (d_high8 << 3 | d_low3) + 1;
+        let d_low8 = u32::from(buf[0]);
+        let distance = (d_high3 << 8 | d_low8) + 1;
         let base_magnitude = l_field + 2;
         let base_max = if s == 0 {
             MEDIUM_FWD_BASE_MAX
@@ -301,10 +301,10 @@ fn encode_match<W: Write>(w: &mut W, dist: u32, abs_len: u32, is_forward: bool) 
             };
             let field = (abs_len.min(base_max) - 2) as u8;
             let d_val = dist - 1;
-            let d_low3 = (d_val & 0x07) as u8;
-            let d_high8 = (d_val >> 3) as u8;
-            let header = (s << 7) | (field << 3) | d_low3;
-            w.write_all(&[header, d_high8])?;
+            let d_high3 = ((d_val >> 8) & 0x07) as u8;
+            let d_low8 = (d_val & 0xFF) as u8;
+            let header = (s << 7) | (field << 3) | d_high3;
+            w.write_all(&[header, d_low8])?;
             encode_extension(abs_len, base_max, w)?;
         }
         _ => {
@@ -484,9 +484,9 @@ mod tests {
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf).unwrap();
-        // s=0, field=0, d_val=99, d_low3=3, d_high8=12
-        // header = (0<<7)|(0<<3)|3 = 0x03
-        assert_eq!(buf, [0x03, 0x0C]);
+        // s=0, field=0, d_val=99, d_high3=0, d_low8=99
+        // header = (0<<7)|(0<<3)|0 = 0x00
+        assert_eq!(buf, [0x00, 0x63]);
         let decoded = Frame::decode(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(decoded, frame);
     }
@@ -499,9 +499,9 @@ mod tests {
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf).unwrap();
-        // s=0, field=14, d_val=255, d_low3=7, d_high8=31
-        // header = (0<<7)|(14<<3)|7 = 0x77
-        assert_eq!(buf, [0x77, 0x1F]);
+        // s=0, field=14, d_val=255, d_high3=0, d_low8=255
+        // header = (0<<7)|(14<<3)|0 = 0x70
+        assert_eq!(buf, [0x70, 0xFF]);
         assert_eq!(buf.len(), 2);
         let decoded = Frame::decode(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(decoded, frame);
@@ -515,7 +515,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf).unwrap();
-        assert_eq!(buf, [0x7F, 0x1F, 0x00]); // field=15, ext=0
+        assert_eq!(buf, [0x78, 0xFF, 0x00]); // field=15, ext=0
         let decoded = Frame::decode(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(decoded, frame);
     }
@@ -528,7 +528,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf).unwrap();
-        assert_eq!(buf, [0x7F, 0x1F, 0x01]); // field=15, ext=1
+        assert_eq!(buf, [0x78, 0xFF, 0x01]); // field=15, ext=1
         let decoded = Frame::decode(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(decoded, frame);
     }
@@ -541,9 +541,9 @@ mod tests {
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf).unwrap();
-        // s=1, field=3, d_val=49, d_low3=1, d_high8=6
-        // header = (1<<7)|(3<<3)|1 = 0x99
-        assert_eq!(buf, [0x99, 0x06]);
+        // s=1, field=3, d_val=49, d_high3=0, d_low8=49
+        // header = (1<<7)|(3<<3)|0 = 0x98
+        assert_eq!(buf, [0x98, 0x31]);
         assert_eq!(buf.len(), 2);
         let decoded = Frame::decode(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(decoded, frame);
@@ -557,7 +557,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf).unwrap();
-        // s=0, field=2, d_val=2047=0x7FF, d_low3=7, d_high8=0xFF
+        // s=0, field=2, d_val=2047=0x7FF, d_high3=7, d_low8=0xFF
         // header = (0<<7)|(2<<3)|7 = 0x17
         assert_eq!(buf, [0x17, 0xFF]);
         let decoded = Frame::decode(&mut Cursor::new(&buf)).unwrap();
@@ -598,9 +598,9 @@ mod tests {
         };
         let mut buf = Vec::new();
         frame.encode(&mut buf).unwrap();
-        // s=1, field=1, d_val=999=0x3E7, d_low3=7, d_high8=124=0x7C
-        // header = (1<<7)|(1<<3)|7 = 0x8F
-        assert_eq!(buf, [0x8F, 0x7C]);
+        // s=1, field=1, d_val=999=0x3E7, d_high3=3, d_low8=0xE7
+        // header = (1<<7)|(1<<3)|3 = 0x8B
+        assert_eq!(buf, [0x8B, 0xE7]);
         let decoded = Frame::decode(&mut Cursor::new(&buf)).unwrap();
         assert_eq!(decoded, frame);
     }

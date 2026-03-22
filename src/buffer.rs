@@ -1,6 +1,6 @@
 use std::ops::{Index, IndexMut, Range};
 
-struct Buffer<const N: usize> {
+pub(crate) struct Buffer<const N: usize> {
     buf: [u8; N],
 }
 
@@ -11,41 +11,54 @@ impl<const N: usize> Buffer<N> {
     };
 }
 
+impl<const N: usize> Buffer<N> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            buf: [0u8; N],
+        }
+    }
+
+    pub(crate) fn copy_within(&mut self, src: Range<usize>, dest: usize) {
+        for i in 0..src.len() {
+            self[dest + i] = self[src.start + i];
+        }
+    }
+
+    pub(crate) fn copy_within_rev(&mut self, src: Range<usize>, dest: usize) {
+        for i in 0..src.len() {
+            self[dest + i] = self[src.start.wrapping_sub(i)];
+        }
+    }
+
+    pub(crate) fn copy_from_slice(&mut self, src: &[u8], dest: usize) {
+        for (i, &b) in src.iter().enumerate() {
+            self[dest + i] = b;
+        }
+    }
+
+    pub(crate) fn slices(&self, start: usize, len: usize) -> (&[u8], &[u8]) {
+        let start = start & Self::MASK;
+        let end = start + len;
+
+        if end <= N {
+            (&self.buf[start..end], &[])
+        } else {
+            (&self.buf[start..], &self.buf[..end - N])
+        }
+    }
+}
+
 impl<const N: usize> Index<usize> for Buffer<N> {
     type Output = u8;
-    #[inline]
+
     fn index(&self, index: usize) -> &u8 {
         &self.buf[index & Self::MASK]
     }
 }
 
 impl<const N: usize> IndexMut<usize> for Buffer<N> {
-    #[inline]
     fn index_mut(&mut self, index: usize) -> &mut u8 {
         &mut self.buf[index & Self::MASK]
-    }
-}
-
-impl<const N: usize> Buffer<N> {
-    #[inline]
-    fn copy_within(&mut self, src: Range<usize>, dest: usize) {
-        for i in 0..src.len() {
-            self[dest + i] = self[src.start + i];
-        }
-    }
-
-    #[inline]
-    fn copy_within_rev(&mut self, src: Range<usize>, dest: usize) {
-        for i in 0..src.len() {
-            self[dest + i] = self[src.start.wrapping_sub(i)];
-        }
-    }
-
-    #[inline]
-    fn copy_from_slice(&mut self, src: &[u8], dest: usize) {
-        for (i, &b) in src.iter().enumerate() {
-            self[dest + i] = b;
-        }
     }
 }
 
@@ -78,6 +91,10 @@ mod tests {
             data: Vec<u8>,
             dest: usize,
         },
+        Slices {
+            start: usize,
+            len: usize,
+        },
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
@@ -95,6 +112,10 @@ mod tests {
                 data,
                 dest
             }),
+            (any::<usize>(), 0..=256usize).prop_map(|(start, len)| Op::Slices {
+                start,
+                len
+            }),
         ]
     }
 
@@ -102,7 +123,7 @@ mod tests {
         #[test]
         fn matches_oracle(ops in prop::collection::vec(op_strategy(), 0..=128)) {
             const N: usize = 256;
-            let mut buf = Buffer::<N> { buf: [0; N] };
+            let mut buf = Buffer::<N>::new();
             let mut oracle = vec![0u8; N];
 
             for op in ops {
@@ -128,6 +149,16 @@ mod tests {
                         for (i, &b) in data.iter().enumerate() {
                             oracle[wrap(N, dest + i)] = b;
                         }
+                    }
+                    Op::Slices { start, len } => {
+                        let (a, b) = buf.slices(start, len);
+                        let mut actual = Vec::new();
+                        actual.extend_from_slice(a);
+                        actual.extend_from_slice(b);
+
+                        let masked = wrap(N, start);
+                        let expected: Vec<u8> = (0..len).map(|i| oracle[wrap(N, masked + i)]).collect();
+                        assert_eq!(actual, expected);
                     }
                 }
                 assert_eq!(&buf.buf[..], &oracle[..]);

@@ -69,7 +69,7 @@ The default/most common frame type. Bits 7–6 of byte 0 determine whether this 
 
 - **S** (bit 7): sign bit, 0/1 => positive/negative length => forward/reverse match.
 - **L** (bits 6–3): length magnitude, encoding -9..=-2,2..=17 (LLLL + 2).
-- **D** (bits 2–0 of byte 0 : byte 1): 11-bits, encoding 1..=2,048. The 3 bits from byte 0 are the low bits (little-endian): (byte1 << 3) | (byte0 & 0x07)
+- **D** (bits 2–0 of byte 0 : byte 1): 11-bits, encoding 1..=2,048. The 3 bits from byte 0 are the high bits: ((byte0 & 0x07) << 8) | byte1
 
 A length of -9 or 17 triggers a length extension. A Medium frame cannot have bits 7 and 6 of byte 0 set.
 
@@ -101,7 +101,7 @@ Long frames are the simplest to understand.
 
 ```
   Byte 0                           Byte 1     Byte 2
-  7  6  5  4  3  2  1  0           7 ───── 0  7 ────── 0
+  7   6   5   4   3   2   1   0    7 ───── 0  7 ────── 0
 ┌───┬───┬───┬───┬───┬───┬───┬───┐ ┌─────────┐┌──────────┐
 │ 1   1   1 │ S │ L   L   L   L │ │ D (low) ││ D (high) │
 └───┴───┴───┴───┴───┴───┴───┴───┘ └─────────┘└──────────┘

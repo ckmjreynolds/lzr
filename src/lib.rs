@@ -8,6 +8,7 @@ pub(crate) mod buffer;
 pub(crate) mod frame;
 pub(crate) mod matchfinder;
 pub(crate) mod ringbuf;
+pub(crate) mod uleb128;
 
 /// LZR stream header: magic bytes (`LZR`) + format version (`0x00`).
 pub(crate) const HEADER: [u8; 4] = [0x4C, 0x5A, 0x52, 0x00];
