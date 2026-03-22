@@ -32,7 +32,6 @@ use crate::{BATCH_SIZE, BLOCK_SIZE, HEADER, WINDOW_SIZE};
 /// let mut compressed = Vec::new();
 /// encode(&mut &input[..], &mut compressed, &EncodeOptions::new()).unwrap();
 /// ```
-#[allow(clippy::large_stack_frames)]
 pub fn encode(input: &mut impl BufRead, output: &mut impl Write, options: &EncodeOptions) -> Result<()> {
     // TODO: configure Rayon thread pool when options.get_threads() > 0.
     let _ = options;
@@ -120,7 +119,7 @@ fn compress_block(buf: &Buffer<BATCH_SIZE>, range: Range<usize>, _options: &Enco
     let end = range.end;
 
     while pos < end {
-        let chunk_len = (end - pos).min(15);
+        let chunk_len = (end - pos).min(14);
         // Short literal frame: 110LLLLD, L = chunk_len, D = 0.
         #[allow(clippy::cast_possible_truncation)]
         let header = 0xC0 | ((chunk_len as u8) << 1);

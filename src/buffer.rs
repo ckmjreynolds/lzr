@@ -1,7 +1,7 @@
 use std::ops::{Index, IndexMut, Range};
 
 pub(crate) struct Buffer<const N: usize> {
-    buf: [u8; N],
+    buf: Vec<u8>,
 }
 
 impl<const N: usize> Buffer<N> {
@@ -12,9 +12,9 @@ impl<const N: usize> Buffer<N> {
 }
 
 impl<const N: usize> Buffer<N> {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            buf: [0u8; N],
+            buf: vec![0u8; N],
         }
     }
 
