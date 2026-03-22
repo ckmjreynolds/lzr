@@ -6,3 +6,4 @@ CLAUDE.md
 lcov.info
 profile.json.gz
 corpora.tar
+proptest-regressions/
