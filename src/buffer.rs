@@ -46,6 +46,18 @@ impl<const N: usize> Buffer<N> {
             (&self.buf[start..], &self.buf[..end - N])
         }
     }
+
+    pub(crate) fn slices_mut(&mut self, start: usize, len: usize) -> (&mut [u8], &mut [u8]) {
+        let start = start & Self::MASK;
+        let end = start + len;
+
+        if end <= N {
+            (&mut self.buf[start..end], &mut [])
+        } else {
+            let (left, right) = self.buf.split_at_mut(start);
+            (right, &mut left[..end - N])
+        }
+    }
 }
 
 impl<const N: usize> Index<usize> for Buffer<N> {

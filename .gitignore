@@ -7,3 +7,4 @@ lcov.info
 profile.json.gz
 corpora.tar
 proptest-regressions/
+tests/cli.proptest-regressions
