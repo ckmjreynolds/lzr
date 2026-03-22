@@ -36,6 +36,7 @@ pub fn encode(input: &mut impl BufRead, output: &mut impl Write, options: &Encod
     // TODO: configure Rayon thread pool when options.get_threads() > 0.
     let _ = options;
 
+    // Write out the header, it never changes.
     output.write_all(&HEADER)?;
 
     // Heap-allocated to avoid a 4 MiB stack frame.
@@ -43,12 +44,15 @@ pub fn encode(input: &mut impl BufRead, output: &mut impl Write, options: &Encod
     let mut checksum = Adler32::new();
     let mut total_len: u64 = 0;
 
+    // Process the file in 4MiB batches each composed of 64KiB blocks.
     loop {
         let data_len = read_batch(input, &mut buf)?;
+
         if data_len == 0 {
             break;
         }
 
+        // Spawn threads to do the compression, then collect the results.
         let blocks: Vec<Range<usize>> = (0..data_len)
             .step_by(BLOCK_SIZE)
             .map(|offset| {
@@ -61,10 +65,12 @@ pub fn encode(input: &mut impl BufRead, output: &mut impl Write, options: &Encod
         let results: Vec<(Vec<u8>, Adler32)> =
             blocks.par_iter().map(|range| compress_block(&buf, range.clone(), options)).collect();
 
+        // Write the compressed blocks out and combine the checksums.
         for (compressed, block_checksum) in results {
             output.write_all(&compressed)?;
             checksum = checksum.combine(&block_checksum);
         }
+
         total_len += data_len as u64;
 
         // Slide window: copy last WINDOW_SIZE bytes to position 0 for the next batch.
@@ -82,41 +88,27 @@ pub fn encode(input: &mut impl BufRead, output: &mut impl Write, options: &Encod
     Ok(())
 }
 
-/// Fills the batch buffer starting at [`WINDOW_SIZE`], returning the number of bytes read.
-fn read_batch(input: &mut impl BufRead, buf: &mut Buffer<BATCH_SIZE>) -> Result<usize> {
-    let capacity = BATCH_SIZE - WINDOW_SIZE;
-    let mut filled = 0;
-
-    while filled < capacity {
-        let (slice, _) = buf.slices_mut(WINDOW_SIZE + filled, capacity - filled);
-        let n = input.read(slice)?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-
-    Ok(filled)
-}
-
 /// Compresses a single block from the batch buffer.
 ///
 /// The block's data is `buf[range]`. The preceding [`WINDOW_SIZE`] bytes
 /// (`buf[range.start - WINDOW_SIZE .. range.start]`) are the sliding window
 /// context available for match references.
 fn compress_block(buf: &Buffer<BATCH_SIZE>, range: Range<usize>, _options: &EncodeOptions) -> (Vec<u8>, Adler32) {
+    let mut compressed = Vec::new();
     let mut checksum = Adler32::new();
-    let (s1, s2) = buf.slices(range.start, range.len());
-    checksum.update(s1);
-    if !s2.is_empty() {
-        checksum.update(s2);
+    let mut pos = range.start;
+    let end = range.end;
+
+    // Batch update the checksum.
+    let slices = buf.slices(range.start, range.len());
+    checksum.update(slices.0);
+
+    if !slices.1.is_empty() {
+        checksum.update(slices.1);
     }
 
     // TODO: LZ77 match finding and frame encoding.
     // Placeholder: emit all data as literal Short frames (up to 15 bytes each).
-    let mut compressed = Vec::new();
-    let mut pos = range.start;
-    let end = range.end;
 
     while pos < end {
         let chunk_len = (end - pos).min(14);
@@ -131,4 +123,23 @@ fn compress_block(buf: &Buffer<BATCH_SIZE>, range: Range<usize>, _options: &Enco
     }
 
     (compressed, checksum)
+}
+
+/// Fills the batch buffer starting at [`WINDOW_SIZE`], returning the number of bytes read.
+fn read_batch(input: &mut impl BufRead, buf: &mut Buffer<BATCH_SIZE>) -> Result<usize> {
+    let capacity = BATCH_SIZE - WINDOW_SIZE;
+    let mut filled = 0;
+
+    while filled < capacity {
+        let (slice, _) = buf.slices_mut(WINDOW_SIZE + filled, capacity - filled);
+        let n = input.read(slice)?;
+
+        if n == 0 {
+            break;
+        }
+
+        filled += n;
+    }
+
+    Ok(filled)
 }
