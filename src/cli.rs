@@ -140,7 +140,7 @@ fn process_stdin(args: &Args, options: &EncodeOptions) -> Result<()> {
 fn process_file(args: &Args, options: &EncodeOptions, input_path: &Path) -> Result<()> {
     if args.test {
         let file = fs::File::open(input_path)?;
-        let mut input = io::BufReader::new(file);
+        let mut input = io::BufReader::with_capacity(IO_BUF_CAP, file);
         decode::decode(&mut input, &mut io::sink())?;
         if args.verbose {
             eprintln!("{}: ok", input_path.display());
@@ -150,9 +150,9 @@ fn process_file(args: &Args, options: &EncodeOptions, input_path: &Path) -> Resu
 
     if args.stdout {
         let file = fs::File::open(input_path)?;
-        let mut input = io::BufReader::new(file);
+        let mut input = io::BufReader::with_capacity(IO_BUF_CAP, file);
         let stdout = io::stdout().lock();
-        let mut output = io::BufWriter::new(stdout);
+        let mut output = io::BufWriter::with_capacity(IO_BUF_CAP, stdout);
         if args.decompress {
             decode::decode(&mut input, &mut output)?;
         } else {
@@ -175,9 +175,9 @@ fn process_file(args: &Args, options: &EncodeOptions, input_path: &Path) -> Resu
 
     let input_len = fs::metadata(input_path)?.len();
     let file_in = fs::File::open(input_path)?;
-    let mut input = io::BufReader::new(file_in);
+    let mut input = io::BufReader::with_capacity(IO_BUF_CAP, file_in);
     let file_out = fs::File::create(&out_path)?;
-    let mut output = io::BufWriter::new(file_out);
+    let mut output = io::BufWriter::with_capacity(IO_BUF_CAP, file_out);
 
     if args.decompress {
         decode::decode(&mut input, &mut output)?;

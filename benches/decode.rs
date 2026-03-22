@@ -14,11 +14,11 @@ fn decode(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("decode");
     group.sample_size(10);
-    group.throughput(Throughput::Bytes(compressed.len() as u64));
+    group.throughput(Throughput::Bytes(data.len() as u64));
     group.bench_function("decode", |b| {
         b.iter(|| {
             let mut input = compressed.as_slice();
-            let mut output = Vec::with_capacity(compressed.len());
+            let mut output = Vec::with_capacity(data.len());
             lzr::decode::decode(&mut input, &mut output).unwrap();
             std::hint::black_box(&output);
         });

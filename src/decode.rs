@@ -26,6 +26,8 @@ use crate::{HEADER, WINDOW_SIZE};
 use arbitrary_int::{u1, u4, u11};
 use smallvec::{SmallVec, smallvec};
 
+const FLUSH_THRESHOLD: usize = i16::MAX as usize;
+
 /// Decompresses one or more concatenated LZR streams from `input` into `output`.
 ///
 /// Reads frames from the bitstream, replays matches against a 64 KiB sliding
@@ -96,25 +98,19 @@ pub fn decode(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
                 (0, _) => break,
             }
 
-            // Write the frame from our window to the output.
-            let slices = window.slices(pos, len);
-
-            output.write_all(slices.0)?;
-
-            if !slices.1.is_empty() {
-                output.write_all(slices.1)?;
-            }
-
             // Update our position.
             pos += len;
             pending += len;
 
-            // Update the checksum.
-            if pending >= i16::MAX as usize {
+            // Flush bytes to the output and to the checksum.
+            if pending >= FLUSH_THRESHOLD {
                 let slices = window.slices(pos - pending, pending);
+
+                output.write_all(slices.0)?;
                 adler.update(slices.0);
 
                 if !slices.1.is_empty() {
+                    output.write_all(slices.1)?;
                     adler.update(slices.1);
                 }
 
@@ -125,17 +121,18 @@ pub fn decode(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
         // 3. Flush any remaining pending bytes to the checksum.
         if pending > 0 {
             let slices = window.slices(pos - pending, pending);
+
+            output.write_all(slices.0)?;
             adler.update(slices.0);
+
             if !slices.1.is_empty() {
+                output.write_all(slices.1)?;
                 adler.update(slices.1);
             }
         }
 
         // 4. Read and verify the footer.
         let expected_len = decode_uleb128_u64(input)?;
-        let mut checksum_buf = [0u8; 4];
-        input.read_exact(&mut checksum_buf)?;
-        let expected_checksum = u32::from_le_bytes(checksum_buf);
 
         if pos as u64 != expected_len {
             return Err(Error::LengthMismatch {
@@ -144,7 +141,12 @@ pub fn decode(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
             });
         }
 
+        let mut checksum_buf = [0u8; 4];
+        input.read_exact(&mut checksum_buf)?;
+
+        let expected_checksum = u32::from_le_bytes(checksum_buf);
         let actual_checksum = adler.checksum();
+
         if actual_checksum != expected_checksum {
             return Err(Error::ChecksumMismatch {
                 expected: expected_checksum,
