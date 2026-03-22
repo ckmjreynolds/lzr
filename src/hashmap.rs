@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 /// map.insert(0xDEAD, 5, 5);
 ///
 /// // Look up candidate match positions for a given hash.
-/// assert_eq!(map.get(&0xDEAD).unwrap().as_slice(), &[0, 5]);
+/// assert_eq!(map.get(&0xDEAD).unwrap(), &[0, 5]);
 /// assert_eq!(map.len(), 3);
 /// ```
 pub(crate) struct FifoHashMap<K, V> {
@@ -82,7 +82,7 @@ impl<K: Hash + Eq + Clone, V: Copy + Into<usize>> FifoHashMap<K, V> {
     /// map.insert(1, 0, 0);
     /// map.insert(1, 1, 1);
     /// map.insert(1, 2, 2); // bucket overflow: position 0 is evicted
-    /// assert_eq!(map.get(&1).unwrap().as_slice(), &[1, 2]);
+    /// assert_eq!(map.get(&1).unwrap(), &[1, 2]);
     /// ```
     pub(crate) fn insert(&mut self, key: K, value: V, current_pos: usize) {
         // 1. Bucket overflow — cap per-key positions.
@@ -125,9 +125,9 @@ impl<K: Hash + Eq + Clone, V: Copy + Into<usize>> FifoHashMap<K, V> {
         self.count += 1;
     }
 
-    /// Returns a reference to the bucket for `key`, or `None` if the key has no stored positions.
-    pub(crate) fn get(&self, key: &K) -> Option<&SmallVec<[V; 4]>> {
-        self.map.get(key)
+    /// Returns the stored positions for `key` as a slice, or `None` if the key has no entries.
+    pub(crate) fn get(&self, key: &K) -> Option<&[V]> {
+        self.map.get(key).map(SmallVec::as_slice)
     }
 
     /// Returns the total number of positions stored across all buckets.
@@ -165,8 +165,8 @@ mod tests {
         m.insert(10, 2, 2);
 
         assert_eq!(m.len(), 3);
-        assert_eq!(m.get(&10).unwrap().as_slice(), &[0, 2]);
-        assert_eq!(m.get(&20).unwrap().as_slice(), &[1]);
+        assert_eq!(m.get(&10).unwrap(), &[0, 2]);
+        assert_eq!(m.get(&20).unwrap(), &[1]);
         assert!(m.get(&99).is_none());
     }
 
@@ -179,7 +179,7 @@ mod tests {
         m.insert(1, 30, 30);
 
         // Bucket should only hold the 2 newest.
-        assert_eq!(m.get(&1).unwrap().as_slice(), &[20, 30]);
+        assert_eq!(m.get(&1).unwrap(), &[20, 30]);
         assert_eq!(m.len(), 2);
     }
 
@@ -347,7 +347,7 @@ mod tests {
 
             // Verify all keys.
             for key in 0..16u32 {
-                let actual: Vec<usize> = m.get(&key).map_or_else(Vec::new, |b| b.to_vec());
+                let actual: Vec<usize> = m.get(&key).map_or_else(Vec::new, <[usize]>::to_vec);
                 let expected = oracle.get(key);
                 prop_assert_eq!(&actual, &expected, "mismatch for key {}", key);
             }
