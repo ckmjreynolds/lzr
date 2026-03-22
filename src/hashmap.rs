@@ -19,6 +19,21 @@ use smallvec::SmallVec;
 /// queue is drained from the front: entries whose oldest position satisfies
 /// `current_pos - pos >= capacity` are evicted; stale entries (whose position
 /// was already removed by bucket overflow) are skipped.
+///
+/// # Examples
+///
+/// ```text
+/// let mut map = FifoHashMap::<u32, usize>::with_capacity(1024, 4);
+///
+/// // Insert hash → position mappings as the encoder slides forward.
+/// map.insert(0xDEAD, 0, 0);
+/// map.insert(0xBEEF, 1, 1);
+/// map.insert(0xDEAD, 5, 5);
+///
+/// // Look up candidate match positions for a given hash.
+/// assert_eq!(map.get(&0xDEAD).unwrap().as_slice(), &[0, 5]);
+/// assert_eq!(map.len(), 3);
+/// ```
 pub(crate) struct FifoHashMap<K, V> {
     map: HashMap<K, SmallVec<[V; 4]>>,
     queue: VecDeque<K>,
@@ -32,6 +47,14 @@ impl<K: Hash + Eq + Clone, V: Copy + Into<usize>> FifoHashMap<K, V> {
     ///
     /// - `capacity` — maximum total positions stored across all buckets.
     /// - `bucket_capacity` — maximum positions stored per key.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// let map = FifoHashMap::<u32, usize>::with_capacity(1024, 4);
+    /// assert!(map.is_empty());
+    /// assert_eq!(map.capacity(), 1024);
+    /// ```
     pub(crate) fn with_capacity(capacity: usize, bucket_capacity: usize) -> Self {
         Self {
             map: HashMap::with_capacity(capacity),
@@ -50,6 +73,17 @@ impl<K: Hash + Eq + Clone, V: Copy + Into<usize>> FifoHashMap<K, V> {
     ///
     /// `current_pos` is the current stream position, used to determine whether
     /// a queued position is out of range.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// let mut map = FifoHashMap::<u32, usize>::with_capacity(4, 2);
+    ///
+    /// map.insert(1, 0, 0);
+    /// map.insert(1, 1, 1);
+    /// map.insert(1, 2, 2); // bucket overflow: position 0 is evicted
+    /// assert_eq!(map.get(&1).unwrap().as_slice(), &[1, 2]);
+    /// ```
     pub(crate) fn insert(&mut self, key: K, value: V, current_pos: usize) {
         // 1. Bucket overflow — cap per-key positions.
         if let Some(bucket) = self.map.get_mut(&key) {
@@ -91,7 +125,7 @@ impl<K: Hash + Eq + Clone, V: Copy + Into<usize>> FifoHashMap<K, V> {
         self.count += 1;
     }
 
-    /// Returns a reference to the bucket for `key`, or `None` if absent.
+    /// Returns a reference to the bucket for `key`, or `None` if the key has no stored positions.
     pub(crate) fn get(&self, key: &K) -> Option<&SmallVec<[V; 4]>> {
         self.map.get(key)
     }

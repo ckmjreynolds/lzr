@@ -15,7 +15,7 @@ pub(crate) const HEADER: [u8; 4] = [0x4C, 0x5A, 0x52, 0x00];
 pub(crate) const WINDOW_SIZE: usize = 65_536;
 
 /// Encoder batch buffer size (4 MiB). Must be a power of two for [`buffer::Buffer`].
-pub(crate) const BATCH_SIZE: usize = 4 * 1024 * 1024;
+pub(crate) const BATCH_SIZE: usize = 1 << 22;
 
 /// Encoder block size — each parallel compression job processes this many bytes.
 pub(crate) const BLOCK_SIZE: usize = WINDOW_SIZE;
