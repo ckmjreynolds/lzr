@@ -144,6 +144,18 @@ impl<const N: usize> Buffer<N> {
     /// Mutable variant of [`Buffer::slices`].
     ///
     /// Returns one or two mutable slices covering `len` bytes starting at `start`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// let mut buf = Buffer::<256>::new();
+    ///
+    /// let (a, b) = buf.slices_mut(254, 5);
+    /// a.fill(0xFF);  // writes indices 254, 255
+    /// b.fill(0xFF);  // writes indices 0, 1, 2
+    /// assert_eq!(buf[254], 0xFF);
+    /// assert_eq!(buf[2], 0xFF);
+    /// ```
     pub(crate) fn slices_mut(&mut self, start: usize, len: usize) -> (&mut [u8], &mut [u8]) {
         let start = start & Self::MASK;
         let end = start + len;
@@ -204,6 +216,11 @@ mod tests {
             start: usize,
             len: usize,
         },
+        SlicesMut {
+            start: usize,
+            len: usize,
+            fill: u8,
+        },
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
@@ -224,6 +241,11 @@ mod tests {
             (any::<usize>(), 0..=256usize).prop_map(|(start, len)| Op::Slices {
                 start,
                 len
+            }),
+            (any::<usize>(), 0..=256usize, any::<u8>()).prop_map(|(start, len, fill)| Op::SlicesMut {
+                start,
+                len,
+                fill,
             }),
         ]
     }
@@ -269,8 +291,18 @@ mod tests {
                         let expected: Vec<u8> = (0..len).map(|i| oracle[wrap(N, masked + i)]).collect();
                         assert_eq!(actual, expected);
                     }
+                    Op::SlicesMut { start, len, fill } => {
+                        let (a, b) = buf.slices_mut(start, len);
+                        a.fill(fill);
+                        b.fill(fill);
+
+                        let masked = wrap(N, start);
+                        for i in 0..len {
+                            oracle[wrap(N, masked + i)] = fill;
+                        }
+                    }
                 }
-                assert_eq!(&buf.buf[..], &oracle[..]);
+                prop_assert_eq!(&buf.buf[..], &oracle[..]);
             }
         }
     }

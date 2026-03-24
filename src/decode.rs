@@ -2,7 +2,7 @@
 //!
 //! # Examples
 //!
-//! ```
+//! ```ignore
 //! use lzr::decode::decode;
 //!
 //! // The 13-byte "Hi" stream from the FORMAT.md worked example.
@@ -15,18 +15,22 @@
 //! assert_eq!(&output, b"Hi");
 //! ```
 
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
 
-use crate::adler32::Adler32;
-use crate::buffer::Buffer;
-use crate::error::{Error, Result};
-use crate::uleb128::decode_uleb128_u64;
-use crate::{HEADER, WINDOW_SIZE};
+// use crate::adler32::Adler32;
+// use crate::buffer::Buffer;
+use crate::error::Result;
+// use crate::{HEADER, WINDOW_SIZE};
 
-use arbitrary_int::{u1, u4, u11};
-use smallvec::{SmallVec, smallvec};
+// const FLUSH_THRESHOLD: usize = i16::MAX as usize;
 
-const FLUSH_THRESHOLD: usize = i16::MAX as usize;
+// /// Compressed-input ring buffer size (must be power of two, ≥ 2 × max frame lookahead).
+// const INPUT_BUF_SIZE: usize = 1 << 16; // 64 KiB
+
+// /// Refill when fewer than this many bytes remain in the input buffer.
+// /// Must cover the longest possible frame: 3-byte Long + 128 extension bytes +
+// /// 32 KiB literal payload.
+// const REFILL_THRESHOLD: usize = INPUT_BUF_SIZE / 2;
 
 /// Decompresses one or more concatenated LZR streams from `input` into `output`.
 ///
@@ -45,7 +49,7 @@ const FLUSH_THRESHOLD: usize = i16::MAX as usize;
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use lzr::decode::decode;
 ///
 /// let compressed = [
@@ -56,187 +60,255 @@ const FLUSH_THRESHOLD: usize = i16::MAX as usize;
 /// decode(&mut compressed.as_slice(), &mut output).unwrap();
 /// assert_eq!(&output, b"Hi");
 /// ```
-pub fn decode(input: &mut impl BufRead, output: &mut impl Write) -> Result<()> {
-    // Repeat for each stream in the input.
-    while input.fill_buf().is_ok_and(|buf| !buf.is_empty()) {
-        let mut window = Buffer::<WINDOW_SIZE>::new();
-        let mut adler = Adler32::new();
-        let mut pos = 0usize;
-        let mut pending = 0usize;
+pub fn decode(_input: &mut impl Read, _output: &mut impl Write) -> Result<()> {
+    todo!()
+    // let mut inp = InputBuf::new();
 
-        // 1. Read and validate the header.
-        let mut header = [0u8; HEADER.len()];
-        input.read_exact(&mut header)?;
+    // while inp.refill(input)? > 0 {
+    //     let mut window = Buffer::<WINDOW_SIZE>::new();
+    //     let mut adler = Adler32::new();
+    //     let mut pos = 0usize;
+    //     let mut pending = 0usize;
 
-        if header != HEADER {
-            return Err(Error::InvalidMagic);
-        }
+    //     if inp.read_array::<4>() != HEADER {
+    //         return Err(Error::InvalidMagic);
+    //     }
 
-        // 2. Process and expand frames.
-        loop {
-            let (length, distance) = decode_frame(input)?;
+    //     loop {
+    //         if inp.available() < REFILL_THRESHOLD {
+    //             inp.refill(input)?;
+    //         }
 
-            // Expand the frame into our sliding window.
-            let len = length.unsigned_abs();
+    //         let len = decode_frame(&mut inp, &mut window, pos);
+    //         if len == 0 {
+    //             break; // EOS
+    //         }
 
-            match (length, distance) {
-                // Forward match (including RLE when distance=1)
-                (1.., 1..) => {
-                    window.copy_within(pos - distance..pos - distance + len, pos);
-                }
-                // Reverse match.
-                (..=-1, _) => {
-                    window.copy_within_rev(pos - distance..pos - distance + len, pos);
-                }
-                // Literals
-                (1.., 0) => {
-                    let mut buf: SmallVec<[u8; 15]> = smallvec![0u8; len];
-                    input.read_exact(&mut buf)?;
-                    window.copy_from_slice(&buf, pos);
-                }
-                // EOS (or reserved, we treat them the same)
-                (0, _) => break,
-            }
+    //         pos += len;
+    //         pending += len;
 
-            // Update our position.
-            pos += len;
-            pending += len;
+    //         if pending >= FLUSH_THRESHOLD {
+    //             flush(&window, output, &mut adler, pos - pending, pending)?;
+    //             pending = 0;
+    //         }
+    //     }
 
-            // Flush bytes to the output and to the checksum.
-            if pending >= FLUSH_THRESHOLD {
-                let slices = window.slices(pos - pending, pending);
+    //     if pending > 0 {
+    //         flush(&window, output, &mut adler, pos - pending, pending)?;
+    //     }
 
-                output.write_all(slices.0)?;
-                adler.update(slices.0);
+    //     if inp.available() < REFILL_THRESHOLD {
+    //         inp.refill(input)?;
+    //     }
 
-                if !slices.1.is_empty() {
-                    output.write_all(slices.1)?;
-                    adler.update(slices.1);
-                }
+    //     let expected_len = read_uleb128(&mut inp);
+    //     if pos as u64 != expected_len {
+    //         return Err(Error::LengthMismatch {
+    //             expected: expected_len,
+    //             actual: pos as u64,
+    //         });
+    //     }
 
-                pending = 0;
-            }
-        }
-
-        // 3. Flush any remaining pending bytes to the checksum.
-        if pending > 0 {
-            let slices = window.slices(pos - pending, pending);
-
-            output.write_all(slices.0)?;
-            adler.update(slices.0);
-
-            if !slices.1.is_empty() {
-                output.write_all(slices.1)?;
-                adler.update(slices.1);
-            }
-        }
-
-        // 4. Read and verify the footer.
-        let expected_len = decode_uleb128_u64(input)?;
-
-        if pos as u64 != expected_len {
-            return Err(Error::LengthMismatch {
-                expected: expected_len,
-                actual: pos as u64,
-            });
-        }
-
-        let mut checksum_buf = [0u8; 4];
-        input.read_exact(&mut checksum_buf)?;
-
-        let expected_checksum = u32::from_le_bytes(checksum_buf);
-        let actual_checksum = adler.checksum();
-
-        if actual_checksum != expected_checksum {
-            return Err(Error::ChecksumMismatch {
-                expected: expected_checksum,
-                actual: actual_checksum,
-            });
-        }
-    }
-    Ok(())
+    //     let expected_checksum = u32::from_le_bytes(inp.read_array::<4>());
+    //     let actual_checksum = adler.checksum();
+    //     if actual_checksum != expected_checksum {
+    //         return Err(Error::ChecksumMismatch {
+    //             expected: expected_checksum,
+    //             actual: actual_checksum,
+    //         });
+    //     }
+    // }
+    // Ok(())
 }
 
-#[allow(clippy::cast_lossless)]
-fn decode_frame(input: &mut impl BufRead) -> Result<(isize, usize)> {
-    let sign: u1;
-    let mut length: i16;
-    let distance: u16;
+// /// Decodes one frame, expanding it into the window. Returns the number of
+// /// output bytes produced (0 = EOS).
+// #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+// fn decode_frame(inp: &mut InputBuf, window: &mut Buffer<WINDOW_SIZE>, pos: usize) -> usize {
+//     let b0 = inp.read_u8();
 
-    // Decode the frame (length and distance).
-    match input.fill_buf()?[0] {
-        0x00..=0xBF => {
-            // Medium Frame
-            let mut buf = [0u8; 2];
-            input.read_exact(&mut buf)?;
+//     if b0 <= 0xBF {
+//         // Medium Frame
+//         let b1 = inp.read_u8();
+//         let frame = u16::from_be_bytes([b0, b1]);
+//         let sign = frame >> 15;
+//         let mut mag = ((frame >> 11) & 0xF) as i16 + 2;
+//         let distance = (frame & 0x7FF) as usize + 1;
 
-            let frame = u16::from_be_bytes(buf);
-            sign = u1::extract_u16(frame, 15);
-            length = u4::extract_u16(frame, 11).value() as i16 + 2;
-            distance = u11::extract_u16(frame, 0).value();
+//         if sign == 1 {
+//             mag = -mag;
+//         }
+//         if mag == -9 || mag == 17 {
+//             mag = read_extension(inp, mag);
+//         }
 
-            if sign.value() == 1 {
-                length = -length;
-            }
+//         let len = mag.unsigned_abs() as usize;
+//         if mag > 0 {
+//             window.copy_fwd(pos.wrapping_sub(distance), len, pos);
+//         } else {
+//             window.copy_rev(pos.wrapping_sub(distance), len, pos);
+//         }
+//         len
+//     } else if b0 <= 0xDF {
+//         // Short Frame
+//         let l = i16::from((b0 >> 1) & 0xF);
+//         let d = b0 & 1;
 
-            if length == -9 || length == 17 {
-                length = decode_extension(input, length)?;
-            }
+//         if l == 0 && d == 0 {
+//             return 0; // EOS
+//         }
 
-            Ok((length as isize, distance as usize + 1))
-        }
-        0xC0..=0xDF => {
-            // Short Frame (EOS is implicit) L/D = 0.
-            let mut buf = [0u8; 1];
-            input.read_exact(&mut buf)?;
+//         let mut len = l;
+//         if len == 15 {
+//             len = read_extension(inp, len);
+//         }
+//         let len = len as usize;
 
-            length = u4::extract_u8(buf[0], 1).value() as i16;
-            distance = u1::extract_u8(buf[0], 0).value() as u16;
+//         if d == 0 {
+//             for i in 0..len {
+//                 window[pos + i] = inp.read_u8();
+//             }
+//         } else {
+//             window.copy_fwd(pos.wrapping_sub(1), len, pos);
+//         }
+//         len
+//     } else {
+//         // Long Frame
+//         let b1 = inp.read_u8();
+//         let b2 = inp.read_u8();
+//         let sign = (b0 >> 4) & 1;
+//         let mut mag = i16::from(b0 & 0xF) + 3;
+//         let distance = u16::from_le_bytes([b1, b2]) as usize + 1;
 
-            if length == 15 {
-                length = decode_extension(input, length)?;
-            }
+//         if sign == 1 {
+//             mag = -mag;
+//         }
+//         if mag.abs() == 18 {
+//             mag = read_extension(inp, mag);
+//         }
 
-            Ok((length as isize, distance as usize))
-        }
-        0xE0..=0xFF => {
-            // Long Frame
-            let mut buf = [0u8; 3];
-            input.read_exact(&mut buf)?;
+//         let len = mag.unsigned_abs() as usize;
+//         if mag > 0 {
+//             window.copy_fwd(pos.wrapping_sub(distance), len, pos);
+//         } else {
+//             window.copy_rev(pos.wrapping_sub(distance), len, pos);
+//         }
+//         len
+//     }
+// }
 
-            sign = u1::extract_u8(buf[0], 4);
-            length = u4::extract_u8(buf[0], 0).value() as i16 + 3;
-            distance = u16::from_le_bytes([buf[1], buf[2]]);
+// // ── Input buffer ────────────────────────────────────────────────────────
 
-            if sign.value() == 1 {
-                length = -length;
-            }
+// /// A flat ring buffer for compressed input. Frame parsing reads directly from
+// /// the buffer via index, avoiding per-frame `fill_buf` / `read_exact` overhead.
+// struct InputBuf {
+//     buf: Vec<u8>,
+//     pos: usize,
+//     len: usize,
+// }
 
-            if length.abs() == 18 {
-                length = decode_extension(input, length)?;
-            }
+// impl InputBuf {
+//     fn new() -> Self {
+//         Self {
+//             buf: vec![0u8; INPUT_BUF_SIZE],
+//             pos: 0,
+//             len: 0,
+//         }
+//     }
 
-            Ok((length as isize, distance as usize + 1))
-        }
-    }
-}
+//     /// How many unread bytes remain in the buffer.
+//     const fn available(&self) -> usize {
+//         self.len - self.pos
+//     }
 
-#[allow(clippy::cast_lossless)]
-fn decode_extension(input: &mut impl BufRead, mut length: i16) -> Result<i16> {
-    loop {
-        let value = input.fill_buf()?[0] as i16;
-        input.consume(1);
+//     /// Refills the buffer from `reader`. Shifts unconsumed data to the front
+//     /// first. Returns total available bytes after refill.
+//     fn refill(&mut self, reader: &mut impl Read) -> Result<usize> {
+//         let remaining = self.available();
+//         if remaining > 0 {
+//             self.buf.copy_within(self.pos..self.len, 0);
+//         }
+//         self.pos = 0;
+//         self.len = remaining;
 
-        if length >= 0 {
-            length = length.saturating_add(value);
-        } else {
-            length = length.saturating_sub(value);
-        }
+//         while self.len < INPUT_BUF_SIZE {
+//             let n = reader.read(&mut self.buf[self.len..])?;
+//             if n == 0 {
+//                 break;
+//             }
+//             self.len += n;
+//         }
 
-        if value < 0xFF {
-            break;
-        }
-    }
+//         Ok(self.available())
+//     }
 
-    Ok(length)
-}
+//     /// Reads one byte, advancing the position.
+//     #[inline]
+//     fn read_u8(&mut self) -> u8 {
+//         let b = self.buf[self.pos];
+//         self.pos += 1;
+//         b
+//     }
+
+//     /// Reads a fixed-size array.
+//     fn read_array<const N: usize>(&mut self) -> [u8; N] {
+//         let mut arr = [0u8; N];
+//         arr.copy_from_slice(&self.buf[self.pos..self.pos + N]);
+//         self.pos += N;
+//         arr
+//     }
+// }
+
+// // ── Helpers ─────────────────────────────────────────────────────────────
+
+// /// Reads a length extension chain from the input buffer.
+// fn read_extension(inp: &mut InputBuf, mut length: i16) -> i16 {
+//     loop {
+//         let value = i16::from(inp.read_u8());
+//         if length >= 0 {
+//             length = length.saturating_add(value);
+//         } else {
+//             length = length.saturating_sub(value);
+//         }
+//         if value < 0xFF {
+//             break;
+//         }
+//     }
+//     length
+// }
+
+// /// Reads a ULEB128-encoded u64 from the input buffer (max 9 bytes).
+// fn read_uleb128(inp: &mut InputBuf) -> u64 {
+//     let mut result: u64 = 0;
+//     for i in 0..9 {
+//         let byte = inp.read_u8();
+//         if i < 8 {
+//             result |= u64::from(byte & 0x7F) << (i * 7);
+//             if byte & 0x80 == 0 {
+//                 return result;
+//             }
+//         } else {
+//             result |= u64::from(byte) << 56;
+//             return result;
+//         }
+//     }
+//     result
+// }
+
+// /// Flushes pending decoded bytes to output and updates the Adler-32 checksum.
+// fn flush(
+//     window: &Buffer<WINDOW_SIZE>,
+//     output: &mut impl Write,
+//     adler: &mut Adler32,
+//     start: usize,
+//     len: usize,
+// ) -> Result<()> {
+//     let slices = window.slices(start, len);
+//     output.write_all(slices.0)?;
+//     adler.update(slices.0);
+//     if !slices.1.is_empty() {
+//         output.write_all(slices.1)?;
+//         adler.update(slices.1);
+//     }
+//     Ok(())
+// }

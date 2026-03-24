@@ -61,8 +61,8 @@ bench() {
     rm -f "$comp_file"
 }
 
-bench "lzr -1"    "$LZR -l 1"        "$LZR -d"
-bench "lzr -9"    "$LZR -l 9"        "$LZR -d"
+bench "lzr -1"    "$LZR -T 1 -l 1"   "$LZR -d"
+bench "lzr -9"    "$LZR -T 1 -l 9"   "$LZR -d"
 
 if command -v lz4 &>/dev/null; then
     bench "lz4 -1"    "lz4 -1 -c"       "lz4 -d -c"

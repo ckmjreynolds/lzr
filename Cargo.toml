@@ -52,10 +52,6 @@ pedantic = { level = "warn", priority = -1 }
 redundant_pub_crate = "allow"
 
 [[bench]]
-name = "adler32"
-harness = false
-
-[[bench]]
 name = "encode"
 harness = false
 

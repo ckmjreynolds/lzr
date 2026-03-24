@@ -8,11 +8,11 @@
 LZR is an LZ77-based compression format. A stream has three parts:
 
 ```
-┌────Header────┐┌────Frame────┐┌────Frame────┐     ┌────────Footer────────┐
-│┌────────────┐││┌───────────┐││┌───────────┐│     │┌────────┐┌──────────┐│
-││ LZR | 0x00 ││││ 1-3 bytes ││││ 1-3 bytes ││ ... ││ Length ││ Adler-32 ││
-│└────────────┘││└───────────┘││└───────────┘│     │└────────┘└──────────┘│
-└──────────────┘└─────────────┘└─────────────┘     └──────────────────────┘
+┌────Header────┐┌───Frame────┐┌───Frame────┐     ┌────────Footer────────┐
+│┌────────────┐││┌──────────┐││┌──────────┐│     │┌────────┐┌──────────┐│
+││ LZR | 0x00 ││││ 3+ bytes ││││ 3+ bytes ││ ... ││ Length ││ Adler-32 ││
+│└────────────┘││└──────────┘││└──────────┘│     │└────────┘└──────────┘│
+└──────────────┘└────────────┘└────────────┘     └──────────────────────┘
 ```
 
 All multi-byte integers are little-endian unless noted otherwise. All frames are byte-aligned.
@@ -28,105 +28,79 @@ Version `0x00` is format version 1.0. All other values are reserved. A decoder m
 
 ## Frames
 
-There are three frame types, identified by the tag bits of the first byte:
+Every frame has the same structure:
 
 ```
-Short  (1B):  110LLLLD                          L  = 0..=15,   D = 0/1
-Medium (2B):  SLLLLDDD | DDDDDDDD              |L| = 2..=17/9, D = 1..=2,048
-Long   (3B):  111SLLLL | DDDDDDDD | DDDDDDDD   |L| = 3..=18,   D = 1..=65,536
+Token (1B) │ Distance (2B LE)    │ Lit Ext* │ Match Ext* │ Literals*
+LLLMMMMM   │ DDDDDDDD | DDDDDDDD │ 0+ bytes │ 0+ bytes   │ 0+ bytes
 ```
 
-- The format is most easily understood if the Medium frame type is considered the baseline.
-- Length is a signed 16-bit integer (i16). Distance is an unsigned 16-bit integer (u16).
-- When the magnitude of L is the maximum permitted value, a length extension chain follows (see below).
+Fields marked `*` are conditionally present. A frame is always at least 3 bytes (token + distance).
 
-### Frame Type Dispatch
-
-The decoder determines the frame type from the first byte `b`:
-
-| Condition | Frame type |
-| - | - |
-| `b = 0xC0` | End of Stream |
-| `b & 0xE0 = 0xC0` | Short (`110xxxxx`, excluding EOS) |
-| `b & 0xE0 = 0xE0` | Long (`111xxxxx`) |
-| otherwise | Medium (`0x00`–`0xBF`) |
-
-### End of Stream
-
-A single `0xC0` byte. This is the Short frame encoding with L=0, D=0, reserved as the end-of-stream marker.
-
-### Medium Frame (2 bytes)
-
-The default/most common frame type. Bits 7–6 of byte 0 determine whether this is a forward match, reverse match, or an escape to Short/Long:
-
-```
-  Byte 0                              Byte 1
-  7   6   5   4   3   2   1   0       7   6   5   4   3   2   1   0
-┌───┬───┬───┬───┬───┬───┬───┬───┐   ┌───┬───┬───┬───┬───┬───┬───┬───┐
-│ S │ L   L   L   L │ D   D   D │   │ D   D   D   D   D   D   D   D │
-└───┴───┴───┴───┴───┴───┴───┴───┘   └───┴───┴───┴───┴───┴───┴───┴───┘
-```
-
-- **S** (bit 7): sign bit, 0/1 => positive/negative length => forward/reverse match.
-- **L** (bits 6–3): length magnitude, encoding -9..=-2,2..=17 (LLLL + 2).
-- **D** (bits 2–0 of byte 0 : byte 1): 11-bits, encoding 1..=2,048. The 3 bits from byte 0 are the high bits: ((byte0 & 0x07) << 8) | byte1
-
-A length of -9 or 17 triggers a length extension. A Medium frame cannot have bits 7 and 6 of byte 0 set.
-
-### Short Frame (1 byte)
-
-Short frames are used to encode literals and for RLE.
+### Token Byte
 
 ```
   7   6   5   4   3   2   1   0
 ┌───┬───┬───┬───┬───┬───┬───┬───┐
-│ 1   1   0 │ L   L   L   L │ D │
+│ L   L   L │ M   M   M   M   M │
 └───┴───┴───┴───┴───┴───┴───┴───┘
 ```
 
-- **L** (bits 4–1): length/count encoding 0..=15.
-- **D** (bit 0): 0 = literal, 1 = RLE of the last byte.
-- **EOS**: L=0, D=0 (`0xC0`).
-- **Reserved**: L=0, D=1 (`0xC1`). Encoders must not emit this byte. Decoder behavior is undefined.
+- **L** (bits 7–5): literal count, `0..=7`. A value of 7 triggers a literal length extension.
+- **M** (bits 4–0): match length field, decoded as follows:
 
-**When D=0 (literal):** L raw bytes follow. L is the number of literal bytes (1..=15).
+| MMMMM | Match Length | Type |
+|-|-|-|
+| `0..=5` | `-9..=-4` | Reverse match |
+| `6` | `0` | Literal-only (no match) |
+| `7..=31` | `4..=28` | Forward match |
 
-**When D=1 (RLE):** Repeats the last output byte L times (1..=15).
+Match length is a signed 16-bit integer (i16). MMMMM=0 (length -9) triggers a negative match extension. MMMMM=31 (length 28) triggers a positive match extension.
 
-A length of 15 triggers a length extension.
+### Distance
 
-### Long Frame (3 bytes)
+Bytes 1–2 of the frame. A 16-bit little-endian unsigned integer encoding a distance of `1..=65,536` (stored as `value - 1`).
 
-Long frames are the simplest to understand.
+When match length is 0 (literal-only frame), the distance is ignored but still present. Encoders may write any value; decoders must not interpret it.
 
-```
-  Byte 0                           Byte 1     Byte 2
-  7   6   5   4   3   2   1   0    7 ───── 0  7 ────── 0
-┌───┬───┬───┬───┬───┬───┬───┬───┐ ┌─────────┐┌──────────┐
-│ 1   1   1 │ S │ L   L   L   L │ │ D (low) ││ D (high) │
-└───┴───┴───┴───┴───┴───┴───┴───┘ └─────────┘└──────────┘
-```
+### End of Stream
 
-- **S** (bit 7): sign bit, 0/1 => positive/negative length => forward/reverse match.
-- **L** (bits 3–0): encoding |L| = 3..=18
-- **D** (bytes 1–2): 16-bit little-endian, encoding 1..=65,536.
-
-A length of +/- 18 triggers a length extension.
+Token `0x00` with distance `0xFFFF`. This encodes zero literals, match length -9 at distance 65,536 — a match that would read outside the sliding window, reserved as the end-of-stream sentinel.
 
 ### Length Extension
 
-When the L field is the maximum magnitude, one or more extension bytes follow immediately after the frame's base bytes. The extension chain adds to the base magnitude:
+When a length field is at its maximum base value, one or more extension bytes follow. The extension chain adds to the base value:
 
 1. Read one byte.
-2. Add its value to the magnitude.
+2. Add its value to the total.
 3. If the byte equals 255, repeat from step 1.
 4. If the byte is less than 255, the chain is complete.
 
-`total = original_magnitude + sum(ext_bytes)`
+**Literal length extension** (L=7): appears after the distance bytes, before any match extension.
 
-The total length (base + extensions) is a signed 16-bit quantity. Lengths must fall within -32,768..=32,767 (i16). Encoders must not produce lengths outside this range; decoder behavior for out-of-range lengths is undefined.
+`total_literals = 7 + sum(ext_bytes)`
 
-For literals, the extension chain appears after the frame byte and before the literal bytes.
+Literal length is an unsigned 16-bit quantity (u16). Encoders must not produce literal lengths exceeding 65,535; decoder behavior for out-of-range lengths is undefined.
+
+**Positive match extension** (MMMMM=31, length 28): appears after literal extension bytes (if any), before literal data.
+
+`total_match = 28 + sum(ext_bytes)`
+
+**Negative match extension** (MMMMM=0, length -9): appears after literal extension bytes (if any), before literal data. Each extension byte increases the magnitude:
+
+`total_match = -9 - sum(ext_bytes)`
+
+Match length is a signed 16-bit quantity (i16). Encoders must not produce match lengths outside -32,768..=32,767; decoder behavior for out-of-range lengths is undefined.
+
+### Frame Order Summary
+
+```
+┌────────┐┌──────────┐┌───────────────┐┌───────────────┐┌──────────┐
+│ Token  ││ Distance ││ Lit Ext (L=7) ││ Match Ext     ││ Literals │
+│ 1 byte ││ 2 bytes  ││ 0+ bytes      ││ (M=0 or M=31) ││ L bytes  │
+│        ││          ││               ││ 0+ bytes      ││          │
+└────────┘└──────────┘└───────────────┘└───────────────┘└──────────┘
+```
 
 ## Copy Semantics
 
@@ -137,7 +111,7 @@ for i in 0..length:
     output[pos + i] = output[pos - distance + i]
 ```
 
-When length > distance, the copy overlaps its own output. Each byte is copied individually — this enables run-length encoding (e.g., distance 1, length 33 repeats the last byte 33 times).
+When length > distance, the copy overlaps its own output. Each byte is copied individually — this naturally provides run-length encoding (e.g., distance 1, length 33 repeats the last byte 33 times).
 
 **Reverse copy (negative length):**
 
@@ -189,23 +163,25 @@ A file may contain multiple concatenated streams. If data remains after a footer
 
 Compressing `Hi` (0x48 0x69):
 
-**Frames:**
+**Frame 1 — Literal-only:**
 
-| Frame | Type | Header Byte | Payload | Description |
-|-|-|-|-|-|
-| 1 | Short Literal | `0xC4` (L=2, D=0) | `0x48 0x69` | 2 literal bytes |
-| 2 | EOS | `0xC0` | — | End of stream |
+Token = `0x46` = `010_00110`: L=2 (2 literal bytes), M=6 (match length 0, literal-only).
+Distance = `0x00 0x00` (ignored).
+Literals = `0x48 0x69`.
 
-`0xC4` = `1100_0100`: tag `110`, LLLL=0010 (2), D=0 → literal, 2 bytes follow.
+**Frame 2 — End of Stream:**
+
+Token = `0x00` = `000_00000`: L=0, M=0 (match length -9).
+Distance = `0xFF 0xFF` (65,536, out of bounds).
 
 **Footer:**
 
 - ULEB128(2) = `0x02` (1 byte, no continuation needed).
 - Adler-32("Hi"): A = 1 + 72 + 105 = 178 (0xB2), B = 0 + 73 + 178 = 251 (0xFB). Checksum = 0x00FB00B2, little-endian: `B2 00 FB 00`.
 
-**Complete stream (13 bytes):**
+**Complete stream (17 bytes):**
 
 ```
-4C 5A 52 00  C4 48 69 C0  02 B2 00 FB 00
-├─ Header ─┤ ├─ Frames ─┤ ├── Footer ──┤
+4C 5A 52 00  46 00 00 48 69  00 FF FF  02 B2 00 FB 00
+├─ Header ─┤ ├── Frame 1 ──┤ ├─ EOS ─┤ ├── Footer ──┤
 ```
