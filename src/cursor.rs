@@ -21,8 +21,11 @@ pub(crate) trait ReadBuf {
     /// Reads a little-endian `u16` (2 bytes) and advances the position by two.
     fn read_u16_le(&mut self) -> u16;
 
-    /// Reads `dst.len()` bytes into `dst` and advances the position accordingly.
-    fn read_bytes(&mut self, dst: &mut [u8]);
+    /// Reads a little-endian `u32` (4 bytes) and advances the position by four.
+    fn read_u32_le(&mut self) -> u32;
+
+    /// Reads `buf.len()` bytes into `buf` and advances the position accordingly.
+    fn read_bytes(&mut self, buf: &mut [u8]);
 }
 
 /// Sequential byte writer.
@@ -34,6 +37,9 @@ pub(crate) trait WriteBuf {
 
     /// Writes a `u16` in little-endian order (2 bytes) and advances the position by two.
     fn write_u16_le(&mut self, value: u16);
+
+    /// Writes a `u32` in little-endian order (4 bytes) and advances the position by four.
+    fn write_u32_le(&mut self, value: u32);
 
     /// Writes all bytes from `src` and advances the position accordingly.
     fn write_bytes(&mut self, src: &[u8]);
@@ -96,11 +102,20 @@ impl<const N: usize> ReadBuf for ReadCursor<'_, N> {
         u16::from_le_bytes([lo, hi])
     }
 
-    fn read_bytes(&mut self, dst: &mut [u8]) {
-        let (a, b) = self.buf.slices(self.pos, dst.len());
-        dst[..a.len()].copy_from_slice(a);
-        dst[a.len()..].copy_from_slice(b);
-        self.pos += dst.len();
+    fn read_u32_le(&mut self) -> u32 {
+        let b0 = self.buf[self.pos];
+        let b1 = self.buf[self.pos + 1];
+        let b2 = self.buf[self.pos + 2];
+        let b3 = self.buf[self.pos + 3];
+        self.pos += 4;
+        u32::from_le_bytes([b0, b1, b2, b3])
+    }
+
+    fn read_bytes(&mut self, buf: &mut [u8]) {
+        let (a, b) = self.buf.slices(self.pos, buf.len());
+        buf[..a.len()].copy_from_slice(a);
+        buf[a.len()..].copy_from_slice(b);
+        self.pos += buf.len();
     }
 }
 
@@ -150,6 +165,15 @@ impl<const N: usize> WriteBuf for WriteCursor<'_, N> {
         self.buf[self.pos] = lo;
         self.buf[self.pos + 1] = hi;
         self.pos += 2;
+    }
+
+    fn write_u32_le(&mut self, value: u32) {
+        let [b0, b1, b2, b3] = value.to_le_bytes();
+        self.buf[self.pos] = b0;
+        self.buf[self.pos + 1] = b1;
+        self.buf[self.pos + 2] = b2;
+        self.buf[self.pos + 3] = b3;
+        self.pos += 4;
     }
 
     fn write_bytes(&mut self, src: &[u8]) {
@@ -286,6 +310,19 @@ mod tests {
             let mut rc = ReadCursor::new(&buf, start);
             prop_assert_eq!(rc.read_u16_le(), value);
             prop_assert_eq!(rc.position(), start + 2);
+        }
+
+        #[test]
+        fn u32_le_roundtrip(value: u32, start in 0usize..=255) {
+            let mut buf = Buffer::<256>::new();
+
+            let mut wc = WriteCursor::new(&mut buf, start);
+            wc.write_u32_le(value);
+            prop_assert_eq!(wc.position(), start + 4);
+
+            let mut rc = ReadCursor::new(&buf, start);
+            prop_assert_eq!(rc.read_u32_le(), value);
+            prop_assert_eq!(rc.position(), start + 4);
         }
 
         #[test]

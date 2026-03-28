@@ -5,565 +5,434 @@
 //!
 //! See [`FORMAT.md`](../docs/FORMAT.md) for the canonical specification.
 
-use crate::HEADER;
+use arbitrary_int::{u3, u5};
+
+use crate::cursor::{ReadBuf, WriteBuf};
 use crate::error::{Error, Result};
 use crate::uleb128::{decode_uleb128_u64, encode_uleb128_u64};
 
-/// Maximum size of a frame header in bytes (token + distance + extensions, excluding literals).
+/// LZR stream header: magic bytes (`LZR`) + format version (`0x00`).
+const HEADER: [u8; 4] = [0x4C, 0x5A, 0x52, 0x00];
+
+/// LZR end-of-stream sentinel: token `0x00` + distance `0x0000`.
+const EOS: [u8; 3] = [0x00, 0x00, 0x00];
+
+/// Lookup table mapping the 5-bit match field (MMMMM, bits 4–0) of a token byte to its match length (i16).
 ///
-/// Worst case: 1 (token) + 2 (distance) + 129 (literal extension for 32,767)
-/// + 129 (match extension for 32,767 or -32,768) = 261.
-pub(crate) const MAX_FRAME_HEADER: usize = 261;
+/// | MMMMM | Match Length | Type             |
+/// |-------|-------------|------------------|
+/// | 0–5   | −9 to −4    | Reverse match    |
+/// | 6     | 0           | Literal-only     |
+/// | 7–31  | 4 to 28     | Forward match    |
+///
+/// MMMMM=0 and MMMMM=31 are extension sentinels (base values −9 and 28 respectively).
+#[rustfmt::skip]
+const MATCH_LENGTH_TABLE: [i16; 32] = [
+    -9, -8, -7, -6, -5, -4,          // 0..=5:  reverse match
+     0,                              // 6:      literal-only
+     4,  5,  6,  7,  8,  9, 10, 11,  // 7..=14: forward match
+    12, 13, 14, 15, 16, 17, 18, 19,  // 15..=22
+    20, 21, 22, 23, 24, 25, 26, 27,  // 23..=30
+    28,                              // 31:     forward match (extension sentinel)
+];
 
-// ── Header ──────────────────────────────────────────────────────────────
-
-/// Writes the 4-byte LZR stream header into `buf` and returns 4.
-pub(crate) fn encode_header(buf: &mut [u8]) -> usize {
-    buf[..4].copy_from_slice(&HEADER);
-    4
+/// Writes the 4-byte LZR stream header (magic `LZR` + version `0x00`).
+pub(crate) fn encode_header(output: &mut impl WriteBuf) {
+    output.write_bytes(&HEADER);
 }
 
-/// Validates the 4-byte LZR stream header in `buf` and returns 4.
+/// Reads and validates the 4-byte LZR stream header.
 ///
-/// # Errors
-///
-/// Returns [`Error::InvalidMagic`] if the first three bytes are not `LZR`.
-/// Returns [`Error::UnsupportedVersion`] if the version byte is not `0x00`.
-pub(crate) fn decode_header(buf: &[u8]) -> Result<usize> {
+/// Returns [`Error::InvalidMagic`] if the first three bytes are not `LZR`, or
+/// [`Error::UnsupportedVersion`] if the version byte is not `0x00`.
+pub(crate) fn decode_header(input: &mut impl ReadBuf) -> Result<()> {
+    let mut buf = [0u8; HEADER.len()];
+
+    input.read_bytes(&mut buf);
+
     if buf[..3] != HEADER[..3] {
         return Err(Error::InvalidMagic);
     }
     if buf[3] != 0x00 {
         return Err(Error::UnsupportedVersion(buf[3]));
     }
-    Ok(4)
+
+    Ok(())
 }
 
-// ── Frame ───────────────────────────────────────────────────────────────
+/// Encodes a single LZR frame (token + distance + extensions) into `output`.
+///
+/// Writes the token byte (`LLLMMMMM`), the 2-byte little-endian distance, and
+/// any literal-length or match-length extension bytes. The caller is responsible
+/// for appending the `literal_len` literal bytes after this call.
+///
+/// # Examples
+///
+/// ```text
+/// // Literal-only frame: 2 literals, match length 0, distance ignored.
+/// encode_frame(2, 0, 0, &mut output);
+/// // Writes: [0x46, 0x00, 0x00] — token 010_00110, distance 0.
+/// ```
+pub(crate) fn encode_frame(literal_len: i16, match_len: i16, distance: u16, output: &mut impl WriteBuf) {
+    let (mmmmm, match_ext) = match_len_to_mmmmm(match_len);
 
-/// Encodes a frame into `buf` and returns the number of bytes written.
-///
-/// Writes the token byte, distance, any extension bytes, and the literal data.
-/// `buf` must be large enough to hold the entire frame ([`MAX_FRAME_HEADER`]
-/// + `literals.len()`).
-///
-/// # Parameters
-///
-/// - `literals`: literal bytes to embed in the frame (length 0..=32,767).
-/// - `match_length`: signed match length. Negative = reverse copy, 0 = literal-only,
-///   positive = forward copy. Valid range: -32,768..=-4 or 0 or 4..=32,767.
-/// - `distance`: logical copy distance (1..=65,535). Ignored when `match_length == 0`.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn encode_frame(literals: &[u8], match_length: i16, distance: u16, buf: &mut [u8]) -> usize {
-    let lit_count = literals.len() as u16;
-    let l = lit_count.min(7) as u8;
-
-    let m: u8 = if match_length <= -9 {
-        0
-    } else if match_length < 0 {
-        (match_length + 9) as u8 // -8→1, -7→2, ..., -4→5
-    } else if match_length == 0 {
-        6
-    } else if match_length >= 28 {
-        31
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let (lll, lit_ext) = if literal_len < 7 {
+        (u3::new(literal_len as u8), 0i16)
     } else {
-        (match_length + 3) as u8 // 4→7, 5→8, ..., 27→30
+        (u3::new(7), literal_len - 7)
     };
 
-    buf[0] = (l << 5) | m;
-    buf[1..3].copy_from_slice(&distance.to_le_bytes());
-    let mut offset = 3;
+    let token = (lll.value() << 5) | mmmmm.value();
+    output.write_u8(token);
+    output.write_u16_le(distance);
 
-    // Literal length extension.
-    if l == 7 {
-        offset += encode_extension(lit_count - 7, &mut buf[offset..]);
+    if lll == u3::new(7) {
+        encode_extension(lit_ext, output);
     }
-
-    // Match length extension.
-    if m == 0 {
-        let extra = ((-9i16).wrapping_sub(match_length)) as u16;
-        offset += encode_extension(extra, &mut buf[offset..]);
-    } else if m == 31 {
-        let extra = (match_length - 28) as u16;
-        offset += encode_extension(extra, &mut buf[offset..]);
+    if mmmmm == u5::new(0) || mmmmm == u5::new(31) {
+        encode_extension(match_ext, output);
     }
-
-    // Literal data.
-    buf[offset..offset + literals.len()].copy_from_slice(literals);
-    offset + literals.len()
 }
 
-/// Decodes a frame from `buf`.
+/// Decodes a single LZR frame from `input`.
 ///
-/// Returns `None` for the end-of-stream sentinel. Otherwise returns
-/// `Some((literal_count, distance, match_length, header_size))` where
-/// `header_size` is the number of bytes consumed by the token, distance, and
-/// extensions. The caller reads `literal_count` literal bytes starting at
-/// `buf[header_size..]`.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-pub(crate) fn decode_frame(buf: &[u8]) -> Option<(i16, u16, i16, usize)> {
-    let token = buf[0];
-    let distance = u16::from_le_bytes([buf[1], buf[2]]);
-    let mut offset = 3;
+/// Reads the token byte, distance, and any extension bytes. Returns
+/// `(literal_len, match_len, distance)`. The caller is responsible for
+/// reading `literal_len` literal bytes from `input` after this call.
+///
+/// When `distance` is 0 the frame is the end-of-stream sentinel — no
+/// extensions are read and the caller should stop decoding frames.
+///
+/// Uses [`MATCH_LENGTH_TABLE`] for a direct lookup of the base match
+/// length from the 5-bit MMMMM field.
+///
+/// # Examples
+///
+/// ```text
+/// // Decode a literal-only frame: token 0x46, distance 0x0000.
+/// let (lit, mat, dist) = decode_frame(&mut input);
+/// assert_eq!((lit, mat, dist), (2, 0, 0));
+/// ```
+pub(crate) fn decode_frame(input: &mut impl ReadBuf) -> (i16, i16, u16) {
+    let token = input.read_u8();
+    let lll = token >> 5;
+    let mmmmm = token & 0x1F;
 
-    // EOS sentinel: token 0x00, distance 0x0000.
-    if token == 0x00 && distance == 0x0000 {
-        return None;
+    let distance = input.read_u16_le();
+
+    // Distance 0 is reserved for EOS — no extensions follow.
+    if distance == 0 {
+        return (i16::from(lll), MATCH_LENGTH_TABLE[mmmmm as usize], 0);
     }
 
-    let l = token >> 5;
-    let m = token & 0x1F;
-
-    // Decode literal count.
-    let literal_count: i16 = if l == 7 {
-        let (ext, n) = decode_extension(&buf[offset..]);
-        offset += n;
-        7 + ext as i16
+    let literal_len = if lll < 7 {
+        i16::from(lll)
     } else {
-        i16::from(l)
+        7 + decode_extension(input)
     };
 
-    // Decode match length.
-    let match_length: i16 = if m == 0 {
-        let (ext, n) = decode_extension(&buf[offset..]);
-        offset += n;
-        -9 - ext as i16
-    } else if m <= 5 {
-        i16::from(m) - 9 // 1→-8, 2→-7, ..., 5→-4
-    } else if m == 6 {
-        0
-    } else if m == 31 {
-        let (ext, n) = decode_extension(&buf[offset..]);
-        offset += n;
-        28 + ext as i16
-    } else {
-        i16::from(m) - 3 // 7→4, 8→5, ..., 30→27
+    let match_len = match mmmmm {
+        0 => MATCH_LENGTH_TABLE[0] - decode_extension(input),
+        31 => MATCH_LENGTH_TABLE[31] + decode_extension(input),
+        m => MATCH_LENGTH_TABLE[m as usize],
     };
 
-    Some((literal_count, distance, match_length, offset))
+    (literal_len, match_len, distance)
 }
 
-// ── EOS ─────────────────────────────────────────────────────────────────
-
-/// Writes the 3-byte end-of-stream sentinel into `buf` and returns 3.
-pub(crate) fn encode_eos(buf: &mut [u8]) -> usize {
-    buf[0] = 0x00;
-    buf[1] = 0x00;
-    buf[2] = 0x00;
-    3
+/// Writes the 3-byte end-of-stream sentinel (token `0x00`, distance `0x0000`).
+pub(crate) fn encode_eos(output: &mut impl WriteBuf) {
+    output.write_bytes(&EOS);
 }
 
-// ── Footer ──────────────────────────────────────────────────────────────
-
-/// Encodes the stream footer (ULEB128 length + Adler-32 checksum) into `buf`.
+/// Encodes the stream footer: ULEB128-encoded uncompressed `length` followed
+/// by a 4-byte little-endian Adler-32 `checksum`.
 ///
-/// Returns the number of bytes written (at most 13: 9 for ULEB128 + 4 for checksum).
-pub(crate) fn encode_footer(uncompressed_len: u64, checksum: u32, buf: &mut [u8]) -> usize {
-    let n = encode_uleb128_u64(uncompressed_len, buf);
-    buf[n..n + 4].copy_from_slice(&checksum.to_le_bytes());
-    n + 4
+/// # Examples
+///
+/// ```text
+/// // Footer for the 2-byte input "Hi":
+/// encode_footer(2, 0x00FB_00B2, &mut output);
+/// // Writes: [0x02, 0xB2, 0x00, 0xFB, 0x00]
+/// ```
+pub(crate) fn encode_footer(length: u64, checksum: u32, output: &mut impl WriteBuf) {
+    encode_uleb128_u64(length, output);
+    output.write_u32_le(checksum);
 }
 
-/// Decodes the stream footer from `buf`.
+/// Decodes the stream footer from `input`.
 ///
-/// Returns `(uncompressed_len, checksum, bytes_consumed)`. The caller is
-/// responsible for verifying the length and checksum against the decoded data.
-pub(crate) fn decode_footer(buf: &[u8]) -> (u64, u32, usize) {
-    let (len, n) = decode_uleb128_u64(buf);
-    let checksum = u32::from_le_bytes([buf[n], buf[n + 1], buf[n + 2], buf[n + 3]]);
-    (len, checksum, n + 4)
+/// Reads a ULEB128-encoded uncompressed length and a 4-byte little-endian
+/// Adler-32 checksum. Returns `(length, checksum)`.
+///
+/// # Examples
+///
+/// ```text
+/// let (length, checksum) = decode_footer(&mut input);
+/// assert_eq!(length, 2);
+/// assert_eq!(checksum, 0x00FB_00B2);
+/// ```
+pub(crate) fn decode_footer(input: &mut impl ReadBuf) -> (u64, u32) {
+    let length = decode_uleb128_u64(input);
+    let checksum = input.read_u32_le();
+    (length, checksum)
 }
 
-// ── Extension helpers ───────────────────────────────────────────────────
-
-/// Encodes a length extension chain into `buf` and returns bytes written.
+/// Maps a match length to its 5-bit MMMMM token field and extension remainder.
 ///
-/// The extension represents `extra` additional units beyond the base value.
-/// Always writes at least one byte (a `0x00` byte when `extra == 0`).
-#[allow(clippy::cast_possible_truncation)]
-fn encode_extension(extra: u16, buf: &mut [u8]) -> usize {
-    let mut remaining = extra;
-    let mut offset = 0;
+/// Returns `(mmmmm, remainder)` where `mmmmm` is the 5-bit field packed into the
+/// token byte and `remainder` is the non-negative value written as an extension
+/// chain (only present when `mmmmm` is 0 or 31).
+///
+/// This is the inverse of the [`MATCH_LENGTH_TABLE`] lookup used during decoding.
+fn match_len_to_mmmmm(match_len: i16) -> (u5, i16) {
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    match match_len {
+        0 => (u5::new(6), 0),
+        -8..=-4 => (u5::new((match_len + 9) as u8), 0),
+        ..=-9 => (u5::new(0), -9 - match_len),
+        4..=27 => (u5::new((match_len + 3) as u8), 0),
+        28.. => (u5::new(31), match_len - 28),
+        _ => unreachable!("invalid match length: {match_len}"),
+    }
+}
+
+/// Writes an extension byte chain for the given non-negative remainder.
+///
+/// Emits one or more bytes: each `0xFF` byte adds 255 to the total, and a
+/// final byte in `0x00..=0xFE` terminates the chain. Always writes at least
+/// one byte (a zero remainder produces a single `0x00`).
+fn encode_extension(mut remainder: i16, output: &mut impl WriteBuf) {
     loop {
-        if remaining >= 255 {
-            buf[offset] = 0xFF;
-            offset += 1;
-            remaining -= 255;
+        if remainder >= 255 {
+            output.write_u8(0xFF);
+            remainder -= 255;
         } else {
-            buf[offset] = remaining as u8;
-            offset += 1;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            output.write_u8(remainder as u8);
             break;
         }
     }
-    offset
 }
 
-/// Decodes a length extension chain from `buf`, returning `(sum, bytes_read)`.
-fn decode_extension(buf: &[u8]) -> (u16, usize) {
-    let mut sum: u16 = 0;
-    let mut offset = 0;
+/// Reads an extension byte chain, returning the accumulated sum.
+///
+/// Reads bytes until a value less than 255 is encountered. The sum of all
+/// bytes read (including the terminator) is returned.
+fn decode_extension(input: &mut impl ReadBuf) -> i16 {
+    let mut total: i16 = 0;
     loop {
-        let byte = u16::from(buf[offset]);
-        sum += byte;
-        offset += 1;
+        let byte = input.read_u8();
+        total += i16::from(byte);
         if byte < 255 {
-            break;
+            return total;
         }
     }
-    (sum, offset)
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use super::*;
+    use crate::buffer::Buffer;
+    use crate::cursor::{ReadCursor, WriteCursor};
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
 
-    use super::*;
+    /// Helper: encode into a buffer and return the written bytes.
+    fn encode_frame_to_vec(literal_len: i16, match_len: i16, distance: u16) -> Vec<u8> {
+        let mut buf = Buffer::<256>::new();
+        let mut cursor = WriteCursor::<256>::new(&mut buf, 0);
+        encode_frame(literal_len, match_len, distance, &mut cursor);
+        let len = cursor.position();
+        let (a, b) = buf.slices(0, len);
+        let mut v = Vec::from(a);
+        v.extend_from_slice(b);
+        v
+    }
 
-    // ── Header ──────────────────────────────────────────────────────────
+    /// Helper: decode a frame from a byte slice.
+    fn decode_frame_from_slice(data: &[u8]) -> (i16, i16, u16) {
+        let mut buf = Buffer::<256>::new();
+        buf.copy_from_slice(data, 0);
+        let mut cursor = ReadCursor::<256>::new(&buf, 0);
+        decode_frame(&mut cursor)
+    }
+
+    #[test]
+    fn header_encode() {
+        let mut buf = Buffer::<256>::new();
+        let mut w = WriteCursor::<256>::new(&mut buf, 0);
+        encode_header(&mut w);
+        assert_eq!(w.position(), 4);
+        let (a, _) = buf.slices(0, 4);
+        assert_eq!(a, &[0x4C, 0x5A, 0x52, 0x00]);
+    }
+
+    #[test]
+    fn header_decode_valid() {
+        let mut buf = Buffer::<256>::new();
+        buf.copy_from_slice(&[0x4C, 0x5A, 0x52, 0x00], 0);
+        let mut r = ReadCursor::<256>::new(&buf, 0);
+        assert!(decode_header(&mut r).is_ok());
+        assert_eq!(r.position(), 4);
+    }
+
+    #[test]
+    fn header_decode_bad_magic() {
+        let mut buf = Buffer::<256>::new();
+        buf.copy_from_slice(&[0x00, 0x00, 0x00, 0x00], 0);
+        let mut r = ReadCursor::<256>::new(&buf, 0);
+        let err = decode_header(&mut r).unwrap_err();
+        assert!(matches!(err, Error::InvalidMagic));
+    }
+
+    #[test]
+    fn header_decode_bad_version() {
+        let mut buf = Buffer::<256>::new();
+        buf.copy_from_slice(&[0x4C, 0x5A, 0x52, 0x01], 0);
+        let mut r = ReadCursor::<256>::new(&buf, 0);
+        let err = decode_header(&mut r).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedVersion(0x01)));
+    }
 
     #[test]
     fn header_roundtrip() {
-        let mut buf = [0u8; 4];
-        let n = encode_header(&mut buf);
-        assert_eq!(n, 4);
-        assert_eq!(&buf, &[0x4C, 0x5A, 0x52, 0x00]);
-        assert_eq!(decode_header(&buf).unwrap(), 4);
+        let mut buf = Buffer::<256>::new();
+        let mut w = WriteCursor::<256>::new(&mut buf, 0);
+        encode_header(&mut w);
+
+        let mut r = ReadCursor::<256>::new(&buf, 0);
+        assert!(decode_header(&mut r).is_ok());
     }
 
     #[test]
-    fn header_bad_magic() {
-        let buf = [0x00, 0x00, 0x00, 0x00];
-        assert!(matches!(decode_header(&buf), Err(Error::InvalidMagic)));
+    fn eos_encode() {
+        let mut buf = Buffer::<256>::new();
+        let mut w = WriteCursor::<256>::new(&mut buf, 0);
+        encode_eos(&mut w);
+        assert_eq!(w.position(), 3);
+        let (a, _) = buf.slices(0, 3);
+        assert_eq!(a, &[0x00, 0x00, 0x00]);
     }
 
     #[test]
-    fn header_bad_version() {
-        let buf = [0x4C, 0x5A, 0x52, 0x01];
-        assert!(matches!(decode_header(&buf), Err(Error::UnsupportedVersion(1))));
-    }
-
-    // ── EOS ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn eos_roundtrip() {
-        let mut buf = [0xFFu8; 3];
-        let n = encode_eos(&mut buf);
-        assert_eq!(n, 3);
-        assert_eq!(&buf, &[0x00, 0x00, 0x00]);
-        assert!(decode_frame(&buf).is_none());
-    }
-
-    // ── Extension helpers ───────────────────────────────────────────────
-
-    #[test]
-    fn extension_known_values() {
-        let cases: &[(u16, &[u8])] = &[
-            (0, &[0x00]),
-            (1, &[0x01]),
-            (254, &[0xFE]),
-            (255, &[0xFF, 0x00]),
-            (256, &[0xFF, 0x01]),
-            (510, &[0xFF, 0xFF, 0x00]),
-            (511, &[0xFF, 0xFF, 0x01]),
-        ];
-
-        for &(extra, expected) in cases {
-            let mut buf = [0u8; 130];
-            let n = encode_extension(extra, &mut buf);
-            assert_eq!(&buf[..n], expected, "encode {extra}");
-
-            let (decoded, consumed) = decode_extension(expected);
-            assert_eq!(consumed, expected.len(), "decode len {extra}");
-            assert_eq!(decoded, extra, "decode {extra}");
-        }
-    }
-
-    // ── Frame known values ──────────────────────────────────────────────
-
-    #[test]
-    fn frame_literal_only_hi() {
-        // Worked example from FORMAT.md: "Hi" literal-only frame.
-        // Token 0x46 = 010_00110: L=2, M=6 (literal-only).
-        // Distance 0x0000 (ignored). Literals: 0x48 0x69.
-        let mut buf = [0u8; 64];
-        let n = encode_frame(b"Hi", 0, 0, &mut buf);
-        assert_eq!(&buf[..n], &[0x46, 0x00, 0x00, 0x48, 0x69]);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 2);
-        assert_eq!(distance, 0);
-        assert_eq!(match_length, 0);
-        assert_eq!(header_size, 3);
-        assert_eq!(&buf[header_size..header_size + usize::from(lit_count.cast_unsigned())], b"Hi");
+    fn worked_example_literal_only() {
+        // FORMAT.md: Token 0x46 = 010_00110: L=2, M=6 (literal-only), distance ignored.
+        let bytes = encode_frame_to_vec(2, 0, 0);
+        assert_eq!(bytes, vec![0x46, 0x00, 0x00]);
     }
 
     #[test]
-    fn frame_forward_match_no_literals() {
-        // match_length=4, distance=1 → M=7, L=0. Token = 000_00111 = 0x07.
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&[], 4, 1, &mut buf);
-        assert_eq!(&buf[..n], &[0x07, 0x01, 0x00]);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 0);
-        assert_eq!(distance, 1);
-        assert_eq!(match_length, 4);
-        assert_eq!(header_size, 3);
+    fn eos_decode() {
+        let (lit, mat, dist) = decode_frame_from_slice(&[0x00, 0x00, 0x00]);
+        assert_eq!((lit, mat, dist), (0, -9, 0));
     }
 
     #[test]
-    fn frame_reverse_match() {
-        // match_length=-4, distance=10 → M=5, L=0. Token = 000_00101 = 0x05.
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&[], -4, 10, &mut buf);
-        assert_eq!(&buf[..n], &[0x05, 0x0A, 0x00]);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 0);
-        assert_eq!(distance, 10);
-        assert_eq!(match_length, -4);
-        assert_eq!(header_size, 3);
+    fn boundary_match_neg9() {
+        // match_len=-9 uses MMMMM=0 sentinel with extension byte 0x00.
+        let bytes = encode_frame_to_vec(0, -9, 1);
+        assert_eq!(bytes, vec![0x00, 0x01, 0x00, 0x00]); // token, dist_lo, dist_hi, ext=0
+        let decoded = decode_frame_from_slice(&bytes);
+        assert_eq!(decoded, (0, -9, 1));
     }
 
     #[test]
-    fn frame_negative_extension() {
-        // match_length=-9, distance=5 → M=0, extension byte 0x00.
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&[], -9, 5, &mut buf);
-        assert_eq!(&buf[..n], &[0x00, 0x05, 0x00, 0x00]);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 0);
-        assert_eq!(distance, 5);
-        assert_eq!(match_length, -9);
-        assert_eq!(header_size, 4);
+    fn boundary_match_neg4() {
+        let bytes = encode_frame_to_vec(0, -4, 100);
+        let decoded = decode_frame_from_slice(&bytes);
+        assert_eq!(decoded, (0, -4, 100));
     }
 
     #[test]
-    fn frame_negative_extension_larger() {
-        // match_length=-10, distance=5 → M=0, extension byte 0x01.
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&[], -10, 5, &mut buf);
-        assert_eq!(&buf[..n], &[0x00, 0x05, 0x00, 0x01]);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 0);
-        assert_eq!(distance, 5);
-        assert_eq!(match_length, -10);
-        assert_eq!(header_size, 4);
+    fn boundary_match_4() {
+        let bytes = encode_frame_to_vec(0, 4, 500);
+        let decoded = decode_frame_from_slice(&bytes);
+        assert_eq!(decoded, (0, 4, 500));
     }
 
     #[test]
-    fn frame_positive_extension() {
-        // match_length=28, distance=100 → M=31, extension byte 0x00.
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&[], 28, 100, &mut buf);
-        assert_eq!(&buf[..n], &[0x1F, 0x64, 0x00, 0x00]);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 0);
-        assert_eq!(distance, 100);
-        assert_eq!(match_length, 28);
-        assert_eq!(header_size, 4);
+    fn boundary_match_28() {
+        // match_len=28 uses MMMMM=31 sentinel with extension byte 0x00.
+        let bytes = encode_frame_to_vec(0, 28, 1);
+        assert_eq!(bytes[3], 0x00); // extension byte
+        let decoded = decode_frame_from_slice(&bytes);
+        assert_eq!(decoded, (0, 28, 1));
     }
 
     #[test]
-    fn frame_positive_extension_larger() {
-        // match_length=30, distance=100 → M=31, extension byte 0x02.
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&[], 30, 100, &mut buf);
-        assert_eq!(&buf[..n], &[0x1F, 0x64, 0x00, 0x02]);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 0);
-        assert_eq!(distance, 100);
-        assert_eq!(match_length, 30);
-        assert_eq!(header_size, 4);
+    fn large_literal_extension() {
+        // literal_len=262 = 7 + 255 + 0
+        let bytes = encode_frame_to_vec(262, 4, 1);
+        let decoded = decode_frame_from_slice(&bytes);
+        assert_eq!(decoded, (262, 4, 1));
     }
 
     #[test]
-    fn frame_literal_extension() {
-        // 10 literal bytes, match_length=0 → L=7, extension byte 0x03.
-        let literals = [0xAA; 10];
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&literals, 0, 0, &mut buf);
-        // Token: 111_00110 = 0xE6. Distance: 0x0000. Lit ext: 0x03. Then 10 literal bytes.
-        assert_eq!(buf[0], 0xE6);
-        assert_eq!(&buf[1..3], &[0x00, 0x00]);
-        assert_eq!(buf[3], 0x03);
-        assert_eq!(&buf[4..14], &[0xAA; 10]);
-        assert_eq!(n, 14);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 10);
-        assert_eq!(distance, 0);
-        assert_eq!(match_length, 0);
-        assert_eq!(header_size, 4);
+    fn large_positive_match_extension() {
+        // match_len=283 = 28 + 255 + 0
+        let bytes = encode_frame_to_vec(0, 283, 1);
+        let decoded = decode_frame_from_slice(&bytes);
+        assert_eq!(decoded, (0, 283, 1));
     }
 
     #[test]
-    fn frame_both_extensions() {
-        // 10 literals + match_length=30, distance=500.
-        // L=7, ext 0x03. M=31, ext 0x02.
-        let literals = [0xBB; 10];
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&literals, 30, 500, &mut buf);
-        // Token: 111_11111 = 0xFF. Distance: 500 LE = [0xF4, 0x01].
-        // Lit ext: 0x03. Match ext: 0x02. Then 10 literal bytes.
-        assert_eq!(buf[0], 0xFF);
-        assert_eq!(&buf[1..3], &[0xF4, 0x01]);
-        assert_eq!(buf[3], 0x03); // lit ext
-        assert_eq!(buf[4], 0x02); // match ext
-        assert_eq!(&buf[5..15], &[0xBB; 10]);
-        assert_eq!(n, 15);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 10);
-        assert_eq!(distance, 500);
-        assert_eq!(match_length, 30);
-        assert_eq!(header_size, 5);
+    fn large_negative_match_extension() {
+        // match_len=-264 = -9 - 255 - 0
+        let bytes = encode_frame_to_vec(0, -264, 1);
+        let decoded = decode_frame_from_slice(&bytes);
+        assert_eq!(decoded, (0, -264, 1));
     }
 
-    // ── Footer ──────────────────────────────────────────────────────────
-
     #[test]
-    fn footer_worked_example() {
-        // From FORMAT.md: uncompressed length 2, Adler-32 0x00FB00B2.
-        let mut buf = [0u8; 16];
-        let n = encode_footer(2, 0x00FB_00B2, &mut buf);
-        assert_eq!(&buf[..n], &[0x02, 0xB2, 0x00, 0xFB, 0x00]);
-        assert_eq!(n, 5);
+    fn footer_roundtrip_known() {
+        let mut buf = Buffer::<64>::new();
+        let mut w = WriteCursor::<64>::new(&mut buf, 0);
+        encode_footer(42, 0x00FB_00B2, &mut w);
+        let len = w.position();
 
-        let (len, checksum, consumed) = decode_footer(&buf);
-        assert_eq!(len, 2);
+        let mut r = ReadCursor::<64>::new(&buf, 0);
+        let (length, checksum) = decode_footer(&mut r);
+        assert_eq!(length, 42);
         assert_eq!(checksum, 0x00FB_00B2);
-        assert_eq!(consumed, 5);
+        assert_eq!(r.position(), len);
     }
 
     #[test]
-    fn footer_large_length() {
-        let mut buf = [0u8; 16];
-        let n = encode_footer(u64::MAX, 0xDEAD_BEEF, &mut buf);
-        assert_eq!(n, 13); // 9 ULEB128 bytes + 4 checksum bytes
-
-        let (len, checksum, consumed) = decode_footer(&buf);
-        assert_eq!(len, u64::MAX);
-        assert_eq!(checksum, 0xDEAD_BEEF);
-        assert_eq!(consumed, 13);
+    #[should_panic(expected = "invalid match length")]
+    fn invalid_match_length() {
+        let _ = match_len_to_mmmmm(-3);
     }
 
-    // ── Edge cases ──────────────────────────────────────────────────────
-
-    #[test]
-    fn frame_max_literal_count() {
-        let literals = vec![0x42u8; 32_767];
-        let mut buf = vec![0u8; MAX_FRAME_HEADER + 32_767];
-        let n = encode_frame(&literals, 0, 0, &mut buf);
-
-        let (lit_count, _, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 32_767);
-        assert_eq!(match_length, 0);
-        assert_eq!(&buf[header_size..header_size + 32_767], &literals[..]);
-        assert_eq!(n, header_size + 32_767);
-    }
-
-    #[test]
-    fn frame_max_positive_match() {
-        let mut buf = [0u8; 512];
-        let n = encode_frame(&[], 32_767, 1000, &mut buf);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 0);
-        assert_eq!(distance, 1000);
-        assert_eq!(match_length, 32_767);
-        assert_eq!(header_size, n);
-    }
-
-    #[test]
-    fn frame_max_negative_match() {
-        let mut buf = [0u8; 512];
-        let n = encode_frame(&[], -32_768, 1000, &mut buf);
-
-        let (lit_count, distance, match_length, header_size) = decode_frame(&buf).unwrap();
-        assert_eq!(lit_count, 0);
-        assert_eq!(distance, 1000);
-        assert_eq!(match_length, -32_768);
-        assert_eq!(header_size, n);
-    }
-
-    #[test]
-    fn frame_max_distance() {
-        let mut buf = [0u8; 64];
-        let n = encode_frame(&[], 4, 65_535, &mut buf);
-        assert_eq!(&buf[1..3], &[0xFF, 0xFF]);
-
-        let (_, distance, _, _) = decode_frame(&buf).unwrap();
-        assert_eq!(distance, 65_535);
-        assert_eq!(n, 3);
-    }
-
-    #[test]
-    fn frame_min_distance() {
-        let mut buf = [0u8; 64];
-        encode_frame(&[], 4, 1, &mut buf);
-
-        let (_, distance, _, _) = decode_frame(&buf).unwrap();
-        assert_eq!(distance, 1);
-    }
-
-    // ── Proptest ────────────────────────────────────────────────────────
-
-    fn match_length_strategy() -> impl Strategy<Value = i16> {
-        prop_oneof![
-            (-32_768i16..=-4), // reverse match
-            Just(0i16),        // literal-only
-            (4i16..=32_767),   // forward match
-        ]
+    /// Generates valid match lengths for property testing.
+    fn valid_match_len() -> impl Strategy<Value = i16> {
+        prop_oneof![Just(0i16), (-8..=-4i16), (4..=27i16), (-500..=-9i16), (28..=500i16),]
     }
 
     proptest! {
         #[test]
         fn frame_roundtrip(
-            lit_len in 0u16..=1000,
-            match_length in match_length_strategy(),
-            distance in 1u16..=65_535,
+            literal_len in 0..=500i16,
+            match_len in valid_match_len(),
+            distance in 1..=u16::MAX,
         ) {
-            let literals: Vec<u8> = (0..lit_len).map(|i| u8::try_from(i % 256).unwrap()).collect();
-            let mut buf = vec![0u8; MAX_FRAME_HEADER + literals.len()];
-            let n = encode_frame(&literals, match_length, distance, &mut buf);
-
-            let result = decode_frame(&buf);
-            prop_assert!(result.is_some(), "should not decode as EOS");
-            let (dec_lit, dec_dist, dec_match, header_size) = result.unwrap();
-
-            prop_assert_eq!(dec_lit, lit_len.cast_signed());
-            prop_assert_eq!(dec_match, match_length);
-            prop_assert_eq!(dec_dist, distance);
-
-            let lit_usize = usize::from(lit_len);
-            prop_assert_eq!(&buf[header_size..header_size + lit_usize], &literals[..]);
-            prop_assert_eq!(n, header_size + lit_usize);
+            let bytes = encode_frame_to_vec(literal_len, match_len, distance);
+            let decoded = decode_frame_from_slice(&bytes);
+            prop_assert_eq!(decoded, (literal_len, match_len, distance));
         }
 
         #[test]
-        fn extension_roundtrip(extra: u16) {
-            let mut buf = [0u8; 258];
-            let n = encode_extension(extra, &mut buf);
-            let (decoded, consumed) = decode_extension(&buf);
-            prop_assert_eq!(consumed, n);
-            prop_assert_eq!(decoded, extra);
-        }
+        fn footer_roundtrip(length: u64, checksum: u32) {
+            let mut buf = Buffer::<64>::new();
+            let mut w = WriteCursor::<64>::new(&mut buf, 0);
+            encode_footer(length, checksum, &mut w);
 
-        #[test]
-        fn footer_roundtrip(len: u64, checksum: u32) {
-            let mut buf = [0u8; 16];
-            let n = encode_footer(len, checksum, &mut buf);
-            let (dec_len, dec_checksum, consumed) = decode_footer(&buf);
-            prop_assert_eq!(consumed, n);
-            prop_assert_eq!(dec_len, len);
-            prop_assert_eq!(dec_checksum, checksum);
+            let mut r = ReadCursor::<64>::new(&buf, 0);
+            let (dec_len, dec_cksum) = decode_footer(&mut r);
+            prop_assert_eq!(dec_len, length);
+            prop_assert_eq!(dec_cksum, checksum);
         }
     }
 }

@@ -22,18 +22,18 @@ use crate::cursor::{ReadBuf, WriteBuf};
 /// assert_eq!(cur.position(), 2);
 /// ```
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn encode_uleb128_u64(mut value: u64, w: &mut impl WriteBuf) {
+pub(crate) fn encode_uleb128_u64(mut value: u64, output: &mut impl WriteBuf) {
     for _ in 0..8 {
         let byte = (value & 0x7F) as u8;
         value >>= 7;
         if value == 0 {
-            w.write_u8(byte);
+            output.write_u8(byte);
             return;
         }
-        w.write_u8(byte | 0x80);
+        output.write_u8(byte | 0x80);
     }
     // 9th byte: all 8 bits are payload.
-    w.write_u8(value as u8);
+    output.write_u8(value as u8);
 }
 
 /// Decodes a ULEB128-encoded `u64` from `r`.
@@ -49,12 +49,12 @@ pub(crate) fn encode_uleb128_u64(mut value: u64, w: &mut impl WriteBuf) {
 /// assert_eq!(decode_uleb128_u64(&mut cur), 128);
 /// assert_eq!(cur.position(), 2);
 /// ```
-pub(crate) fn decode_uleb128_u64(r: &mut impl ReadBuf) -> u64 {
+pub(crate) fn decode_uleb128_u64(input: &mut impl ReadBuf) -> u64 {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
 
     for _ in 0..8 {
-        let byte = r.read_u8();
+        let byte = input.read_u8();
         value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             return value;
@@ -62,7 +62,7 @@ pub(crate) fn decode_uleb128_u64(r: &mut impl ReadBuf) -> u64 {
         shift += 7;
     }
     // 9th byte: all 8 bits are payload.
-    value |= u64::from(r.read_u8()) << shift;
+    value |= u64::from(input.read_u8()) << shift;
     value
 }
 
