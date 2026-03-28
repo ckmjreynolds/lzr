@@ -59,13 +59,13 @@ Match length is a signed 16-bit integer (i16). MMMMM=0 (length -9) triggers a ne
 
 ### Distance
 
-Bytes 1–2 of the frame. A 16-bit little-endian unsigned integer encoding a distance of `1..=65,536` (stored as `value - 1`).
+Bytes 1–2 of the frame. A 16-bit little-endian unsigned integer (`0..=65,535`). Distance 0 is reserved for the end-of-stream sentinel; valid match distances are `1..=65,535`.
 
 When match length is 0 (literal-only frame), the distance is ignored but still present. Encoders may write any value; decoders must not interpret it.
 
 ### End of Stream
 
-Token `0x00` with distance `0xFFFF`. This encodes zero literals, match length -9 at distance 65,536 — a match that would read outside the sliding window, reserved as the end-of-stream sentinel.
+Token `0x00` with distance `0x0000`. This encodes zero literals with match length -9 at distance 0 — a reserved sentinel that signals the end of the frame sequence.
 
 ### Length Extension
 
@@ -80,7 +80,7 @@ When a length field is at its maximum base value, one or more extension bytes fo
 
 `total_literals = 7 + sum(ext_bytes)`
 
-Literal length is an unsigned 16-bit quantity (u16). Encoders must not produce literal lengths exceeding 65,535; decoder behavior for out-of-range lengths is undefined.
+Literal length is a signed 16-bit quantity (i16). Encoders must not produce literal lengths outside 0..=32,767; decoder behavior for out-of-range lengths is undefined.
 
 **Positive match extension** (MMMMM=31, length 28): appears after literal extension bytes (if any), before literal data.
 
@@ -172,7 +172,7 @@ Literals = `0x48 0x69`.
 **Frame 2 — End of Stream:**
 
 Token = `0x00` = `000_00000`: L=0, M=0 (match length -9).
-Distance = `0xFF 0xFF` (65,536, out of bounds).
+Distance = `0x00 0x00` (0, reserved sentinel).
 
 **Footer:**
 
@@ -182,6 +182,6 @@ Distance = `0xFF 0xFF` (65,536, out of bounds).
 **Complete stream (17 bytes):**
 
 ```
-4C 5A 52 00  46 00 00 48 69  00 FF FF  02 B2 00 FB 00
+4C 5A 52 00  46 00 00 48 69  00 00 00  02 B2 00 FB 00
 ├─ Header ─┤ ├── Frame 1 ──┤ ├─ EOS ─┤ ├── Footer ──┤
 ```

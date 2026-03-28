@@ -28,7 +28,7 @@ use std::ops::{Index, IndexMut, Range};
 /// assert_eq!([a, b].concat(), b"hello");
 /// ```
 pub(crate) struct Buffer<const N: usize> {
-    buf: Vec<u8>,
+    buf: Box<[u8; N]>,
 }
 
 impl<const N: usize> Buffer<N> {
@@ -50,7 +50,7 @@ impl<const N: usize> Buffer<N> {
     /// ```
     pub(crate) fn new() -> Self {
         Self {
-            buf: vec![0u8; N],
+            buf: vec![0u8; N].into_boxed_slice().try_into().unwrap(),
         }
     }
 

@@ -52,6 +52,8 @@ impl Adler32 {
     #[allow(clippy::cast_lossless)]
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn update(&mut self, data: &[u8]) {
+        // AUTOVECTORIZED: Don't touch without benchmarking!
+        //
         // FAST_NMAX represents the value I've found that performs the best. ~12GB/s vs ~7GB/s
         // checksum/compute        time:   [309.80 µs 310.32 µs 310.83 µs]
         //                         thrpt:  [12.127 GiB/s 12.147 GiB/s 12.167 GiB/s]

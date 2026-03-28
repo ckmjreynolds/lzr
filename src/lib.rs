@@ -6,6 +6,8 @@
 
 pub(crate) mod adler32;
 pub(crate) mod buffer;
+pub(crate) mod cursor;
+// pub(crate) mod format;
 pub(crate) mod hashmap;
 pub(crate) mod matchfinder;
 pub(crate) mod uleb128;
