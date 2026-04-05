@@ -65,7 +65,3 @@ codegen-units = 1
 [profile.bench]
 lto = "thin"
 codegen-units = 1
-
-[profile.samply]
-inherits = "release"
-debug = true
