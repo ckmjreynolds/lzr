@@ -83,11 +83,11 @@ mod tests {
 
             let mut wc = WriteCursor::new(&mut buf, 0);
             encode_uleb128_u64(value, &mut wc);
-            let written = wc.position();
+            let end = wc.position();
 
-            let mut rc = ReadCursor::new(&buf, 0);
+            let mut rc = ReadCursor::new(&mut buf, 0, end);
             let decoded = decode_uleb128_u64(&mut rc);
-            prop_assert_eq!(rc.position(), written);
+            prop_assert_eq!(rc.position(), end);
             prop_assert_eq!(decoded, value);
         }
     }
@@ -119,7 +119,7 @@ mod tests {
             assert_eq!(&encoded[..], expected, "encode {value}");
 
             // Verify decoding reads the expected value.
-            let mut rc = ReadCursor::new(&buf, 0);
+            let mut rc = ReadCursor::new(&mut buf, 0, expected.len());
             let decoded = decode_uleb128_u64(&mut rc);
             assert_eq!(rc.position(), expected.len(), "decode len {value}");
             assert_eq!(decoded, value, "decode {value}");

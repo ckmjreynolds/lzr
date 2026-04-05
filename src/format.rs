@@ -256,7 +256,7 @@ mod tests {
     fn decode_frame_from_slice(data: &[u8]) -> (i16, i16, u16) {
         let mut buf = Buffer::<256>::new();
         buf.copy_from_slice(data, 0);
-        let mut cursor = ReadCursor::<256>::new(&buf, 0);
+        let mut cursor = ReadCursor::<256>::new(&mut buf, 0, data.len());
         decode_frame(&mut cursor)
     }
 
@@ -274,7 +274,7 @@ mod tests {
     fn header_decode_valid() {
         let mut buf = Buffer::<256>::new();
         buf.copy_from_slice(&[0x4C, 0x5A, 0x52, 0x00], 0);
-        let mut r = ReadCursor::<256>::new(&buf, 0);
+        let mut r = ReadCursor::<256>::new(&mut buf, 0, 4);
         assert!(decode_header(&mut r).is_ok());
         assert_eq!(r.position(), 4);
     }
@@ -283,7 +283,7 @@ mod tests {
     fn header_decode_bad_magic() {
         let mut buf = Buffer::<256>::new();
         buf.copy_from_slice(&[0x00, 0x00, 0x00, 0x00], 0);
-        let mut r = ReadCursor::<256>::new(&buf, 0);
+        let mut r = ReadCursor::<256>::new(&mut buf, 0, 4);
         let err = decode_header(&mut r).unwrap_err();
         assert!(matches!(err, Error::InvalidMagic));
     }
@@ -292,7 +292,7 @@ mod tests {
     fn header_decode_bad_version() {
         let mut buf = Buffer::<256>::new();
         buf.copy_from_slice(&[0x4C, 0x5A, 0x52, 0x01], 0);
-        let mut r = ReadCursor::<256>::new(&buf, 0);
+        let mut r = ReadCursor::<256>::new(&mut buf, 0, 4);
         let err = decode_header(&mut r).unwrap_err();
         assert!(matches!(err, Error::UnsupportedVersion(0x01)));
     }
@@ -303,7 +303,7 @@ mod tests {
         let mut w = WriteCursor::<256>::new(&mut buf, 0);
         encode_header(&mut w);
 
-        let mut r = ReadCursor::<256>::new(&buf, 0);
+        let mut r = ReadCursor::<256>::new(&mut buf, 0, 4);
         assert!(decode_header(&mut r).is_ok());
     }
 
@@ -391,13 +391,13 @@ mod tests {
         let mut buf = Buffer::<64>::new();
         let mut w = WriteCursor::<64>::new(&mut buf, 0);
         encode_footer(42, 0x00FB_00B2, &mut w);
-        let len = w.position();
+        let end = w.position();
 
-        let mut r = ReadCursor::<64>::new(&buf, 0);
+        let mut r = ReadCursor::<64>::new(&mut buf, 0, end);
         let (length, checksum) = decode_footer(&mut r);
         assert_eq!(length, 42);
         assert_eq!(checksum, 0x00FB_00B2);
-        assert_eq!(r.position(), len);
+        assert_eq!(r.position(), end);
     }
 
     #[test]
@@ -428,8 +428,9 @@ mod tests {
             let mut buf = Buffer::<64>::new();
             let mut w = WriteCursor::<64>::new(&mut buf, 0);
             encode_footer(length, checksum, &mut w);
+            let end = w.position();
 
-            let mut r = ReadCursor::<64>::new(&buf, 0);
+            let mut r = ReadCursor::<64>::new(&mut buf, 0, end);
             let (dec_len, dec_cksum) = decode_footer(&mut r);
             prop_assert_eq!(dec_len, length);
             prop_assert_eq!(dec_cksum, checksum);

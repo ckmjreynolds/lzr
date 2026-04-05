@@ -4,6 +4,7 @@
 //! bitmask indexing (`index & (N - 1)`) so that logical positions wrap automatically.
 //! This avoids explicit modulo arithmetic in the encoder and decoder hot paths.
 
+use std::io::{self, Read, Write};
 use std::ops::{Index, IndexMut, Range};
 
 /// A fixed-size circular byte buffer with power-of-two masking.
@@ -139,6 +140,31 @@ impl<const N: usize> Buffer<N> {
         } else {
             (&self.buf[start..], &self.buf[..end - N])
         }
+    }
+
+    /// Reads from `src` into the buffer starting at logical position `start`,
+    /// filling up to `len` bytes across the ring boundary.
+    ///
+    /// Returns the number of bytes actually read. A short read from the first
+    /// physical slice skips the second slice (matching [`Read::read`] semantics).
+    pub(crate) fn read_from(&mut self, start: usize, len: usize, src: &mut impl Read) -> io::Result<usize> {
+        let (a, b) = self.slices_mut(start, len);
+        let n1 = src.read(a)?;
+        let mut total = n1;
+        if n1 == a.len() && !b.is_empty() {
+            total += src.read(b)?;
+        }
+        Ok(total)
+    }
+
+    /// Writes `len` bytes starting at logical position `start` to `dst`.
+    pub(crate) fn write_to(&self, start: usize, len: usize, dst: &mut impl Write) -> io::Result<()> {
+        let (a, b) = self.slices(start, len);
+        dst.write_all(a)?;
+        if !b.is_empty() {
+            dst.write_all(b)?;
+        }
+        Ok(())
     }
 
     /// Mutable variant of [`Buffer::slices`].
@@ -305,5 +331,49 @@ mod tests {
                 prop_assert_eq!(&buf.buf[..], &oracle[..]);
             }
         }
+    }
+
+    #[test]
+    fn read_from_basic() {
+        let mut buf = Buffer::<256>::new();
+        let n = buf.read_from(0, 5, &mut &b"hello"[..]).unwrap();
+        assert_eq!(n, 5);
+        let (a, _) = buf.slices(0, 5);
+        assert_eq!(a, b"hello");
+    }
+
+    #[test]
+    fn read_from_wraps() {
+        let mut buf = Buffer::<256>::new();
+        let n = buf.read_from(254, 5, &mut &b"wrap!"[..]).unwrap();
+        assert_eq!(n, 5);
+        let (a, b) = buf.slices(254, 5);
+        assert_eq!(a, b"wr");
+        assert_eq!(b, b"ap!");
+    }
+
+    #[test]
+    fn read_from_partial() {
+        let mut buf = Buffer::<256>::new();
+        let n = buf.read_from(0, 100, &mut &b"short"[..]).unwrap();
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn write_to_basic() {
+        let mut buf = Buffer::<256>::new();
+        buf.copy_from_slice(b"hello", 0);
+        let mut out = Vec::new();
+        buf.write_to(0, 5, &mut out).unwrap();
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn write_to_wraps() {
+        let mut buf = Buffer::<256>::new();
+        buf.copy_from_slice(b"wrap!", 254);
+        let mut out = Vec::new();
+        buf.write_to(254, 5, &mut out).unwrap();
+        assert_eq!(out, b"wrap!");
     }
 }
