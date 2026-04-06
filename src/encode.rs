@@ -1,14 +1,14 @@
 //! LZR compression encoder.
 //!
 //! Compresses raw data into the LZR format using LZ77-based matching with
-//! hash-table-driven match finding. Supports compression levels 1–9, where
-//! levels 1–8 check 1–8 forward match candidates and level 9 additionally
-//! checks 8 reverse match candidates.
+//! hash-table-driven match finding. Supports compression levels 1–9; the
+//! number of forward and reverse match candidates checked at each level is
+//! defined by [`candidates_for_level`].
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 
 use rayon::prelude::*;
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::adler32::Adler32;
 use crate::buffer::Buffer;
@@ -27,6 +27,17 @@ const MAX_LIT_LEN: usize = i16::MAX as usize;
 
 /// Maximum match length per frame (limited by i16).
 const MAX_MATCH_LEN: usize = i16::MAX as usize;
+
+/// Per-level number of hash-bucket candidates to inspect.
+///
+/// Index 0 is unused. L1 always inspects only the most recent candidate so the
+/// fast path stays fast; L2..=L9 scale linearly up to [`Queue::CAPACITY`].
+/// Reverse matching (L9 only today) uses the same depth as forward.
+const fn candidates_for_level(level: usize) -> usize {
+    // 4-slot Queue: L1 keeps the fast path at 1 candidate; L4..=L9 saturate at 4.
+    const TABLE: [usize; 10] = [0, 1, 2, 3, 4, 4, 4, 4, 4, 4];
+    TABLE[level]
+}
 
 /// Compresses data from `input` into LZR format, writing to `output`.
 ///
@@ -163,12 +174,20 @@ fn compress_block<'a>(
         return (cursor, checksum);
     }
 
+    // L1 specialization: a much smaller value type (`u16` instead of `Queue`)
+    // halves the FxHashMap bucket footprint, which Phase D measurements showed
+    // is the dominant cost driver for the L1 fast path.
+    if level == 1 {
+        compress_block_l1_inner(input, &mut cursor, prefix_start, block_start, block_end);
+        return (cursor, checksum);
+    }
+
     let use_reverse = level >= 9;
-    let mut forward_map: HashMap<u32, Queue> = HashMap::with_capacity(WINDOW_SIZE);
-    let mut reverse_map: HashMap<u32, Queue> = if use_reverse {
-        HashMap::with_capacity(WINDOW_SIZE)
+    let mut forward_map: FxHashMap<u32, Queue> = FxHashMap::with_capacity_and_hasher(WINDOW_SIZE, FxBuildHasher);
+    let mut reverse_map: FxHashMap<u32, Queue> = if use_reverse {
+        FxHashMap::with_capacity_and_hasher(WINDOW_SIZE, FxBuildHasher)
     } else {
-        HashMap::new()
+        FxHashMap::default()
     };
 
     // Phase 1: populate hash maps with prefix positions.
@@ -241,12 +260,102 @@ fn compress_block<'a>(
     (cursor, checksum)
 }
 
+/// L1-only main scan with a `FxHashMap<u32, u16>` (no `Queue`, no reverse, no
+/// candidate walking). Caller has already initialized the cursor and checksum
+/// and verified `block_len >= 4`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn compress_block_l1_inner(
+    input: &Buffer<BATCH_SIZE>,
+    cursor: &mut WriteCursor<'_, OUTPUT_BUF_SIZE>,
+    prefix_start: usize,
+    block_start: usize,
+    block_end: usize,
+) {
+    let block_len = block_end - block_start;
+    let mut map: FxHashMap<u32, u16> = FxHashMap::with_capacity_and_hasher(WINDOW_SIZE, FxBuildHasher);
+
+    // Phase 1: prefix walk — store the most recent position per hash key.
+    for p in prefix_start..block_start {
+        let key = read_u32_le(input, p);
+        map.insert(key, p as u16);
+    }
+
+    // Phase 2: main scan.
+    let mut pos = block_start;
+    let mut literal_start = block_start;
+
+    while pos + 4 <= block_end {
+        if cursor.position() > block_len {
+            break;
+        }
+
+        let key = read_u32_le(input, pos);
+        let best = find_l1_match(input, &map, key, pos, block_end);
+
+        // Insert AFTER searching so we never match against ourselves.
+        map.insert(key, pos as u16);
+
+        if let Some((match_len, distance)) = best {
+            emit_match_frame(input, cursor, literal_start, pos, match_len as i16, distance);
+
+            // Insert skipped positions inside the matched span.
+            let match_end = pos + match_len;
+            for skip in (pos + 1)..match_end {
+                if skip + 4 > block_end {
+                    break;
+                }
+                let skey = read_u32_le(input, skip);
+                map.insert(skey, skip as u16);
+            }
+
+            pos = match_end;
+            literal_start = pos;
+        } else {
+            pos += 1;
+        }
+    }
+
+    // Phase 3: trailing literals.
+    if literal_start < block_end {
+        emit_literals(input, cursor, literal_start, block_end);
+    }
+}
+
+/// L1-only single-candidate forward match: look up the most recent position
+/// for `key`, verify the 4-byte hash, and expand forward.
+#[allow(clippy::cast_possible_truncation)]
+fn find_l1_match(
+    input: &Buffer<BATCH_SIZE>,
+    map: &FxHashMap<u32, u16>,
+    key: u32,
+    pos: usize,
+    block_end: usize,
+) -> Option<(usize, u16)> {
+    let candidate_low = *map.get(&key)?;
+    let distance = (pos as u16).wrapping_sub(candidate_low);
+    if distance == 0 || (distance as usize) > pos {
+        return None;
+    }
+    let cand = pos - distance as usize;
+    if read_u32_le(input, cand) != key {
+        return None;
+    }
+
+    let max_len = (block_end - pos).min(MAX_MATCH_LEN);
+    let mut len = 4;
+    while len < max_len && input[cand + len] == input[pos + len] {
+        len += 1;
+    }
+
+    Some((len, distance))
+}
+
 /// Selects the best forward or reverse match at `pos`.
 #[allow(clippy::too_many_arguments)]
 fn find_best_match(
     input: &Buffer<BATCH_SIZE>,
-    forward_map: &HashMap<u32, Queue>,
-    reverse_map: &HashMap<u32, Queue>,
+    forward_map: &FxHashMap<u32, Queue>,
+    reverse_map: &FxHashMap<u32, Queue>,
     key: u32,
     pos: usize,
     block_end: usize,
@@ -270,7 +379,7 @@ fn find_best_match(
 #[allow(clippy::cast_possible_truncation)]
 fn find_best_forward_match(
     input: &Buffer<BATCH_SIZE>,
-    forward_map: &HashMap<u32, Queue>,
+    forward_map: &FxHashMap<u32, Queue>,
     key: u32,
     pos: usize,
     block_end: usize,
@@ -288,7 +397,7 @@ fn find_best_forward_match(
         return None;
     }
 
-    let candidates = level.min(8);
+    let candidates = candidates_for_level(level);
     let max_len = (block_end - pos).min(MAX_MATCH_LEN);
     let mut best_len: usize = 3;
     let mut best_dist: u16 = 0;
@@ -336,7 +445,7 @@ fn find_best_forward_match(
 #[allow(clippy::cast_possible_truncation)]
 fn find_best_reverse_match(
     input: &Buffer<BATCH_SIZE>,
-    reverse_map: &HashMap<u32, Queue>,
+    reverse_map: &FxHashMap<u32, Queue>,
     forward_key: u32,
     pos: usize,
     block_end: usize,
@@ -359,7 +468,8 @@ fn find_best_reverse_match(
     let mut best_len: usize = 3;
     let mut best_dist: u16 = 0;
 
-    for i in 0..8 {
+    let candidates = candidates_for_level(9);
+    for i in 0..candidates {
         let candidate_low = queue.get(i);
         let raw_dist = (pos as u16).wrapping_sub(candidate_low);
         if raw_dist < 4 || (raw_dist as usize) > pos {
