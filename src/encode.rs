@@ -37,7 +37,6 @@ const MAX_MATCH_LEN: usize = i16::MAX as usize;
 /// # Panics
 ///
 /// Panics if the rayon thread pool cannot be created.
-#[allow(clippy::missing_errors_doc)]
 pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOptions) -> Result<()> {
     let level = options.get_level();
     let threads = options.get_threads();
@@ -45,16 +44,13 @@ pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOp
     let mut in_buf = Buffer::<BATCH_SIZE>::new();
     let mut pos: usize = 0;
 
-    // Write header.
     let mut hdr_buf = Buffer::<WINDOW_SIZE>::new();
     let mut hdr = WriteCursor::new(&mut hdr_buf, 0);
     format::encode_header(&mut hdr);
     hdr.flush(|bytes| output.write_all(bytes))?;
 
     let mut total_checksum = Adler32::new();
-    let mut total_len: u64 = 0;
 
-    // Build a custom thread pool if the user specified a thread count.
     let pool = if threads > 0 {
         Some(rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(std::io::Error::other)?)
     } else {
@@ -69,8 +65,7 @@ pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOp
 
         let data_end = pos + n;
 
-        // Compute block ranges for this batch.
-        let mut blocks = Vec::new();
+        let mut blocks = Vec::with_capacity(n / BLOCK_SIZE + 1);
         let mut block_start = pos;
         while block_start < data_end {
             let block_end = (block_start + BLOCK_SIZE).min(data_end);
@@ -79,12 +74,11 @@ pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOp
             block_start = block_end;
         }
 
-        // Compress blocks in parallel.
         let compress = |&(prefix_start, block_start, block_end): &(usize, usize, usize)| {
             let mut out_buf = Buffer::<OUTPUT_BUF_SIZE>::new();
             let (mut cursor, checksum) =
                 compress_block(&in_buf, &mut out_buf, prefix_start, block_start, block_end, level);
-            let mut compressed = Vec::new();
+            let mut compressed = Vec::with_capacity(OUTPUT_BUF_SIZE);
             cursor
                 .flush(|bytes| {
                     compressed.extend_from_slice(bytes);
@@ -99,21 +93,18 @@ pub fn encode(input: &mut impl Read, output: &mut impl Write, options: &EncodeOp
             |pool| pool.install(|| blocks.par_iter().map(compress).collect()),
         );
 
-        // Write results sequentially and combine checksums.
         for (compressed, checksum) in &results {
             output.write_all(compressed)?;
             total_checksum = total_checksum.combine(checksum);
         }
-        total_len += n as u64;
 
         pos = data_end;
     }
 
-    // Write EOS + footer.
     let mut ftr_buf = Buffer::<WINDOW_SIZE>::new();
     let mut ftr = WriteCursor::new(&mut ftr_buf, 0);
     format::encode_eos(&mut ftr);
-    format::encode_footer(total_len, total_checksum.checksum(), &mut ftr);
+    format::encode_footer(pos as u64, total_checksum.checksum(), &mut ftr);
     ftr.flush(|bytes| output.write_all(bytes))?;
 
     Ok(())
@@ -159,13 +150,10 @@ fn compress_block<'a>(
     let mut cursor = WriteCursor::new(out_buf, 0);
     let block_len = block_end - block_start;
 
-    // Checksum over block bytes only.
     let mut checksum = Adler32::new();
     let (a, b) = input.slices(block_start, block_len);
     checksum.update(a);
-    if !b.is_empty() {
-        checksum.update(b);
-    }
+    checksum.update(b);
 
     // Too small for any match — emit as literals.
     if block_len < 4 {
@@ -185,9 +173,6 @@ fn compress_block<'a>(
 
     // Phase 1: populate hash maps with prefix positions.
     for p in prefix_start..block_start {
-        if p + 4 > block_end {
-            break;
-        }
         let key = read_u32_le(input, p);
         forward_map.entry(key).or_insert_with(Queue::new).enqueue(p as u16);
         if use_reverse {
@@ -199,29 +184,23 @@ fn compress_block<'a>(
     // Phase 2: scan block bytes, find matches, emit frames.
     let mut pos = block_start;
     let mut literal_start = block_start;
-    let mut escaped = false;
 
     while pos + 4 <= block_end {
-        // Escape: stop match-finding when output exceeds input size.
-        if !escaped && cursor.position() > block_len {
-            escaped = true;
+        // Escape: stop match-finding when output exceeds input size, emit remainder as literals.
+        if cursor.position() > block_len {
+            break;
         }
 
         let key = read_u32_le(input, pos);
 
-        let best = if escaped {
-            None
-        } else {
-            find_best_match(input, &forward_map, &reverse_map, key, pos, block_end, prefix_start, level, use_reverse)
-        };
+        let best =
+            find_best_match(input, &forward_map, &reverse_map, key, pos, block_end, prefix_start, level, use_reverse);
 
         // Insert current position AFTER searching.
-        if !escaped {
-            forward_map.entry(key).or_insert_with(Queue::new).enqueue(pos as u16);
-            if use_reverse {
-                let rkey = read_u32_be(input, pos);
-                reverse_map.entry(rkey).or_insert_with(Queue::new).enqueue(pos as u16);
-            }
+        forward_map.entry(key).or_insert_with(Queue::new).enqueue(pos as u16);
+        if use_reverse {
+            let rkey = read_u32_be(input, pos);
+            reverse_map.entry(rkey).or_insert_with(Queue::new).enqueue(pos as u16);
         }
 
         if let Some((match_len, distance, is_reverse)) = best {
@@ -275,26 +254,16 @@ fn find_best_match(
     level: usize,
     use_reverse: bool,
 ) -> Option<(usize, u16, bool)> {
-    let fwd = find_best_forward_match(input, forward_map, key, pos, block_end, level);
+    let fwd = find_best_forward_match(input, forward_map, key, pos, block_end, level).map(|(l, d)| (l, d, false));
 
     if !use_reverse {
-        return fwd.map(|(len, dist)| (len, dist, false));
+        return fwd;
     }
 
-    let rev = find_best_reverse_match(input, reverse_map, key, pos, block_end, prefix_start);
+    let rev = find_best_reverse_match(input, reverse_map, key, pos, block_end, prefix_start).map(|(l, d)| (l, d, true));
 
-    match (fwd, rev) {
-        (Some((fl, fd)), Some((rl, rd))) => {
-            if rl > fl {
-                Some((rl, rd, true))
-            } else {
-                Some((fl, fd, false))
-            }
-        }
-        (Some((fl, fd)), None) => Some((fl, fd, false)),
-        (None, Some((rl, rd))) => Some((rl, rd, true)),
-        (None, None) => None,
-    }
+    // On ties, prefer forward (the last element wins in `max_by_key`).
+    [rev, fwd].into_iter().flatten().max_by_key(|&(len, _, _)| len)
 }
 
 /// Finds the best forward match at `pos`.

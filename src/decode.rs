@@ -59,13 +59,10 @@ fn decode_stream(
 ) -> Result<()> {
     let mut writer = WriteCursor::new(out_buf, 0);
     let mut checksum = Adler32::new();
-    let mut total_len: u64 = 0;
 
-    // Header
     reader.ensure(input, 4)?;
     format::decode_header(reader)?;
 
-    // Frame loop
     loop {
         reader.fill_toward(input, WINDOW_SIZE)?;
 
@@ -77,35 +74,30 @@ fn decode_stream(
             break;
         }
 
-        // Transfer literal bytes from input to output.
         #[allow(clippy::cast_sign_loss)]
         let lit_count = literal_len as usize;
         transfer_literals(reader, input, &mut writer, output, &mut checksum, lit_count)?;
-        total_len += lit_count as u64;
 
-        // Match copy.
-        let abs_match = match_len.unsigned_abs() as usize;
-        if match_len > 0 {
+        if match_len != 0 {
+            let abs_match = match_len.unsigned_abs() as usize;
             flush_if_needed(&mut writer, output, &mut checksum, abs_match)?;
-            writer.copy_within(distance as usize, abs_match);
-            total_len += abs_match as u64;
-        } else if match_len < 0 {
-            flush_if_needed(&mut writer, output, &mut checksum, abs_match)?;
-            writer.copy_within_rev(distance as usize, abs_match);
-            total_len += abs_match as u64;
+            if match_len > 0 {
+                writer.copy_within(distance as usize, abs_match);
+            } else {
+                writer.copy_within_rev(distance as usize, abs_match);
+            }
         }
     }
 
-    // Flush remaining output.
     writer.flush(|bytes| {
         checksum.update(bytes);
         output.write_all(bytes)
     })?;
 
-    // Footer
     reader.fill_toward(input, 13)?;
     let (expected_len, expected_checksum) = format::decode_footer(reader);
 
+    let total_len = writer.position() as u64;
     if total_len != expected_len {
         return Err(Error::LengthMismatch {
             expected: expected_len,
@@ -141,9 +133,7 @@ fn transfer_literals(
 
         let (a, b) = reader.consume(chunk);
         writer.write_bytes(a);
-        if !b.is_empty() {
-            writer.write_bytes(b);
-        }
+        writer.write_bytes(b);
 
         remaining -= chunk;
     }
@@ -266,6 +256,7 @@ mod tests {
         // Encode "ABCDABCD" as: 4 literals "ABCD" + forward match (distance=4, length=4).
         let mut checksum = Adler32::new();
         checksum.update(b"ABCDABCD");
+        let cs = checksum.checksum().to_le_bytes();
 
         #[rustfmt::skip]
         let compressed = [
@@ -276,10 +267,7 @@ mod tests {
             0x41, 0x42, 0x43, 0x44,          // Literals: "ABCD"
             0x00, 0x00, 0x00,                // EOS
             0x08,                            // Footer: length = 8
-            checksum.checksum().to_le_bytes()[0],
-            checksum.checksum().to_le_bytes()[1],
-            checksum.checksum().to_le_bytes()[2],
-            checksum.checksum().to_le_bytes()[3],
+            cs[0], cs[1], cs[2], cs[3],
         ];
         let output = decode_bytes(&compressed).unwrap();
         assert_eq!(output, b"ABCDABCD");
@@ -291,6 +279,7 @@ mod tests {
         // Reverse copy from pos-1 backwards: D, C, B, A.
         let mut checksum = Adler32::new();
         checksum.update(b"ABCDDCBA");
+        let cs = checksum.checksum().to_le_bytes();
 
         #[rustfmt::skip]
         let compressed = [
@@ -301,10 +290,7 @@ mod tests {
             0x41, 0x42, 0x43, 0x44,          // Literals: "ABCD"
             0x00, 0x00, 0x00,                // EOS
             0x08,                            // Footer: length = 8
-            checksum.checksum().to_le_bytes()[0],
-            checksum.checksum().to_le_bytes()[1],
-            checksum.checksum().to_le_bytes()[2],
-            checksum.checksum().to_le_bytes()[3],
+            cs[0], cs[1], cs[2], cs[3],
         ];
         let output = decode_bytes(&compressed).unwrap();
         assert_eq!(output, b"ABCDDCBA");

@@ -65,8 +65,8 @@ bench "lzr -1"    "$LZR -T 1 -l 1"   "$LZR -d"
 bench "lzr -9"    "$LZR -T 1 -l 9"   "$LZR -d"
 
 if command -v lz4 &>/dev/null; then
-    bench "lz4 -1"    "lz4 -1 -c"       "lz4 -d -c"
-    bench "lz4 -9"    "lz4 -9 -c"       "lz4 -d -c"
+    bench "lz4 -1"    "lz4 -1 -T1 -c"   "lz4 -d -c"
+    bench "lz4 -9"    "lz4 -9 -T1 -c"   "lz4 -d -c"
 fi
 
 if command -v gzip &>/dev/null; then
