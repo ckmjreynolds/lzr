@@ -28,3 +28,45 @@ pub fn lipsum_bytes(min_bytes: usize) -> Vec<u8> {
     let text = lipsum(words);
     text.into_bytes()[..min_bytes].to_vec()
 }
+
+/// Thin wrapper around the internal entropy `Model`.
+pub struct EntropyModel(crate::entropy::Model);
+
+impl EntropyModel {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(crate::entropy::Model::new())
+    }
+}
+
+/// Thin wrapper around the internal entropy `Encoder`.
+pub struct EntropyEncoder(crate::entropy::Encoder);
+
+impl EntropyEncoder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(crate::entropy::Encoder::new())
+    }
+
+    pub fn encode(&mut self, symbol: u8, model: &mut EntropyModel, output: &mut Vec<u8>) {
+        self.0.encode(symbol, &mut model.0, output);
+    }
+
+    pub fn finish(self, output: &mut Vec<u8>) {
+        self.0.finish(output);
+    }
+}
+
+/// Thin wrapper around the internal entropy `Decoder`.
+pub struct EntropyDecoder(crate::entropy::Decoder);
+
+impl EntropyDecoder {
+    #[must_use]
+    pub fn new(input: &mut &[u8]) -> Self {
+        Self(crate::entropy::Decoder::new(input))
+    }
+
+    pub fn decode(&mut self, model: &mut EntropyModel, input: &mut &[u8]) -> u8 {
+        self.0.decode(&mut model.0, input)
+    }
+}
