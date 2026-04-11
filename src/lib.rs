@@ -7,7 +7,8 @@ pub(crate) mod adler32;
 pub(crate) mod entropy;
 pub(crate) mod uleb128;
 
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[allow(
     missing_docs,
     missing_copy_implementations,

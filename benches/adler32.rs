@@ -1,8 +1,7 @@
 #![allow(missing_docs)]
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use lipsum::lipsum;
-use lzr::_bench::Adler32;
+use lzr::_bench::{Adler32, lipsum_bytes};
 
 const SIZE: usize = 1_048_576;
 
@@ -18,14 +17,6 @@ fn bench_compute(c: &mut Criterion) {
         });
     });
     group.finish();
-}
-
-/// Generates `min_bytes` of deterministic lipsum text.
-fn lipsum_bytes(min_bytes: usize) -> Vec<u8> {
-    // lipsum counts words, not bytes; average English word is ~5 chars + space.
-    let words = min_bytes / 5 + 1;
-    let text = lipsum(words);
-    text.into_bytes()[..min_bytes].to_vec()
 }
 
 criterion_group!(benches, bench_compute);
