@@ -65,6 +65,26 @@ pub(crate) fn decode_uleb128_u64(buf: &[u8], pos: &mut usize) -> u64 {
     value
 }
 
+/// Returns the number of bytes needed to encode `value` as ULEB128.
+///
+/// Uses `leading_zeros` to compute the result in constant time without
+/// encoding. Returns a value in the range `1..=9`.
+///
+/// # Examples
+///
+/// ```text
+/// assert_eq!(uleb128_u64_len(0), 1);
+/// assert_eq!(uleb128_u64_len(127), 1);
+/// assert_eq!(uleb128_u64_len(128), 2);
+/// assert_eq!(uleb128_u64_len(u64::MAX), 9);
+/// ```
+pub(crate) fn uleb128_u64_len(value: u64) -> usize {
+    // Each of the first 8 bytes carries 7 payload bits; the 9th byte carries
+    // all 8 bits. Ceiling-divide significant bits by 7, then cap at 9.
+    let bits = (64 - value.leading_zeros()).max(1);
+    (bits as usize).div_ceil(7).min(9)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -82,6 +102,15 @@ mod tests {
             let decoded = decode_uleb128_u64(&buf, &mut pos);
             prop_assert_eq!(pos, buf.len());
             prop_assert_eq!(decoded, value);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn len_matches_encode(value: u64) {
+            let mut buf = Vec::new();
+            encode_uleb128_u64(value, &mut buf);
+            prop_assert_eq!(uleb128_u64_len(value), buf.len());
         }
     }
 
@@ -107,6 +136,9 @@ mod tests {
             let decoded = decode_uleb128_u64(expected, &mut pos);
             assert_eq!(pos, expected.len(), "decode len {value}");
             assert_eq!(decoded, value, "decode {value}");
+
+            // Verify length prediction matches actual encoding.
+            assert_eq!(uleb128_u64_len(value), expected.len(), "len {value}");
         }
     }
 }
