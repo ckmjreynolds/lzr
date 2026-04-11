@@ -15,6 +15,14 @@ documentation   = "https://docs.rs/lzr"
 
 include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
+[features]
+# When enabled (the default), a small audited set of `unsafe` primitives in
+# `src/wild.rs` is used for hot-path memory access (unaligned reads, wildcopy).
+# Build with `--no-default-features` to get a fully safe (slightly slower)
+# implementation.
+default = ["unsafe"]
+unsafe = []
+
 [dependencies]
 arbitrary-int = "=2.1.1"
 clap = { version = "=4.6.0", features = ["derive"] }
@@ -38,7 +46,10 @@ non_ascii_idents = "forbid"
 rust_2018_idioms = { level = "warn", priority = -1 }
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 unreachable_pub = "deny"
-unsafe_code = "forbid"
+# Switched from `forbid` to `deny` so the small audited unsafe block in
+# `src/wild.rs` (gated by `feature = "unsafe"`) can opt in via
+# `#[allow(unsafe_code)]`. With `--no-default-features` no `unsafe` is compiled.
+unsafe_code = "deny"
 # Too many false positives in a crate with both a library and executable.
 # unused_crate_dependencies = "warn"
 unused_lifetimes = "warn"

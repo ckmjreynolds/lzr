@@ -6,9 +6,7 @@
 //!
 //! See the [FORMAT.md](../docs/FORMAT.md) specification for details on the encoding.
 
-use crate::cursor::{ReadBuf, WriteBuf};
-
-/// Encodes `value` as ULEB128 into `w`.
+/// Encodes `value` as ULEB128 by appending bytes to `out`.
 ///
 /// Writes at most 9 bytes. Values up to 127 require a single byte;
 /// `u64::MAX` requires exactly 9 bytes.
@@ -16,45 +14,44 @@ use crate::cursor::{ReadBuf, WriteBuf};
 /// # Examples
 ///
 /// ```text
-/// let mut buf = Buffer::<256>::new();
-/// let mut cur = WriteCursor::new(&mut buf, 0);
-/// encode_uleb128_u64(128, &mut cur);
-/// assert_eq!(cur.position(), 2);
+/// let mut out = Vec::new();
+/// encode_uleb128_u64(128, &mut out);
+/// assert_eq!(out, vec![0x80, 0x01]);
 /// ```
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn encode_uleb128_u64(mut value: u64, output: &mut impl WriteBuf) {
+pub(crate) fn encode_uleb128_u64(mut value: u64, out: &mut Vec<u8>) {
     for _ in 0..8 {
         let byte = (value & 0x7F) as u8;
         value >>= 7;
         if value == 0 {
-            output.write_u8(byte);
+            out.push(byte);
             return;
         }
-        output.write_u8(byte | 0x80);
+        out.push(byte | 0x80);
     }
     // 9th byte: all 8 bits are payload.
-    output.write_u8(value as u8);
+    out.push(value as u8);
 }
 
-/// Decodes a ULEB128-encoded `u64` from `r`.
+/// Decodes a ULEB128-encoded `u64` from `buf` starting at `*pos`.
 ///
-/// Reads at most 9 bytes and returns the decoded value.
+/// Advances `*pos` by the number of bytes consumed (1 to 9).
 ///
 /// # Examples
 ///
 /// ```text
-/// let mut buf = Buffer::<256>::new();
-/// // ... write [0x80, 0x01] into buf ...
-/// let mut cur = ReadCursor::new(&buf, 0);
-/// assert_eq!(decode_uleb128_u64(&mut cur), 128);
-/// assert_eq!(cur.position(), 2);
+/// let buf = [0x80, 0x01];
+/// let mut pos = 0;
+/// assert_eq!(decode_uleb128_u64(&buf, &mut pos), 128);
+/// assert_eq!(pos, 2);
 /// ```
-pub(crate) fn decode_uleb128_u64(input: &mut impl ReadBuf) -> u64 {
+pub(crate) fn decode_uleb128_u64(buf: &[u8], pos: &mut usize) -> u64 {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
 
     for _ in 0..8 {
-        let byte = input.read_u8();
+        let byte = buf[*pos];
+        *pos += 1;
         value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             return value;
@@ -62,7 +59,9 @@ pub(crate) fn decode_uleb128_u64(input: &mut impl ReadBuf) -> u64 {
         shift += 7;
     }
     // 9th byte: all 8 bits are payload.
-    value |= u64::from(input.read_u8()) << shift;
+    let byte = buf[*pos];
+    *pos += 1;
+    value |= u64::from(byte) << shift;
     value
 }
 
@@ -73,21 +72,15 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::buffer::Buffer;
-    use crate::cursor::{ReadCursor, WriteCursor};
 
     proptest! {
         #[test]
         fn roundtrip(value: u64) {
-            let mut buf = Buffer::<256>::new();
-
-            let mut wc = WriteCursor::new(&mut buf, 0);
-            encode_uleb128_u64(value, &mut wc);
-            let end = wc.position();
-
-            let mut rc = ReadCursor::new(&mut buf, 0, end);
-            let decoded = decode_uleb128_u64(&mut rc);
-            prop_assert_eq!(rc.position(), end);
+            let mut buf = Vec::new();
+            encode_uleb128_u64(value, &mut buf);
+            let mut pos = 0;
+            let decoded = decode_uleb128_u64(&buf, &mut pos);
+            prop_assert_eq!(pos, buf.len());
             prop_assert_eq!(decoded, value);
         }
     }
@@ -104,24 +97,15 @@ mod tests {
         ];
 
         for &(value, expected) in cases {
-            let mut buf = Buffer::<256>::new();
-            buf.copy_from_slice(expected, 0);
-
             // Verify encoding produces the expected bytes.
-            let mut enc_buf = Buffer::<256>::new();
-            let mut wc = WriteCursor::new(&mut enc_buf, 0);
-            encode_uleb128_u64(value, &mut wc);
-            let n = wc.position();
-
-            let (a, b) = enc_buf.slices(0, n);
-            let mut encoded = Vec::from(a);
-            encoded.extend_from_slice(b);
+            let mut encoded = Vec::new();
+            encode_uleb128_u64(value, &mut encoded);
             assert_eq!(&encoded[..], expected, "encode {value}");
 
             // Verify decoding reads the expected value.
-            let mut rc = ReadCursor::new(&mut buf, 0, expected.len());
-            let decoded = decode_uleb128_u64(&mut rc);
-            assert_eq!(rc.position(), expected.len(), "decode len {value}");
+            let mut pos = 0;
+            let decoded = decode_uleb128_u64(expected, &mut pos);
+            assert_eq!(pos, expected.len(), "decode len {value}");
             assert_eq!(decoded, value, "decode {value}");
         }
     }

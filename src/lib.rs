@@ -5,11 +5,9 @@
 #![allow(dead_code)]
 
 pub(crate) mod adler32;
-pub(crate) mod buffer;
-pub(crate) mod cursor;
 pub(crate) mod format;
-pub(crate) mod packed;
 pub(crate) mod uleb128;
+pub(crate) mod wild;
 
 /// Sliding window size in bytes (64 KiB, per format spec).
 pub(crate) const WINDOW_SIZE: usize = 1 << 16;

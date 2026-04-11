@@ -61,15 +61,14 @@ bench() {
     rm -f "$comp_file"
 }
 
-bench "lzr -1"    "$LZR -T 1 -l 1"   "$LZR -d"
-bench "lzr -9"    "$LZR -T 1 -l 9"   "$LZR -d"
+bench "lzr -1 ST"  "$LZR -T 1 -l 1"  "$LZR -T 1 -d"
+bench "lzr -1 MT"  "$LZR -T 0 -l 1"  "$LZR -T 0 -d"
+bench "lzr -9 ST"  "$LZR -T 1 -l 9"  "$LZR -T 1 -d"
+bench "lzr -9 MT"  "$LZR -T 0 -l 9"  "$LZR -T 0 -d"
 
 if command -v lz4 &>/dev/null; then
-    bench "lz4 -1"    "lz4 -1 -T1 -c"   "lz4 -d -c"
-    bench "lz4 -9"    "lz4 -9 -T1 -c"   "lz4 -d -c"
-fi
-
-if command -v gzip &>/dev/null; then
-    bench "gzip -1"   "gzip -1 -c"      "gzip -d -c"
-    bench "gzip -9"   "gzip -9 -c"      "gzip -d -c"
+    bench "lz4 -1 ST"  "lz4 -1 -T1 -c"  "lz4 -d -c"
+    bench "lz4 -1 MT"  "lz4 -1 -c"      "lz4 -d -c"
+    bench "lz4 -9 ST"  "lz4 -9 -T1 -c"  "lz4 -d -c"
+    bench "lz4 -9 MT"  "lz4 -9 -c"      "lz4 -d -c"
 fi

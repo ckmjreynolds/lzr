@@ -1,13 +1,13 @@
 //! LZR format codec — header, frame, EOS, and footer encode/decode.
 //!
-//! All functions operate on byte buffers and are independent of I/O. The caller
-//! is responsible for reading from and writing to streams.
+//! All functions operate on byte buffers and are independent of I/O. Encoders
+//! append bytes to a `Vec<u8>`; decoders read from a `&[u8]` and advance a
+//! position cursor passed by `&mut`.
 //!
 //! See [`FORMAT.md`](../docs/FORMAT.md) for the canonical specification.
 
 use arbitrary_int::{u3, u5};
 
-use crate::cursor::{ReadBuf, WriteBuf};
 use crate::error::{Error, Result};
 use crate::uleb128::{decode_uleb128_u64, encode_uleb128_u64};
 
@@ -37,43 +37,41 @@ const MATCH_LENGTH_TABLE: [i16; 32] = [
 ];
 
 /// Writes the 4-byte LZR stream header (magic `LZR` + version `0x00`).
-pub(crate) fn encode_header(output: &mut impl WriteBuf) {
-    output.write_bytes(&HEADER);
+pub(crate) fn encode_header(out: &mut Vec<u8>) {
+    out.extend_from_slice(&HEADER);
 }
 
-/// Reads and validates the 4-byte LZR stream header.
+/// Reads and validates the 4-byte LZR stream header from `buf` starting at `*pos`.
 ///
 /// Returns [`Error::InvalidMagic`] if the first three bytes are not `LZR`, or
 /// [`Error::UnsupportedVersion`] if the version byte is not `0x00`.
-pub(crate) fn decode_header(input: &mut impl ReadBuf) -> Result<()> {
-    let mut buf = [0u8; HEADER.len()];
-
-    input.read_bytes(&mut buf);
-
-    if buf[..3] != HEADER[..3] {
+pub(crate) fn decode_header(buf: &[u8], pos: &mut usize) -> Result<()> {
+    let p = *pos;
+    if buf[p..p + 3] != HEADER[..3] {
         return Err(Error::InvalidMagic);
     }
-    if buf[3] != 0x00 {
-        return Err(Error::UnsupportedVersion(buf[3]));
+    if buf[p + 3] != 0x00 {
+        return Err(Error::UnsupportedVersion(buf[p + 3]));
     }
-
+    *pos = p + 4;
     Ok(())
 }
 
-/// Encodes a single LZR frame (token + distance + extensions) into `output`.
+/// Encodes a single LZR frame (token + distance + extensions) by appending
+/// bytes to `out`.
 ///
 /// Writes the token byte (`LLLMMMMM`), the 2-byte little-endian distance, and
-/// any literal-length or match-length extension bytes. The caller is responsible
-/// for appending the `literal_len` literal bytes after this call.
+/// any literal-length or match-length extension bytes. The caller is
+/// responsible for appending the `literal_len` literal bytes after this call.
 ///
 /// # Examples
 ///
 /// ```text
-/// // Literal-only frame: 2 literals, match length 0, distance ignored.
-/// encode_frame(2, 0, 0, &mut output);
-/// // Writes: [0x46, 0x00, 0x00] — token 010_00110, distance 0.
+/// let mut out = Vec::new();
+/// encode_frame(2, 0, 0, &mut out);
+/// // out == [0x46, 0x00, 0x00] — token 010_00110, distance 0.
 /// ```
-pub(crate) fn encode_frame(literal_len: i16, match_len: i16, distance: u16, output: &mut impl WriteBuf) {
+pub(crate) fn encode_frame(literal_len: i16, match_len: i16, distance: u16, out: &mut Vec<u8>) {
     let (mmmmm, match_ext) = match_len_to_mmmmm(match_len);
 
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -84,42 +82,33 @@ pub(crate) fn encode_frame(literal_len: i16, match_len: i16, distance: u16, outp
     };
 
     let token = (lll.value() << 5) | mmmmm.value();
-    output.write_u8(token);
-    output.write_u16_le(distance);
+    out.push(token);
+    out.extend_from_slice(&distance.to_le_bytes());
 
     if lll == u3::new(7) {
-        encode_extension(lit_ext, output);
+        encode_extension(lit_ext, out);
     }
     if mmmmm == u5::new(0) || mmmmm == u5::new(31) {
-        encode_extension(match_ext, output);
+        encode_extension(match_ext, out);
     }
 }
 
-/// Decodes a single LZR frame from `input`.
+/// Decodes a single LZR frame from `buf` starting at `*pos`.
 ///
 /// Reads the token byte, distance, and any extension bytes. Returns
-/// `(literal_len, match_len, distance)`. The caller is responsible for
-/// reading `literal_len` literal bytes from `input` after this call.
+/// `(literal_len, match_len, distance)` and advances `*pos` by the number of
+/// bytes consumed (NOT including any literal payload bytes that follow).
 ///
 /// When `distance` is 0 the frame is the end-of-stream sentinel — no
 /// extensions are read and the caller should stop decoding frames.
-///
-/// Uses [`MATCH_LENGTH_TABLE`] for a direct lookup of the base match
-/// length from the 5-bit MMMMM field.
-///
-/// # Examples
-///
-/// ```text
-/// // Decode a literal-only frame: token 0x46, distance 0x0000.
-/// let (lit, mat, dist) = decode_frame(&mut input);
-/// assert_eq!((lit, mat, dist), (2, 0, 0));
-/// ```
-pub(crate) fn decode_frame(input: &mut impl ReadBuf) -> (i16, i16, u16) {
-    let token = input.read_u8();
+pub(crate) fn decode_frame(buf: &[u8], pos: &mut usize) -> (i16, i16, u16) {
+    let p = *pos;
+    let token = buf[p];
     let lll = token >> 5;
     let mmmmm = token & 0x1F;
 
-    let distance = input.read_u16_le();
+    let distance = u16::from_le_bytes([buf[p + 1], buf[p + 2]]);
+    *pos = p + 3;
 
     // Distance 0 is reserved for EOS — no extensions follow.
     if distance == 0 {
@@ -129,12 +118,12 @@ pub(crate) fn decode_frame(input: &mut impl ReadBuf) -> (i16, i16, u16) {
     let literal_len = if lll < 7 {
         i16::from(lll)
     } else {
-        7 + decode_extension(input)
+        7 + decode_extension(buf, pos)
     };
 
     let match_len = match mmmmm {
-        0 => MATCH_LENGTH_TABLE[0] - decode_extension(input),
-        31 => MATCH_LENGTH_TABLE[31] + decode_extension(input),
+        0 => MATCH_LENGTH_TABLE[0] - decode_extension(buf, pos),
+        31 => MATCH_LENGTH_TABLE[31] + decode_extension(buf, pos),
         m => MATCH_LENGTH_TABLE[m as usize],
     };
 
@@ -142,40 +131,26 @@ pub(crate) fn decode_frame(input: &mut impl ReadBuf) -> (i16, i16, u16) {
 }
 
 /// Writes the 3-byte end-of-stream sentinel (token `0x00`, distance `0x0000`).
-pub(crate) fn encode_eos(output: &mut impl WriteBuf) {
-    output.write_bytes(&EOS);
+pub(crate) fn encode_eos(out: &mut Vec<u8>) {
+    out.extend_from_slice(&EOS);
 }
 
 /// Encodes the stream footer: ULEB128-encoded uncompressed `length` followed
 /// by a 4-byte little-endian Adler-32 `checksum`.
-///
-/// # Examples
-///
-/// ```text
-/// // Footer for the 2-byte input "Hi":
-/// encode_footer(2, 0x00FB_00B2, &mut output);
-/// // Writes: [0x02, 0xB2, 0x00, 0xFB, 0x00]
-/// ```
-pub(crate) fn encode_footer(length: u64, checksum: u32, output: &mut impl WriteBuf) {
-    encode_uleb128_u64(length, output);
-    output.write_u32_le(checksum);
+pub(crate) fn encode_footer(length: u64, checksum: u32, out: &mut Vec<u8>) {
+    encode_uleb128_u64(length, out);
+    out.extend_from_slice(&checksum.to_le_bytes());
 }
 
-/// Decodes the stream footer from `input`.
+/// Decodes the stream footer from `buf` starting at `*pos`.
 ///
 /// Reads a ULEB128-encoded uncompressed length and a 4-byte little-endian
-/// Adler-32 checksum. Returns `(length, checksum)`.
-///
-/// # Examples
-///
-/// ```text
-/// let (length, checksum) = decode_footer(&mut input);
-/// assert_eq!(length, 2);
-/// assert_eq!(checksum, 0x00FB_00B2);
-/// ```
-pub(crate) fn decode_footer(input: &mut impl ReadBuf) -> (u64, u32) {
-    let length = decode_uleb128_u64(input);
-    let checksum = input.read_u32_le();
+/// Adler-32 checksum. Returns `(length, checksum)` and advances `*pos`.
+pub(crate) fn decode_footer(buf: &[u8], pos: &mut usize) -> (u64, u32) {
+    let length = decode_uleb128_u64(buf, pos);
+    let p = *pos;
+    let checksum = u32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
+    *pos = p + 4;
     (length, checksum)
 }
 
@@ -203,14 +178,14 @@ fn match_len_to_mmmmm(match_len: i16) -> (u5, i16) {
 /// Emits one or more bytes: each `0xFF` byte adds 255 to the total, and a
 /// final byte in `0x00..=0xFE` terminates the chain. Always writes at least
 /// one byte (a zero remainder produces a single `0x00`).
-fn encode_extension(mut remainder: i16, output: &mut impl WriteBuf) {
+fn encode_extension(mut remainder: i16, out: &mut Vec<u8>) {
     loop {
         if remainder >= 255 {
-            output.write_u8(0xFF);
+            out.push(0xFF);
             remainder -= 255;
         } else {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            output.write_u8(remainder as u8);
+            out.push(remainder as u8);
             break;
         }
     }
@@ -220,10 +195,11 @@ fn encode_extension(mut remainder: i16, output: &mut impl WriteBuf) {
 ///
 /// Reads bytes until a value less than 255 is encountered. The sum of all
 /// bytes read (including the terminator) is returned.
-fn decode_extension(input: &mut impl ReadBuf) -> i16 {
+fn decode_extension(buf: &[u8], pos: &mut usize) -> i16 {
     let mut total: i16 = 0;
     loop {
-        let byte = input.read_u8();
+        let byte = buf[*pos];
+        *pos += 1;
         total += i16::from(byte);
         if byte < 255 {
             return total;
@@ -234,87 +210,68 @@ fn decode_extension(input: &mut impl ReadBuf) -> i16 {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::*;
-    use crate::buffer::Buffer;
-    use crate::cursor::{ReadCursor, WriteCursor};
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
 
-    /// Helper: encode into a buffer and return the written bytes.
+    use super::*;
+
+    /// Helper: encode a frame and return the written bytes.
     fn encode_frame_to_vec(literal_len: i16, match_len: i16, distance: u16) -> Vec<u8> {
-        let mut buf = Buffer::<256>::new();
-        let mut cursor = WriteCursor::<256>::new(&mut buf, 0);
-        encode_frame(literal_len, match_len, distance, &mut cursor);
-        let len = cursor.position();
-        let (a, b) = buf.slices(0, len);
-        let mut v = Vec::from(a);
-        v.extend_from_slice(b);
-        v
+        let mut out = Vec::new();
+        encode_frame(literal_len, match_len, distance, &mut out);
+        out
     }
 
     /// Helper: decode a frame from a byte slice.
     fn decode_frame_from_slice(data: &[u8]) -> (i16, i16, u16) {
-        let mut buf = Buffer::<256>::new();
-        buf.copy_from_slice(data, 0);
-        let mut cursor = ReadCursor::<256>::new(&mut buf, 0, data.len());
-        decode_frame(&mut cursor)
+        let mut pos = 0;
+        decode_frame(data, &mut pos)
     }
 
     #[test]
     fn header_encode() {
-        let mut buf = Buffer::<256>::new();
-        let mut w = WriteCursor::<256>::new(&mut buf, 0);
-        encode_header(&mut w);
-        assert_eq!(w.position(), 4);
-        let (a, _) = buf.slices(0, 4);
-        assert_eq!(a, &[0x4C, 0x5A, 0x52, 0x00]);
+        let mut out = Vec::new();
+        encode_header(&mut out);
+        assert_eq!(out, vec![0x4C, 0x5A, 0x52, 0x00]);
     }
 
     #[test]
     fn header_decode_valid() {
-        let mut buf = Buffer::<256>::new();
-        buf.copy_from_slice(&[0x4C, 0x5A, 0x52, 0x00], 0);
-        let mut r = ReadCursor::<256>::new(&mut buf, 0, 4);
-        assert!(decode_header(&mut r).is_ok());
-        assert_eq!(r.position(), 4);
+        let buf = [0x4C, 0x5A, 0x52, 0x00];
+        let mut pos = 0;
+        assert!(decode_header(&buf, &mut pos).is_ok());
+        assert_eq!(pos, 4);
     }
 
     #[test]
     fn header_decode_bad_magic() {
-        let mut buf = Buffer::<256>::new();
-        buf.copy_from_slice(&[0x00, 0x00, 0x00, 0x00], 0);
-        let mut r = ReadCursor::<256>::new(&mut buf, 0, 4);
-        let err = decode_header(&mut r).unwrap_err();
+        let buf = [0x00, 0x00, 0x00, 0x00];
+        let mut pos = 0;
+        let err = decode_header(&buf, &mut pos).unwrap_err();
         assert!(matches!(err, Error::InvalidMagic));
     }
 
     #[test]
     fn header_decode_bad_version() {
-        let mut buf = Buffer::<256>::new();
-        buf.copy_from_slice(&[0x4C, 0x5A, 0x52, 0x01], 0);
-        let mut r = ReadCursor::<256>::new(&mut buf, 0, 4);
-        let err = decode_header(&mut r).unwrap_err();
+        let buf = [0x4C, 0x5A, 0x52, 0x01];
+        let mut pos = 0;
+        let err = decode_header(&buf, &mut pos).unwrap_err();
         assert!(matches!(err, Error::UnsupportedVersion(0x01)));
     }
 
     #[test]
     fn header_roundtrip() {
-        let mut buf = Buffer::<256>::new();
-        let mut w = WriteCursor::<256>::new(&mut buf, 0);
-        encode_header(&mut w);
-
-        let mut r = ReadCursor::<256>::new(&mut buf, 0, 4);
-        assert!(decode_header(&mut r).is_ok());
+        let mut buf = Vec::new();
+        encode_header(&mut buf);
+        let mut pos = 0;
+        assert!(decode_header(&buf, &mut pos).is_ok());
     }
 
     #[test]
     fn eos_encode() {
-        let mut buf = Buffer::<256>::new();
-        let mut w = WriteCursor::<256>::new(&mut buf, 0);
-        encode_eos(&mut w);
-        assert_eq!(w.position(), 3);
-        let (a, _) = buf.slices(0, 3);
-        assert_eq!(a, &[0x00, 0x00, 0x00]);
+        let mut out = Vec::new();
+        encode_eos(&mut out);
+        assert_eq!(out, vec![0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -388,16 +345,13 @@ mod tests {
 
     #[test]
     fn footer_roundtrip_known() {
-        let mut buf = Buffer::<64>::new();
-        let mut w = WriteCursor::<64>::new(&mut buf, 0);
-        encode_footer(42, 0x00FB_00B2, &mut w);
-        let end = w.position();
-
-        let mut r = ReadCursor::<64>::new(&mut buf, 0, end);
-        let (length, checksum) = decode_footer(&mut r);
+        let mut out = Vec::new();
+        encode_footer(42, 0x00FB_00B2, &mut out);
+        let mut pos = 0;
+        let (length, checksum) = decode_footer(&out, &mut pos);
         assert_eq!(length, 42);
         assert_eq!(checksum, 0x00FB_00B2);
-        assert_eq!(r.position(), end);
+        assert_eq!(pos, out.len());
     }
 
     #[test]
@@ -425,15 +379,13 @@ mod tests {
 
         #[test]
         fn footer_roundtrip(length: u64, checksum: u32) {
-            let mut buf = Buffer::<64>::new();
-            let mut w = WriteCursor::<64>::new(&mut buf, 0);
-            encode_footer(length, checksum, &mut w);
-            let end = w.position();
-
-            let mut r = ReadCursor::<64>::new(&mut buf, 0, end);
-            let (dec_len, dec_cksum) = decode_footer(&mut r);
+            let mut out = Vec::new();
+            encode_footer(length, checksum, &mut out);
+            let mut pos = 0;
+            let (dec_len, dec_cksum) = decode_footer(&out, &mut pos);
             prop_assert_eq!(dec_len, length);
             prop_assert_eq!(dec_cksum, checksum);
+            prop_assert_eq!(pos, out.len());
         }
     }
 }
