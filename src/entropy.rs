@@ -35,7 +35,6 @@ const BOTTOM: u64 = 1 << 48;
 /// backtracking through the output buffer. Models are passed per-call,
 /// allowing the caller to switch between multiple models.
 #[derive(Debug)]
-#[allow(missing_copy_implementations)]
 pub(crate) struct Encoder {
     low: u64,
     range: u64,
@@ -86,22 +85,10 @@ impl Encoder {
     }
 
     /// Flushes all remaining encoder state to `output`. Consumes the encoder.
-    #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn finish(mut self, output: &mut Vec<u8>) {
         // Shift out all 8 bytes of `low` through the carry-safe mechanism.
         for _ in 0..8 {
-            let byte = (self.low >> 56) as u8;
-            if self.first_byte {
-                self.cache = byte;
-                self.first_byte = false;
-            } else if byte == 0xFF {
-                self.pending += 1;
-            } else {
-                output.push(self.cache);
-                Self::emit_pending(output, 0xFF, self.pending);
-                self.cache = byte;
-                self.pending = 0;
-            }
+            self.buffer_top_byte(output);
             self.low <<= 8;
         }
         // Flush final cache and pending.
@@ -124,31 +111,34 @@ impl Encoder {
     /// Renormalize: while `range < BOTTOM`, extract the top byte of `low`
     /// into the cache/pending pipeline and shift both `low` and `range` left
     /// by 8 bits.
-    #[allow(clippy::cast_possible_truncation)]
     fn shift_low(&mut self, output: &mut Vec<u8>) {
         while self.range < BOTTOM {
-            let byte = (self.low >> 56) as u8;
-            if self.first_byte {
-                self.cache = byte;
-                self.first_byte = false;
-            } else if byte == 0xFF {
-                self.pending += 1;
-            } else {
-                output.push(self.cache);
-                Self::emit_pending(output, 0xFF, self.pending);
-                self.cache = byte;
-                self.pending = 0;
-            }
+            self.buffer_top_byte(output);
             self.low <<= 8;
             self.range <<= 8;
         }
     }
 
+    /// Extracts the top byte of `low` into the cache/pending carry-safe pipeline.
+    #[allow(clippy::cast_possible_truncation)]
+    fn buffer_top_byte(&mut self, output: &mut Vec<u8>) {
+        let byte = (self.low >> 56) as u8;
+        if self.first_byte {
+            self.cache = byte;
+            self.first_byte = false;
+        } else if byte == 0xFF {
+            self.pending += 1;
+        } else {
+            output.push(self.cache);
+            Self::emit_pending(output, 0xFF, self.pending);
+            self.cache = byte;
+            self.pending = 0;
+        }
+    }
+
     /// Pushes `count` copies of `byte` to `output`.
     fn emit_pending(output: &mut Vec<u8>, byte: u8, count: u32) {
-        for _ in 0..count {
-            output.push(byte);
-        }
+        output.resize(output.len() + count as usize, byte);
     }
 }
 
@@ -158,7 +148,6 @@ impl Encoder {
 /// additional bytes during renormalization. Models are passed per-call,
 /// allowing the caller to switch between multiple models.
 #[derive(Debug)]
-#[allow(missing_copy_implementations)]
 pub(crate) struct Decoder {
     low: u64,
     range: u64,

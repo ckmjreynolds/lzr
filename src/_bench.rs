@@ -26,7 +26,9 @@ pub fn lipsum_bytes(min_bytes: usize) -> Vec<u8> {
     // lipsum counts words, not bytes; average English word is ~5 chars + space.
     let words = min_bytes / 5 + 1;
     let text = lipsum(words);
-    text.into_bytes()[..min_bytes].to_vec()
+    let mut bytes = text.into_bytes();
+    bytes.truncate(min_bytes);
+    bytes
 }
 
 /// Thin wrapper around the internal entropy `Model`.
