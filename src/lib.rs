@@ -4,4 +4,17 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(dead_code)]
 pub(crate) mod adler32;
+pub(crate) mod entropy;
 pub(crate) mod uleb128;
+
+#[cfg(feature = "bench-internals")]
+#[allow(
+    missing_docs,
+    missing_copy_implementations,
+    missing_debug_implementations,
+    unreachable_pub,
+    clippy::redundant_pub_crate,
+    clippy::new_without_default,
+    clippy::missing_const_for_fn
+)]
+pub mod _bench;

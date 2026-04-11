@@ -25,7 +25,8 @@ static_assertions = "=1.1.0"
 
 [dev-dependencies]
 # assert_cmd = "=2.2.0"
-# criterion = "=0.8.2"
+criterion = "=0.8.2"
+lipsum = "=0.9.1"
 pretty_assertions = "=1.4.1"
 proptest = "=1.11.0"
 
@@ -50,6 +51,14 @@ cargo = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 redundant_pub_crate = "allow"
+
+[features]
+bench-internals = []
+
+[[bench]]
+name = "adler32"
+harness = false
+required-features = ["bench-internals"]
 
 [profile.release]
 lto = "thin"
