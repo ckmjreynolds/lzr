@@ -18,4 +18,4 @@ pub(crate) mod uleb128;
     clippy::new_without_default,
     clippy::missing_const_for_fn
 )]
-pub mod _bench;
+pub mod bench;

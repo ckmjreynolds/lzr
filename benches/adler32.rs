@@ -1,9 +1,9 @@
 #![allow(missing_docs)]
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use lzr::_bench::{Adler32, lipsum_bytes};
+use lzr::bench::{Adler32, lipsum_bytes};
 
-const SIZE: usize = 1_048_576;
+const SIZE: usize = 65_536;
 
 fn bench_compute(c: &mut Criterion) {
     let data = lipsum_bytes(SIZE);

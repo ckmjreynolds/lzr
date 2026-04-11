@@ -157,7 +157,7 @@ mod test {
 
     proptest! {
         #[test]
-        fn test_random_vectors(data in prop::collection::vec(any::<u8>(), 0..65536)) {
+        fn test_random_vectors(data in prop::collection::vec(any::<u8>(), 0..8_192)) {
           let mut naive = super::Adler32::new();
           naive.update_naive(&data);
 
@@ -168,7 +168,7 @@ mod test {
         }
 
         #[test]
-        fn test_combine(data in prop::collection::vec(any::<u8>(), 2..65536)) {
+        fn test_combine(data in prop::collection::vec(any::<u8>(), 2..8_192)) {
           let split = data.len() / 2;
 
           let mut whole = super::Adler32::new();

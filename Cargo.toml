@@ -61,11 +61,6 @@ name = "adler32"
 harness = false
 required-features = ["bench-internals"]
 
-[[bench]]
-name = "entropy"
-harness = false
-required-features = ["bench-internals"]
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
