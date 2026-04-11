@@ -49,7 +49,6 @@ impl Adler32 {
     ///
     /// Can be called repeatedly to process data in chunks; the result is
     /// identical to a single call with the concatenated input.
-    #[allow(clippy::cast_lossless)]
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn update(&mut self, data: &[u8]) {
         // AUTOVECTORIZED: Don't touch without benchmarking!
@@ -63,8 +62,9 @@ impl Adler32 {
             let n = chunk.len();
 
             for (i, &d) in chunk.iter().enumerate() {
-                a += d as u32;
-                b += d as u32 * ((n - i) as u32);
+                let d = u32::from(d);
+                a += d;
+                b += d * ((n - i) as u32);
             }
 
             self.b = (self.b + (self.a * (n as u32) + b)) % MOD_ADLER;
@@ -127,10 +127,9 @@ impl Adler32 {
 #[cfg_attr(coverage_nightly, coverage(off))]
 impl Adler32 {
     /// Naive per-byte implementation. Used as a reference for testing.
-    #[allow(clippy::cast_lossless)]
     fn update_naive(&mut self, data: &[u8]) {
         for byte in data {
-            self.a = (self.a + *byte as u32) % MOD_ADLER;
+            self.a = (self.a + u32::from(*byte)) % MOD_ADLER;
             self.b = (self.b + self.a) % MOD_ADLER;
         }
         self.len += data.len();
