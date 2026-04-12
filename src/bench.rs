@@ -19,6 +19,48 @@ impl Adler32 {
     }
 }
 
+/// Thin wrapper around the internal entropy `Encoder`.
+pub struct Encoder(crate::entropy::Encoder);
+
+impl Encoder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(crate::entropy::Encoder::new())
+    }
+
+    pub fn encode(&mut self, model: &mut Model, symbol: u8, output: &mut Vec<u8>) {
+        self.0.encode(&mut model.0, symbol, output);
+    }
+
+    pub fn finish(self, output: &mut Vec<u8>) {
+        self.0.finish(output);
+    }
+}
+
+/// Thin wrapper around the internal entropy `Decoder`.
+pub struct Decoder(crate::entropy::Decoder);
+
+impl Decoder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(crate::entropy::Decoder::new())
+    }
+
+    pub fn decode(&mut self, model: &mut Model, input: &mut &[u8]) -> u8 {
+        self.0.decode(&mut model.0, input)
+    }
+}
+
+/// Thin wrapper around the internal adaptive frequency `Model`.
+pub struct Model(crate::model::Model);
+
+impl Model {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(crate::model::Model::new())
+    }
+}
+
 /// Generates `min_bytes` of deterministic lipsum text.
 #[must_use]
 pub fn lipsum_bytes(min_bytes: usize) -> Vec<u8> {
