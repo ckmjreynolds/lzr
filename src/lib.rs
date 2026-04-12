@@ -4,7 +4,7 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(dead_code)]
 pub(crate) mod adler32;
-pub(crate) mod entropy;
+pub(crate) mod model;
 pub(crate) mod uleb128;
 
 #[cfg(any(test, feature = "bench-internals"))]
