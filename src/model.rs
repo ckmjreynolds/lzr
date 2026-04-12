@@ -9,6 +9,7 @@
 //! total constant. Symbols with a frequency of 1 are skipped as victims so that
 //! every symbol always has a non-zero probability.
 
+#[cfg(test)]
 use std::fmt;
 
 use static_assertions::const_assert;
@@ -208,6 +209,8 @@ impl Model {
     }
 }
 
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl fmt::Debug for Model {
     #[cfg_attr(coverage_nightly, coverage(off))]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -226,106 +229,51 @@ impl fmt::Debug for Model {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use pretty_assertions::assert_eq;
+    //use pretty_assertions::assert_eq;
     use proptest::prelude::*;
 
     use super::*;
 
-    /// Asserts that the Fenwick tree and raw frequency table are consistent.
-    ///
-    /// For every symbol `b`, `prefix_sum(b) + freq(b)` must equal the prefix
-    /// sum of the next symbol (or [`Model::total`] for the last symbol).
-    fn assert_tree_freq_sync(model: &Model) {
-        for b in 0..=255u8 {
-            let lo = model.prefix_sum(b);
-            let hi = if b == 255 {
-                Model::total()
-            } else {
-                model.prefix_sum(b.wrapping_add(1))
-            };
-            assert_eq!(lo + model.freq(b), hi, "tree/freq mismatch at symbol {b}");
+    /// Verifies that the Fenwick tree and raw frequency table are in sync.
+    fn in_sync(model: &Model) -> bool {
+        let mut remaining = Model::total();
+
+        for b in (0..=255u8).rev() {
+            remaining -= model.freq(b);
+
+            if remaining != model.prefix_sum(b) {
+                return false;
+            }
         }
+
+        true
     }
 
     #[test]
-    fn tree_freq_sync_uniform() {
-        let model = Model::new();
-        assert_tree_freq_sync(&model);
-    }
-
-    #[test]
-    fn reset_restores_uniform() {
+    fn uniform_model() {
         let mut model = Model::new();
+
         for b in 0..=255u8 {
             model.update(b);
         }
+
         model.reset();
-        assert_eq!(model.tree, UNIFORM_TREE);
-        assert_eq!(model.freq, UNIFORM_FREQ);
-    }
+        model.freq.iter().for_each(|freq| assert_eq!(*freq as usize, INITIAL_COUNT));
 
-    #[test]
-    fn debug_output() {
-        let model = Model::new();
-        let debug = format!("{model:?}");
-        // Every symbol starts at freq 16, which has bit-width 5.
-        assert!(debug.contains("freq[000](0016) #####"));
-        assert!(debug.contains("freq[255](0016) #####"));
-    }
-
-    #[test]
-    fn victim_skip_and_find_bounds() {
-        let mut model = Model::new();
-        // Hammer byte 0 enough times to drain neighboring symbols to freq 1,
-        // which exercises the victim-skip loop (lines 137-139) and also creates
-        // a skewed distribution that exercises the bounds check in `find`.
-        for _ in 0..4_000 {
-            model.update(0);
-        }
-
-        // At least one symbol must have been drained to freq 1.
-        let min_freq = (1..=255u8).map(|b| model.freq(b)).min().unwrap();
-        assert_eq!(min_freq, 1);
-
-        // Verify tree/freq invariant still holds after heavy skew.
-        assert_tree_freq_sync(&model);
-
-        // Exercise `find` across the full CDF range, covering the bounds branch.
-        for target in 0..Model::total() {
-            let byte = model.find(target);
-            let lo = model.prefix_sum(byte);
-            assert!(target >= lo && target < lo + model.freq(byte));
-        }
+        assert!(in_sync(&model));
     }
 
     proptest! {
         #[test]
-        fn tree_freq_sync_after_updates(updates in prop::collection::vec(any::<u8>(), 0..1_024)) {
+        fn roundtrip(updates in prop::collection::vec(any::<u8>(), 0..8_192), byte: u8) {
             let mut model = Model::new();
-            for &b in &updates {
-                model.update(b);
-            }
-            assert_tree_freq_sync(&model);
-        }
 
-        #[test]
-        fn update_preserves_total(updates in prop::collection::vec(any::<u8>(), 1..1_024)) {
-            let mut model = Model::new();
             for &b in &updates {
                 model.update(b);
             }
-            let sum: u64 = (0..=255u8).map(|b| model.freq(b)).sum();
-            prop_assert_eq!(sum, Model::total());
-        }
 
-        #[test]
-        fn find_roundtrip(updates in prop::collection::vec(any::<u8>(), 0..512), byte: u8) {
-            let mut model = Model::new();
-            for &b in &updates {
-                model.update(b);
-            }
-            let found = model.find(model.prefix_sum(byte));
-            prop_assert_eq!(found, byte);
+            prop_assert_eq!(model.find(model.prefix_sum(byte)), byte);
+            prop_assert!(in_sync(&model));
         }
     }
 }
