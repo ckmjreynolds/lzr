@@ -78,19 +78,28 @@ impl Encoder {
         // Emit the top byte of low, resolving any pending underflow.
         let byte = (self.low >> 56) as u8;
         output.push(byte);
-        let fill = if byte == self.straddle {
-            0xFF
-        } else {
-            0x00
-        };
-        for _ in 0..self.pending {
-            output.push(fill);
-        }
+        self.emit_pending(byte, output);
 
         // Emit the remaining 7 bytes of low so the decoder has enough data.
         for shift in (0..7).rev() {
             #[allow(clippy::cast_possible_truncation)]
             output.push((self.low >> (shift * 8)) as u8);
+        }
+    }
+
+    /// Emits deferred underflow bytes after a resolved byte, then resets the
+    /// pending count. The fill value is `0xFF` if `byte` matches the straddle
+    /// byte recorded when the underflow began, `0x00` otherwise.
+    #[allow(clippy::cast_possible_truncation)]
+    fn emit_pending(&mut self, byte: u8, output: &mut Vec<u8>) {
+        if self.pending > 0 {
+            let fill = if byte == self.straddle {
+                0xFF
+            } else {
+                0x00
+            };
+            output.resize(output.len() + self.pending as usize, fill);
+            self.pending = 0;
         }
     }
 
@@ -102,16 +111,7 @@ impl Encoder {
                 // Top bytes match — safe to emit.
                 let byte = (self.low >> 56) as u8;
                 output.push(byte);
-
-                let fill = if byte == self.straddle {
-                    0xFF
-                } else {
-                    0x00
-                };
-                for _ in 0..self.pending {
-                    output.push(fill);
-                }
-                self.pending = 0;
+                self.emit_pending(byte, output);
 
                 self.low <<= 8;
                 self.high = (self.high << 8) | 0xFF;
@@ -248,6 +248,15 @@ mod tests {
     }
 
     #[test]
+    fn decode_empty() {
+        let mut input: &[u8] = &[];
+
+        let mut decoder = Decoder::new();
+        let mut model = Model::new();
+        assert_eq!(decoder.decode(&mut model, &mut input), 0x00);
+    }
+
+    #[test]
     fn lipsum_roundtrip_compresses() {
         let data = lipsum_bytes(65_536);
 
@@ -263,7 +272,7 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let ratio = 100.0 * (1.0 - compressed.len() as f64 / data.len() as f64);
         eprintln!("compression ratio: {ratio:.1}% ({} → {} bytes)", data.len(), compressed.len());
-        eprintln!("{model:?}");
+        // eprintln!("{model:?}");
 
         // Decode and verify roundtrip.
         let mut dec = Decoder::new();

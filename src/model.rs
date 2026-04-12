@@ -26,12 +26,13 @@ const INITIAL_COUNT: usize = TOTAL_COUNTS / NUM_SYMBOLS;
 const NUM_SYMBOLS: usize = 1 << 8;
 
 /// Rescale threshold. When total reaches this value, all frequencies are halved.
-const RESCALE_AT: u32 = 16_384;
+const RESCALE_AT: u16 = 16_384;
 
 // Guard that the pre-computed tables below match the constants above.
 const_assert!(TOTAL_COUNTS == 256);
 const_assert!(INITIAL_COUNT == 1);
 const_assert!(NUM_SYMBOLS == 256);
+const_assert!(RESCALE_AT as usize >= TOTAL_COUNTS);
 
 /// Pre-computed Fenwick tree for a uniform distribution where every symbol has
 /// a frequency of [`INITIAL_COUNT`].
@@ -39,7 +40,7 @@ const_assert!(NUM_SYMBOLS == 256);
 /// Index 0 is unused (Fenwick trees are 1-based). Each internal node stores the
 /// partial sum of a range determined by the lowest set bit of its index.
 #[rustfmt::skip]
-pub(crate) const UNIFORM_TREE: [i32; NUM_SYMBOLS + 1] = [
+pub(crate) const UNIFORM_TREE: [i16; NUM_SYMBOLS + 1] = [
     0,
     1, 2, 1, 4, 1, 2, 1, 8,
     1, 2, 1, 4, 1, 2, 1, 16,
@@ -94,11 +95,11 @@ const UNIFORM_FREQ: [u16; NUM_SYMBOLS] = [1u16; NUM_SYMBOLS];
 /// ```
 pub(crate) struct Model {
     /// Fenwick (binary indexed) tree over symbol frequencies.
-    tree: [i32; NUM_SYMBOLS + 1],
+    tree: [i16; NUM_SYMBOLS + 1],
     /// Raw frequency count for each symbol.
     freq: [u16; NUM_SYMBOLS],
     /// Current total of all frequencies.
-    total: u32,
+    total: u16,
 }
 
 impl Model {
@@ -142,21 +143,26 @@ impl Model {
 
     /// Halves all frequencies (floor 1) and rebuilds the Fenwick tree.
     fn rescale(&mut self) {
-        let mut total = 0u32;
+        let mut total = 0u16;
+
         for f in &mut self.freq {
             *f = (*f >> 1).max(1);
-            total += u32::from(*f);
+            total += *f;
         }
+
         self.total = total;
         self.rebuild_tree();
     }
 
     /// Reconstructs the Fenwick tree from the raw frequency table.
+    #[allow(clippy::cast_possible_wrap)]
     fn rebuild_tree(&mut self) {
         self.tree[0] = 0;
+
         for i in 1..=NUM_SYMBOLS {
-            self.tree[i] = i32::from(self.freq[i - 1]);
+            self.tree[i] = self.freq[i - 1] as i16;
         }
+
         for i in 1..=NUM_SYMBOLS {
             let parent = i + (i & i.wrapping_neg());
             if parent <= NUM_SYMBOLS {
@@ -166,7 +172,7 @@ impl Model {
     }
 
     /// Applies `delta` to the Fenwick tree at position `i`.
-    const fn update_inner(&mut self, mut i: usize, delta: i32) {
+    const fn update_inner(&mut self, mut i: usize, delta: i16) {
         // Fenwick trees are 1-based for more efficient index math.
         i += 1;
 
@@ -185,8 +191,8 @@ impl Model {
     }
 
     /// Fenwick prefix-sum query over the first `i` elements.
-    const fn prefix_sum_inner(&self, mut i: usize) -> i32 {
-        let mut sum = 0i32;
+    const fn prefix_sum_inner(&self, mut i: usize) -> i16 {
+        let mut sum = 0i16;
 
         while i > 0 {
             sum += self.tree[i];
@@ -202,7 +208,7 @@ impl Model {
     /// Used by the arithmetic decoder to map a code point back to a symbol.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) const fn find(&self, target: u64) -> u8 {
-        let mut target = target.cast_signed() as i32;
+        let mut target = target.cast_signed() as i16;
         let mut bit = NUM_SYMBOLS >> 1;
         let mut i = 0;
 
