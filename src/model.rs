@@ -26,7 +26,7 @@ const INITIAL_COUNT: usize = TOTAL_COUNTS / NUM_SYMBOLS;
 const NUM_SYMBOLS: usize = 1 << 8;
 
 /// Rescale threshold. When total reaches this value, all frequencies are halved.
-const RESCALE_AT: u32 = 8_192;
+const RESCALE_AT: u32 = 16_384;
 
 // Guard that the pre-computed tables below match the constants above.
 const_assert!(TOTAL_COUNTS == 256);
