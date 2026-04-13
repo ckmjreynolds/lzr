@@ -66,6 +66,11 @@ name = "entropy"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "lz77"
+harness = false
+required-features = ["bench-internals"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

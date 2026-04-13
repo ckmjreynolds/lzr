@@ -271,7 +271,7 @@ mod tests {
 
         #[allow(clippy::cast_precision_loss)]
         let ratio = 100.0 * (1.0 - compressed.len() as f64 / data.len() as f64);
-        eprintln!("compression ratio: {ratio:.1}% ({} → {} bytes)", data.len(), compressed.len());
+        eprintln!("entropy compression ratio: {ratio:.1}% ({} → {} bytes)", data.len(), compressed.len());
         // eprintln!("{model:?}");
 
         // Decode and verify roundtrip.

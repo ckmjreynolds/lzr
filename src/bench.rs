@@ -61,6 +61,37 @@ impl Model {
     }
 }
 
+/// Thin wrapper around the internal LZ77 `Sequence`.
+pub struct Sequence(pub(crate) crate::lz77::Sequence);
+
+/// Thin wrapper around the internal LZ77 `Encoder`.
+pub struct Lz77Encoder<'a>(crate::lz77::Encoder<'a>);
+
+impl<'a> Lz77Encoder<'a> {
+    #[must_use]
+    pub fn new(input: &'a [u8]) -> Self {
+        Self(crate::lz77::Encoder::new(input))
+    }
+
+    pub fn next_token(&mut self) -> Option<(Sequence, &'a [u8])> {
+        self.0.next().map(|t| (Sequence(t.seq), t.literals))
+    }
+}
+
+/// Thin wrapper around the internal LZ77 `Decoder`.
+pub struct Lz77Decoder(crate::lz77::Decoder);
+
+impl Lz77Decoder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(crate::lz77::Decoder::new())
+    }
+
+    pub fn decode(&mut self, seq: &Sequence, literals: &[u8], output: &mut Vec<u8>) {
+        self.0.decode(seq.0, literals, output);
+    }
+}
+
 /// Generates `min_bytes` of deterministic lipsum text.
 #[must_use]
 pub fn lipsum_bytes(min_bytes: usize) -> Vec<u8> {

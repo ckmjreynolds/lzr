@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 pub(crate) mod adler32;
 pub(crate) mod entropy;
+pub(crate) mod lz77;
 pub(crate) mod model;
 pub(crate) mod uleb128;
 
