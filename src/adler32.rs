@@ -45,6 +45,19 @@ impl Adler32 {
         }
     }
 
+    /// Restores a checksum from a previously computed value and byte count.
+    ///
+    /// Used for cold-start resume: load the cumulative checksum from a stored
+    /// footer and continue updating from there.
+    #[must_use]
+    pub(crate) const fn from_checksum(checksum: u32, len: usize) -> Self {
+        Self {
+            a: checksum & 0xFFFF,
+            b: checksum >> 16,
+            len,
+        }
+    }
+
     /// Feeds `data` into the running checksum.
     ///
     /// Can be called repeatedly to process data in chunks; the result is
@@ -156,6 +169,23 @@ mod test {
     }
 
     proptest! {
+        #[test]
+        fn from_checksum_roundtrip(data in prop::collection::vec(any::<u8>(), 1..8_192)) {
+            let mut original = super::Adler32::new();
+            original.update(&data);
+
+            let restored = super::Adler32::from_checksum(original.checksum(), data.len());
+            prop_assert_eq!(restored.checksum(), original.checksum());
+
+            // Verify that continued updates produce the same result.
+            let more = b"extra data";
+            let mut from_original = original;
+            from_original.update(more);
+            let mut from_restored = restored;
+            from_restored.update(more);
+            prop_assert_eq!(from_restored.checksum(), from_original.checksum());
+        }
+
         #[test]
         fn test_random_vectors(data in prop::collection::vec(any::<u8>(), 0..8_192)) {
           let mut naive = super::Adler32::new();

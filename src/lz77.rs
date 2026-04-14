@@ -1,11 +1,15 @@
-//! Greedy LZ77 encoder and decoder, one sequence at a time.
+//! Greedy LZ77 encoder and decoder.
 //!
 //! A [`Sequence`] describes zero or more literal bytes followed by an optional
 //! back-reference (match). The encoder uses a hash-chain match finder with a
 //! 64 KB sliding window. The decoder maintains the same window to resolve
 //! back-references.
 //!
-//! # Pipeline (future integration)
+//! The encoder is streaming: data is fed via [`Encoder::feed`], and tokens are
+//! pulled out via [`Encoder::next`]. Call [`Encoder::finish`] to signal end of
+//! input, then drain remaining tokens.
+//!
+//! # Pipeline
 //!
 //! ```text
 //! Encode:  Bytes → LZ77 Encoder  → Arithmetic Coder
@@ -39,6 +43,10 @@ const MAX_CHAIN: usize = 32;
 /// Sentinel value meaning "no entry" in the hash tables.
 const NIL: u32 = u32::MAX;
 
+/// Minimum lookahead required in streaming mode before emitting tokens.
+/// Ensures matches are not truncated at the buffer boundary.
+const LOOKAHEAD_MIN: usize = MAX_MATCH + MIN_MATCH;
+
 /// One LZ77 token: zero or more literal bytes followed by an optional
 /// back-reference.
 ///
@@ -56,14 +64,13 @@ pub(crate) struct Sequence {
 
 assert_eq_size!(Sequence, u32);
 
-/// A [`Sequence`] together with the literal bytes it references.
+/// A [`Sequence`] together with the literal bytes it owns.
 ///
-/// The literal slice borrows from the encoder's input — no allocation per
-/// token.
+/// The valid literal region is `&self.literals[..self.seq.literal_len as usize]`.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Token<'a> {
+pub(crate) struct Token {
     pub(crate) seq: Sequence,
-    pub(crate) literals: &'a [u8],
+    pub(crate) literals: [u8; 255],
 }
 
 /// Multiply-shift hash over the three bytes at `data[pos..pos+3]`.
@@ -78,129 +85,245 @@ fn common_prefix_len(a: &[u8], b: &[u8], max: usize) -> usize {
     a.iter().zip(b.iter()).take(max).take_while(|(x, y)| x == y).count()
 }
 
-/// Greedy LZ77 encoder with hash-chain match finding.
+/// Greedy streaming LZ77 encoder with hash-chain match finding.
 ///
-/// Created with the full input slice; call [`next`](Self::next) repeatedly to
-/// emit one [`Token`] at a time until `None` is returned.
-pub(crate) struct Encoder<'a> {
-    /// Full input being compressed.
-    input: &'a [u8],
-    /// Current read position.
+/// Data is fed incrementally via [`feed`](Self::feed). Call
+/// [`next`](Self::next) to pull tokens. Call [`finish`](Self::finish)
+/// to signal end of input, then drain remaining tokens with `next`.
+pub(crate) struct Encoder {
+    /// Compacting flat buffer holding recent + unprocessed input.
+    buf: Vec<u8>,
+    /// Absolute stream offset of `buf[0]`.
+    base: usize,
+    /// Current encode position (absolute).
     pos: usize,
+    /// Absolute position of the first pending literal byte.
+    lit_start: usize,
+    /// Number of pending literal bytes.
+    lit_len: usize,
     /// Hash-chain heads: `head[hash] = most recent absolute position`.
     head: Vec<u32>,
     /// Hash-chain links: `prev[pos % WINDOW_SIZE] = previous position with
     /// the same hash`.
     prev: Vec<u32>,
+    /// True once [`finish`](Self::finish) has been called.
+    finished: bool,
 }
 
-impl<'a> Encoder<'a> {
-    /// Creates a new encoder over `input`.
-    pub(crate) fn new(input: &'a [u8]) -> Self {
+impl Encoder {
+    /// Creates a new empty encoder.
+    pub(crate) fn new() -> Self {
         Self {
-            input,
+            buf: Vec::with_capacity(2 * WINDOW_SIZE + MAX_MATCH),
+            base: 0,
             pos: 0,
+            lit_start: 0,
+            lit_len: 0,
             head: vec![NIL; HASH_SIZE],
             prev: vec![NIL; WINDOW_SIZE],
+            finished: false,
         }
     }
 
-    /// Returns the next token, or `None` if all input has been consumed.
-    pub(crate) fn next(&mut self) -> Option<Token<'a>> {
-        if self.pos >= self.input.len() {
+    /// Appends input data to the encoder's internal buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after [`finish`](Self::finish).
+    pub(crate) fn feed(&mut self, data: &[u8]) {
+        assert!(!self.finished, "cannot feed after finish");
+        self.maybe_compact();
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Signals that no more input will be fed.
+    ///
+    /// After this call, [`next`](Self::next) will drain all remaining data.
+    pub(crate) const fn finish(&mut self) {
+        self.finished = true;
+    }
+
+    /// Emits any pending literals as a literal-only token without signaling
+    /// end of input.
+    pub(crate) fn drain(&mut self) -> Option<Token> {
+        if self.lit_len == 0 {
             return None;
         }
+        Some(self.emit_literals())
+    }
 
-        let lit_start = self.pos;
-        let mut lit_len: usize = 0;
+    /// Processes all remaining buffered data and returns the resulting tokens.
+    ///
+    /// Used at frame boundaries and seal. Unlike [`finish`](Self::finish),
+    /// the encoder can continue receiving [`feed`](Self::feed) calls after
+    /// this. Hash chains and window state are preserved.
+    pub(crate) fn flush(&mut self) -> Vec<Token> {
+        self.finished = true;
+        let mut tokens = Vec::new();
+        while let Some(token) = self.next() {
+            tokens.push(token);
+        }
+        self.finished = false;
+        tokens
+    }
+
+    /// Resets all encoder state for a new block.
+    pub(crate) fn reset(&mut self) {
+        self.buf.clear();
+        self.base = 0;
+        self.pos = 0;
+        self.lit_start = 0;
+        self.lit_len = 0;
+        self.head.fill(NIL);
+        self.prev.fill(NIL);
+        self.finished = false;
+    }
+
+    /// Returns the next token, or `None` if more data is needed.
+    ///
+    /// In streaming mode (before [`finish`](Self::finish)), returns `None`
+    /// when insufficient lookahead remains. After `finish`, drains all
+    /// remaining data.
+    pub(crate) fn next(&mut self) -> Option<Token> {
+        let available = self.base + self.buf.len();
 
         loop {
             // Max literals reached — flush them without a match.
-            if lit_len == MAX_LITERALS {
-                #[allow(clippy::cast_possible_truncation)]
-                return Some(Token {
-                    seq: Sequence {
-                        literal_len: lit_len as u8,
-                        match_len: 0,
-                        match_distance: 0,
-                    },
-                    literals: &self.input[lit_start..lit_start + lit_len],
-                });
+            if self.lit_len == MAX_LITERALS {
+                return Some(self.emit_literals());
             }
 
-            // No more input — flush remaining literals.
-            if self.pos >= self.input.len() {
-                break;
+            // No more data at current position.
+            if self.pos >= available {
+                if self.finished {
+                    break;
+                }
+                return None;
+            }
+
+            // In streaming mode, require enough lookahead.
+            if !self.finished && available - self.pos < LOOKAHEAD_MIN {
+                return None;
             }
 
             // Try to find a match at the current position.
             let (dist, mlen) = self.find_match();
 
             if mlen >= MIN_MATCH {
-                // Insert hashes for every position inside the match so future
-                // searches can find them.
                 self.insert_hash(self.pos);
                 for i in 1..mlen {
                     self.insert_hash(self.pos + i);
                 }
                 self.pos += mlen;
-
-                #[allow(clippy::cast_possible_truncation)]
-                return Some(Token {
-                    seq: Sequence {
-                        literal_len: lit_len as u8,
-                        match_len: mlen as u8,
-                        match_distance: dist as u16,
-                    },
-                    literals: &self.input[lit_start..lit_start + lit_len],
-                });
+                return Some(self.emit_match(dist, mlen));
             }
 
             // No match — accumulate as a literal.
             self.insert_hash(self.pos);
             self.pos += 1;
-            lit_len += 1;
+            self.lit_len += 1;
         }
 
         // Trailing literals (end of input).
-        #[allow(clippy::cast_possible_truncation)]
-        Some(Token {
+        if self.lit_len > 0 {
+            Some(self.emit_literals())
+        } else {
+            None
+        }
+    }
+
+    /// Builds a literal-only token from pending literals and resets them.
+    #[allow(clippy::cast_possible_truncation)]
+    fn emit_literals(&mut self) -> Token {
+        debug_assert!(self.lit_len > 0 && self.lit_len <= MAX_LITERALS);
+        let mut literals = [0u8; 255];
+        let start = self.lit_start - self.base;
+        literals[..self.lit_len].copy_from_slice(&self.buf[start..start + self.lit_len]);
+
+        let token = Token {
             seq: Sequence {
-                literal_len: lit_len as u8,
+                literal_len: self.lit_len as u8,
                 match_len: 0,
                 match_distance: 0,
             },
-            literals: &self.input[lit_start..lit_start + lit_len],
-        })
+            literals,
+        };
+        self.lit_start = self.pos;
+        self.lit_len = 0;
+        token
     }
 
-    /// Inserts `self.pos` (which must have ≥ 3 bytes remaining) into the hash
-    /// chain.
-    fn insert_hash(&mut self, pos: usize) {
-        if pos + 2 >= self.input.len() {
+    /// Builds a token with pending literals and a match, then resets literals.
+    #[allow(clippy::cast_possible_truncation)]
+    fn emit_match(&mut self, dist: usize, mlen: usize) -> Token {
+        let mut literals = [0u8; 255];
+        if self.lit_len > 0 {
+            let start = self.lit_start - self.base;
+            literals[..self.lit_len].copy_from_slice(&self.buf[start..start + self.lit_len]);
+        }
+
+        let token = Token {
+            seq: Sequence {
+                literal_len: self.lit_len as u8,
+                match_len: mlen as u8,
+                match_distance: dist as u16,
+            },
+            literals,
+        };
+        self.lit_start = self.pos;
+        self.lit_len = 0;
+        token
+    }
+
+    /// Compacts the buffer when it grows too large, keeping the match window
+    /// and unprocessed data.
+    fn maybe_compact(&mut self) {
+        if self.buf.len() <= 2 * WINDOW_SIZE {
             return;
         }
-        let h = hash3(self.input, pos);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            self.prev[pos % WINDOW_SIZE] = self.head[h];
-            self.head[h] = pos as u32;
+        let abs_keep_from = self.pos.saturating_sub(WINDOW_SIZE);
+        if abs_keep_from <= self.base {
+            return;
         }
+        let keep_from = abs_keep_from - self.base;
+        self.buf.drain(..keep_from);
+        self.base += keep_from;
+    }
+
+    /// Inserts `pos` into the hash chain (if ≥ 3 bytes remain at that
+    /// position).
+    #[allow(clippy::cast_possible_truncation)]
+    fn insert_hash(&mut self, pos: usize) {
+        // Guard against u32 overflow for extremely long streams.
+        if pos > u32::MAX as usize - WINDOW_SIZE {
+            self.head.fill(NIL);
+            self.prev.fill(NIL);
+            return;
+        }
+        let buf_pos = pos - self.base;
+        if buf_pos + 2 >= self.buf.len() {
+            return;
+        }
+        let h = hash3(&self.buf, buf_pos);
+        self.prev[pos % WINDOW_SIZE] = self.head[h];
+        self.head[h] = pos as u32;
     }
 
     /// Finds the best match at the current position.  Returns `(distance,
     /// length)` or `(0, 0)` if no match ≥ `MIN_MATCH` exists.
     fn find_match(&self) -> (usize, usize) {
         let pos = self.pos;
-        let remaining = self.input.len() - pos;
+        let available = self.base + self.buf.len();
+        let remaining = available - pos;
         let max_len = MAX_MATCH.min(remaining);
 
         if max_len < MIN_MATCH {
             return (0, 0);
         }
 
+        let buf_pos = pos - self.base;
         let min_pos = pos.saturating_sub(WINDOW_SIZE);
-        let h = hash3(self.input, pos);
+        let h = hash3(&self.buf, buf_pos);
         let mut chain_pos = self.head[h];
         let mut best_len = MIN_MATCH - 1;
         let mut best_dist = 0;
@@ -214,7 +337,8 @@ impl<'a> Encoder<'a> {
                 break;
             }
 
-            let len = common_prefix_len(&self.input[candidate..], &self.input[pos..], max_len);
+            let ci = candidate - self.base;
+            let len = common_prefix_len(&self.buf[ci..], &self.buf[buf_pos..], max_len);
             if len > best_len {
                 best_len = len;
                 best_dist = pos - candidate;
@@ -256,6 +380,12 @@ impl Decoder {
         }
     }
 
+    /// Resets the decoder for a new block.
+    pub(crate) fn reset(&mut self) {
+        self.window.fill(0);
+        self.pos = 0;
+    }
+
     /// Decodes one sequence, appending the result to `output`.
     ///
     /// `literals` must have exactly `seq.literal_len` bytes.
@@ -293,14 +423,22 @@ mod tests {
     use super::*;
     use crate::bench::lipsum_bytes;
 
-    /// Encode-then-decode helper. Returns the decoded bytes.
+    /// Helper: valid literal slice from a token.
+    fn token_literals(token: &Token) -> &[u8] {
+        &token.literals[..token.seq.literal_len as usize]
+    }
+
+    /// Encode-then-decode helper using feed/finish/next. Returns decoded bytes.
     fn roundtrip_codec(data: &[u8]) -> Vec<u8> {
-        let mut enc = Encoder::new(data);
+        let mut enc = Encoder::new();
+        enc.feed(data);
+        enc.finish();
+
         let mut dec = Decoder::new();
         let mut decoded = Vec::new();
 
         while let Some(token) = enc.next() {
-            dec.decode(token.seq, token.literals, &mut decoded);
+            dec.decode(token.seq, token_literals(&token), &mut decoded);
         }
 
         assert_eq!(data, &decoded[..]);
@@ -316,7 +454,10 @@ mod tests {
     fn lipsum_roundtrip_compresses() {
         let data = lipsum_bytes(65_536);
 
-        let mut enc = Encoder::new(&data);
+        let mut enc = Encoder::new();
+        enc.feed(&data);
+        enc.finish();
+
         let mut dec = Decoder::new();
         let mut decoded = Vec::with_capacity(data.len());
         let mut seq_count = 0_usize;
@@ -325,11 +466,10 @@ mod tests {
         while let Some(token) = enc.next() {
             seq_count += 1;
             total_literal_bytes += token.seq.literal_len as usize;
-            dec.decode(token.seq, token.literals, &mut decoded);
+            dec.decode(token.seq, token_literals(&token), &mut decoded);
         }
 
         // Compressed size proxy: 4-byte sequence header + literal bytes.
-        // Matched bytes are "free" (replaced by the back-reference).
         let encoded_size = seq_count * size_of::<Sequence>() + total_literal_bytes;
 
         #[allow(clippy::cast_precision_loss)]
@@ -347,9 +487,112 @@ mod tests {
 
     #[test]
     fn larger_than_window() {
-        // Exercises the stale-chain-entry path in find_match (candidate < min_pos).
+        // Exercises the stale-chain-entry path in find_match (candidate < min_pos)
+        // and buffer compaction.
         let data = lipsum_bytes(128 * 1024);
         roundtrip_codec(&data);
+    }
+
+    #[test]
+    fn multi_feed_roundtrip() {
+        let data = lipsum_bytes(4096);
+
+        let mut enc = Encoder::new();
+        let mut dec = Decoder::new();
+        let mut decoded = Vec::new();
+
+        // Feed in small chunks, draining tokens between feeds.
+        for chunk in data.chunks(100) {
+            enc.feed(chunk);
+            while let Some(token) = enc.next() {
+                dec.decode(token.seq, token_literals(&token), &mut decoded);
+            }
+        }
+        enc.finish();
+        while let Some(token) = enc.next() {
+            dec.decode(token.seq, token_literals(&token), &mut decoded);
+        }
+
+        assert_eq!(data, &decoded[..]);
+    }
+
+    #[test]
+    fn drain_without_finish() {
+        let data = lipsum_bytes(1024);
+
+        let mut enc = Encoder::new();
+        enc.feed(&data);
+
+        // Drain some tokens via next().
+        let mut tokens_before_drain = Vec::new();
+        while let Some(token) = enc.next() {
+            tokens_before_drain.push(token);
+        }
+
+        // Drain pending literals.
+        if let Some(token) = enc.drain() {
+            tokens_before_drain.push(token);
+        }
+
+        // Feed more data and finish.
+        let more = lipsum_bytes(512);
+        enc.feed(&more);
+        enc.finish();
+
+        let mut all_tokens = tokens_before_drain;
+        while let Some(token) = enc.next() {
+            all_tokens.push(token);
+        }
+
+        // Decode all and verify.
+        let mut dec = Decoder::new();
+        let mut decoded = Vec::new();
+        for token in &all_tokens {
+            dec.decode(token.seq, token_literals(token), &mut decoded);
+        }
+
+        let mut expected = data;
+        expected.extend_from_slice(&more);
+        assert_eq!(expected, decoded);
+    }
+
+    #[test]
+    fn reset_between_blocks() {
+        let block1 = lipsum_bytes(2048);
+        let block2 = vec![0x42; 2048]; // different data
+
+        // Encode block 1.
+        let mut enc = Encoder::new();
+        enc.feed(&block1);
+        enc.finish();
+        let mut tokens1 = Vec::new();
+        while let Some(token) = enc.next() {
+            tokens1.push(token);
+        }
+
+        // Reset and encode block 2.
+        enc.reset();
+        enc.feed(&block2);
+        enc.finish();
+        let mut tokens2 = Vec::new();
+        while let Some(token) = enc.next() {
+            tokens2.push(token);
+        }
+
+        // Decode both blocks with reset between.
+        let mut dec = Decoder::new();
+        let mut decoded1 = Vec::new();
+        for token in &tokens1 {
+            dec.decode(token.seq, token_literals(token), &mut decoded1);
+        }
+        assert_eq!(block1, decoded1);
+
+        dec.reset();
+        let mut decoded2 = Vec::new();
+        for token in &tokens2 {
+            dec.decode(token.seq, token_literals(token), &mut decoded2);
+        }
+        assert_eq!(block2, decoded2);
     }
 
     proptest! {
@@ -360,11 +603,14 @@ mod tests {
 
         #[test]
         fn sequence_invariants(data in prop::collection::vec(any::<u8>(), 0..4_096)) {
-            let mut enc = Encoder::new(&data);
+            let mut enc = Encoder::new();
+            enc.feed(&data);
+            enc.finish();
+
             let mut total_bytes = 0_usize;
 
             while let Some(token) = enc.next() {
-                prop_assert_eq!(token.literals.len(), token.seq.literal_len as usize);
+                prop_assert_eq!(token_literals(&token).len(), token.seq.literal_len as usize);
                 prop_assert!(
                     token.seq.match_len == 0 || token.seq.match_len as usize >= MIN_MATCH,
                     "bad match_len: {}", token.seq.match_len,
@@ -378,6 +624,28 @@ mod tests {
             }
 
             prop_assert_eq!(total_bytes, data.len());
+        }
+
+        #[test]
+        fn streaming_roundtrip(data in prop::collection::vec(any::<u8>(), 0..4_096)) {
+            let mut enc = Encoder::new();
+            let mut dec = Decoder::new();
+            let mut decoded = Vec::new();
+
+            // Feed in random-sized chunks.
+            let chunk_size = 100;
+            for chunk in data.chunks(chunk_size) {
+                enc.feed(chunk);
+                while let Some(token) = enc.next() {
+                    dec.decode(token.seq, token_literals(&token), &mut decoded);
+                }
+            }
+            enc.finish();
+            while let Some(token) = enc.next() {
+                dec.decode(token.seq, token_literals(&token), &mut decoded);
+            }
+
+            prop_assert_eq!(&data[..], &decoded[..]);
         }
     }
 }

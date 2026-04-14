@@ -32,8 +32,8 @@ impl Encoder {
         self.0.encode(&mut model.0, symbol, output);
     }
 
-    pub fn finish(self, output: &mut Vec<u8>) {
-        self.0.finish(output);
+    pub fn flush(&mut self, output: &mut Vec<u8>) {
+        self.0.flush(output);
     }
 }
 
@@ -65,16 +65,22 @@ impl Model {
 pub struct Sequence(pub(crate) crate::lz77::Sequence);
 
 /// Thin wrapper around the internal LZ77 `Encoder`.
-pub struct Lz77Encoder<'a>(crate::lz77::Encoder<'a>);
+pub struct Lz77Encoder(crate::lz77::Encoder);
 
-impl<'a> Lz77Encoder<'a> {
+impl Lz77Encoder {
     #[must_use]
-    pub fn new(input: &'a [u8]) -> Self {
-        Self(crate::lz77::Encoder::new(input))
+    pub fn new(input: &[u8]) -> Self {
+        let mut enc = crate::lz77::Encoder::new();
+        enc.feed(input);
+        enc.finish();
+        Self(enc)
     }
 
-    pub fn next_token(&mut self) -> Option<(Sequence, &'a [u8])> {
-        self.0.next().map(|t| (Sequence(t.seq), t.literals))
+    pub fn next_token(&mut self) -> Option<(Sequence, Vec<u8>)> {
+        self.0.next().map(|t| {
+            let len = t.seq.literal_len as usize;
+            (Sequence(t.seq), t.literals[..len].to_vec())
+        })
     }
 }
 

@@ -71,6 +71,10 @@ name = "lz77"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "roundtrip"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

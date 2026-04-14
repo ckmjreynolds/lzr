@@ -1,13 +1,41 @@
-//! LZ77-based compression library.
+//! LZR — append-only, random-access compression format.
+//!
+//! Data is compressed through an LZ77 stage followed by adaptive arithmetic
+//! coding, then stored in fixed 256 KiB blocks that enable random access by
+//! byte offset or line number.
+//!
+//! # Quick start
+//!
+//! ```
+//! use std::io::{Cursor, Read, Write};
+//!
+//! // Compress
+//! let mut w = lzr::Writer::new(Vec::new()).unwrap();
+//! w.write_all(b"Hello, world!\n").unwrap();
+//! let compressed = w.seal().unwrap();
+//!
+//! // Decompress
+//! let mut r = lzr::Reader::new(Cursor::new(compressed)).unwrap();
+//! let mut output = String::new();
+//! r.read_to_string(&mut output).unwrap();
+//! assert_eq!(output, "Hello, world!\n");
+//! ```
 
 #![allow(unused_features)]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(dead_code)]
 pub(crate) mod adler32;
+pub(crate) mod block;
+pub(crate) mod codec;
 pub(crate) mod entropy;
 pub(crate) mod lz77;
 pub(crate) mod model;
+mod reader;
 pub(crate) mod uleb128;
+mod writer;
+
+pub use reader::Reader;
+pub use writer::Writer;
 
 #[cfg(any(test, feature = "bench-internals"))]
 #[cfg_attr(coverage_nightly, coverage(off))]

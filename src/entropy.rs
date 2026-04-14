@@ -68,11 +68,11 @@ impl Encoder {
         model.update(symbol);
     }
 
-    /// Flushes remaining state so the decoder can reconstruct the final interval.
+    /// Flushes remaining state so the decoder can reconstruct the final
+    /// interval, then resets the arithmetic interval for the next frame.
     ///
-    /// Consumes `self` — no further encoding is possible.
-    #[allow(unused_mut)]
-    pub(crate) fn finish(mut self, output: &mut Vec<u8>) {
+    /// Models are NOT reset — the caller manages model lifetime.
+    pub(crate) fn flush(&mut self, output: &mut Vec<u8>) {
         self.normalize(output);
 
         // Emit the top byte of low, resolving any pending underflow.
@@ -85,6 +85,20 @@ impl Encoder {
             #[allow(clippy::cast_possible_truncation)]
             output.push((self.low >> (shift * 8)) as u8);
         }
+
+        // Reset arithmetic interval for the next frame.
+        self.low = 0;
+        self.high = u64::MAX;
+        self.pending = 0;
+        self.straddle = 0;
+    }
+
+    /// Resets the encoder to its initial state (for block boundaries).
+    pub(crate) const fn reset(&mut self) {
+        self.low = 0;
+        self.high = u64::MAX;
+        self.pending = 0;
+        self.straddle = 0;
     }
 
     /// Emits deferred underflow bytes after a resolved byte, then resets the
@@ -152,6 +166,14 @@ impl Decoder {
             code: 0,
             loaded: false,
         }
+    }
+
+    /// Resets the decoder to its initial state (for block or frame boundaries).
+    pub(crate) const fn reset(&mut self) {
+        self.low = 0;
+        self.high = u64::MAX;
+        self.code = 0;
+        self.loaded = false;
     }
 
     /// Decodes one symbol using `model`, consuming bytes from `input` as needed.
@@ -233,7 +255,7 @@ mod tests {
         for &b in data {
             enc.encode(&mut model, b, &mut compressed);
         }
-        enc.finish(&mut compressed);
+        enc.flush(&mut compressed);
 
         let mut dec = Decoder::new();
         let mut model = Model::new();
@@ -267,7 +289,7 @@ mod tests {
         for &b in &data {
             enc.encode(&mut model, b, &mut compressed);
         }
-        enc.finish(&mut compressed);
+        enc.flush(&mut compressed);
 
         #[allow(clippy::cast_precision_loss)]
         let ratio = 100.0 * (1.0 - compressed.len() as f64 / data.len() as f64);
@@ -287,10 +309,93 @@ mod tests {
         assert!(compressed.len() < data.len());
     }
 
+    #[test]
+    fn multi_frame_flush() {
+        // Encode two frames with flush between them (models persist).
+        let frame1 = lipsum_bytes(1024);
+        let frame2 = lipsum_bytes(2048);
+        let frame2 = &frame2[1024..];
+
+        let mut enc = Encoder::new();
+        let mut model = Model::new();
+        let mut compressed = Vec::new();
+
+        // Frame 1
+        for &b in &frame1 {
+            enc.encode(&mut model, b, &mut compressed);
+        }
+        enc.flush(&mut compressed);
+
+        // Frame 2 (model continues, encoder interval was reset by flush)
+        for &b in frame2 {
+            enc.encode(&mut model, b, &mut compressed);
+        }
+        enc.flush(&mut compressed);
+
+        // Decode both frames from a single stream.
+        let mut dec = Decoder::new();
+        let mut dec_model = Model::new();
+        let mut input: &[u8] = &compressed;
+        let mut decoded = Vec::new();
+
+        // Frame 1
+        for _ in 0..frame1.len() {
+            decoded.push(dec.decode(&mut dec_model, &mut input));
+        }
+        assert_eq!(&frame1[..], &decoded[..]);
+
+        // Reset decoder for frame 2 (flush wrote finalization bytes).
+        dec.reset();
+
+        decoded.clear();
+        for _ in 0..frame2.len() {
+            decoded.push(dec.decode(&mut dec_model, &mut input));
+        }
+        assert_eq!(frame2, &decoded[..]);
+    }
+
     proptest! {
         #[test]
         fn roundtrip(data in prop::collection::vec(any::<u8>(), 0..4_096)) {
             roundtrip_codec(&data);
+        }
+
+        #[test]
+        fn multi_frame_roundtrip(data in prop::collection::vec(any::<u8>(), 1..2_048)) {
+            // Split data at midpoint, encode as two frames with flush boundary, verify roundtrip.
+            let mid = data.len() / 2;
+            let (part1, part2) = data.split_at(mid);
+
+            let mut enc = Encoder::new();
+            let mut model = Model::new();
+            let mut compressed = Vec::new();
+
+            for &b in part1 {
+                enc.encode(&mut model, b, &mut compressed);
+            }
+            enc.flush(&mut compressed);
+
+            for &b in part2 {
+                enc.encode(&mut model, b, &mut compressed);
+            }
+            enc.flush(&mut compressed);
+
+            let mut dec = Decoder::new();
+            let mut dec_model = Model::new();
+            let mut input: &[u8] = &compressed;
+            let mut decoded = Vec::new();
+
+            for _ in 0..part1.len() {
+                decoded.push(dec.decode(&mut dec_model, &mut input));
+            }
+
+            dec.reset();
+
+            for _ in 0..part2.len() {
+                decoded.push(dec.decode(&mut dec_model, &mut input));
+            }
+
+            prop_assert_eq!(&data[..], &decoded[..]);
         }
     }
 }
