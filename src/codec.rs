@@ -316,6 +316,64 @@ mod tests {
         assert_eq!(data, output);
     }
 
+    #[test]
+    fn multi_token_roundtrip_large() {
+        // 100K of lipsum → triggers model rescaling in the full codec pipeline.
+        let data = crate::bench::lipsum_bytes(100_000);
+        let mut lz_enc = lz77::Encoder::new(lz77::DEFAULT_LEVEL);
+        lz_enc.feed(&data);
+        lz_enc.finish();
+
+        let mut tokens = Vec::new();
+        while let Some(token) = lz_enc.next() {
+            tokens.push(token);
+        }
+
+        let mut enc = entropy::Encoder::new();
+        let mut models = ModelSet::new();
+        let mut compressed = Vec::new();
+        for token in &tokens {
+            encode_line(&mut enc, &mut models, token, &mut compressed);
+        }
+        encode_terminator(&mut enc, &mut models, TAG_EOS, &mut compressed);
+        enc.finalize_sonnet(&mut compressed);
+
+        let mut dec = entropy::Decoder::new();
+        let mut dec_models = ModelSet::new();
+        let mut input: &[u8] = &compressed;
+        let mut decoded_tokens = Vec::new();
+
+        loop {
+            match decode_token(&mut dec, &mut dec_models, &mut input) {
+                DecodedToken::Line(t) => decoded_tokens.push(t),
+                DecodedToken::EndOfSonnet => break,
+                other => panic!(
+                    "unexpected token: {}",
+                    match other {
+                        DecodedToken::EndOfHaiku => "EOH",
+                        DecodedToken::EndOfOpus => "EOO",
+                        _ => "?",
+                    }
+                ),
+            }
+        }
+
+        assert_eq!(tokens.len(), decoded_tokens.len(), "token count mismatch");
+        for (i, (orig, decoded)) in tokens.iter().zip(decoded_tokens.iter()).enumerate() {
+            assert_eq!(orig.seq, decoded.seq, "token {i} sequence mismatch");
+            let len = orig.seq.literal_len as usize;
+            assert_eq!(&orig.literals[..len], &decoded.literals[..len], "token {i} literals mismatch");
+        }
+
+        let mut lz_dec = lz77::Decoder::new();
+        let mut output = Vec::new();
+        for token in &decoded_tokens {
+            let lits = &token.literals[..token.seq.literal_len as usize];
+            lz_dec.decode(token.seq, lits, &mut output);
+        }
+        assert_eq!(data, output);
+    }
+
     proptest! {
         #[test]
         fn roundtrip_random_line(

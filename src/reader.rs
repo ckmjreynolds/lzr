@@ -439,7 +439,7 @@ fn decode_partial_sonnet(data: &[u8]) -> (u64, u64, bool) {
         }
     }
 
-    let lines = output.iter().filter(|&&b| b == b'\n').count() as u64;
+    let lines = crate::count_lines(&output) as u64;
     (output.len() as u64, lines, sealed)
 }
 

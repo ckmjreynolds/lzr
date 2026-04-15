@@ -521,4 +521,37 @@ mod tests {
     fn generic_tag_model() {
         verify_freq_model(&mut TagModel::new(), 4);
     }
+
+    proptest! {
+        #[test]
+        fn tag_model_rescale(
+            symbols in prop::collection::vec(0u8..4, 16_384..20_000),
+        ) {
+            let mut model = TagModel::new();
+            for &s in &symbols {
+                model.update(s);
+            }
+            // After 16384+ updates, rescale must have fired. Verify consistency.
+            prop_assert!(model.total() < u32::from(RESCALE_AT), "total {} should be < {RESCALE_AT}", model.total());
+            #[allow(clippy::cast_possible_truncation)]
+            for s in 0..TAG_SYMBOLS as u8 {
+                prop_assert!(model.freq(s) >= 1, "freq({s}) must be >= 1 after rescale");
+                prop_assert_eq!(model.find(model.cum_freq(s)), s);
+            }
+        }
+
+        #[test]
+        fn model_rescale(
+            symbols in prop::collection::vec(any::<u8>(), 16_384..20_000),
+        ) {
+            let mut model = Model::new();
+            for &s in &symbols {
+                model.update(s);
+            }
+            // After 16384+ updates, rescale must have fired. Verify consistency.
+            for s in 0..=255u8 {
+                prop_assert_eq!(model.find(model.cum_freq(s)), s);
+            }
+        }
+    }
 }

@@ -118,11 +118,6 @@ impl BitReader {
     const fn align_to_byte_boundary(&mut self) {
         self.bits_remaining = 0;
     }
-
-    const fn reset(&mut self) {
-        self.byte_buffer = 0;
-        self.bits_remaining = 0;
-    }
 }
 
 /// Reads one byte from `input`, advancing the slice. Returns `0x00` if empty.
@@ -150,8 +145,6 @@ pub(crate) struct Encoder {
     high: u16,
     pending_bits: u64,
     writer: BitWriter,
-    /// Output byte offset at the start of the current Haiku.
-    haiku_start: usize,
 }
 
 impl Encoder {
@@ -162,7 +155,6 @@ impl Encoder {
             high: 0xFFFF,
             pending_bits: 0,
             writer: BitWriter::new(),
-            haiku_start: 0,
         }
     }
 
@@ -219,7 +211,6 @@ impl Encoder {
         self.high = 0xFFFF;
         self.pending_bits = 0;
         self.writer.total_bits = 0;
-        self.haiku_start = output.len();
     }
 
     /// Writes Kireji finalization bits, pads to byte boundary, and fully resets.
@@ -256,7 +247,6 @@ impl Encoder {
         self.high = 0xFFFF;
         self.pending_bits = 0;
         self.writer.reset();
-        self.haiku_start = 0;
     }
 
     /// Returns the number of pending E3 underflow bits.
@@ -393,15 +383,6 @@ impl Decoder {
         self.low = 0x0000;
         self.high = 0xFFFF;
         self.code = 0;
-        self.initialized = false;
-    }
-
-    /// Resets all decoder state (for Sonnet boundaries).
-    pub(crate) const fn reset(&mut self) {
-        self.low = 0x0000;
-        self.high = 0xFFFF;
-        self.code = 0;
-        self.reader.reset();
         self.initialized = false;
     }
 
@@ -545,6 +526,14 @@ mod tests {
             decoded2.push(dec.decode(&mut dec_model, &mut input));
         }
         assert_eq!(&data2[..], &decoded2[..]);
+    }
+
+    #[test]
+    fn large_roundtrip_triggers_rescale() {
+        // 100K bytes → 100K model updates → triggers rescale multiple times.
+        let data = crate::bench::lipsum_bytes(100_000);
+        let compressed = roundtrip_bytes(&data);
+        assert!(compressed.len() < data.len());
     }
 
     #[test]

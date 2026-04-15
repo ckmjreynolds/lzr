@@ -37,6 +37,12 @@ mod writer;
 pub use reader::Reader;
 pub use writer::Writer;
 
+/// Counts newline bytes in `data`.
+#[allow(clippy::naive_bytecount)]
+pub(crate) fn count_lines(data: &[u8]) -> usize {
+    data.iter().filter(|&&b| b == b'\n').count()
+}
+
 /// Default compression level (1–9). Levels 1–8 use hash-chain match finding;
 /// level 9 uses B+tree match finding.
 pub const DEFAULT_LEVEL: u8 = lz77::DEFAULT_LEVEL;

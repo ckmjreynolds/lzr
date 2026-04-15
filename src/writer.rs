@@ -76,6 +76,11 @@ struct WriterState<W: Write> {
     // Per-Sonnet counters (reset at Sonnet boundaries).
     sonnet_bytes: u64,
     sonnet_lines: u64,
+
+    // Decoder mirror: tracks the sliding window so we can resolve match bytes
+    // for accurate line counting and checksumming.
+    lz77_dec: lz77::Decoder,
+    decode_buf: Vec<u8>,
 }
 
 impl<W: Write> Writer<W> {
@@ -118,6 +123,8 @@ impl<W: Write> Writer<W> {
                 checksum: Adler32::new(),
                 sonnet_bytes: 0,
                 sonnet_lines: 0,
+                lz77_dec: lz77::Decoder::new(),
+                decode_buf: Vec::with_capacity(512),
             }),
         })
     }
@@ -133,11 +140,8 @@ impl<W: Write> Writer<W> {
     pub fn seal(mut self) -> io::Result<W> {
         let mut st = self.state.take().ok_or_else(|| io::Error::other("writer already consumed"))?;
 
-        // Flush all remaining LZ77 data.
-        for token in st.lz77_enc.flush() {
-            st.track_token(&token);
-            codec::encode_line(&mut st.entropy_enc, &mut st.models, &token, &mut st.encode_buf);
-        }
+        // Drain all remaining LZ77 data, finalizing Sonnets as needed.
+        st.drain_lz77()?;
 
         // Encode EOO terminator and finalize (Kireji + byte-align).
         codec::encode_terminator(&mut st.entropy_enc, &mut st.models, TAG_EOO, &mut st.encode_buf);
@@ -234,7 +238,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                         checksum.update(&decoded_output[start..]);
 
                         sonnet_bytes += seq_bytes;
-                        sonnet_lines += count_lines(&decoded_output[start..]) as u64;
+                        sonnet_lines += crate::count_lines(&decoded_output[start..]) as u64;
                     }
                     codec::DecodedToken::EndOfHaiku => {
                         dec.finalize_haiku(&mut input);
@@ -270,15 +274,11 @@ impl<W: Read + Write + Seek> Writer<W> {
                 checksum,
                 sonnet_bytes: 0,
                 sonnet_lines: 0,
+                lz77_dec: lz77::Decoder::new(),
+                decode_buf: Vec::with_capacity(512),
             }),
         })
     }
-}
-
-/// Counts newline bytes in `data`.
-#[allow(clippy::naive_bytecount)]
-fn count_lines(data: &[u8]) -> usize {
-    data.iter().filter(|&&b| b == b'\n').count()
 }
 
 impl<W: Write> WriterState<W> {
@@ -299,15 +299,47 @@ impl<W: Write> WriterState<W> {
         terminator_cost + kireji_bytes
     }
 
+    /// Bytes remaining in the current Sonnet before the footer and tail.
+    fn remaining_capacity(&self) -> usize {
+        let tail = self.compute_tail_bytes();
+        SONNET_SIZE.saturating_sub(self.sonnet_bytes_used()).saturating_sub(MAX_FOOTER_SIZE).saturating_sub(tail)
+    }
+
+    /// Drains all pending LZ77 data, finalizing Sonnets as needed.
+    fn drain_lz77(&mut self) -> io::Result<()> {
+        self.lz77_enc.finish();
+        loop {
+            self.encode_tokens()?;
+            if self.remaining_capacity() < MATCH_UPPER + PER_LIT_UPPER {
+                self.finalize_sonnet()?;
+                // finalize_sonnet resets the encoder; re-finish so it can drain carry data.
+                self.lz77_enc.finish();
+            } else {
+                break;
+            }
+        }
+        // Emit any remaining pending literals that didn't form a full token.
+        if let Some(token) = self.lz77_enc.drain() {
+            self.track_token(&token);
+            codec::encode_line(&mut self.entropy_enc, &mut self.models, &token, &mut self.encode_buf);
+        }
+        Ok(())
+    }
+
     /// Tracks a token's contribution to counters and checksum.
+    ///
+    /// Decodes the full token (literals + match) through the LZ77 decoder to
+    /// resolve back-reference bytes, ensuring newlines in matched regions are
+    /// counted and the checksum covers all uncompressed data.
     fn track_token(&mut self, token: &lz77::Token) {
         let lits = &token.literals[..token.seq.literal_len as usize];
-        let match_bytes = u64::from(token.seq.match_len);
-        let lit_bytes = u64::from(token.seq.literal_len);
 
-        self.checksum.update(lits);
-        self.sonnet_bytes += lit_bytes + match_bytes;
-        self.sonnet_lines += count_lines(lits) as u64;
+        self.decode_buf.clear();
+        self.lz77_dec.decode(token.seq, lits, &mut self.decode_buf);
+
+        self.checksum.update(&self.decode_buf);
+        self.sonnet_bytes += self.decode_buf.len() as u64;
+        self.sonnet_lines += crate::count_lines(&self.decode_buf) as u64;
     }
 
     /// Flushes the encode buffer to dest (does NOT flush dest itself).
@@ -325,11 +357,7 @@ impl<W: Write> WriterState<W> {
     #[allow(clippy::cast_possible_truncation)]
     fn encode_tokens(&mut self) -> io::Result<()> {
         loop {
-            let tail = self.compute_tail_bytes();
-            let remaining = SONNET_SIZE
-                .saturating_sub(self.sonnet_bytes_used())
-                .saturating_sub(MAX_FOOTER_SIZE)
-                .saturating_sub(tail);
+            let remaining = self.remaining_capacity();
 
             if remaining == 0 {
                 break;
@@ -362,12 +390,12 @@ impl<W: Write> WriterState<W> {
     }
 
     /// Checks if the Sonnet is full and finalizes it if so.
+    ///
+    /// Triggers when the remaining capacity is too small for even the smallest
+    /// token (one literal, no match). Without this threshold, the encoder would
+    /// stall with a few unusable bytes remaining.
     fn maybe_finalize_sonnet(&mut self) -> io::Result<()> {
-        let tail = self.compute_tail_bytes();
-        let remaining =
-            SONNET_SIZE.saturating_sub(self.sonnet_bytes_used()).saturating_sub(MAX_FOOTER_SIZE).saturating_sub(tail);
-
-        if remaining == 0 {
+        if self.remaining_capacity() < MATCH_UPPER + PER_LIT_UPPER {
             self.finalize_sonnet()?;
         }
         Ok(())
@@ -378,11 +406,7 @@ impl<W: Write> WriterState<W> {
     fn finalize_sonnet(&mut self) -> io::Result<()> {
         // Drain remaining LZ77 literals that fit.
         loop {
-            let tail = self.compute_tail_bytes();
-            let rem = SONNET_SIZE
-                .saturating_sub(self.sonnet_bytes_used())
-                .saturating_sub(MAX_FOOTER_SIZE)
-                .saturating_sub(tail);
+            let rem = self.remaining_capacity();
             if rem == 0 {
                 break;
             }
@@ -401,12 +425,7 @@ impl<W: Write> WriterState<W> {
 
         // Drain any remaining pending literals.
         if let Some(t) = self.lz77_enc.drain() {
-            // Check if it fits.
-            let tail = self.compute_tail_bytes();
-            let rem = SONNET_SIZE
-                .saturating_sub(self.sonnet_bytes_used())
-                .saturating_sub(MAX_FOOTER_SIZE)
-                .saturating_sub(tail);
+            let rem = self.remaining_capacity();
             let needed = t.seq.literal_len as usize * PER_LIT_UPPER + 6; // lit-only overhead
             if rem >= needed {
                 self.track_token(&t);
@@ -425,6 +444,7 @@ impl<W: Write> WriterState<W> {
         // Carry unconsumed input to next Sonnet.
         let carry = self.lz77_enc.unconsumed_input();
         self.lz77_enc.reset();
+        self.lz77_dec = lz77::Decoder::new();
         self.entropy_enc.reset();
         self.models.reset();
         self.sonnet_index += 1;

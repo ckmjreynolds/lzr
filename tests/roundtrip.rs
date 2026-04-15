@@ -4,6 +4,9 @@ use std::fmt::Write as _;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 use lzr::{Reader, Writer};
+use pretty_assertions::assert_eq;
+
+mod common;
 
 /// Write data, seal, read back, verify.
 fn roundtrip(data: &[u8]) -> Vec<u8> {
@@ -62,6 +65,26 @@ fn line_count() {
 
     let r = Reader::new(Cursor::new(buf)).unwrap();
     assert_eq!(r.lines(), 3);
+    assert_eq!(r.len(), data.len() as u64);
+}
+
+#[test]
+fn line_count_in_matched_regions() {
+    // Repeated identical lines force LZ77 to match across newlines,
+    // exercising the decoder-mirror path in the writer's track_token().
+    let line = b"the quick brown fox jumps over the lazy dog\n";
+    let mut data = Vec::new();
+    for _ in 0..100 {
+        data.extend_from_slice(line);
+    }
+
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    w.write_all(&data).unwrap();
+    let buf = w.seal().unwrap();
+
+    let r = Reader::new(Cursor::new(buf)).unwrap();
+    assert_eq!(r.lines(), 100);
     assert_eq!(r.len(), data.len() as u64);
 }
 
@@ -201,4 +224,160 @@ fn all_levels_roundtrip() {
         r.read_to_end(&mut output).unwrap();
         assert_eq!(data, output, "roundtrip failed at level {level}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Sonnet tests (data > 256 KiB encoded → crosses Sonnet boundaries)
+// ---------------------------------------------------------------------------
+
+fn numbered_lines(min_bytes: usize) -> Vec<u8> {
+    common::numbered_lines(min_bytes)
+}
+
+#[test]
+fn multi_sonnet_roundtrip() {
+    // 600 KiB of low-compressibility numbered lines guarantees >256 KiB encoded.
+    let data = numbered_lines(600 * 1024);
+    roundtrip(&data);
+}
+
+#[test]
+fn multi_sonnet_seek_by_byte() {
+    let data = numbered_lines(600 * 1024);
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    w.write_all(&data).unwrap();
+    let buf = w.seal().unwrap();
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    let total = r.len();
+
+    // Seek to the midpoint (should be in second Sonnet).
+    let mid = total / 2;
+    r.seek(SeekFrom::Start(mid)).unwrap();
+    let mut out = vec![0u8; 64];
+    r.read_exact(&mut out).unwrap();
+    assert_eq!(&out, &data[mid as usize..mid as usize + 64]);
+
+    // Seek near the end.
+    r.seek(SeekFrom::End(-64)).unwrap();
+    let mut out = vec![0u8; 64];
+    r.read_exact(&mut out).unwrap();
+    assert_eq!(&out, &data[data.len() - 64..]);
+}
+
+#[test]
+fn multi_sonnet_seek_to_line() {
+    let data = numbered_lines(600 * 1024);
+
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    w.write_all(&data).unwrap();
+    let buf = w.seal().unwrap();
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    let reader_lines = r.lines();
+    assert!(reader_lines > 0, "expected at least some lines");
+
+    // Seek to a line in the second half (using the reader's line count).
+    let target_line = reader_lines * 3 / 4;
+    let offset = r.seek_to_line(target_line).unwrap();
+
+    // Read one line and verify against the original data at that offset.
+    let mut line_buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = r.read(&mut byte).unwrap();
+        if n == 0 || byte[0] == b'\n' {
+            break;
+        }
+        line_buf.push(byte[0]);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let expected_line = std::str::from_utf8(&data[offset as usize..]).unwrap().lines().next().unwrap();
+    assert_eq!(std::str::from_utf8(&line_buf).unwrap(), expected_line);
+}
+
+#[test]
+fn reader_edge_cases() {
+    // Empty sealed file.
+    let buf = Vec::new();
+    let w = Writer::new(buf).unwrap();
+    let buf = w.seal().unwrap();
+    let mut r = Reader::new(Cursor::new(&buf)).unwrap();
+    assert!(r.is_empty());
+    assert_eq!(r.len(), 0);
+    assert_eq!(r.lines(), 0);
+
+    // Debug format doesn't panic.
+    let _ = format!("{r:?}");
+
+    // seek_to_line out of range.
+    let err = r.seek_to_line(1);
+    assert!(err.is_err());
+
+    // SeekFrom::Current positive and negative.
+    let data = b"0123456789abcdef";
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    w.write_all(data).unwrap();
+    let buf = w.seal().unwrap();
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+
+    r.seek(SeekFrom::Start(4)).unwrap();
+    let pos = r.seek(SeekFrom::Current(4)).unwrap();
+    assert_eq!(pos, 8);
+
+    let pos = r.seek(SeekFrom::Current(-2)).unwrap();
+    assert_eq!(pos, 6);
+    let mut out = vec![0u8; 4];
+    r.read_exact(&mut out).unwrap();
+    assert_eq!(&out, b"6789");
+
+    // SeekFrom::End with positive offset clamps to total_bytes.
+    let pos = r.seek(SeekFrom::End(100)).unwrap();
+    assert_eq!(pos, data.len() as u64);
+
+    // SeekFrom::End with negative offset past start → error.
+    let err = r.seek(SeekFrom::End(-100));
+    assert!(err.is_err());
+
+    // SeekFrom::Current with negative offset past start → error.
+    r.seek(SeekFrom::Start(2)).unwrap();
+    let err = r.seek(SeekFrom::Current(-10));
+    assert!(err.is_err());
+}
+
+#[test]
+fn writer_edge_cases() {
+    // Debug format doesn't panic.
+    let w = Writer::new(Vec::new()).unwrap();
+    let _ = format!("{w:?}");
+
+    // Drop without seal — exercises the Drop impl.
+    {
+        let mut w = Writer::new(Vec::new()).unwrap();
+        w.write_all(b"data that will be dropped\n").unwrap();
+        // Writer drops here, calling flush() in Drop.
+    }
+}
+
+#[test]
+fn multi_sonnet_with_flush() {
+    let data = numbered_lines(600 * 1024);
+    let chunk_size = 50 * 1024;
+
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    for chunk in data.chunks(chunk_size) {
+        w.write_all(chunk).unwrap();
+        w.flush().unwrap();
+    }
+    let buf = w.seal().unwrap();
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    let mut output = Vec::new();
+    r.read_to_end(&mut output).unwrap();
+    assert_eq!(data, output);
 }

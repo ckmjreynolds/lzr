@@ -168,7 +168,7 @@ impl MatchFinder {
         }
 
         let buf_pos = pos - base;
-        let min_pos = pos.saturating_sub(WINDOW_SIZE);
+        let min_pos = pos.saturating_sub(u16::MAX as usize);
         let key = make_key(buf, buf_pos);
 
         let mut best_len = MIN_MATCH - 1;
@@ -292,12 +292,6 @@ impl Encoder {
             finder: MatchFinder::new(level),
             finished: false,
         }
-    }
-
-    /// Returns the compression level.
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) const fn level(&self) -> u8 {
-        self.finder.depth as u8
     }
 
     /// Appends input data to the encoder's internal buffer.
@@ -513,11 +507,6 @@ impl Decoder {
         }
     }
 
-    pub(crate) fn reset(&mut self) {
-        self.window.fill(0);
-        self.pos = 0;
-    }
-
     pub(crate) fn decode(&mut self, seq: Sequence, literals: &[u8], output: &mut Vec<u8>) {
         debug_assert_eq!(literals.len(), seq.literal_len as usize);
 
@@ -669,42 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_between_blocks() {
-        let block1 = lipsum_bytes(2048);
-        let block2 = vec![0x42; 2048];
-
-        let mut enc = Encoder::new(DEFAULT_LEVEL);
-        enc.feed(&block1);
-        enc.finish();
-        let mut tokens1 = Vec::new();
-        while let Some(token) = enc.next() {
-            tokens1.push(token);
-        }
-
-        enc.reset();
-        enc.feed(&block2);
-        enc.finish();
-        let mut tokens2 = Vec::new();
-        while let Some(token) = enc.next() {
-            tokens2.push(token);
-        }
-
-        let mut dec = Decoder::new();
-        let mut decoded1 = Vec::new();
-        for token in &tokens1 {
-            dec.decode(token.seq, token_literals(token), &mut decoded1);
-        }
-        assert_eq!(block1, decoded1);
-
-        dec.reset();
-        let mut decoded2 = Vec::new();
-        for token in &tokens2 {
-            dec.decode(token.seq, token_literals(token), &mut decoded2);
-        }
-        assert_eq!(block2, decoded2);
-    }
-
-    #[test]
     fn next_capped_basic() {
         let data = lipsum_bytes(1024);
         let mut enc = Encoder::new(DEFAULT_LEVEL);
@@ -827,5 +780,27 @@ mod tests {
 
             prop_assert_eq!(&data[..], &decoded[..]);
         }
+    }
+
+    #[test]
+    fn compact_triggers_on_large_incremental_feed() {
+        // Feed data in chunks totaling >128 KiB to trigger maybe_compact().
+        let data = lipsum_bytes(200 * 1024);
+        let mut enc = Encoder::new(DEFAULT_LEVEL);
+        let mut dec = Decoder::new();
+        let mut decoded = Vec::new();
+
+        for chunk in data.chunks(4096) {
+            enc.feed(chunk);
+            while let Some(token) = enc.next() {
+                dec.decode(token.seq, token_literals(&token), &mut decoded);
+            }
+        }
+        enc.finish();
+        while let Some(token) = enc.next() {
+            dec.decode(token.seq, token_literals(&token), &mut decoded);
+        }
+
+        assert_eq!(data, &decoded[..]);
     }
 }
