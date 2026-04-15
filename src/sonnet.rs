@@ -1,39 +1,40 @@
-//! Block-level constants and footer handling for the LZR format.
+//! Sonnet-level constants and footer handling for the LZR format.
 //!
-//! Each block is exactly [`BLOCK_SIZE`] bytes (256 KiB). Block 0 begins with
-//! a 4-byte magic header ([`MAGIC`]). Every complete block ends with a
-//! variable-length footer containing cumulative counters.
+//! A **Sonnet** is a fixed-size block (256 KiB) — the unit of random access.
+//! The first Sonnet begins after the 4-byte Invocation header ([`INVOCATION`]).
+//! Every complete Sonnet ends with a variable-length footer (Couplet or Coda)
+//! containing cumulative counters.
 //!
-//! # Footer layout
+//! # Footer layout (Couplet / Coda)
 //!
 //! ```text
-//! | bytes_count (uleb128) | lines_count (uleb128) | adler32 (4 bytes) | footer_len (1 byte) |
+//! | cumulative_bytes (uleb128) | cumulative_lines (uleb128) | checksum (4 bytes) | footer_len (1 byte) |
 //! ```
 //!
-//! `footer_len` is the **last byte** of the 256 KiB block. A reader reads that
-//! byte first, then backs up `footer_len` bytes to parse the footer fields.
-//! All counts are **cumulative** across blocks.
+//! `footer_len` is the **last byte** of the Sonnet. A reader reads that byte
+//! first, then backs up `footer_len` bytes to parse the footer fields.
+//! All counts are **cumulative** from the start of the Opus.
 
 use crate::uleb128;
 
-/// Fixed block size: 256 KiB.
-pub(crate) const BLOCK_SIZE: usize = 256 * 1024;
+/// Fixed Sonnet size: 256 KiB (262,144 bytes).
+pub(crate) const SONNET_SIZE: usize = 256 * 1024;
 
-/// Magic bytes at the start of block 0.
-pub(crate) const MAGIC: [u8; 4] = *b"LZR\0";
+/// Invocation header: magic bytes + version (FORMAT.md Section 1.3).
+pub(crate) const INVOCATION: [u8; 4] = *b"LZR\0";
 
-/// Length of the magic header in bytes.
-pub(crate) const MAGIC_LEN: usize = MAGIC.len();
+/// Length of the Invocation header in bytes.
+pub(crate) const INVOCATION_LEN: usize = INVOCATION.len();
 
 /// Maximum footer size: 9 (max uleb128) + 9 + 4 (adler32) + 1 (len) = 23.
 pub(crate) const MAX_FOOTER_SIZE: usize = 9 + 9 + 4 + 1;
 
-/// Parsed block footer.
+/// Parsed Sonnet footer (Couplet for non-final, Coda for final).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Footer {
-    /// Cumulative uncompressed byte count through end of this block.
+    /// Cumulative uncompressed byte count through end of this Sonnet.
     pub(crate) bytes_count: u64,
-    /// Cumulative newline count through end of this block.
+    /// Cumulative newline count through end of this Sonnet.
     pub(crate) lines_count: u64,
     /// Cumulative Adler-32 checksum.
     pub(crate) adler32: u32,
@@ -59,7 +60,7 @@ pub(crate) fn encode_footer(footer: &Footer) -> Vec<u8> {
     buf
 }
 
-/// Decodes a footer from a complete block.
+/// Decodes a footer from a complete Sonnet (or suffix containing the footer).
 ///
 /// Reads `footer_len` from the last byte, then parses the footer fields
 /// from the appropriate offset.
@@ -100,9 +101,8 @@ mod tests {
         let expected_size = footer_size(footer.bytes_count, footer.lines_count);
         assert_eq!(encoded.len(), expected_size);
 
-        // Place footer at the end of a block-sized buffer.
-        let mut block = vec![0u8; BLOCK_SIZE];
-        let start = BLOCK_SIZE - encoded.len();
+        let mut block = vec![0u8; SONNET_SIZE];
+        let start = SONNET_SIZE - encoded.len();
         block[start..].copy_from_slice(&encoded);
 
         let decoded = decode_footer(&block);
@@ -129,11 +129,10 @@ mod tests {
             adler32: 1,
         };
         let encoded = encode_footer(&footer);
-        // 1 + 1 + 4 + 1 = 7 bytes
         assert_eq!(encoded.len(), 7);
 
-        let mut block = vec![0u8; BLOCK_SIZE];
-        let start = BLOCK_SIZE - encoded.len();
+        let mut block = vec![0u8; SONNET_SIZE];
+        let start = SONNET_SIZE - encoded.len();
         block[start..].copy_from_slice(&encoded);
         let decoded = decode_footer(&block);
         assert_eq!(footer, decoded);
@@ -150,8 +149,8 @@ mod tests {
             let encoded = encode_footer(&footer);
             prop_assert_eq!(encoded.len(), footer_size(bytes_count, lines_count));
 
-            let mut block = vec![0u8; BLOCK_SIZE];
-            let start = BLOCK_SIZE - encoded.len();
+            let mut block = vec![0u8; SONNET_SIZE];
+            let start = SONNET_SIZE - encoded.len();
             block[start..].copy_from_slice(&encoded);
 
             let decoded = decode_footer(&block);

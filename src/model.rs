@@ -1,8 +1,13 @@
-//! Adaptive frequency model for arithmetic coding.
+//! Adaptive frequency models for arithmetic coding.
 //!
-//! Maintains per-symbol frequency counts (256 symbols, one per byte value).
-//! A Fenwick tree provides O(log N) prefix-sum queries and updates, enabling
-//! efficient CDF lookups for encoding and decoding.
+//! Two model types are provided:
+//!
+//! - [`Model`] — 256-symbol model (one per byte value), backed by a Fenwick tree
+//!   for O(log N) prefix-sum queries.
+//! - [`TagModel`] — 4-symbol model for the token tag alphabet (LINE, EOH, EOS, EOO),
+//!   using a flat array with linear scan.
+//!
+//! Both implement the [`FreqModel`] trait consumed by the arithmetic coder.
 //!
 //! Adaptation increments the observed symbol's frequency on each update.
 //! When the total reaches [`RESCALE_AT`], all frequencies are halved (with a
@@ -14,6 +19,48 @@ use std::fmt;
 
 use static_assertions::const_assert;
 
+// ---------------------------------------------------------------------------
+// Shared constants
+// ---------------------------------------------------------------------------
+
+/// Rescale threshold. When total reaches this value, all frequencies are halved.
+const RESCALE_AT: u16 = 16_384;
+
+// ---------------------------------------------------------------------------
+// FreqModel trait
+// ---------------------------------------------------------------------------
+
+/// Trait for adaptive frequency models used by the arithmetic coder.
+///
+/// Provides CDF queries (`cum_freq`, `freq`, `total`, `find`) and adaptation
+/// (`update`, `reset`). Implementations must maintain synchronized state so
+/// that encoder and decoder produce identical model evolution.
+pub(crate) trait FreqModel {
+    /// Returns the cumulative frequency for all symbols `< symbol`.
+    fn cum_freq(&self, symbol: u8) -> u32;
+
+    /// Returns the frequency of `symbol`.
+    fn freq(&self, symbol: u8) -> u32;
+
+    /// Returns the total of all frequencies.
+    fn total(&self) -> u32;
+
+    /// Finds the symbol whose CDF interval contains `value`.
+    ///
+    /// Returns the largest `s` such that `cum_freq(s) <= value < cum_freq(s) + freq(s)`.
+    fn find(&self, value: u32) -> u8;
+
+    /// Adapts the model after encoding/decoding `symbol`.
+    fn update(&mut self, symbol: u8);
+
+    /// Resets the model to a uniform distribution.
+    fn reset(&mut self);
+}
+
+// ===========================================================================
+// Model — 256-symbol byte model (Fenwick tree)
+// ===========================================================================
+
 const_assert!(TOTAL_COUNTS == NUM_SYMBOLS * INITIAL_COUNT);
 
 /// Initial total frequency count across all symbols.
@@ -24,9 +71,6 @@ const INITIAL_COUNT: usize = TOTAL_COUNTS / NUM_SYMBOLS;
 
 /// Number of distinct symbols (one per possible byte value).
 const NUM_SYMBOLS: usize = 1 << 8;
-
-/// Rescale threshold. When total reaches this value, all frequencies are halved.
-const RESCALE_AT: u16 = 16_384;
 
 // Guard that the pre-computed tables below match the constants above.
 const_assert!(TOTAL_COUNTS == 256);
@@ -79,20 +123,11 @@ pub(crate) const UNIFORM_TREE: [i16; NUM_SYMBOLS + 1] = [
 /// Flat frequency table for a uniform distribution.
 const UNIFORM_FREQ: [u16; NUM_SYMBOLS] = [1u16; NUM_SYMBOLS];
 
-/// Adaptive frequency model backed by a Fenwick tree.
+/// Adaptive frequency model for 256 byte symbols, backed by a Fenwick tree.
 ///
 /// Tracks the frequency of each byte value and maintains a Fenwick tree for
 /// efficient cumulative-frequency queries. The total grows by 1 on each update
 /// and is halved (with floor 1) when it reaches [`RESCALE_AT`].
-///
-/// # Examples
-///
-/// ```text
-/// let mut m = Model::new();
-/// assert_eq!(m.freq(0x41), 1);     // uniform at start
-/// m.update(0x41);                   // boost 'A'
-/// assert_eq!(m.freq(0x41), 2);
-/// ```
 pub(crate) struct Model {
     /// Fenwick (binary indexed) tree over symbol frequencies.
     tree: [i16; NUM_SYMBOLS + 1],
@@ -109,35 +144,6 @@ impl Model {
             tree: UNIFORM_TREE,
             freq: UNIFORM_FREQ,
             total: 256,
-        }
-    }
-
-    /// Resets the model to a uniform frequency distribution.
-    pub(crate) const fn reset(&mut self) {
-        *self = Self::new();
-    }
-
-    /// Returns the current total count across all symbols.
-    pub(crate) const fn total(&self) -> u64 {
-        self.total as u64
-    }
-
-    /// Returns the current frequency of `byte`.
-    pub(crate) const fn freq(&self, byte: u8) -> u64 {
-        self.freq[byte as usize] as u64
-    }
-
-    /// Adapts the model by boosting `byte`'s frequency by 1.
-    ///
-    /// When the total reaches [`RESCALE_AT`], all frequencies are halved
-    /// (floored at 1) to provide exponential decay.
-    pub(crate) fn update(&mut self, byte: u8) {
-        self.freq[byte as usize] += 1;
-        self.update_inner(byte as usize, 1);
-        self.total += 1;
-
-        if self.total >= RESCALE_AT {
-            self.rescale();
         }
     }
 
@@ -182,14 +188,6 @@ impl Model {
         }
     }
 
-    /// Returns the cumulative frequency for all symbols `< byte`.
-    ///
-    /// This is the lower bound of `byte`'s interval in the CDF, used by the
-    /// arithmetic encoder.
-    pub(crate) const fn prefix_sum(&self, byte: u8) -> u64 {
-        self.prefix_sum_inner(byte as usize).cast_unsigned() as u64
-    }
-
     /// Fenwick prefix-sum query over the first `i` elements.
     const fn prefix_sum_inner(&self, mut i: usize) -> i16 {
         let mut sum = 0i16;
@@ -201,14 +199,24 @@ impl Model {
 
         sum
     }
+}
 
-    /// Finds the symbol whose CDF interval contains `target`.
-    ///
-    /// Returns the largest `byte` such that `prefix_sum(byte) <= target`.
-    /// Used by the arithmetic decoder to map a code point back to a symbol.
+impl FreqModel for Model {
+    fn cum_freq(&self, symbol: u8) -> u32 {
+        u32::from(self.prefix_sum_inner(symbol as usize).cast_unsigned())
+    }
+
+    fn freq(&self, symbol: u8) -> u32 {
+        u32::from(self.freq[symbol as usize])
+    }
+
+    fn total(&self) -> u32 {
+        u32::from(self.total)
+    }
+
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) const fn find(&self, target: u64) -> u8 {
-        let mut target = target.cast_signed() as i16;
+    fn find(&self, value: u32) -> u8 {
+        let mut target = value as i16;
         let mut bit = NUM_SYMBOLS >> 1;
         let mut i = 0;
 
@@ -225,7 +233,108 @@ impl Model {
 
         i as u8
     }
+
+    fn update(&mut self, symbol: u8) {
+        self.freq[symbol as usize] += 1;
+        self.update_inner(symbol as usize, 1);
+        self.total += 1;
+
+        if self.total >= RESCALE_AT {
+            self.rescale();
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
 }
+
+// ===========================================================================
+// TagModel — 4-symbol tag model (flat array, linear scan)
+// ===========================================================================
+
+/// Number of tag symbols.
+const TAG_SYMBOLS: usize = 4;
+
+/// Adaptive frequency model for the 4-symbol tag alphabet.
+///
+/// Uses a flat frequency array with linear-scan CDF queries. For 4 symbols,
+/// a linear scan is faster than any tree structure due to branch prediction
+/// and cache locality.
+pub(crate) struct TagModel {
+    freq: [u16; TAG_SYMBOLS],
+    total: u16,
+}
+
+impl TagModel {
+    /// Creates a new tag model with a uniform frequency distribution.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) const fn new() -> Self {
+        Self {
+            freq: [1u16; TAG_SYMBOLS],
+            total: TAG_SYMBOLS as u16,
+        }
+    }
+}
+
+impl FreqModel for TagModel {
+    fn cum_freq(&self, symbol: u8) -> u32 {
+        let mut sum = 0u32;
+        for i in 0..symbol as usize {
+            sum += u32::from(self.freq[i]);
+        }
+        sum
+    }
+
+    fn freq(&self, symbol: u8) -> u32 {
+        u32::from(self.freq[symbol as usize])
+    }
+
+    fn total(&self) -> u32 {
+        u32::from(self.total)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn find(&self, value: u32) -> u8 {
+        let mut cum = 0u32;
+        for (i, &f) in self.freq.iter().enumerate() {
+            cum += u32::from(f);
+            if cum > value {
+                return i as u8;
+            }
+        }
+        (TAG_SYMBOLS - 1) as u8
+    }
+
+    fn update(&mut self, symbol: u8) {
+        self.freq[symbol as usize] += 1;
+        self.total += 1;
+
+        if self.total >= RESCALE_AT {
+            self.rescale();
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+impl TagModel {
+    /// Halves all frequencies (floor 1) and recomputes total.
+    fn rescale(&mut self) {
+        let mut total = 0u16;
+        for f in &mut self.freq {
+            *f = (*f >> 1).max(1);
+            total += *f;
+        }
+        self.total = total;
+    }
+}
+
+// ===========================================================================
+// Debug impl (test only)
+// ===========================================================================
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -244,6 +353,10 @@ impl fmt::Debug for Model {
     }
 }
 
+// ===========================================================================
+// Tests
+// ===========================================================================
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -251,14 +364,18 @@ mod tests {
 
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Model (256-symbol) tests
+    // -----------------------------------------------------------------------
+
     /// Verifies that the Fenwick tree and raw frequency table are in sync.
-    fn in_sync(model: &Model) -> bool {
+    fn model_in_sync(model: &Model) -> bool {
         let mut remaining = model.total();
 
         for b in (0..=255u8).rev() {
             remaining -= model.freq(b);
 
-            if remaining != model.prefix_sum(b) {
+            if remaining != model.cum_freq(b) {
                 return false;
             }
         }
@@ -275,22 +392,133 @@ mod tests {
         }
 
         model.reset();
-        model.freq.iter().for_each(|freq| assert_eq!(*freq as usize, INITIAL_COUNT));
+        model.freq.iter().for_each(|freq| assert_eq!(usize::from(*freq), INITIAL_COUNT));
 
-        assert!(in_sync(&model));
+        assert!(model_in_sync(&model));
     }
 
     proptest! {
         #[test]
-        fn roundtrip(updates in prop::collection::vec(any::<u8>(), 0..8_192), byte: u8) {
+        fn model_roundtrip(updates in prop::collection::vec(any::<u8>(), 0..8_192), byte: u8) {
             let mut model = Model::new();
 
             for &b in &updates {
                 model.update(b);
             }
 
-            prop_assert_eq!(model.find(model.prefix_sum(byte)), byte);
-            prop_assert!(in_sync(&model));
+            prop_assert_eq!(model.find(model.cum_freq(byte)), byte);
+            prop_assert!(model_in_sync(&model));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TagModel (4-symbol) tests
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn tag_in_sync(model: &TagModel) -> bool {
+        let mut remaining = model.total();
+
+        for s in (0..TAG_SYMBOLS as u8).rev() {
+            remaining -= model.freq(s);
+            if remaining != model.cum_freq(s) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tag_uniform() {
+        let model = TagModel::new();
+        assert_eq!(model.total(), TAG_SYMBOLS as u32);
+        for s in 0..TAG_SYMBOLS as u8 {
+            assert_eq!(model.freq(s), 1);
+            assert_eq!(model.cum_freq(s), u32::from(s));
+        }
+        assert!(tag_in_sync(&model));
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn tag_reset() {
+        let mut model = TagModel::new();
+        for _ in 0..100 {
+            model.update(0);
+        }
+        model.reset();
+        assert_eq!(model.total(), TAG_SYMBOLS as u32);
+        for s in 0..TAG_SYMBOLS as u8 {
+            assert_eq!(model.freq(s), 1);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn tag_roundtrip(updates in prop::collection::vec(0u8..4, 0..8_192), symbol in 0u8..4) {
+            let mut model = TagModel::new();
+
+            for &s in &updates {
+                model.update(s);
+            }
+
+            prop_assert_eq!(model.find(model.cum_freq(symbol)), symbol);
+            prop_assert!(tag_in_sync(&model));
+        }
+
+        #[test]
+        fn tag_find_covers_range(updates in prop::collection::vec(0u8..4, 0..1_000)) {
+            let mut model = TagModel::new();
+            for &s in &updates {
+                model.update(s);
+            }
+
+            // Every value in 0..total should map to a valid symbol.
+            for v in 0..model.total() {
+                let s = model.find(v);
+                #[allow(clippy::cast_possible_truncation)]
+                { prop_assert!(s < TAG_SYMBOLS as u8, "find({v}) returned {s}"); }
+                let lo = model.cum_freq(s);
+                let hi = lo + model.freq(s);
+                prop_assert!(v >= lo && v < hi, "find({v})={s}, but cum_freq={lo}, hi={hi}");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Generic FreqModel tests (run on both types)
+    // -----------------------------------------------------------------------
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn verify_freq_model<M: FreqModel>(model: &mut M, num_symbols: u16) {
+        assert_eq!(model.total(), u32::from(num_symbols));
+
+        // Update each symbol once.
+        for s in 0..num_symbols {
+            model.update(s as u8);
+        }
+        assert_eq!(model.total(), 2 * u32::from(num_symbols));
+
+        // find(cum_freq(s)) == s for each symbol.
+        for s in 0..num_symbols {
+            let s8 = s as u8;
+            assert_eq!(model.find(model.cum_freq(s8)), s8);
+        }
+
+        // Reset brings it back.
+        model.reset();
+        assert_eq!(model.total(), u32::from(num_symbols));
+    }
+
+    #[test]
+    fn generic_model_256() {
+        verify_freq_model(&mut Model::new(), 256);
+    }
+
+    #[test]
+    fn generic_tag_model() {
+        verify_freq_model(&mut TagModel::new(), 4);
     }
 }

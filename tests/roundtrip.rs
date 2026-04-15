@@ -185,3 +185,20 @@ fn multiple_writes() {
     }
     assert_eq!(expected, output);
 }
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn all_levels_roundtrip() {
+    let data: Vec<u8> = (0..10_000u16).map(|i| (i % 256) as u8).collect();
+    for level in 1..=4u8 {
+        let buf = Vec::new();
+        let mut w = Writer::with_level(buf, level).unwrap();
+        w.write_all(&data).unwrap();
+        let buf = w.seal().unwrap();
+
+        let mut r = Reader::new(Cursor::new(buf)).unwrap();
+        let mut output = Vec::new();
+        r.read_to_end(&mut output).unwrap();
+        assert_eq!(data, output, "roundtrip failed at level {level}");
+    }
+}

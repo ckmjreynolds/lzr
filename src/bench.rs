@@ -29,11 +29,11 @@ impl Encoder {
     }
 
     pub fn encode(&mut self, model: &mut Model, symbol: u8, output: &mut Vec<u8>) {
-        self.0.encode(&mut model.0, symbol, output);
+        self.0.encode(symbol, &mut model.0, output);
     }
 
-    pub fn flush(&mut self, output: &mut Vec<u8>) {
-        self.0.flush(output);
+    pub fn finalize(&mut self, output: &mut Vec<u8>) {
+        self.0.finalize_sonnet(output);
     }
 }
 
@@ -48,6 +48,14 @@ impl Decoder {
 
     pub fn decode(&mut self, model: &mut Model, input: &mut &[u8]) -> u8 {
         self.0.decode(&mut model.0, input)
+    }
+
+    pub fn finalize_haiku(&mut self, input: &mut &[u8]) {
+        self.0.finalize_haiku(input);
+    }
+
+    pub fn finalize_sonnet(&mut self) {
+        self.0.finalize_sonnet();
     }
 }
 
@@ -70,7 +78,12 @@ pub struct Lz77Encoder(crate::lz77::Encoder);
 impl Lz77Encoder {
     #[must_use]
     pub fn new(input: &[u8]) -> Self {
-        let mut enc = crate::lz77::Encoder::new();
+        Self::with_level(input, crate::lz77::DEFAULT_LEVEL)
+    }
+
+    #[must_use]
+    pub fn with_level(input: &[u8], level: u8) -> Self {
+        let mut enc = crate::lz77::Encoder::new(level);
         enc.feed(input);
         enc.finish();
         Self(enc)

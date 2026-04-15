@@ -1,24 +1,36 @@
 //! Append-only compressed writer for the LZR format.
 //!
 //! [`Writer`] implements [`std::io::Write`]. Each `write()` call feeds raw
-//! bytes through the LZ77 → entropy coding pipeline into a 256 KiB block
-//! buffer. Blocks are automatically finalized and flushed when full.
+//! bytes through the LZ77 → entropy coding pipeline, writing encoded data
+//! incrementally to the destination. Sonnets (256 KiB blocks) are automatically
+//! managed with proactive boundary detection.
 //!
-//! Call [`Write::flush`] to create a durability point (frame boundary).
-//! Call [`Writer::seal`] to finalize and close the file.
+//! Call [`Write::flush`] to create a Haiku boundary (durability point).
+//! Call [`Writer::seal`] to finalize and close the Opus.
 
-use std::collections::VecDeque;
 use std::io::{self, Read, Seek, Write};
 
 use crate::adler32::Adler32;
-use crate::block::{self, BLOCK_SIZE, Footer, MAGIC, MAGIC_LEN};
-use crate::codec::{self, ModelSet, encode_sequence, is_eoframe, is_seal};
+use crate::codec::{self, ModelSet, TAG_EOH, TAG_EOO, TAG_EOS};
 use crate::entropy;
 use crate::lz77;
+use crate::sonnet::{self, Footer, INVOCATION, INVOCATION_LEN, MAX_FOOTER_SIZE, SONNET_SIZE};
+
+/// Upper bound: bytes per literal symbol in worst case (14 bits → 2 bytes).
+const PER_LIT_UPPER: usize = 2;
+
+/// Upper bound: bytes for tag + `lit_len` + `match_len` + `dist_lo` + `dist_hi` (5 symbols x 2).
+const MATCH_UPPER: usize = 10;
+
+/// When remaining space drops below this, switch to capped literal mode.
+const THRESHOLD: usize = 600;
+
+/// Flush `encode_buf` to dest when it exceeds this size.
+const FLUSH_THRESHOLD: usize = 4096;
 
 /// Append-only compressed writer for the LZR format.
 ///
-/// Wraps an inner [`Write`] and compresses data written to it. Blocks of
+/// Wraps an inner [`Write`] and compresses data written to it. Sonnets of
 /// 256 KiB are automatically managed. Use [`seal`](Self::seal) to finalize.
 ///
 /// # Examples
@@ -44,73 +56,76 @@ impl<W: Write> std::fmt::Debug for Writer<W> {
 
 struct WriterState<W: Write> {
     dest: W,
-    block_index: u64,
+    sonnet_index: u64,
 
-    /// Block buffer: compressed output accumulates here until the block is full.
-    block_buf: Vec<u8>,
+    /// Bytes written to dest within the current Sonnet.
+    sonnet_offset: usize,
+    /// Small buffer collecting entropy encoder output between flushes.
+    encode_buf: Vec<u8>,
 
     // Compression pipeline.
     lz77_enc: lz77::Encoder,
     entropy_enc: entropy::Encoder,
     models: ModelSet,
 
-    // Cumulative counters (NEVER reset — all are cumulative across the file).
+    // Cumulative counters (NEVER reset — cumulative across the Opus).
     total_bytes: u64,
     total_lines: u64,
     checksum: Adler32,
 
-    // Shadow decoder for tracking committed sequences.
-    shadow_dec: entropy::Decoder,
-    shadow_models: ModelSet,
-    shadow_read_pos: usize,
-
-    // Rewind tracking.
-    pending_input: VecDeque<u8>,
-    /// `(input_byte_count, line_count)` per pending sequence.
-    pending_seq_info: VecDeque<(usize, usize)>,
-    committed_bytes_in_block: u64,
-    committed_lines_in_block: u64,
+    // Per-Sonnet counters (reset at Sonnet boundaries).
+    sonnet_bytes: u64,
+    sonnet_lines: u64,
 }
 
 impl<W: Write> Writer<W> {
-    /// Creates a new LZR file, writing the magic header.
+    /// Creates a new LZR file at the default compression level (6).
     ///
     /// # Errors
     ///
-    /// Returns an error if flushing the destination fails.
-    pub fn new(mut dest: W) -> io::Result<Self> {
-        let mut block_buf = Vec::with_capacity(BLOCK_SIZE);
-        block_buf.extend_from_slice(&MAGIC);
+    /// Returns an error if writing the header fails.
+    pub fn new(dest: W) -> io::Result<Self> {
+        Self::with_level(dest, lz77::DEFAULT_LEVEL)
+    }
 
+    /// Creates a new LZR file at the given compression level (1–9).
+    ///
+    /// Levels 1–4 control how many candidate positions are checked for
+    /// matches (1 = fastest, 4 = best compression).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the header fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `level` is not in 1..=4.
+    pub fn with_level(mut dest: W, level: u8) -> io::Result<Self> {
+        dest.write_all(&INVOCATION)?;
         dest.flush()?;
 
         Ok(Self {
             state: Some(WriterState {
                 dest,
-                block_index: 0,
-                block_buf,
-                lz77_enc: lz77::Encoder::new(),
+                sonnet_index: 0,
+                sonnet_offset: INVOCATION_LEN,
+                encode_buf: Vec::with_capacity(FLUSH_THRESHOLD * 2),
+                lz77_enc: lz77::Encoder::new(level),
                 entropy_enc: entropy::Encoder::new(),
                 models: ModelSet::new(),
                 total_bytes: 0,
                 total_lines: 0,
                 checksum: Adler32::new(),
-                shadow_dec: entropy::Decoder::new(),
-                shadow_models: ModelSet::new(),
-                shadow_read_pos: MAGIC_LEN,
-                pending_input: VecDeque::new(),
-                pending_seq_info: VecDeque::new(),
-                committed_bytes_in_block: 0,
-                committed_lines_in_block: 0,
+                sonnet_bytes: 0,
+                sonnet_lines: 0,
             }),
         })
     }
 
-    /// Seals the file: encodes the SEAL sentinel, flushes the entropy coder,
-    /// writes a footer, and returns the inner writer.
+    /// Seals the Opus: encodes the EOO sentinel, writes the Coda footer,
+    /// and returns the inner writer.
     ///
-    /// After sealing, no further writes are possible. `Writer::open` refuses
-    /// to open a sealed file.
+    /// After sealing, no further writes are possible.
     ///
     /// # Errors
     ///
@@ -120,38 +135,16 @@ impl<W: Write> Writer<W> {
 
         // Flush all remaining LZ77 data.
         for token in st.lz77_enc.flush() {
-            st.encode_token(&token)?;
+            st.track_token(&token);
+            codec::encode_line(&mut st.entropy_enc, &mut st.models, &token, &mut st.encode_buf);
         }
 
-        // Encode the SEAL sentinel.
-        let seal_token = lz77::Token {
-            seq: lz77::Sequence {
-                literal_len: 0,
-                match_len: 0,
-                match_distance: codec::SEAL_DISTANCE,
-            },
-            literals: [0u8; 255],
-        };
-        encode_sequence(&mut st.entropy_enc, &mut st.models, &seal_token, &mut st.block_buf);
+        // Encode EOO terminator and finalize (Kireji + byte-align).
+        codec::encode_terminator(&mut st.entropy_enc, &mut st.models, TAG_EOO, &mut st.encode_buf);
+        st.entropy_enc.finalize_sonnet(&mut st.encode_buf);
 
-        // Flush entropy coder.
-        st.entropy_enc.flush(&mut st.block_buf);
-
-        // All pending sequences are now committed.
-        st.commit_all_pending();
-
-        // Write footer at end of current block data.
-        let footer = Footer {
-            bytes_count: st.total_bytes + st.committed_bytes_in_block,
-            lines_count: st.total_lines + st.committed_lines_in_block,
-            adler32: st.checksum.checksum(),
-        };
-        let footer_bytes = block::encode_footer(&footer);
-        st.block_buf.extend_from_slice(&footer_bytes);
-
-        // Flush everything to dest.
-        st.dest.write_all(&st.block_buf)?;
-        st.dest.flush()?;
+        // Write the Coda footer.
+        st.write_footer_and_pad(true)?;
 
         Ok(st.dest)
     }
@@ -160,8 +153,7 @@ impl<W: Write> Writer<W> {
 impl<W: Read + Write + Seek> Writer<W> {
     /// Opens an existing LZR file for appending (cold-start resume).
     ///
-    /// Reads the last incomplete block to reconstruct encoder state. Refuses
-    /// to open sealed files.
+    /// Reads the file to reconstruct encoder state. Refuses to open sealed files.
     ///
     /// # Errors
     ///
@@ -171,28 +163,28 @@ impl<W: Read + Write + Seek> Writer<W> {
     pub fn open(mut dest: W) -> io::Result<Self> {
         let file_size = dest.seek(io::SeekFrom::End(0))?;
 
-        if file_size < MAGIC_LEN as u64 {
+        if file_size < INVOCATION_LEN as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small for LZR header"));
         }
 
-        // Verify magic.
+        // Verify Invocation.
         dest.seek(io::SeekFrom::Start(0))?;
-        let mut magic = [0u8; MAGIC_LEN];
+        let mut magic = [0u8; INVOCATION_LEN];
         dest.read_exact(&mut magic)?;
-        if magic != MAGIC {
+        if magic != INVOCATION {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not an LZR file: invalid magic"));
         }
 
-        let complete_blocks = file_size / BLOCK_SIZE as u64;
-        let partial_size = (file_size % BLOCK_SIZE as u64) as usize;
+        let complete_sonnets = file_size / SONNET_SIZE as u64;
+        let partial_size = (file_size % SONNET_SIZE as u64) as usize;
 
-        // Restore cumulative state from the last complete block's footer.
-        let (mut total_bytes, mut total_lines, mut checksum) = if complete_blocks > 0 {
-            let last_complete_offset = (complete_blocks - 1) * BLOCK_SIZE as u64;
-            dest.seek(io::SeekFrom::Start(last_complete_offset))?;
-            let mut block_data = vec![0u8; BLOCK_SIZE];
+        // Restore cumulative state from the last complete Sonnet's footer.
+        let (mut total_bytes, mut total_lines, mut checksum) = if complete_sonnets > 0 {
+            let last_offset = (complete_sonnets - 1) * SONNET_SIZE as u64;
+            dest.seek(io::SeekFrom::Start(last_offset))?;
+            let mut block_data = vec![0u8; SONNET_SIZE];
             dest.read_exact(&mut block_data)?;
-            let footer = block::decode_footer(&block_data);
+            let footer = sonnet::decode_footer(&block_data);
             (
                 footer.bytes_count,
                 footer.lines_count,
@@ -202,93 +194,82 @@ impl<W: Read + Write + Seek> Writer<W> {
             (0u64, 0u64, Adler32::new())
         };
 
-        // Read the last partial block (if any).
-        let partial_offset = complete_blocks * BLOCK_SIZE as u64;
-        let block_buf = if partial_size > 0 {
-            dest.seek(io::SeekFrom::Start(partial_offset))?;
-            let mut buf = vec![0u8; partial_size];
-            dest.read_exact(&mut buf)?;
-            buf
-        } else if complete_blocks == 0 {
-            let mut buf = Vec::with_capacity(BLOCK_SIZE);
-            buf.extend_from_slice(&MAGIC);
-            buf
-        } else {
-            Vec::with_capacity(BLOCK_SIZE)
-        };
-
-        // Check for seal in partial block.
-        let data_start = if complete_blocks == 0 && partial_size > 0 {
-            MAGIC_LEN
+        // Read the partial Sonnet data.
+        let partial_offset = complete_sonnets * SONNET_SIZE as u64;
+        let data_start = if complete_sonnets == 0 {
+            INVOCATION_LEN
         } else {
             0
         };
 
-        if partial_size > data_start {
-            let data_region = &block_buf[data_start..];
-            if check_sealed(data_region) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "file is sealed; cannot append"));
-            }
-        }
-
-        // Decode the partial block to reconstruct model state.
-        let mut lz77_dec = lz77::Decoder::new();
-        let mut entropy_dec = entropy::Decoder::new();
         let mut models = ModelSet::new();
+        let mut sonnet_bytes = 0u64;
+        let mut sonnet_lines = 0u64;
 
         if partial_size > data_start {
-            let data_region = &block_buf[data_start..];
-            let mut input: &[u8] = data_region;
+            dest.seek(io::SeekFrom::Start(partial_offset + data_start as u64))?;
+            let data_len = partial_size - data_start;
+            let mut partial_data = vec![0u8; data_len];
+            dest.read_exact(&mut partial_data)?;
+
+            // Decode the partial Sonnet to restore model state and count bytes/lines.
+            let mut dec = entropy::Decoder::new();
+            let mut lz77_dec = lz77::Decoder::new();
+            let mut input: &[u8] = &partial_data;
             let mut decoded_output = Vec::new();
 
-            // Decode sequences until we run out of data.
-            while !input.is_empty() {
-                let remaining_before = input.len();
-                let token = codec::decode_sequence(&mut entropy_dec, &mut models, &mut input);
-                if input.len() == remaining_before {
-                    break; // no progress — corrupted/torn data
+            let max_tokens = partial_data.len() * 8;
+            for _ in 0..max_tokens {
+                if input.is_empty() && !dec.has_buffered_bits() {
+                    break;
                 }
-                if is_seal(token.seq) {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "file is sealed; cannot append"));
-                }
-                if is_eoframe(token.seq) {
-                    continue;
-                }
-                let lits = &token.literals[..token.seq.literal_len as usize];
-                lz77_dec.decode(token.seq, lits, &mut decoded_output);
+                let token = codec::decode_token(&mut dec, &mut models, &mut input);
+                match token {
+                    codec::DecodedToken::Line(t) => {
+                        let lits = &t.literals[..t.seq.literal_len as usize];
+                        lz77_dec.decode(t.seq, lits, &mut decoded_output);
 
-                let seq_bytes = token.seq.literal_len as usize + token.seq.match_len as usize;
-                let start = decoded_output.len() - seq_bytes;
-                checksum.update(&decoded_output[start..]);
+                        let seq_bytes = u64::from(t.seq.literal_len) + u64::from(t.seq.match_len);
+                        let start = decoded_output.len() - seq_bytes as usize;
+                        checksum.update(&decoded_output[start..]);
 
-                total_bytes += seq_bytes as u64;
-                total_lines += count_lines(&decoded_output[start..]) as u64;
+                        sonnet_bytes += seq_bytes;
+                        sonnet_lines += count_lines(&decoded_output[start..]) as u64;
+                    }
+                    codec::DecodedToken::EndOfHaiku => {
+                        dec.finalize_haiku(&mut input);
+                    }
+                    codec::DecodedToken::EndOfSonnet => {
+                        // Should not happen in partial data — it would be a complete Sonnet.
+                        break;
+                    }
+                    codec::DecodedToken::EndOfOpus => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "file is sealed; cannot append"));
+                    }
+                }
             }
+
+            total_bytes += sonnet_bytes;
+            total_lines += sonnet_lines;
         }
 
-        // Seek back to overwrite the partial block.
-        dest.seek(io::SeekFrom::Start(partial_offset))?;
-
-        let shadow_read_pos = block_buf.len();
+        // Seek to end to append.
+        dest.seek(io::SeekFrom::End(0))?;
 
         Ok(Self {
             state: Some(WriterState {
                 dest,
-                block_index: complete_blocks,
-                block_buf,
-                lz77_enc: lz77::Encoder::new(),
+                sonnet_index: complete_sonnets,
+                sonnet_offset: partial_size,
+                encode_buf: Vec::with_capacity(FLUSH_THRESHOLD * 2),
+                lz77_enc: lz77::Encoder::new(lz77::DEFAULT_LEVEL),
                 entropy_enc: entropy::Encoder::new(),
                 models,
                 total_bytes,
                 total_lines,
                 checksum,
-                shadow_dec: entropy::Decoder::new(),
-                shadow_models: ModelSet::new(),
-                shadow_read_pos,
-                pending_input: VecDeque::new(),
-                pending_seq_info: VecDeque::new(),
-                committed_bytes_in_block: 0,
-                committed_lines_in_block: 0,
+                sonnet_bytes: 0,
+                sonnet_lines: 0,
             }),
         })
     }
@@ -300,154 +281,191 @@ fn count_lines(data: &[u8]) -> usize {
     data.iter().filter(|&&b| b == b'\n').count()
 }
 
-/// Checks if a data region contains the SEAL sentinel by decoding sequences.
-fn check_sealed(data: &[u8]) -> bool {
-    if data.len() < 8 {
-        return false;
-    }
-
-    let mut dec = entropy::Decoder::new();
-    let mut models = ModelSet::new();
-    let mut input: &[u8] = data;
-
-    while !input.is_empty() {
-        let remaining_before = input.len();
-        let token = codec::decode_sequence(&mut dec, &mut models, &mut input);
-        if input.len() == remaining_before {
-            break;
-        }
-        if is_seal(token.seq) {
-            return true;
-        }
-    }
-
-    false
-}
-
 impl<W: Write> WriterState<W> {
-    /// Processes a single LZ77 token through the entropy encoder and shadow
-    /// decoder.
-    fn encode_token(&mut self, token: &lz77::Token) -> io::Result<()> {
-        let seq = &token.seq;
-        let lits = &token.literals[..seq.literal_len as usize];
+    /// Total encoded bytes in the current Sonnet (on disk + in buffer).
+    const fn sonnet_bytes_used(&self) -> usize {
+        self.sonnet_offset + self.encode_buf.len()
+    }
 
-        let seq_lines = count_lines(lits);
-        let seq_bytes = seq.literal_len as usize + seq.match_len as usize;
+    /// Upper-bound bytes needed to finalize (terminator + Kireji).
+    #[allow(clippy::cast_possible_truncation)]
+    fn compute_tail_bytes(&self) -> usize {
+        let terminator_cost = 2; // 1 tag symbol, worst case 2 bytes
+        let pending = self.entropy_enc.pending_bits();
+        let buffered = u64::from(self.entropy_enc.bits_in_buffer());
+        // +14 for terminator symbol's potential E3 accumulation
+        let kireji_bits = pending + 14 + 2 + 7 + buffered;
+        let kireji_bytes = kireji_bits.div_ceil(8) as usize;
+        terminator_cost + kireji_bytes
+    }
+
+    /// Tracks a token's contribution to counters and checksum.
+    fn track_token(&mut self, token: &lz77::Token) {
+        let lits = &token.literals[..token.seq.literal_len as usize];
+        let match_bytes = u64::from(token.seq.match_len);
+        let lit_bytes = u64::from(token.seq.literal_len);
 
         self.checksum.update(lits);
-        self.pending_seq_info.push_back((seq_bytes, seq_lines));
+        self.sonnet_bytes += lit_bytes + match_bytes;
+        self.sonnet_lines += count_lines(lits) as u64;
+    }
 
-        encode_sequence(&mut self.entropy_enc, &mut self.models, token, &mut self.block_buf);
-
-        self.advance_shadow_decoder();
-
-        // Check if block is full.
-        let ftr_size = block::footer_size(
-            self.total_bytes + self.committed_bytes_in_block,
-            self.total_lines + self.committed_lines_in_block,
-        );
-        if self.block_buf.len() + ftr_size >= BLOCK_SIZE {
-            self.finalize_block()?;
+    /// Flushes the encode buffer to dest (does NOT flush dest itself).
+    fn flush_encode_buf(&mut self) -> io::Result<()> {
+        if !self.encode_buf.is_empty() {
+            self.dest.write_all(&self.encode_buf)?;
+            self.sonnet_offset += self.encode_buf.len();
+            self.encode_buf.clear();
         }
-
         Ok(())
     }
 
-    /// Runs the shadow decoder on any new bytes in `block_buf` to retire
-    /// committed sequences.
-    fn advance_shadow_decoder(&mut self) {
-        while self.shadow_read_pos < self.block_buf.len() && !self.pending_seq_info.is_empty() {
-            let available = &self.block_buf[self.shadow_read_pos..];
-            let mut input: &[u8] = available;
-            let before_len = input.len();
+    /// Main encoding loop: pulls LZ77 tokens and entropy-encodes them,
+    /// respecting the Sonnet boundary.
+    #[allow(clippy::cast_possible_truncation)]
+    fn encode_tokens(&mut self) -> io::Result<()> {
+        loop {
+            let tail = self.compute_tail_bytes();
+            let remaining = SONNET_SIZE
+                .saturating_sub(self.sonnet_bytes_used())
+                .saturating_sub(MAX_FOOTER_SIZE)
+                .saturating_sub(tail);
 
-            let _token = codec::decode_sequence(&mut self.shadow_dec, &mut self.shadow_models, &mut input);
-            let consumed = before_len - input.len();
-
-            if consumed == 0 {
+            if remaining == 0 {
                 break;
             }
 
-            self.shadow_read_pos += consumed;
+            let token = if remaining < THRESHOLD {
+                let max_lits = remaining.saturating_sub(MATCH_UPPER) / PER_LIT_UPPER;
+                let max_lits = max_lits.min(255) as u8;
+                if max_lits == 0 {
+                    break;
+                }
+                self.lz77_enc.next_capped(max_lits)
+            } else {
+                self.lz77_enc.next()
+            };
 
-            if let Some((bytes, lines)) = self.pending_seq_info.pop_front() {
-                self.committed_bytes_in_block += bytes as u64;
-                self.committed_lines_in_block += lines as u64;
+            match token {
+                Some(t) => {
+                    self.track_token(&t);
+                    codec::encode_line(&mut self.entropy_enc, &mut self.models, &t, &mut self.encode_buf);
 
-                let drain_count = bytes.min(self.pending_input.len());
-                self.pending_input.drain(..drain_count);
+                    if self.encode_buf.len() >= FLUSH_THRESHOLD {
+                        self.flush_encode_buf()?;
+                    }
+                }
+                None => break,
             }
         }
+        Ok(())
     }
 
-    /// Commits all remaining pending sequences (called after entropy flush).
-    fn commit_all_pending(&mut self) {
-        while let Some((bytes, lines)) = self.pending_seq_info.pop_front() {
-            self.committed_bytes_in_block += bytes as u64;
-            self.committed_lines_in_block += lines as u64;
+    /// Checks if the Sonnet is full and finalizes it if so.
+    fn maybe_finalize_sonnet(&mut self) -> io::Result<()> {
+        let tail = self.compute_tail_bytes();
+        let remaining =
+            SONNET_SIZE.saturating_sub(self.sonnet_bytes_used()).saturating_sub(MAX_FOOTER_SIZE).saturating_sub(tail);
+
+        if remaining == 0 {
+            self.finalize_sonnet()?;
         }
-        self.pending_input.clear();
+        Ok(())
     }
 
-    /// Finalizes the current block: writes footer, flushes to dest, resets
-    /// block-scoped state, and re-encodes uncommitted data.
-    fn finalize_block(&mut self) -> io::Result<()> {
-        let footer = Footer {
-            bytes_count: self.total_bytes + self.committed_bytes_in_block,
-            lines_count: self.total_lines + self.committed_lines_in_block,
-            adler32: self.checksum.checksum(),
-        };
-        let footer_bytes = block::encode_footer(&footer);
+    /// Finalizes the current Sonnet: writes EOS, Kireji, padding, Couplet.
+    #[allow(clippy::cast_possible_truncation)]
+    fn finalize_sonnet(&mut self) -> io::Result<()> {
+        // Drain remaining LZ77 literals that fit.
+        loop {
+            let tail = self.compute_tail_bytes();
+            let rem = SONNET_SIZE
+                .saturating_sub(self.sonnet_bytes_used())
+                .saturating_sub(MAX_FOOTER_SIZE)
+                .saturating_sub(tail);
+            if rem == 0 {
+                break;
+            }
+            let max_lits = (rem.saturating_sub(MATCH_UPPER) / PER_LIT_UPPER).min(255) as u8;
+            if max_lits == 0 {
+                break;
+            }
+            match self.lz77_enc.next_capped(max_lits) {
+                Some(t) => {
+                    self.track_token(&t);
+                    codec::encode_line(&mut self.entropy_enc, &mut self.models, &t, &mut self.encode_buf);
+                }
+                None => break,
+            }
+        }
 
-        // Pad block to BLOCK_SIZE with footer at the end.
-        self.block_buf.resize(BLOCK_SIZE - footer_bytes.len(), 0);
-        self.block_buf.extend_from_slice(&footer_bytes);
-        debug_assert_eq!(self.block_buf.len(), BLOCK_SIZE);
+        // Drain any remaining pending literals.
+        if let Some(t) = self.lz77_enc.drain() {
+            // Check if it fits.
+            let tail = self.compute_tail_bytes();
+            let rem = SONNET_SIZE
+                .saturating_sub(self.sonnet_bytes_used())
+                .saturating_sub(MAX_FOOTER_SIZE)
+                .saturating_sub(tail);
+            let needed = t.seq.literal_len as usize * PER_LIT_UPPER + 6; // lit-only overhead
+            if rem >= needed {
+                self.track_token(&t);
+                codec::encode_line(&mut self.entropy_enc, &mut self.models, &t, &mut self.encode_buf);
+            }
+            // If it doesn't fit, those literals will be in the unconsumed input.
+        }
 
-        self.dest.write_all(&self.block_buf)?;
+        // EOS tag + Kireji (byte-aligned for Sonnet boundary).
+        codec::encode_terminator(&mut self.entropy_enc, &mut self.models, TAG_EOS, &mut self.encode_buf);
+        self.entropy_enc.finalize_sonnet(&mut self.encode_buf);
 
-        // Update cumulative counters.
-        self.total_bytes += self.committed_bytes_in_block;
-        self.total_lines += self.committed_lines_in_block;
+        // Write footer and pad.
+        self.write_footer_and_pad(false)?;
 
-        // Reset block-scoped state.
-        self.block_index += 1;
-        self.block_buf.clear();
+        // Carry unconsumed input to next Sonnet.
+        let carry = self.lz77_enc.unconsumed_input();
         self.lz77_enc.reset();
         self.entropy_enc.reset();
         self.models.reset();
-        self.shadow_dec.reset();
-        self.shadow_models.reset();
-        self.shadow_read_pos = 0;
-        self.committed_bytes_in_block = 0;
-        self.committed_lines_in_block = 0;
+        self.sonnet_index += 1;
+        self.sonnet_offset = 0;
+        self.sonnet_bytes = 0;
+        self.sonnet_lines = 0;
 
-        // Re-encode uncommitted input bytes into the new block.
-        let rewind_data: Vec<u8> = self.pending_input.drain(..).collect();
-        self.pending_seq_info.clear();
-
-        if !rewind_data.is_empty() {
-            self.lz77_enc.feed(&rewind_data);
-            while let Some(token) = self.lz77_enc.next() {
-                self.encode_token_no_block_check(&token);
-            }
+        if !carry.is_empty() {
+            self.lz77_enc.feed(&carry);
         }
 
         Ok(())
     }
 
-    /// Encodes a token without checking for block overflow.
-    /// Used during rewind re-encoding to avoid infinite recursion.
-    fn encode_token_no_block_check(&mut self, token: &lz77::Token) {
-        let seq = &token.seq;
-        let lits = &token.literals[..seq.literal_len as usize];
-        let seq_lines = count_lines(lits);
-        let seq_bytes = seq.literal_len as usize + seq.match_len as usize;
+    /// Writes the encode buffer, padding, and footer to dest.
+    fn write_footer_and_pad(&mut self, is_final: bool) -> io::Result<()> {
+        // Flush any remaining encoded data.
+        self.flush_encode_buf()?;
 
-        self.checksum.update(lits);
-        self.pending_seq_info.push_back((seq_bytes, seq_lines));
-        encode_sequence(&mut self.entropy_enc, &mut self.models, token, &mut self.block_buf);
-        self.advance_shadow_decoder();
+        let footer = Footer {
+            bytes_count: self.total_bytes + self.sonnet_bytes,
+            lines_count: self.total_lines + self.sonnet_lines,
+            adler32: self.checksum.checksum(),
+        };
+        let footer_bytes = sonnet::encode_footer(&footer);
+
+        if !is_final {
+            // Non-final Sonnet (Couplet): pad to exactly SONNET_SIZE.
+            let padding_len = SONNET_SIZE - self.sonnet_offset - footer_bytes.len();
+            let padding = vec![0u8; padding_len];
+            self.dest.write_all(&padding)?;
+        }
+        self.dest.write_all(&footer_bytes)?;
+
+        self.dest.flush()?;
+
+        // Update cumulative counters.
+        self.total_bytes += self.sonnet_bytes;
+        self.total_lines += self.sonnet_lines;
+
+        Ok(())
     }
 }
 
@@ -459,11 +477,13 @@ impl<W: Write> Write for Writer<W> {
             return Ok(0);
         }
 
-        st.pending_input.extend(buf);
         st.lz77_enc.feed(buf);
+        st.encode_tokens()?;
+        st.maybe_finalize_sonnet()?;
 
-        while let Some(token) = st.lz77_enc.next() {
-            st.encode_token(&token)?;
+        // If the Sonnet was finalized and there's carry-over data, keep encoding.
+        if st.lz77_enc.has_pending_literals() || st.sonnet_offset == 0 {
+            st.encode_tokens()?;
         }
 
         Ok(buf.len())
@@ -472,50 +492,24 @@ impl<W: Write> Write for Writer<W> {
     fn flush(&mut self) -> io::Result<()> {
         let st = self.state.as_mut().ok_or_else(|| io::Error::other("writer is sealed"))?;
 
-        // Flush all remaining LZ77 data (process buffered lookahead).
+        // Flush all remaining LZ77 data.
         for token in st.lz77_enc.flush() {
-            st.encode_token(&token)?;
+            st.track_token(&token);
+            codec::encode_line(&mut st.entropy_enc, &mut st.models, &token, &mut st.encode_buf);
         }
 
-        // Encode EOFrame marker so the decoder knows to reset entropy state.
-        let eoframe = lz77::Token {
-            seq: lz77::Sequence {
-                literal_len: 0,
-                match_len: 0,
-                match_distance: codec::EOFRAME_DISTANCE,
-            },
-            literals: [0u8; 255],
-        };
-        encode_sequence(&mut st.entropy_enc, &mut st.models, &eoframe, &mut st.block_buf);
+        // EOH tag + Kireji + trailing resync bytes.
+        codec::encode_terminator(&mut st.entropy_enc, &mut st.models, TAG_EOH, &mut st.encode_buf);
+        st.entropy_enc.finalize_haiku(&mut st.encode_buf);
 
-        // Entropy coder continues uninterrupted within the block — EOFrame is
-        // just a marker in the stream. Only block boundaries and SEAL reset entropy.
-        st.advance_shadow_decoder();
-        st.commit_all_pending();
+        // Write to dest and flush to disk (durability point).
+        st.flush_encode_buf()?;
+        st.dest.flush()?;
 
-        // Advance the shadow decoder past the EOFrame marker so it stays in
-        // sync with the encoder's entropy state.
-        if st.shadow_read_pos < st.block_buf.len() {
-            let available = &st.block_buf[st.shadow_read_pos..];
-            let mut input: &[u8] = available;
-            let before_len = input.len();
-            let token = codec::decode_sequence(&mut st.shadow_dec, &mut st.shadow_models, &mut input);
-            let consumed = before_len - input.len();
-            if consumed > 0 && is_eoframe(token.seq) {
-                st.shadow_read_pos += consumed;
-            }
-        }
+        // Check if Sonnet is now full after the Haiku.
+        st.maybe_finalize_sonnet()?;
 
-        // Check if the flush pushed us past the block boundary.
-        let ftr_size = block::footer_size(
-            st.total_bytes + st.committed_bytes_in_block,
-            st.total_lines + st.committed_lines_in_block,
-        );
-        if st.block_buf.len() + ftr_size >= BLOCK_SIZE {
-            st.finalize_block()?;
-        }
-
-        st.dest.flush()
+        Ok(())
     }
 }
 

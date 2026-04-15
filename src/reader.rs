@@ -1,17 +1,17 @@
 //! Random-access decompression reader for the LZR format.
 //!
 //! [`Reader`] implements [`std::io::Read`] and [`std::io::Seek`], providing
-//! transparent decompression of LZR files. Block footers are cached lazily
+//! transparent decompression of LZR files. Sonnet footers are cached lazily
 //! during seeks, enabling efficient interpolation search for both byte offsets
 //! and line numbers.
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::block::{self, BLOCK_SIZE, Footer, MAGIC, MAGIC_LEN};
-use crate::codec::{self, ModelSet, is_eoframe, is_seal};
+use crate::codec::{self, DecodedToken, ModelSet};
 use crate::entropy;
 use crate::lz77;
+use crate::sonnet::{self, Footer, INVOCATION, INVOCATION_LEN, SONNET_SIZE};
 
 /// Random-access decompression reader for the LZR format.
 ///
@@ -33,12 +33,12 @@ use crate::lz77;
 pub struct Reader<R: Read + Seek> {
     source: R,
     file_size: u64,
-    block_count: u64,
+    sonnet_count: u64,
     is_sealed: bool,
     footer_cache: HashMap<u64, Footer>,
     total_bytes: u64,
     total_lines: u64,
-    cached_block: Option<CachedBlock>,
+    cached_sonnet: Option<CachedSonnet>,
     position: u64,
 }
 
@@ -46,7 +46,7 @@ impl<R: Read + Seek> std::fmt::Debug for Reader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reader")
             .field("file_size", &self.file_size)
-            .field("block_count", &self.block_count)
+            .field("sonnet_count", &self.sonnet_count)
             .field("is_sealed", &self.is_sealed)
             .field("total_bytes", &self.total_bytes)
             .field("total_lines", &self.total_lines)
@@ -55,8 +55,8 @@ impl<R: Read + Seek> std::fmt::Debug for Reader<R> {
     }
 }
 
-struct CachedBlock {
-    block_index: u64,
+struct CachedSonnet {
+    sonnet_index: u64,
     data: Vec<u8>,
     start_bytes: u64,
     start_lines: u64,
@@ -65,8 +65,8 @@ struct CachedBlock {
 impl<R: Read + Seek> Reader<R> {
     /// Opens an LZR file for reading.
     ///
-    /// Validates the magic header and determines total size by reading the
-    /// last block's footer (if sealed) or decoding the last partial block.
+    /// Validates the Invocation header and determines total size by reading
+    /// Sonnet footers.
     ///
     /// # Errors
     ///
@@ -75,41 +75,41 @@ impl<R: Read + Seek> Reader<R> {
     #[allow(clippy::cast_possible_truncation)]
     pub fn new(mut source: R) -> io::Result<Self> {
         source.seek(SeekFrom::Start(0))?;
-        let mut magic = [0u8; MAGIC_LEN];
+        let mut magic = [0u8; INVOCATION_LEN];
         source.read_exact(&mut magic)?;
-        if magic != MAGIC {
+        if magic != INVOCATION {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "not an LZR file: invalid magic"));
         }
 
         let file_size = source.seek(SeekFrom::End(0))?;
-        let block_count = file_size / BLOCK_SIZE as u64;
-        let partial_size = (file_size % BLOCK_SIZE as u64) as usize;
+        let sonnet_count = file_size / SONNET_SIZE as u64;
+        let partial_size = (file_size % SONNET_SIZE as u64) as usize;
 
         let mut footer_cache = HashMap::new();
         let mut is_sealed = false;
         let mut total_bytes = 0u64;
         let mut total_lines = 0u64;
 
-        if block_count > 0 {
-            let last_footer = read_footer_from(&mut source, block_count - 1)?;
+        if sonnet_count > 0 {
+            let last_footer = read_footer_from(&mut source, sonnet_count - 1)?;
             total_bytes = last_footer.bytes_count;
             total_lines = last_footer.lines_count;
-            footer_cache.insert(block_count - 1, last_footer);
+            footer_cache.insert(sonnet_count - 1, last_footer);
         }
 
         if partial_size > 0 {
-            let partial_offset = block_count * BLOCK_SIZE as u64;
+            let partial_offset = sonnet_count * SONNET_SIZE as u64;
             source.seek(SeekFrom::Start(partial_offset))?;
             let mut partial_data = vec![0u8; partial_size];
             source.read_exact(&mut partial_data)?;
 
-            let data_start = if block_count == 0 {
-                MAGIC_LEN
+            let data_start = if sonnet_count == 0 {
+                INVOCATION_LEN
             } else {
                 0
             };
             if partial_size > data_start {
-                let (decoded_bytes, decoded_lines, sealed) = decode_partial_block(&partial_data[data_start..]);
+                let (decoded_bytes, decoded_lines, sealed) = decode_partial_sonnet(&partial_data[data_start..]);
                 total_bytes += decoded_bytes;
                 total_lines += decoded_lines;
                 is_sealed = sealed;
@@ -119,12 +119,12 @@ impl<R: Read + Seek> Reader<R> {
         Ok(Self {
             source,
             file_size,
-            block_count,
+            sonnet_count,
             is_sealed,
             footer_cache,
             total_bytes,
             total_lines,
-            cached_block: None,
+            cached_sonnet: None,
             position: 0,
         })
     }
@@ -160,14 +160,14 @@ impl<R: Read + Seek> Reader<R> {
     ///
     /// Returns the byte offset of the line start.
     ///
+    /// # Panics
+    ///
+    /// Panics if the internal Sonnet cache is unexpectedly empty after caching.
+    ///
     /// # Errors
     ///
     /// Returns an error if the line number is out of range or if any I/O
     /// operation fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal block cache is inconsistent (should not happen).
     #[allow(clippy::cast_possible_truncation)]
     pub fn seek_to_line(&mut self, line: u64) -> io::Result<u64> {
         if line > self.total_lines {
@@ -182,13 +182,13 @@ impl<R: Read + Seek> Reader<R> {
             return Ok(0);
         }
 
-        let total_blocks = self.total_block_count();
-        let block_idx = self.find_block_by_line(line, total_blocks)?;
-        self.ensure_block_cached(block_idx)?;
+        let total_sonnets = self.total_sonnet_count();
+        let sonnet_idx = self.find_sonnet_by_line(line, total_sonnets)?;
+        self.ensure_sonnet_cached(sonnet_idx)?;
 
-        let cached = self.cached_block.as_ref().expect("block was just cached");
-        let lines_before_block = cached.start_lines;
-        let lines_to_skip = (line - lines_before_block) as usize;
+        let cached = self.cached_sonnet.as_ref().expect("sonnet was just cached");
+        let lines_before = cached.start_lines;
+        let lines_to_skip = (line - lines_before) as usize;
 
         let mut lines_seen = 0usize;
         let mut byte_offset = 0usize;
@@ -206,77 +206,77 @@ impl<R: Read + Seek> Reader<R> {
         Ok(self.position)
     }
 
-    /// Total number of blocks including the partial last block.
-    fn total_block_count(&self) -> u64 {
-        let has_partial = !self.file_size.is_multiple_of(BLOCK_SIZE as u64);
-        self.block_count + u64::from(has_partial)
+    /// Total number of Sonnets including the partial last one.
+    fn total_sonnet_count(&self) -> u64 {
+        let has_partial = !self.file_size.is_multiple_of(SONNET_SIZE as u64);
+        self.sonnet_count + u64::from(has_partial)
     }
 
-    /// Reads a block's footer from disk and caches it.
-    fn read_footer(&mut self, block_idx: u64) -> io::Result<Footer> {
-        if let Some(&footer) = self.footer_cache.get(&block_idx) {
+    /// Reads a Sonnet's footer from disk and caches it.
+    fn read_footer(&mut self, sonnet_idx: u64) -> io::Result<Footer> {
+        if let Some(&footer) = self.footer_cache.get(&sonnet_idx) {
             return Ok(footer);
         }
-        let footer = read_footer_from(&mut self.source, block_idx)?;
-        self.footer_cache.insert(block_idx, footer);
+        let footer = read_footer_from(&mut self.source, sonnet_idx)?;
+        self.footer_cache.insert(sonnet_idx, footer);
         Ok(footer)
     }
 
-    /// Gets the cumulative byte count at the END of `block_idx`.
-    fn block_end_bytes(&mut self, block_idx: u64) -> io::Result<u64> {
-        if block_idx < self.block_count {
-            let footer = self.read_footer(block_idx)?;
+    /// Gets the cumulative byte count at the END of `sonnet_idx`.
+    fn sonnet_end_bytes(&mut self, sonnet_idx: u64) -> io::Result<u64> {
+        if sonnet_idx < self.sonnet_count {
+            let footer = self.read_footer(sonnet_idx)?;
             Ok(footer.bytes_count)
         } else {
             Ok(self.total_bytes)
         }
     }
 
-    /// Gets the cumulative byte count at the START of `block_idx`.
-    fn block_start_bytes(&mut self, block_idx: u64) -> io::Result<u64> {
-        if block_idx == 0 {
+    /// Gets the cumulative byte count at the START of `sonnet_idx`.
+    fn sonnet_start_bytes(&mut self, sonnet_idx: u64) -> io::Result<u64> {
+        if sonnet_idx == 0 {
             Ok(0)
         } else {
-            self.block_end_bytes(block_idx - 1)
+            self.sonnet_end_bytes(sonnet_idx - 1)
         }
     }
 
-    /// Gets the cumulative line count at the END of `block_idx`.
-    fn block_end_lines(&mut self, block_idx: u64) -> io::Result<u64> {
-        if block_idx < self.block_count {
-            let footer = self.read_footer(block_idx)?;
+    /// Gets the cumulative line count at the END of `sonnet_idx`.
+    fn sonnet_end_lines(&mut self, sonnet_idx: u64) -> io::Result<u64> {
+        if sonnet_idx < self.sonnet_count {
+            let footer = self.read_footer(sonnet_idx)?;
             Ok(footer.lines_count)
         } else {
             Ok(self.total_lines)
         }
     }
 
-    /// Finds the block containing byte offset `target` using interpolation search.
+    /// Finds the Sonnet containing byte offset `target` using interpolation search.
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
-    fn find_block_by_byte(&mut self, target: u64, total_blocks: u64) -> io::Result<u64> {
-        if total_blocks == 0 {
+    fn find_sonnet_by_byte(&mut self, target: u64, total_sonnets: u64) -> io::Result<u64> {
+        if total_sonnets == 0 {
             return Ok(0);
         }
 
         let mut lo = 0u64;
-        let mut hi = total_blocks - 1;
+        let mut hi = total_sonnets - 1;
 
         if self.total_bytes > 0 {
-            let estimate = ((target as f64 / self.total_bytes as f64) * total_blocks as f64) as u64;
+            let estimate = ((target as f64 / self.total_bytes as f64) * total_sonnets as f64) as u64;
             lo = estimate.saturating_sub(1).min(hi);
             hi = (estimate + 1).min(hi);
 
-            while lo > 0 && self.block_start_bytes(lo)? > target {
+            while lo > 0 && self.sonnet_start_bytes(lo)? > target {
                 lo = lo.saturating_sub(lo / 2 + 1);
             }
-            while hi < total_blocks - 1 && self.block_end_bytes(hi)? <= target {
-                hi = (hi + hi / 2 + 1).min(total_blocks - 1);
+            while hi < total_sonnets - 1 && self.sonnet_end_bytes(hi)? <= target {
+                hi = (hi + hi / 2 + 1).min(total_sonnets - 1);
             }
         }
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let end = self.block_end_bytes(mid)?;
+            let end = self.sonnet_end_bytes(mid)?;
             if end <= target {
                 lo = mid + 1;
             } else {
@@ -287,18 +287,18 @@ impl<R: Read + Seek> Reader<R> {
         Ok(lo)
     }
 
-    /// Finds the block containing line `target_line` using interpolation search.
-    fn find_block_by_line(&mut self, target_line: u64, total_blocks: u64) -> io::Result<u64> {
-        if total_blocks <= 1 {
+    /// Finds the Sonnet containing line `target_line` using binary search.
+    fn find_sonnet_by_line(&mut self, target_line: u64, total_sonnets: u64) -> io::Result<u64> {
+        if total_sonnets <= 1 {
             return Ok(0);
         }
 
         let mut lo = 0u64;
-        let mut hi = total_blocks - 1;
+        let mut hi = total_sonnets - 1;
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let end_lines = self.block_end_lines(mid)?;
+            let end_lines = self.sonnet_end_lines(mid)?;
             if end_lines < target_line {
                 lo = mid + 1;
             } else {
@@ -309,51 +309,51 @@ impl<R: Read + Seek> Reader<R> {
         Ok(lo)
     }
 
-    /// Ensures the block at `block_idx` is decompressed and cached.
+    /// Ensures the Sonnet at `sonnet_idx` is decompressed and cached.
     #[allow(clippy::cast_possible_truncation)]
-    fn ensure_block_cached(&mut self, block_idx: u64) -> io::Result<()> {
-        if let Some(ref cached) = self.cached_block {
-            if cached.block_index == block_idx {
+    fn ensure_sonnet_cached(&mut self, sonnet_idx: u64) -> io::Result<()> {
+        if let Some(ref cached) = self.cached_sonnet {
+            if cached.sonnet_index == sonnet_idx {
                 return Ok(());
             }
         }
 
-        let start_bytes = self.block_start_bytes(block_idx)?;
-        let start_lines = if block_idx == 0 {
+        let start_bytes = self.sonnet_start_bytes(sonnet_idx)?;
+        let start_lines = if sonnet_idx == 0 {
             0
         } else {
-            let prev_footer = self.read_footer(block_idx - 1)?;
+            let prev_footer = self.read_footer(sonnet_idx - 1)?;
             prev_footer.lines_count
         };
 
-        let block_offset = block_idx * BLOCK_SIZE as u64;
-        self.source.seek(SeekFrom::Start(block_offset))?;
+        let sonnet_offset = sonnet_idx * SONNET_SIZE as u64;
+        self.source.seek(SeekFrom::Start(sonnet_offset))?;
 
-        let read_size = if block_idx < self.block_count {
-            BLOCK_SIZE
+        let read_size = if sonnet_idx < self.sonnet_count {
+            SONNET_SIZE
         } else {
-            (self.file_size - block_offset) as usize
+            (self.file_size - sonnet_offset) as usize
         };
 
-        let mut block_data = vec![0u8; read_size];
-        self.source.read_exact(&mut block_data)?;
+        let mut sonnet_data = vec![0u8; read_size];
+        self.source.read_exact(&mut sonnet_data)?;
 
-        let data_start = if block_idx == 0 {
-            MAGIC_LEN
+        let data_start = if sonnet_idx == 0 {
+            INVOCATION_LEN
         } else {
             0
         };
-        let data_end = if block_idx < self.block_count {
-            let footer_len = block_data[BLOCK_SIZE - 1] as usize;
-            BLOCK_SIZE - footer_len
+        let data_end = if sonnet_idx < self.sonnet_count {
+            let footer_len = sonnet_data[SONNET_SIZE - 1] as usize;
+            SONNET_SIZE - footer_len
         } else {
             read_size
         };
 
-        let data = decompress_block_data(&block_data[data_start..data_end]);
+        let data = decompress_sonnet_data(&sonnet_data[data_start..data_end]);
 
-        self.cached_block = Some(CachedBlock {
-            block_index: block_idx,
+        self.cached_sonnet = Some(CachedSonnet {
+            sonnet_index: sonnet_idx,
             data,
             start_bytes,
             start_lines,
@@ -363,48 +363,49 @@ impl<R: Read + Seek> Reader<R> {
     }
 }
 
-/// Reads a block footer from a source without caching.
-fn read_footer_from<R: Read + Seek>(source: &mut R, block_idx: u64) -> io::Result<Footer> {
-    let block_offset = block_idx * BLOCK_SIZE as u64;
-    source.seek(SeekFrom::Start(block_offset))?;
-    let mut block_data = vec![0u8; BLOCK_SIZE];
-    source.read_exact(&mut block_data)?;
-    Ok(block::decode_footer(&block_data))
+/// Reads a Sonnet footer from a source without caching.
+fn read_footer_from<R: Read + Seek>(source: &mut R, sonnet_idx: u64) -> io::Result<Footer> {
+    let offset = sonnet_idx * SONNET_SIZE as u64;
+    source.seek(SeekFrom::Start(offset))?;
+    let mut data = vec![0u8; SONNET_SIZE];
+    source.read_exact(&mut data)?;
+    Ok(sonnet::decode_footer(&data))
 }
 
-/// Decompresses a block's frame data into raw bytes.
-///
-/// Handles `EOFrame` markers (reset entropy decoder) and stops at SEAL or
-/// when no progress is made.
-fn decompress_block_data(data: &[u8]) -> Vec<u8> {
+/// Decompresses a Sonnet's data region into raw bytes.
+fn decompress_sonnet_data(data: &[u8]) -> Vec<u8> {
     let mut dec = entropy::Decoder::new();
     let mut models = ModelSet::new();
     let mut lz77_dec = lz77::Decoder::new();
     let mut input: &[u8] = data;
     let mut output = Vec::new();
 
-    while !input.is_empty() {
-        let remaining_before = input.len();
-        let token = codec::decode_sequence(&mut dec, &mut models, &mut input);
-        if input.len() == remaining_before {
+    let max_tokens = data.len() * 8;
+    for _ in 0..max_tokens {
+        if input.is_empty() && !dec.has_buffered_bits() {
             break;
         }
-        if is_seal(token.seq) {
-            break;
+        let token = codec::decode_token(&mut dec, &mut models, &mut input);
+        match token {
+            DecodedToken::Line(t) => {
+                let lits = &t.literals[..t.seq.literal_len as usize];
+                lz77_dec.decode(t.seq, lits, &mut output);
+            }
+            DecodedToken::EndOfHaiku => {
+                dec.finalize_haiku(&mut input);
+            }
+            DecodedToken::EndOfSonnet | DecodedToken::EndOfOpus => {
+                break;
+            }
         }
-        if is_eoframe(token.seq) {
-            continue;
-        }
-        let lits = &token.literals[..token.seq.literal_len as usize];
-        lz77_dec.decode(token.seq, lits, &mut output);
     }
 
     output
 }
 
-/// Decodes a partial block's data, returning `(bytes, lines, is_sealed)`.
+/// Decodes a partial Sonnet's data, returning `(bytes, lines, is_sealed)`.
 #[allow(clippy::naive_bytecount)]
-fn decode_partial_block(data: &[u8]) -> (u64, u64, bool) {
+fn decode_partial_sonnet(data: &[u8]) -> (u64, u64, bool) {
     let mut dec = entropy::Decoder::new();
     let mut models = ModelSet::new();
     let mut lz77_dec = lz77::Decoder::new();
@@ -412,21 +413,30 @@ fn decode_partial_block(data: &[u8]) -> (u64, u64, bool) {
     let mut output = Vec::new();
     let mut sealed = false;
 
-    while !input.is_empty() {
-        let remaining_before = input.len();
-        let token = codec::decode_sequence(&mut dec, &mut models, &mut input);
-        if input.len() == remaining_before {
+    // Safety bound: each token produces at least 1 uncompressed byte (except
+    // terminators), so we can't have more tokens than bytes in the data.
+    let max_tokens = data.len() * 8;
+    for _ in 0..max_tokens {
+        if input.is_empty() && !dec.has_buffered_bits() {
             break;
         }
-        if is_seal(token.seq) {
-            sealed = true;
-            break;
+        let token = codec::decode_token(&mut dec, &mut models, &mut input);
+        match token {
+            DecodedToken::Line(t) => {
+                let lits = &t.literals[..t.seq.literal_len as usize];
+                lz77_dec.decode(t.seq, lits, &mut output);
+            }
+            DecodedToken::EndOfHaiku => {
+                dec.finalize_haiku(&mut input);
+            }
+            DecodedToken::EndOfSonnet => {
+                break;
+            }
+            DecodedToken::EndOfOpus => {
+                sealed = true;
+                break;
+            }
         }
-        if is_eoframe(token.seq) {
-            continue;
-        }
-        let lits = &token.literals[..token.seq.literal_len as usize];
-        lz77_dec.decode(token.seq, lits, &mut output);
     }
 
     let lines = output.iter().filter(|&&b| b == b'\n').count() as u64;
@@ -440,18 +450,18 @@ impl<R: Read + Seek> Read for Reader<R> {
             return Ok(0);
         }
 
-        let total_blocks = self.total_block_count();
-        let block_idx = self.find_block_by_byte(self.position, total_blocks)?;
-        self.ensure_block_cached(block_idx)?;
+        let total_sonnets = self.total_sonnet_count();
+        let sonnet_idx = self.find_sonnet_by_byte(self.position, total_sonnets)?;
+        self.ensure_sonnet_cached(sonnet_idx)?;
 
-        let cached = self.cached_block.as_ref().expect("block was just cached");
-        let offset_in_block = (self.position - cached.start_bytes) as usize;
+        let cached = self.cached_sonnet.as_ref().expect("sonnet was just cached");
+        let offset_in_sonnet = (self.position - cached.start_bytes) as usize;
 
-        if offset_in_block >= cached.data.len() {
+        if offset_in_sonnet >= cached.data.len() {
             return Ok(0);
         }
 
-        let available = &cached.data[offset_in_block..];
+        let available = &cached.data[offset_in_sonnet..];
         let to_copy = buf.len().min(available.len());
         buf[..to_copy].copy_from_slice(&available[..to_copy]);
         self.position += to_copy as u64;

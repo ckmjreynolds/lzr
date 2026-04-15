@@ -17,7 +17,7 @@ fn bench_encode(c: &mut Criterion) {
             for &byte in &data {
                 enc.encode(&mut model, byte, &mut compressed);
             }
-            enc.flush(&mut compressed);
+            enc.finalize(&mut compressed);
             compressed
         });
     });
@@ -34,7 +34,7 @@ fn bench_decode(c: &mut Criterion) {
     for &byte in &data {
         enc.encode(&mut model, byte, &mut compressed);
     }
-    enc.flush(&mut compressed);
+    enc.finalize(&mut compressed);
 
     let mut group = c.benchmark_group("entropy");
     group.throughput(Throughput::Bytes(data.len() as u64));

@@ -1,7 +1,7 @@
 //! LZR — append-only, random-access compression format.
 //!
 //! Data is compressed through an LZ77 stage followed by adaptive arithmetic
-//! coding, then stored in fixed 256 KiB blocks that enable random access by
+//! coding, then stored in fixed 256 KiB Sonnets that enable random access by
 //! byte offset or line number.
 //!
 //! # Quick start
@@ -25,17 +25,21 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![allow(dead_code)]
 pub(crate) mod adler32;
-pub(crate) mod block;
 pub(crate) mod codec;
 pub(crate) mod entropy;
 pub(crate) mod lz77;
 pub(crate) mod model;
 mod reader;
+pub(crate) mod sonnet;
 pub(crate) mod uleb128;
 mod writer;
 
 pub use reader::Reader;
 pub use writer::Writer;
+
+/// Default compression level (1–9). Levels 1–8 use hash-chain match finding;
+/// level 9 uses B+tree match finding.
+pub const DEFAULT_LEVEL: u8 = lz77::DEFAULT_LEVEL;
 
 #[cfg(any(test, feature = "bench-internals"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
