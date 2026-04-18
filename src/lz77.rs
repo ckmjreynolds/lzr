@@ -1,15 +1,17 @@
 //! LZ77 encoder and decoder.
 //!
 //! A [`Sequence`] describes zero or more literal bytes followed by an optional
-//! back-reference (match). The encoder uses a `wabi_tree` `OSBTreeMap` with
-//! u128 prefix keys and range queries for match finding within a 64 KB sliding
-//! window.
+//! back-reference (match). Three match finders are provided; each compression
+//! level in [`LEVELS`] selects one:
 //!
-//! Compression levels 1–9 are defined in [`LEVELS`] and control the match
-//! finder breadth ([`LevelConfig::max_scan`]), per-key packed-position depth
-//! ([`LevelConfig::depth`]), the parser (greedy vs lazy, see
-//! [`LevelConfig::lazy`]), and whether the output stream is arithmetic-coded
-//! ([`LevelConfig::entropy`]).
+//! * **Head** (L1) — a single `hash_bits`-sized hash table with no chain,
+//!   mirroring `lz4 -1`. One lookup per byte, no history.
+//! * **Chain** (L2–L6) — hash table plus a `WINDOW_SIZE`-entry chain; each
+//!   chain step visits one older position with the same 3-byte hash. Walk is
+//!   bounded by `max_chain` and short-circuits on `nice_length`.
+//! * **`BTree`** (L7–L9) — `wabi_tree` B+tree keyed by a 16-byte prefix,
+//!   scanning `max_scan` neighbours in each direction; `depth` packed
+//!   positions per visited key.
 //!
 //! # Pipeline
 //!
@@ -45,6 +47,42 @@ pub(crate) const MAX_LEVEL: u8 = 9;
 /// Default compression level (matches the gzip convention).
 pub(crate) const DEFAULT_LEVEL: u8 = 6;
 
+/// Sentinel "no position" used by the hash-based finders.
+const EMPTY_POS: u32 = u32::MAX;
+
+/// Knuth's multiplicative hash constant (`floor(2^32 / phi)`).
+const HASH_MUL: u32 = 2_654_435_761;
+
+// ===========================================================================
+// Level configuration
+// ===========================================================================
+
+/// Per-finder parameters. Each variant is paired with the corresponding
+/// [`MatchFinder`] variant at encoder construction time. Hash tables are
+/// sized as `1 << hash_bits`; the match search stops early on `nice_length`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum FinderConfig {
+    /// Single hash-table lookup per position. No chain walk, no history.
+    Head {
+        hash_bits: u32,
+    },
+    /// Hash-table head followed by a bounded chain walk through older
+    /// positions sharing the same hash.
+    Chain {
+        hash_bits: u32,
+        max_chain: usize,
+        nice_length: usize,
+    },
+    /// `wabi_tree` B+tree with 16-byte prefix keys and range scans. `depth`
+    /// is the packed-position slots per key (1..=4); `max_scan` is neighbours
+    /// inspected per direction.
+    BTree {
+        max_scan: usize,
+        depth: usize,
+        nice_length: usize,
+    },
+}
+
 /// Per-level configuration of the encoder and the on-disk format.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LevelConfig {
@@ -53,75 +91,98 @@ pub(crate) struct LevelConfig {
     pub(crate) entropy: bool,
     /// Whether the parser peeks one position ahead before committing a match.
     pub(crate) lazy: bool,
-    /// Neighbors to inspect per direction in the B+tree range scan.
-    pub(crate) max_scan: usize,
-    /// Packed-position slots to check per visited key (1..=4).
-    pub(crate) depth: usize,
+    /// Which match finder to use at this level.
+    pub(crate) finder: FinderConfig,
 }
 
 const LEVELS: [LevelConfig; 9] = [
-    // L1: raw, greedy, tiny finder
+    // L1: raw, greedy, head-only hash (lz4 -1 class).
     LevelConfig {
         entropy: false,
         lazy: false,
-        max_scan: 4,
-        depth: 1,
+        finder: FinderConfig::Head {
+            hash_bits: 16,
+        },
     },
-    // L2: raw, lazy
+    // L2: raw, greedy, shallow chain.
     LevelConfig {
         entropy: false,
-        lazy: true,
-        max_scan: 4,
-        depth: 1,
-    },
-    // L3: raw, lazy, wider finder
-    LevelConfig {
-        entropy: false,
-        lazy: true,
-        max_scan: 64,
-        depth: 2,
-    },
-    // L4: entropy, greedy, tiny finder
-    LevelConfig {
-        entropy: true,
         lazy: false,
-        max_scan: 4,
-        depth: 1,
+        finder: FinderConfig::Chain {
+            hash_bits: 16,
+            max_chain: 8,
+            nice_length: 16,
+        },
     },
-    // L5: entropy, lazy
+    // L3: raw, lazy, deeper chain.
+    LevelConfig {
+        entropy: false,
+        lazy: true,
+        finder: FinderConfig::Chain {
+            hash_bits: 16,
+            max_chain: 32,
+            nice_length: 32,
+        },
+    },
+    // L4: entropy, lazy, deeper chain.
     LevelConfig {
         entropy: true,
         lazy: true,
-        max_scan: 4,
-        depth: 1,
+        finder: FinderConfig::Chain {
+            hash_bits: 17,
+            max_chain: 64,
+            nice_length: 48,
+        },
     },
-    // L6 (default): entropy, lazy, balanced finder
+    // L5: entropy, lazy, even deeper chain.
     LevelConfig {
         entropy: true,
         lazy: true,
-        max_scan: 32,
-        depth: 2,
+        finder: FinderConfig::Chain {
+            hash_bits: 17,
+            max_chain: 128,
+            nice_length: 64,
+        },
     },
-    // L7: entropy, lazy, deeper
+    // L6 (default): entropy, lazy, balanced chain.
     LevelConfig {
         entropy: true,
         lazy: true,
-        max_scan: 64,
-        depth: 3,
+        finder: FinderConfig::Chain {
+            hash_bits: 18,
+            max_chain: 256,
+            nice_length: 96,
+        },
     },
-    // L8: entropy, lazy, max current finder
+    // L7: entropy, lazy, B+tree — widens search vs L6 without short-circuits.
     LevelConfig {
         entropy: true,
         lazy: true,
-        max_scan: 128,
-        depth: 4,
+        finder: FinderConfig::BTree {
+            max_scan: 256,
+            depth: 4,
+            nice_length: MAX_MATCH,
+        },
     },
-    // L9: entropy, lazy, widest scan
+    // L8: entropy, lazy, deeper B+tree scan.
     LevelConfig {
         entropy: true,
         lazy: true,
-        max_scan: 256,
-        depth: 4,
+        finder: FinderConfig::BTree {
+            max_scan: 1024,
+            depth: 4,
+            nice_length: MAX_MATCH,
+        },
+    },
+    // L9: entropy, lazy, widest B+tree scan (exhaustive, no short-circuit).
+    LevelConfig {
+        entropy: true,
+        lazy: true,
+        finder: FinderConfig::BTree {
+            max_scan: 4096,
+            depth: 4,
+            nice_length: MAX_MATCH,
+        },
     },
 ];
 
@@ -166,13 +227,238 @@ pub(crate) struct Token {
 }
 
 // ===========================================================================
-// Match finder
+// Shared match-finder helpers
 // ===========================================================================
 
 /// Returns the length of the common prefix of `a` and `b`, up to `max`.
 fn common_prefix_len(a: &[u8], b: &[u8], max: usize) -> usize {
     a.iter().zip(b.iter()).take(max).take_while(|(x, y)| x == y).count()
 }
+
+/// 3-byte multiplicative hash projected into `1 << (32 - shift)` buckets.
+///
+/// Caller must ensure `bytes.len() >= 3`.
+#[inline]
+fn hash3(bytes: &[u8], shift: u32) -> usize {
+    let v = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+    (v.wrapping_mul(HASH_MUL) >> shift) as usize
+}
+
+// ===========================================================================
+// Match finders
+// ===========================================================================
+
+/// Dispatch wrapper over the three match-finder implementations. Static
+/// dispatch via `match` keeps the hot path free of indirect calls.
+enum MatchFinder {
+    Head(HeadFinder),
+    Chain(ChainFinder),
+    BTree(BTreeFinder),
+}
+
+impl MatchFinder {
+    fn new(cfg: FinderConfig) -> Self {
+        match cfg {
+            FinderConfig::Head {
+                hash_bits,
+            } => Self::Head(HeadFinder::new(hash_bits)),
+            FinderConfig::Chain {
+                hash_bits,
+                max_chain,
+                nice_length,
+            } => Self::Chain(ChainFinder::new(hash_bits, max_chain, nice_length)),
+            FinderConfig::BTree {
+                max_scan,
+                depth,
+                nice_length,
+            } => Self::BTree(BTreeFinder::new(max_scan, depth, nice_length)),
+        }
+    }
+
+    fn insert(&mut self, pos: usize, buf: &[u8], base: usize) {
+        match self {
+            Self::Head(f) => f.insert(pos, buf, base),
+            Self::Chain(f) => f.insert(pos, buf, base),
+            Self::BTree(f) => f.insert(pos, buf, base),
+        }
+    }
+
+    fn find_match(&self, pos: usize, buf: &[u8], base: usize) -> (usize, usize) {
+        match self {
+            Self::Head(f) => f.find_match(pos, buf, base),
+            Self::Chain(f) => f.find_match(pos, buf, base),
+            Self::BTree(f) => f.find_match(pos, buf, base),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Head(f) => f.clear(),
+            Self::Chain(f) => f.clear(),
+            Self::BTree(f) => f.clear(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HeadFinder (L1)
+// ---------------------------------------------------------------------------
+
+/// Hash-table head only — one u32 absolute position per hash bucket.
+struct HeadFinder {
+    head: Vec<u32>,
+    shift: u32,
+}
+
+impl HeadFinder {
+    fn new(hash_bits: u32) -> Self {
+        Self {
+            head: vec![EMPTY_POS; 1usize << hash_bits],
+            shift: 32 - hash_bits,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn insert(&mut self, pos: usize, buf: &[u8], base: usize) {
+        let buf_pos = pos - base;
+        if buf_pos + 2 >= buf.len() {
+            return;
+        }
+        let h = hash3(&buf[buf_pos..], self.shift);
+        self.head[h] = pos as u32;
+    }
+
+    fn find_match(&self, pos: usize, buf: &[u8], base: usize) -> (usize, usize) {
+        let available = base + buf.len();
+        let remaining = available - pos;
+        let max_len = MAX_MATCH.min(remaining);
+        if max_len < MIN_MATCH {
+            return (0, 0);
+        }
+        let buf_pos = pos - base;
+        if buf_pos + 2 >= buf.len() {
+            return (0, 0);
+        }
+
+        let h = hash3(&buf[buf_pos..], self.shift);
+        let cand = self.head[h];
+        if cand == EMPTY_POS {
+            return (0, 0);
+        }
+        let cand_pos = cand as usize;
+        let min_pos = pos.saturating_sub(u16::MAX as usize);
+        if cand_pos < min_pos || cand_pos >= pos || cand_pos < base {
+            return (0, 0);
+        }
+
+        let ci = cand_pos - base;
+        let len = common_prefix_len(&buf[ci..], &buf[buf_pos..], max_len);
+        if len < MIN_MATCH {
+            return (0, 0);
+        }
+        (pos - cand_pos, len)
+    }
+
+    fn clear(&mut self) {
+        self.head.fill(EMPTY_POS);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChainFinder (L2–L6)
+// ---------------------------------------------------------------------------
+
+/// Hash table plus a `WINDOW_SIZE`-entry chain indexed by `pos % WINDOW_SIZE`.
+/// Each chain slot stores the previous position that hashed to the same
+/// bucket. Stale links (from positions since evicted by modular reuse) are
+/// filtered by the in-window check and the `max_chain` bound.
+struct ChainFinder {
+    head: Vec<u32>,
+    chain: Vec<u32>,
+    shift: u32,
+    max_chain: usize,
+    nice_length: usize,
+}
+
+impl ChainFinder {
+    fn new(hash_bits: u32, max_chain: usize, nice_length: usize) -> Self {
+        Self {
+            head: vec![EMPTY_POS; 1usize << hash_bits],
+            chain: vec![EMPTY_POS; WINDOW_SIZE],
+            shift: 32 - hash_bits,
+            max_chain,
+            nice_length,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn insert(&mut self, pos: usize, buf: &[u8], base: usize) {
+        let buf_pos = pos - base;
+        if buf_pos + 2 >= buf.len() {
+            return;
+        }
+        let h = hash3(&buf[buf_pos..], self.shift);
+        let prev = self.head[h];
+        self.chain[pos % WINDOW_SIZE] = prev;
+        self.head[h] = pos as u32;
+    }
+
+    fn find_match(&self, pos: usize, buf: &[u8], base: usize) -> (usize, usize) {
+        let available = base + buf.len();
+        let remaining = available - pos;
+        let max_len = MAX_MATCH.min(remaining);
+        if max_len < MIN_MATCH {
+            return (0, 0);
+        }
+        let buf_pos = pos - base;
+        if buf_pos + 2 >= buf.len() {
+            return (0, 0);
+        }
+
+        let h = hash3(&buf[buf_pos..], self.shift);
+        let min_pos = pos.saturating_sub(u16::MAX as usize);
+        let cutoff = self.nice_length.min(max_len);
+
+        let mut best_len = MIN_MATCH - 1;
+        let mut best_dist = 0;
+        let mut cand = self.head[h];
+
+        for _ in 0..self.max_chain {
+            if cand == EMPTY_POS {
+                break;
+            }
+            let cand_pos = cand as usize;
+            if cand_pos < min_pos || cand_pos < base || cand_pos >= pos {
+                break;
+            }
+            let ci = cand_pos - base;
+            let len = common_prefix_len(&buf[ci..], &buf[buf_pos..], max_len);
+            if len > best_len {
+                best_len = len;
+                best_dist = pos - cand_pos;
+                if best_len >= cutoff {
+                    break;
+                }
+            }
+            cand = self.chain[cand_pos % WINDOW_SIZE];
+        }
+
+        if best_len >= MIN_MATCH {
+            (best_dist, best_len)
+        } else {
+            (0, 0)
+        }
+    }
+
+    fn clear(&mut self) {
+        self.head.fill(EMPTY_POS);
+        self.chain.fill(EMPTY_POS);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BTreeFinder (L7–L9)
+// ---------------------------------------------------------------------------
 
 /// Builds a big-endian u128 key from the first 16 bytes at `buf[offset..]`.
 ///
@@ -198,9 +484,7 @@ const fn common_prefix_u128(a: u128, b: u128) -> usize {
 /// Extracts up to 4 packed u32 positions from a u128 value.
 ///
 /// Positions are packed newest-at-LSB: on each insert the value is shifted
-/// left by 32 and the new position is `OR`ed into the low 32 bits. To read
-/// back, position 0 (newest) is `value as u32`, position 1 is
-/// `(value >> 32) as u32`, etc.
+/// left by 32 and the new position is `OR`ed into the low 32 bits.
 #[allow(clippy::cast_possible_truncation)]
 const fn unpack_position(packed: u128, index: usize) -> u32 {
     (packed >> (index * 32)) as u32
@@ -213,25 +497,23 @@ const fn pack_position(packed: u128, pos: u32) -> u128 {
 
 /// B+tree match finder using u128 prefix keys.
 ///
-/// Each key maps to a u128 packing up to 4 recent absolute positions.
-/// Stale entries (outside the sliding window) are not evicted — they are
-/// filtered at match time by the distance check. The tree is cleared at
-/// Sonnet boundaries.
-struct MatchFinder {
+/// Each key maps to a u128 packing up to 4 recent absolute positions. Stale
+/// entries (outside the sliding window) are filtered at match time by the
+/// distance check; the tree is cleared at Sonnet boundaries.
+struct BTreeFinder {
     index: OSBTreeMap<u128, u128>,
-    /// How many packed positions to check per visited key (1–4). Applied to
-    /// both the exact-key hit and every neighbor hit during the range scan.
     depth: usize,
-    /// Maximum neighbors to inspect per direction during the range scan.
     max_scan: usize,
+    nice_length: usize,
 }
 
-impl MatchFinder {
-    const fn new(cfg: LevelConfig) -> Self {
+impl BTreeFinder {
+    const fn new(max_scan: usize, depth: usize, nice_length: usize) -> Self {
         Self {
             index: OSBTreeMap::new(),
-            depth: cfg.depth,
-            max_scan: cfg.max_scan,
+            depth,
+            max_scan,
+            nice_length,
         }
     }
 
@@ -263,12 +545,13 @@ impl MatchFinder {
         let buf_pos = pos - base;
         let min_pos = pos.saturating_sub(u16::MAX as usize);
         let key = make_key(buf, buf_pos);
+        let cutoff = self.nice_length.min(max_len);
 
         let mut best_len = MIN_MATCH - 1;
         let mut best_dist = 0;
 
-        // Try every visited key through this helper. Returns true when a full
-        // max_len match is found so the caller can short-circuit.
+        // Returns true when a "good enough" match is found so the caller
+        // can short-circuit. Good enough means best_len >= cutoff.
         let try_packed = |packed: u128, best_len: &mut usize, best_dist: &mut usize| -> bool {
             for i in 0..self.depth {
                 let cand = unpack_position(packed, i) as usize;
@@ -280,7 +563,7 @@ impl MatchFinder {
                 if len > *best_len {
                     *best_len = len;
                     *best_dist = pos - cand;
-                    if *best_len == max_len {
+                    if *best_len >= cutoff {
                         return true;
                     }
                 }
@@ -342,14 +625,14 @@ impl MatchFinder {
 // Encoder
 // ===========================================================================
 
-/// Streaming LZ77 encoder with a B+tree match finder.
+/// Streaming LZ77 encoder.
 ///
 /// Data is fed incrementally via [`feed`](Self::feed). Call
 /// [`next`](Self::next) to pull tokens. Call [`finish`](Self::finish)
 /// to signal end of input, then drain remaining tokens with `next`.
 ///
-/// Parsing strategy (greedy vs lazy) is controlled by the compression level
-/// passed to [`new`](Self::new).
+/// Parsing strategy (greedy vs lazy) and match-finder choice are
+/// determined by the compression level passed to [`new`](Self::new).
 pub(crate) struct Encoder {
     buf: Vec<u8>,
     base: usize,
@@ -375,7 +658,7 @@ impl Encoder {
             pos: 0,
             lit_start: 0,
             lit_len: 0,
-            finder: MatchFinder::new(cfg),
+            finder: MatchFinder::new(cfg.finder),
             finished: false,
             lazy: cfg.lazy,
         }
@@ -965,5 +1248,95 @@ mod tests {
         }
 
         assert_eq!(data, &decoded[..]);
+    }
+
+    // -------------------------------------------------------------------
+    // Finder-specific unit tests (targeted coverage for edge cases beyond
+    // what the all_levels_roundtrip proptest already exercises).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn head_finder_empty_returns_no_match() {
+        let finder = HeadFinder::new(12);
+        let buf = b"hello world";
+        assert_eq!(finder.find_match(0, buf, 0), (0, 0));
+    }
+
+    #[test]
+    fn head_finder_basic_match() {
+        // Insert position 0 then find at position 6 with a shared prefix.
+        let buf = b"abcdefabcdef";
+        let mut finder = HeadFinder::new(12);
+        finder.insert(0, buf, 0);
+        finder.insert(1, buf, 0);
+        finder.insert(2, buf, 0);
+        let (dist, mlen) = finder.find_match(6, buf, 0);
+        assert_eq!(dist, 6);
+        assert!(mlen >= MIN_MATCH);
+    }
+
+    #[test]
+    fn head_finder_short_buf_returns_no_match() {
+        // buf_pos + 2 >= buf.len() path — too few bytes left for a 3-byte hash.
+        let buf = b"ab";
+        let finder = HeadFinder::new(12);
+        assert_eq!(finder.find_match(0, buf, 0), (0, 0));
+    }
+
+    #[test]
+    fn chain_finder_walks_multiple_candidates() {
+        // Three identical 3-byte prefixes preceding the query position.
+        let buf = b"abcZabcYabcXabcQextra";
+        let mut finder = ChainFinder::new(12, 16, 32);
+        // Insert every position strictly before the query.
+        for i in 0..12 {
+            finder.insert(i, buf, 0);
+        }
+        let (dist, mlen) = finder.find_match(12, buf, 0);
+        assert!(mlen >= MIN_MATCH);
+        assert!(dist == 4 || dist == 8 || dist == 12);
+    }
+
+    #[test]
+    fn chain_finder_nice_length_shortcircuits() {
+        // A highly repetitive buffer; nice_length=3 means the chain walk
+        // stops at the first 3+ byte match without walking the full chain.
+        let buf = [b'a'; 64];
+        let mut finder = ChainFinder::new(12, 1000, 3);
+        for i in 0..32 {
+            finder.insert(i, &buf, 0);
+        }
+        let (dist, mlen) = finder.find_match(32, &buf, 0);
+        assert!(mlen >= MIN_MATCH);
+        assert!(dist > 0);
+    }
+
+    #[test]
+    fn chain_finder_empty_returns_no_match() {
+        let finder = ChainFinder::new(12, 8, 16);
+        let buf = b"hello world";
+        assert_eq!(finder.find_match(0, buf, 0), (0, 0));
+    }
+
+    #[test]
+    fn chain_finder_clear_wipes_state() {
+        let buf = b"abcabcabc";
+        let mut finder = ChainFinder::new(12, 8, 16);
+        for i in 0..7 {
+            finder.insert(i, buf, 0);
+        }
+        finder.clear();
+        assert_eq!(finder.find_match(6, buf, 0), (0, 0));
+    }
+
+    #[test]
+    fn level_config_dispatches_correct_finder() {
+        assert!(matches!(level_config(1).finder, FinderConfig::Head { .. }));
+        for l in 2..=6 {
+            assert!(matches!(level_config(l).finder, FinderConfig::Chain { .. }));
+        }
+        for l in 7..=9 {
+            assert!(matches!(level_config(l).finder, FinderConfig::BTree { .. }));
+        }
     }
 }

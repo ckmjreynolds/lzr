@@ -44,8 +44,11 @@ pub(crate) fn count_lines(data: &[u8]) -> usize {
     data.iter().filter(|&&b| b == b'\n').count()
 }
 
-/// Default compression level. Valid levels are `1..=4`, all using a `wabi_tree`
-/// B+tree match finder; higher levels check more candidate positions per match.
+/// Default compression level.
+///
+/// Valid levels are `1..=9`: L1 uses a single hash-table lookup (lz4-style),
+/// L2–L6 a hash chain, and L7–L9 a `wabi_tree` B+tree. Each step trades
+/// speed for a higher compression ratio.
 pub const DEFAULT_LEVEL: u8 = lz77::DEFAULT_LEVEL;
 
 #[cfg(any(test, feature = "bench-internals"))]

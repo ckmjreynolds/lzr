@@ -66,10 +66,10 @@ w.seal().unwrap();
 
 ### Compression level
 
-`Writer::with_level(dest, level)` accepts levels `1..=4`. Levels control how
-many candidate match positions the [`wabi_tree`](https://crates.io/crates/wabi_tree)
-B+tree match finder evaluates per input position — higher levels are slower but
-compress more tightly.
+`Writer::with_level(dest, level)` accepts levels `1..=9`. L1 uses a single
+hash-table lookup (lz4-style); L2–L6 walk a hash chain; L7–L9 fall back to the
+[`wabi_tree`](https://crates.io/crates/wabi_tree) B+tree finder. Higher levels
+are slower but compress more tightly.
 
 ## Status
 

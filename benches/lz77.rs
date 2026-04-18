@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lzr::bench::{Lz77Decoder, Lz77Encoder, lipsum_bytes};
 
 const SIZE: usize = 65_536;
@@ -47,5 +47,24 @@ fn bench_decode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_encode, bench_decode);
+fn bench_encode_all_levels(c: &mut Criterion) {
+    let data = lipsum_bytes(SIZE);
+    let mut group = c.benchmark_group("lz77_levels");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+    for level in 1u8..=9 {
+        group.bench_with_input(BenchmarkId::new("encode", level), &level, |b, &lvl| {
+            b.iter(|| {
+                let mut enc = Lz77Encoder::with_level(&data, lvl);
+                let mut tokens = Vec::new();
+                while let Some((seq, literals)) = enc.next_token() {
+                    tokens.push((seq, literals));
+                }
+                tokens
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_encode, bench_decode, bench_encode_all_levels);
 criterion_main!(benches);
