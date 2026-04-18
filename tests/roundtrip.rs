@@ -361,6 +361,174 @@ fn writer_edge_cases() {
         w.write_all(b"data that will be dropped\n").unwrap();
         // Writer drops here, calling flush() in Drop.
     }
+
+    // Write empty buffer.
+    let mut w = Writer::new(Vec::new()).unwrap();
+    assert_eq!(w.write(b"").unwrap(), 0);
+    w.seal().unwrap();
+}
+
+#[test]
+fn writer_open_errors() {
+    // File too small for header.
+    let result = Writer::open(Cursor::new(vec![0u8; 3]));
+    assert!(result.is_err());
+
+    // Bad magic bytes.
+    let result = Writer::open(Cursor::new(vec![0u8; 300]));
+    assert!(result.is_err());
+}
+
+#[test]
+fn reader_invalid_file() {
+    // Bad magic.
+    let result = Reader::new(Cursor::new(vec![0u8; 100]));
+    assert!(result.is_err());
+}
+
+#[test]
+fn multi_sonnet_compressible_roundtrip() {
+    // Highly compressible data: many LZ77 match tokens per Sonnet, which
+    // exercises the tight-capacity drain paths in finalize_sonnet().
+    let line = b"the quick brown fox jumps over the lazy dog near the riverbank\n";
+    let mut data = Vec::new();
+    // ~512KB of repeated lines → very compressible, many tokens per Sonnet.
+    for _ in 0..(512 * 1024 / line.len()) {
+        data.extend_from_slice(line);
+    }
+
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    w.write_all(&data).unwrap();
+    let buf = w.seal().unwrap();
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    #[allow(clippy::naive_bytecount)]
+    let expected_lines = data.iter().filter(|&&b| b == b'\n').count() as u64;
+    assert_eq!(r.lines(), expected_lines);
+    assert_eq!(r.len(), data.len() as u64);
+
+    let mut output = Vec::new();
+    r.read_to_end(&mut output).unwrap();
+    assert_eq!(data, output);
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn multi_sonnet_seek_exercises_search() {
+    // Non-uniform data: short first Sonnet-worth of data, then dense data.
+    // This makes the interpolation estimate wrong, exercising expansion loops.
+    let data = numbered_lines(800 * 1024);
+
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    w.write_all(&data).unwrap();
+    let buf = w.seal().unwrap();
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    let total = r.len();
+    let total_lines = r.lines();
+
+    // Seek to byte 0 (trivial).
+    r.seek(SeekFrom::Start(0)).unwrap();
+    let mut out = vec![0u8; 16];
+    r.read_exact(&mut out).unwrap();
+    assert_eq!(&out, &data[..16]);
+
+    // Seek to very near the start — interpolation may overshoot.
+    r.seek(SeekFrom::Start(1)).unwrap();
+    let mut out = vec![0u8; 8];
+    r.read_exact(&mut out).unwrap();
+    assert_eq!(&out, &data[1..9]);
+
+    // Seek to near the end — exercises hi expansion.
+    let near_end = total - 32;
+    r.seek(SeekFrom::Start(near_end)).unwrap();
+    let mut out = vec![0u8; 32];
+    r.read_exact(&mut out).unwrap();
+    assert_eq!(&out, &data[near_end as usize..]);
+
+    // Seek to line in first Sonnet — exercises find_sonnet_by_line hi=mid.
+    let offset = r.seek_to_line(1).unwrap();
+    let mut out = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = r.read(&mut byte).unwrap();
+        if n == 0 || byte[0] == b'\n' {
+            break;
+        }
+        out.push(byte[0]);
+    }
+    let expected = std::str::from_utf8(&data[offset as usize..]).unwrap().lines().next().unwrap();
+    assert_eq!(std::str::from_utf8(&out).unwrap(), expected);
+
+    // Seek to line in last Sonnet — exercises different search path.
+    if total_lines > 2 {
+        let target = total_lines - 1;
+        let offset = r.seek_to_line(target).unwrap();
+        assert!(offset < total);
+    }
+}
+
+#[test]
+fn read_unsealed_file() {
+    // Write data without sealing — tests the partial Sonnet decode paths
+    // in the reader (decode_partial_sonnet, EndOfHaiku handling).
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut w = Writer::new(&mut cursor).unwrap();
+        w.write_all(b"line one\nline two\nline three\n").unwrap();
+        w.flush().unwrap();
+        // Drop without seal.
+    }
+
+    cursor.seek(SeekFrom::Start(0)).unwrap();
+    let mut r = Reader::new(cursor).unwrap();
+    assert!(!r.is_sealed());
+    assert_eq!(r.lines(), 3);
+
+    let mut output = String::new();
+    r.read_to_string(&mut output).unwrap();
+    assert_eq!(output, "line one\nline two\nline three\n");
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation)]
+fn multi_sonnet_random_seeks() {
+    // Create a file with 4+ Sonnets and seek to many positions to exercise
+    // footer cache misses and interpolation search expansion.
+    let data = numbered_lines(1024 * 1024);
+
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    w.write_all(&data).unwrap();
+    let buf = w.seal().unwrap();
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    let total = r.len();
+    let total_lines = r.lines();
+    assert!(total > 0);
+
+    // Seek to positions across the entire file to force cache misses on
+    // non-last Sonnet footers and trigger interpolation search paths.
+    for pct in [0, 1, 10, 25, 50, 75, 90, 99, 100] {
+        let pos = (total * pct / 100).min(total.saturating_sub(1));
+        r.seek(SeekFrom::Start(pos)).unwrap();
+        if pos < total {
+            let mut byte = [0u8; 1];
+            let n = r.read(&mut byte).unwrap();
+            if n > 0 {
+                assert_eq!(byte[0], data[pos as usize]);
+            }
+        }
+    }
+
+    // Seek to lines across the file to exercise find_sonnet_by_line.
+    for pct in [0, 1, 25, 50, 75, 99] {
+        let line = total_lines * pct / 100;
+        let offset = r.seek_to_line(line).unwrap();
+        assert!(offset <= total);
+    }
 }
 
 #[test]

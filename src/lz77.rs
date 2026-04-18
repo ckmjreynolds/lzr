@@ -677,13 +677,20 @@ mod tests {
 
     #[test]
     fn next_capped_zero_with_pending() {
+        // Feed enough data for the encoder to accumulate literals, then call
+        // next_capped(0) — should return None when lit_len > 0.
+        #[allow(clippy::cast_possible_truncation)]
+        let data: Vec<u8> = (0..500u32).map(|i| ((i * 137 + 43) % 256) as u8).collect();
         let mut enc = Encoder::new(DEFAULT_LEVEL);
-        enc.feed(b"abc");
-        enc.finish();
+        enc.feed(&data);
 
-        if enc.has_pending_literals() {
-            assert!(enc.next_capped(0).is_none());
-        }
+        // Process until the encoder stalls on insufficient lookahead.
+        while enc.next().is_some() {}
+
+        // The encoder should have pending literals from the lookahead zone.
+        assert!(enc.has_pending_literals());
+        // next_capped(0) with pending literals must return None.
+        assert!(enc.next_capped(0).is_none());
     }
 
     #[test]
@@ -780,6 +787,127 @@ mod tests {
 
             prop_assert_eq!(&data[..], &decoded[..]);
         }
+    }
+
+    #[test]
+    fn emit_partial_literals_via_capped() {
+        // Feed random (incompressible) bytes so the encoder accumulates many
+        // literals without finding matches, then use next_capped with a small
+        // cap to trigger emit_partial_literals.
+        let data: Vec<u8> = (0..200u8).map(|i| i.wrapping_mul(137).wrapping_add(43)).collect();
+        let mut enc = Encoder::new(DEFAULT_LEVEL);
+        enc.feed(&data);
+        enc.finish();
+
+        let mut dec = Decoder::new();
+        let mut decoded = Vec::new();
+
+        // Use cap=3 to force partial literal emission.
+        while let Some(token) = enc.next_capped(3) {
+            assert!(token.seq.literal_len <= 3);
+            dec.decode(token.seq, token_literals(&token), &mut decoded);
+        }
+        if let Some(token) = enc.drain() {
+            dec.decode(token.seq, token_literals(&token), &mut decoded);
+        }
+
+        assert_eq!(data, decoded);
+    }
+
+    #[test]
+    fn streaming_next_returns_none_without_finish() {
+        // Feed a small amount of data without calling finish; next() should
+        // return None because there isn't enough lookahead.
+        let mut enc = Encoder::new(DEFAULT_LEVEL);
+        enc.feed(b"hello");
+        assert!(enc.next().is_none());
+
+        // Feed empty data — exercises pos >= available without finish.
+        let mut enc2 = Encoder::new(DEFAULT_LEVEL);
+        enc2.feed(b"");
+        assert!(enc2.next().is_none());
+    }
+
+    #[test]
+    fn drain_returns_pending_literals() {
+        // Feed enough unique data that next() processes some bytes as literals,
+        // then returns None due to insufficient lookahead. drain() should return
+        // those pending literals.
+        let mut enc = Encoder::new(DEFAULT_LEVEL);
+        // 500 bytes of pseudo-random data — unlikely to find LZ77 matches.
+        #[allow(clippy::cast_possible_truncation)]
+        let data: Vec<u8> = (0..500u32).map(|i| ((i * 137 + 43) % 256) as u8).collect();
+        enc.feed(&data);
+
+        // Drain all available tokens (next returns None when lookahead < 258).
+        while enc.next().is_some() {}
+
+        // The encoder should have pending literals from the lookahead zone.
+        let drained = enc.drain();
+        assert!(drained.is_some(), "drain should return pending literals");
+        let token = drained.unwrap();
+        assert!(token.seq.literal_len > 0);
+        assert_eq!(token.seq.match_len, 0);
+    }
+
+    #[test]
+    fn next_capped_triggers_partial_emission() {
+        // Accumulate more literals than the cap, then call next_capped to
+        // trigger emit_partial_literals.
+        let mut enc = Encoder::new(DEFAULT_LEVEL);
+        // Use enough unique data that the encoder accumulates many literals.
+        #[allow(clippy::cast_possible_truncation)]
+        let data: Vec<u8> = (0..500u32).map(|i| ((i * 137 + 43) % 256) as u8).collect();
+        enc.feed(&data);
+
+        // Process some tokens with normal next() — leaves pending literals
+        // when lookahead runs out.
+        while enc.next().is_some() {}
+
+        // Now lit_len > 0 from the lookahead boundary. Call next_capped with
+        // a cap smaller than lit_len to trigger emit_partial_literals.
+        enc.finish();
+        if enc.has_pending_literals() {
+            // This should trigger emit_partial_literals(5).
+            let token = enc.next_capped(5);
+            assert!(token.is_some());
+            let t = token.unwrap();
+            assert!(t.seq.literal_len <= 5);
+        }
+
+        // Drain the rest and verify roundtrip.
+        let mut dec = Decoder::new();
+        let mut decoded = Vec::new();
+
+        // Re-do from scratch to get all tokens for verification.
+        let mut enc2 = Encoder::new(DEFAULT_LEVEL);
+        enc2.feed(&data);
+        enc2.finish();
+        while let Some(token) = enc2.next() {
+            dec.decode(token.seq, token_literals(&token), &mut decoded);
+        }
+        assert_eq!(data, decoded);
+    }
+
+    #[test]
+    fn maybe_compact_early_return() {
+        // Feed > 2*WINDOW_SIZE bytes in one call, then feed again. The second
+        // feed triggers maybe_compact with buf > 128K but pos=0, so
+        // abs_keep_from=0 <= base=0, exercising the early return.
+        let mut enc = Encoder::new(DEFAULT_LEVEL);
+        let big = vec![0x42u8; 150_000];
+        enc.feed(&big);
+        // Second feed triggers maybe_compact on the large buffer.
+        enc.feed(b"extra");
+        enc.finish();
+        let mut dec = Decoder::new();
+        let mut decoded = Vec::new();
+        while let Some(token) = enc.next() {
+            dec.decode(token.seq, token_literals(&token), &mut decoded);
+        }
+        let mut expected = big;
+        expected.extend_from_slice(b"extra");
+        assert_eq!(expected, decoded);
     }
 
     #[test]

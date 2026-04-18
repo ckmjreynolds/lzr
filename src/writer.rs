@@ -318,11 +318,6 @@ impl<W: Write> WriterState<W> {
                 break;
             }
         }
-        // Emit any remaining pending literals that didn't form a full token.
-        if let Some(token) = self.lz77_enc.drain() {
-            self.track_token(&token);
-            codec::encode_line(&mut self.entropy_enc, &mut self.models, &token, &mut self.encode_buf);
-        }
         Ok(())
     }
 
@@ -402,38 +397,13 @@ impl<W: Write> WriterState<W> {
     }
 
     /// Finalizes the current Sonnet: writes EOS, Kireji, padding, Couplet.
-    #[allow(clippy::cast_possible_truncation)]
+    ///
+    /// Both callers (`maybe_finalize_sonnet` and `drain_lz77`) only invoke this
+    /// when `remaining_capacity() < MATCH_UPPER + PER_LIT_UPPER` (< 12 bytes).
+    /// Any pending literals in the encoder are carried to the next Sonnet via
+    /// `unconsumed_input()` — they're included in that slice and restored after
+    /// the reset.
     fn finalize_sonnet(&mut self) -> io::Result<()> {
-        // Drain remaining LZ77 literals that fit.
-        loop {
-            let rem = self.remaining_capacity();
-            if rem == 0 {
-                break;
-            }
-            let max_lits = (rem.saturating_sub(MATCH_UPPER) / PER_LIT_UPPER).min(255) as u8;
-            if max_lits == 0 {
-                break;
-            }
-            match self.lz77_enc.next_capped(max_lits) {
-                Some(t) => {
-                    self.track_token(&t);
-                    codec::encode_line(&mut self.entropy_enc, &mut self.models, &t, &mut self.encode_buf);
-                }
-                None => break,
-            }
-        }
-
-        // Drain any remaining pending literals.
-        if let Some(t) = self.lz77_enc.drain() {
-            let rem = self.remaining_capacity();
-            let needed = t.seq.literal_len as usize * PER_LIT_UPPER + 6; // lit-only overhead
-            if rem >= needed {
-                self.track_token(&t);
-                codec::encode_line(&mut self.entropy_enc, &mut self.models, &t, &mut self.encode_buf);
-            }
-            // If it doesn't fit, those literals will be in the unconsumed input.
-        }
-
         // EOS tag + Kireji (byte-aligned for Sonnet boundary).
         codec::encode_terminator(&mut self.entropy_enc, &mut self.models, TAG_EOS, &mut self.encode_buf);
         self.entropy_enc.finalize_sonnet(&mut self.encode_buf);

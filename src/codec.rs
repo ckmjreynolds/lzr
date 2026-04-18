@@ -151,8 +151,8 @@ pub(crate) fn decode_token(dec: &mut entropy::Decoder, models: &mut ModelSet, in
         }
         TAG_EOH => DecodedToken::EndOfHaiku,
         TAG_EOS => DecodedToken::EndOfSonnet,
-        TAG_EOO => DecodedToken::EndOfOpus,
-        _ => unreachable!("tag model only has 4 symbols"),
+        // TAG_EOO is the only remaining value from the 4-symbol tag model.
+        _ => DecodedToken::EndOfOpus,
     }
 }
 

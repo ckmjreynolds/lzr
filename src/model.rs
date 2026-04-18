@@ -297,7 +297,8 @@ impl FreqModel for TagModel {
     #[allow(clippy::cast_possible_truncation)]
     fn find(&self, value: u32) -> u8 {
         let mut cum = 0u32;
-        for (i, &f) in self.freq.iter().enumerate() {
+        // Only check first N-1 symbols; the last symbol is the implicit remainder.
+        for (i, &f) in self.freq[..TAG_SYMBOLS - 1].iter().enumerate() {
             cum += u32::from(f);
             if cum > value {
                 return i as u8;

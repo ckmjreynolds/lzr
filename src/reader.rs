@@ -252,11 +252,12 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     /// Finds the Sonnet containing byte offset `target` using interpolation search.
+    ///
+    /// Callers guarantee `total_sonnets > 0` (the `read()` guard at line 449
+    /// ensures `position < total_bytes`, which requires at least one Sonnet).
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
     fn find_sonnet_by_byte(&mut self, target: u64, total_sonnets: u64) -> io::Result<u64> {
-        if total_sonnets == 0 {
-            return Ok(0);
-        }
+        debug_assert!(total_sonnets > 0);
 
         let mut lo = 0u64;
         let mut hi = total_sonnets - 1;
