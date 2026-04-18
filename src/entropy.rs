@@ -375,17 +375,6 @@ impl Decoder {
         self.reader.bits_remaining > 0
     }
 
-    /// Byte-aligns the reader and fully resets for the next Sonnet.
-    ///
-    /// Used after EOS/EOO. The caller reads the footer separately.
-    pub(crate) const fn finalize_sonnet(&mut self) {
-        self.reader.align_to_byte_boundary();
-        self.low = 0x0000;
-        self.high = 0xFFFF;
-        self.code = 0;
-        self.initialized = false;
-    }
-
     /// Decoder normalization — mirrors encoder, shifting in bits from input.
     fn normalize(&mut self, input: &mut &[u8]) {
         loop {
@@ -526,57 +515,6 @@ mod tests {
             decoded2.push(dec.decode(&mut dec_model, &mut input));
         }
         assert_eq!(&data2[..], &decoded2[..]);
-    }
-
-    #[test]
-    fn decoder_finalize_sonnet_resets() {
-        // Encode two independent Sonnets into separate buffers, decode each
-        // using the same decoder with finalize_sonnet() reset between them.
-        let data1: Vec<u8> = (0..100).collect();
-        let data2: Vec<u8> = (100..200).collect();
-
-        let mut compressed1 = Vec::new();
-        {
-            let mut enc = Encoder::new();
-            let mut model = Model::new();
-            for &b in &data1 {
-                enc.encode(b, &mut model, &mut compressed1);
-            }
-            enc.finalize_sonnet(&mut compressed1);
-        }
-
-        let mut compressed2 = Vec::new();
-        {
-            let mut enc = Encoder::new();
-            let mut model = Model::new();
-            for &b in &data2 {
-                enc.encode(b, &mut model, &mut compressed2);
-            }
-            enc.finalize_sonnet(&mut compressed2);
-        }
-
-        let mut dec = Decoder::new();
-
-        // Decode first Sonnet.
-        let mut model1 = Model::new();
-        let mut input1: &[u8] = &compressed1;
-        let mut decoded1 = Vec::new();
-        for _ in 0..data1.len() {
-            decoded1.push(dec.decode(&mut model1, &mut input1));
-        }
-        assert_eq!(data1, decoded1);
-
-        // Reset decoder for next Sonnet.
-        dec.finalize_sonnet();
-
-        // Decode second Sonnet with fresh model.
-        let mut model2 = Model::new();
-        let mut input2: &[u8] = &compressed2;
-        let mut decoded2 = Vec::new();
-        for _ in 0..data2.len() {
-            decoded2.push(dec.decode(&mut model2, &mut input2));
-        }
-        assert_eq!(data2, decoded2);
     }
 
     #[test]

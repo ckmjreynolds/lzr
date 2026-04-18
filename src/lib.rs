@@ -23,10 +23,10 @@
 
 #![allow(unused_features)]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-#![allow(dead_code)]
 pub(crate) mod adler32;
 pub(crate) mod codec;
 pub(crate) mod entropy;
+mod error;
 pub(crate) mod lz77;
 pub(crate) mod model;
 mod reader;
@@ -34,6 +34,7 @@ pub(crate) mod sonnet;
 pub(crate) mod uleb128;
 mod writer;
 
+pub use error::{Error, Result};
 pub use reader::Reader;
 pub use writer::Writer;
 
@@ -43,8 +44,8 @@ pub(crate) fn count_lines(data: &[u8]) -> usize {
     data.iter().filter(|&&b| b == b'\n').count()
 }
 
-/// Default compression level (1–9). Levels 1–8 use hash-chain match finding;
-/// level 9 uses B+tree match finding.
+/// Default compression level. Valid levels are `1..=4`, all using a `wabi_tree`
+/// B+tree match finder; higher levels check more candidate positions per match.
 pub const DEFAULT_LEVEL: u8 = lz77::DEFAULT_LEVEL;
 
 #[cfg(any(test, feature = "bench-internals"))]

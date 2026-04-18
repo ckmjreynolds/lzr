@@ -6,6 +6,8 @@
 //!
 //! See the [FORMAT.md](../docs/FORMAT.md) specification for details on the encoding.
 
+use crate::error::{Error, Result};
+
 /// Encodes `value` as ULEB128 by appending bytes to `out`.
 ///
 /// Writes at most 9 bytes. Values up to 127 require a single byte;
@@ -33,56 +35,51 @@ pub(crate) fn encode_uleb128_u64(mut value: u64, out: &mut Vec<u8>) {
     out.push(value as u8);
 }
 
-/// Decodes a ULEB128-encoded `u64` from `buf` starting at `*pos`.
+/// Decodes a ULEB128-encoded `u64` from `buf` starting at `*pos`, rejecting
+/// non-canonical (overlong) encodings per FORMAT.md §7.
 ///
 /// Advances `*pos` by the number of bytes consumed (1 to 9).
+///
+/// # Errors
+///
+/// Returns [`Error::NonCanonicalUleb128`] if the terminating 7-bit payload
+/// byte is `0x00` yet a shorter encoding would have produced the same value.
 ///
 /// # Examples
 ///
 /// ```text
 /// let buf = [0x80, 0x01];
 /// let mut pos = 0;
-/// assert_eq!(decode_uleb128_u64(&buf, &mut pos), 128);
+/// assert_eq!(decode_uleb128_u64(&buf, &mut pos).unwrap(), 128);
 /// assert_eq!(pos, 2);
 /// ```
-pub(crate) fn decode_uleb128_u64(buf: &[u8], pos: &mut usize) -> u64 {
+pub(crate) fn decode_uleb128_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
 
-    for _ in 0..8 {
+    for i in 0..8 {
         let byte = buf[*pos];
         *pos += 1;
         value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
-            return value;
+            // Canonical requires: either this is the first byte (i=0), or the
+            // terminating byte has a nonzero payload. Otherwise a shorter
+            // encoding would represent the same value.
+            if i > 0 && byte == 0 {
+                return Err(Error::NonCanonicalUleb128);
+            }
+            return Ok(value);
         }
         shift += 7;
     }
-    // 9th byte: all 8 bits are payload.
+    // 9th byte: all 8 bits are payload; canonical requires it to be nonzero.
     let byte = buf[*pos];
     *pos += 1;
+    if byte == 0 {
+        return Err(Error::NonCanonicalUleb128);
+    }
     value |= u64::from(byte) << shift;
-    value
-}
-
-/// Returns the number of bytes needed to encode `value` as ULEB128.
-///
-/// Uses `leading_zeros` to compute the result in constant time without
-/// encoding. Returns a value in the range `1..=9`.
-///
-/// # Examples
-///
-/// ```text
-/// assert_eq!(uleb128_u64_len(0), 1);
-/// assert_eq!(uleb128_u64_len(127), 1);
-/// assert_eq!(uleb128_u64_len(128), 2);
-/// assert_eq!(uleb128_u64_len(u64::MAX), 9);
-/// ```
-pub(crate) fn uleb128_u64_len(value: u64) -> usize {
-    // Each of the first 8 bytes carries 7 payload bits; the 9th byte carries
-    // all 8 bits. Ceiling-divide significant bits by 7, then cap at 9.
-    let bits = (64 - value.leading_zeros()).max(1);
-    (bits as usize).div_ceil(7).min(9)
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -99,18 +96,9 @@ mod tests {
             let mut buf = Vec::new();
             encode_uleb128_u64(value, &mut buf);
             let mut pos = 0;
-            let decoded = decode_uleb128_u64(&buf, &mut pos);
+            let decoded = decode_uleb128_u64(&buf, &mut pos).unwrap();
             prop_assert_eq!(pos, buf.len());
             prop_assert_eq!(decoded, value);
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn len_matches_encode(value: u64) {
-            let mut buf = Vec::new();
-            encode_uleb128_u64(value, &mut buf);
-            prop_assert_eq!(uleb128_u64_len(value), buf.len());
         }
     }
 
@@ -133,12 +121,21 @@ mod tests {
 
             // Verify decoding reads the expected value.
             let mut pos = 0;
-            let decoded = decode_uleb128_u64(expected, &mut pos);
+            let decoded = decode_uleb128_u64(expected, &mut pos).unwrap();
             assert_eq!(pos, expected.len(), "decode len {value}");
             assert_eq!(decoded, value, "decode {value}");
-
-            // Verify length prediction matches actual encoding.
-            assert_eq!(uleb128_u64_len(value), expected.len(), "len {value}");
         }
+    }
+
+    #[test]
+    fn rejects_non_canonical() {
+        // `0x80 0x00` represents 0 but the canonical encoding of 0 is `0x00`.
+        let mut pos = 0;
+        assert!(matches!(decode_uleb128_u64(&[0x80, 0x00], &mut pos), Err(Error::NonCanonicalUleb128),));
+
+        // Nine-byte encoding with a zero top byte is also non-canonical.
+        let mut pos = 0;
+        let bad = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
+        assert!(matches!(decode_uleb128_u64(&bad, &mut pos), Err(Error::NonCanonicalUleb128),));
     }
 }

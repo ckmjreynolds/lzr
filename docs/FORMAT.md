@@ -350,8 +350,8 @@ loop:
 
 ### 3.4 Finalization (Kireji)
 
-When all tokens for a Haiku have been encoded, the encoder finalizes by emitting enough bits
-to place the decoder's code value within the final interval:
+When a terminator tag (`EOH`, `EOS`, or `EOO`) has been encoded, the encoder emits Kireji
+bits that unambiguously identify the final interval, then pads to a byte boundary:
 
 ```
 pending_bits += 1
@@ -366,6 +366,40 @@ flush_to_byte_boundary()    // pad remaining bits in the current byte with 0
 
 The resulting bytes (from the start of this Haiku's arithmetic output through the final
 padded byte) are the Kireji.
+
+#### EOH resync padding
+
+After writing the Kireji at an **`EOH`** terminator, the encoder additionally emits
+`T` zero bytes (`0x00`) so that the decoder's 16-bit lookahead (see
+[Section 3.7](#37-decoder-haiku-finalization)) stays within this Haiku's region
+rather than consuming bytes from the next Haiku. `T` is computed from the encoder's
+state at the moment finalization begins:
+
+```
+# Captured BEFORE emit_finalization runs:
+N = writer.total_bits   # bits emitted during this Haiku's normalize loops
+P = pending_bits        # unresolved E3 underflow bits
+
+# After emit_finalization + flush_to_byte_boundary:
+decoder_bytes = ceil((16 + N + P) / 8)   # bytes the decoder fetches to decode all tokens
+haiku_bytes   = ceil((N + P + 2) / 8)    # bytes of Kireji (normalize bits + P+2 finalization bits, byte-aligned)
+T             = max(0, decoder_bytes + 2 - haiku_bytes)
+```
+
+The `16 + N + P` bits the decoder fetches account for: 16 initial bits preloaded into
+`code`; `N` bits read during normalize that mirror the encoder's bit emissions; and `P`
+additional bits read during E3 shifts — the decoder reads one bit per shift, whereas
+the encoder defers emission of those bits until finalization, so the decoder reads `P`
+bits from the stream that the encoder has not yet emitted. `+ 2` corresponds to the
+two bytes the decoder skips before reading 16 fresh bits for the next Haiku.
+`N + P + 2` is the total bit-length of the Kireji (`N` normalize bits + `P + 2`
+finalization bits; `pending_bits` is incremented by 1 inside the finalization routine
+before the leading + follow-up bits are emitted).
+
+At **`EOS`** or **`EOO`** terminators, the encoder writes **no** trailing bytes; the
+Couplet or Coda footer immediately follows the Kireji (with zero or more `0x00`
+padding bytes between the Kireji and the footer, sized to make the Sonnet exactly
+262 144 bytes per [Section 1.4](#14-sonnet)).
 
 ### 3.5 Bit Packing
 
@@ -451,8 +485,10 @@ the mirror of the encoder's `flush_to_byte_boundary()` in [Section 3.4](#34-fina
 
 After byte-aligning:
 
-- **`EOH`**: The decoder re-initializes `low = 0x0000`, `high = 0xFFFF`, and reads the next
-  16 bits from the byte-aligned position into `code`. Decoding continues with the next Haiku.
+- **`EOH`**: The decoder discards the next 2 bytes of resync padding (see the
+  "EOH resync padding" subsection of [Section 3.4](#34-finalization-kireji)), then
+  reads the following 16 bits into `code` and re-initializes `low = 0x0000`,
+  `high = 0xFFFF`. Decoding continues with the next Haiku.
 - **`EOS`** or **`EOO`**: The decoder proceeds to read the Sonnet footer. See
   [Section 10.1](#101-streaming-decode) for the footer-reading procedure.
 

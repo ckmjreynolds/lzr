@@ -387,6 +387,28 @@ fn reader_invalid_file() {
 }
 
 #[test]
+fn reader_detects_checksum_corruption() {
+    // Build a multi-Sonnet archive and flip a byte inside the first Sonnet's
+    // payload. The Reader must refuse to serve decompressed data rather than
+    // silently returning corrupted bytes.
+    let data = numbered_lines(600 * 1024);
+    let buf = Vec::new();
+    let mut w = Writer::new(buf).unwrap();
+    w.write_all(&data).unwrap();
+    let mut buf = w.seal().unwrap();
+
+    // Corrupt a literal byte well inside the first Sonnet's compressed region.
+    buf[1024] ^= 0xAA;
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    let mut output = Vec::new();
+    let err = r.read_to_end(&mut output).unwrap_err();
+    // The corruption can surface as a checksum mismatch, an invalid token, or
+    // an out-of-range match distance — any of which is a valid refusal.
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "unexpected error: {err:?}");
+}
+
+#[test]
 fn multi_sonnet_compressible_roundtrip() {
     // Highly compressible data: many LZ77 match tokens per Sonnet, which
     // exercises the tight-capacity drain paths in finalize_sonnet().

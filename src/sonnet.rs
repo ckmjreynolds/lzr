@@ -15,6 +15,7 @@
 //! first, then backs up `footer_len` bytes to parse the footer fields.
 //! All counts are **cumulative** from the start of the Opus.
 
+use crate::error::Result;
 use crate::uleb128;
 
 /// Fixed Sonnet size: 256 KiB (262,144 bytes).
@@ -40,11 +41,6 @@ pub(crate) struct Footer {
     pub(crate) adler32: u32,
 }
 
-/// Returns the encoded size of a footer with the given counts.
-pub(crate) fn footer_size(bytes_count: u64, lines_count: u64) -> usize {
-    uleb128::uleb128_u64_len(bytes_count) + uleb128::uleb128_u64_len(lines_count) + 4 + 1
-}
-
 /// Encodes a footer into bytes.
 ///
 /// The returned `Vec` includes the `footer_len` byte at the end.
@@ -64,22 +60,27 @@ pub(crate) fn encode_footer(footer: &Footer) -> Vec<u8> {
 ///
 /// Reads `footer_len` from the last byte, then parses the footer fields
 /// from the appropriate offset.
-pub(crate) fn decode_footer(block: &[u8]) -> Footer {
+///
+/// # Errors
+///
+/// Returns [`crate::Error::NonCanonicalUleb128`] if either ULEB128 field is
+/// non-canonical.
+pub(crate) fn decode_footer(block: &[u8]) -> Result<Footer> {
     assert!(block.len() >= MAX_FOOTER_SIZE, "block too small for footer");
     let footer_len = block[block.len() - 1] as usize;
     let footer_start = block.len() - footer_len;
     let mut pos = footer_start;
 
-    let bytes_count = uleb128::decode_uleb128_u64(block, &mut pos);
-    let lines_count = uleb128::decode_uleb128_u64(block, &mut pos);
+    let bytes_count = uleb128::decode_uleb128_u64(block, &mut pos)?;
+    let lines_count = uleb128::decode_uleb128_u64(block, &mut pos)?;
 
     let adler32 = u32::from_le_bytes([block[pos], block[pos + 1], block[pos + 2], block[pos + 3]]);
 
-    Footer {
+    Ok(Footer {
         bytes_count,
         lines_count,
         adler32,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -98,26 +99,23 @@ mod tests {
         };
 
         let encoded = encode_footer(&footer);
-        let expected_size = footer_size(footer.bytes_count, footer.lines_count);
-        assert_eq!(encoded.len(), expected_size);
 
         let mut block = vec![0u8; SONNET_SIZE];
         let start = SONNET_SIZE - encoded.len();
         block[start..].copy_from_slice(&encoded);
 
-        let decoded = decode_footer(&block);
+        let decoded = decode_footer(&block).unwrap();
         assert_eq!(footer, decoded);
     }
 
     #[test]
-    fn footer_size_matches_encode() {
+    fn footer_max_values_fit_in_max_size() {
         let footer = Footer {
             bytes_count: u64::MAX,
             lines_count: u64::MAX,
             adler32: u32::MAX,
         };
         let encoded = encode_footer(&footer);
-        assert_eq!(encoded.len(), footer_size(footer.bytes_count, footer.lines_count));
         assert_eq!(encoded.len(), MAX_FOOTER_SIZE);
     }
 
@@ -134,7 +132,7 @@ mod tests {
         let mut block = vec![0u8; SONNET_SIZE];
         let start = SONNET_SIZE - encoded.len();
         block[start..].copy_from_slice(&encoded);
-        let decoded = decode_footer(&block);
+        let decoded = decode_footer(&block).unwrap();
         assert_eq!(footer, decoded);
     }
 
@@ -147,14 +145,29 @@ mod tests {
         ) {
             let footer = Footer { bytes_count, lines_count, adler32 };
             let encoded = encode_footer(&footer);
-            prop_assert_eq!(encoded.len(), footer_size(bytes_count, lines_count));
 
             let mut block = vec![0u8; SONNET_SIZE];
             let start = SONNET_SIZE - encoded.len();
             block[start..].copy_from_slice(&encoded);
 
-            let decoded = decode_footer(&block);
+            let decoded = decode_footer(&block).unwrap();
             prop_assert_eq!(footer, decoded);
         }
+    }
+
+    #[test]
+    fn footer_rejects_non_canonical_uleb128() {
+        // Craft a footer where bytes_count is encoded non-canonically
+        // (`0x80 0x00` for 0, instead of the canonical `0x00`).
+        let mut block = vec![0u8; SONNET_SIZE];
+        let footer_bytes: &[u8] = &[
+            0x80, 0x00, // bytes_count (non-canonical 0)
+            0x00, // lines_count = 0
+            0x01, 0x00, 0x00, 0x00, // adler32 = 1
+            8,    // footer_len
+        ];
+        let start = SONNET_SIZE - footer_bytes.len();
+        block[start..].copy_from_slice(footer_bytes);
+        assert!(decode_footer(&block).is_err());
     }
 }

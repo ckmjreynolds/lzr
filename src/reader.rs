@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::codec::{self, DecodedToken, ModelSet};
-use crate::entropy;
-use crate::lz77;
+use crate::adler32::Adler32;
+use crate::codec;
+use crate::error::{Error, Result};
 use crate::sonnet::{self, Footer, INVOCATION, INVOCATION_LEN, SONNET_SIZE};
 
 /// Random-access decompression reader for the LZR format.
@@ -70,15 +70,18 @@ impl<R: Read + Seek> Reader<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file is not a valid LZR file or if any I/O
-    /// operation fails.
+    /// Returns [`Error::InvalidMagic`] or [`Error::UnsupportedVersion`] if the
+    /// file is not a valid LZR file, or [`Error::Io`] if any I/O operation fails.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn new(mut source: R) -> io::Result<Self> {
+    pub fn new(mut source: R) -> Result<Self> {
         source.seek(SeekFrom::Start(0))?;
         let mut magic = [0u8; INVOCATION_LEN];
         source.read_exact(&mut magic)?;
-        if magic != INVOCATION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not an LZR file: invalid magic"));
+        if magic[..3] != INVOCATION[..3] {
+            return Err(Error::InvalidMagic);
+        }
+        if magic[3] != INVOCATION[3] {
+            return Err(Error::UnsupportedVersion(magic[3]));
         }
 
         let file_size = source.seek(SeekFrom::End(0))?;
@@ -109,10 +112,10 @@ impl<R: Read + Seek> Reader<R> {
                 0
             };
             if partial_size > data_start {
-                let (decoded_bytes, decoded_lines, sealed) = decode_partial_sonnet(&partial_data[data_start..]);
-                total_bytes += decoded_bytes;
-                total_lines += decoded_lines;
-                is_sealed = sealed;
+                let decoded = codec::decode_sonnet_data(&partial_data[data_start..])?;
+                total_bytes += decoded.output.len() as u64;
+                total_lines += crate::count_lines(&decoded.output) as u64;
+                is_sealed = decoded.is_sealed;
             }
         }
 
@@ -166,15 +169,15 @@ impl<R: Read + Seek> Reader<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the line number is out of range or if any I/O
-    /// operation fails.
+    /// Returns [`Error::LineOutOfRange`] if `line` is past the end of the file,
+    /// or [`Error::Io`] if any I/O operation fails.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn seek_to_line(&mut self, line: u64) -> io::Result<u64> {
+    pub fn seek_to_line(&mut self, line: u64) -> Result<u64> {
         if line > self.total_lines {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("line {line} out of range (file has {} lines)", self.total_lines),
-            ));
+            return Err(Error::LineOutOfRange {
+                line,
+                total: self.total_lines,
+            });
         }
 
         if line == 0 {
@@ -310,6 +313,31 @@ impl<R: Read + Seek> Reader<R> {
         Ok(lo)
     }
 
+    /// Validates a complete Sonnet's Adler-32 against its Couplet/Coda footer.
+    ///
+    /// The footer's checksum is cumulative from the start of the Opus; for all
+    /// but the first Sonnet we prime the checksum from the previous Sonnet's
+    /// footer so we only hash this Sonnet's decompressed bytes (FORMAT.md §8).
+    #[allow(clippy::cast_possible_truncation)]
+    fn validate_sonnet_checksum(&mut self, sonnet_idx: u64, data: &[u8]) -> Result<()> {
+        let this_footer = self.read_footer(sonnet_idx)?;
+        let mut checksum = if sonnet_idx == 0 {
+            Adler32::new()
+        } else {
+            let prev = self.read_footer(sonnet_idx - 1)?;
+            Adler32::from_checksum(prev.adler32)
+        };
+        checksum.update(data);
+        let computed = checksum.checksum();
+        if computed != this_footer.adler32 {
+            return Err(Error::ChecksumMismatch {
+                expected: this_footer.adler32,
+                computed,
+            });
+        }
+        Ok(())
+    }
+
     /// Ensures the Sonnet at `sonnet_idx` is decompressed and cached.
     #[allow(clippy::cast_possible_truncation)]
     fn ensure_sonnet_cached(&mut self, sonnet_idx: u64) -> io::Result<()> {
@@ -351,7 +379,11 @@ impl<R: Read + Seek> Reader<R> {
             read_size
         };
 
-        let data = decompress_sonnet_data(&sonnet_data[data_start..data_end]);
+        let data = codec::decode_sonnet_data(&sonnet_data[data_start..data_end]).map_err(io::Error::from)?.output;
+
+        if sonnet_idx < self.sonnet_count {
+            self.validate_sonnet_checksum(sonnet_idx, &data).map_err(io::Error::from)?;
+        }
 
         self.cached_sonnet = Some(CachedSonnet {
             sonnet_index: sonnet_idx,
@@ -370,78 +402,7 @@ fn read_footer_from<R: Read + Seek>(source: &mut R, sonnet_idx: u64) -> io::Resu
     source.seek(SeekFrom::Start(offset))?;
     let mut data = vec![0u8; SONNET_SIZE];
     source.read_exact(&mut data)?;
-    Ok(sonnet::decode_footer(&data))
-}
-
-/// Decompresses a Sonnet's data region into raw bytes.
-fn decompress_sonnet_data(data: &[u8]) -> Vec<u8> {
-    let mut dec = entropy::Decoder::new();
-    let mut models = ModelSet::new();
-    let mut lz77_dec = lz77::Decoder::new();
-    let mut input: &[u8] = data;
-    let mut output = Vec::new();
-
-    let max_tokens = data.len() * 8;
-    for _ in 0..max_tokens {
-        if input.is_empty() && !dec.has_buffered_bits() {
-            break;
-        }
-        let token = codec::decode_token(&mut dec, &mut models, &mut input);
-        match token {
-            DecodedToken::Line(t) => {
-                let lits = &t.literals[..t.seq.literal_len as usize];
-                lz77_dec.decode(t.seq, lits, &mut output);
-            }
-            DecodedToken::EndOfHaiku => {
-                dec.finalize_haiku(&mut input);
-            }
-            DecodedToken::EndOfSonnet | DecodedToken::EndOfOpus => {
-                break;
-            }
-        }
-    }
-
-    output
-}
-
-/// Decodes a partial Sonnet's data, returning `(bytes, lines, is_sealed)`.
-#[allow(clippy::naive_bytecount)]
-fn decode_partial_sonnet(data: &[u8]) -> (u64, u64, bool) {
-    let mut dec = entropy::Decoder::new();
-    let mut models = ModelSet::new();
-    let mut lz77_dec = lz77::Decoder::new();
-    let mut input: &[u8] = data;
-    let mut output = Vec::new();
-    let mut sealed = false;
-
-    // Safety bound: each token produces at least 1 uncompressed byte (except
-    // terminators), so we can't have more tokens than bytes in the data.
-    let max_tokens = data.len() * 8;
-    for _ in 0..max_tokens {
-        if input.is_empty() && !dec.has_buffered_bits() {
-            break;
-        }
-        let token = codec::decode_token(&mut dec, &mut models, &mut input);
-        match token {
-            DecodedToken::Line(t) => {
-                let lits = &t.literals[..t.seq.literal_len as usize];
-                lz77_dec.decode(t.seq, lits, &mut output);
-            }
-            DecodedToken::EndOfHaiku => {
-                dec.finalize_haiku(&mut input);
-            }
-            DecodedToken::EndOfSonnet => {
-                break;
-            }
-            DecodedToken::EndOfOpus => {
-                sealed = true;
-                break;
-            }
-        }
-    }
-
-    let lines = crate::count_lines(&output) as u64;
-    (output.len() as u64, lines, sealed)
+    sonnet::decode_footer(&data).map_err(io::Error::from)
 }
 
 impl<R: Read + Seek> Read for Reader<R> {
@@ -482,7 +443,8 @@ impl<R: Read + Seek> Seek for Reader<R> {
                 } else {
                     self.total_bytes
                         .checked_sub(offset.unsigned_abs())
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek to negative offset"))?
+                        .ok_or(Error::NegativeSeek)
+                        .map_err(io::Error::from)?
                 }
             }
             SeekFrom::Current(offset) => {
@@ -491,7 +453,8 @@ impl<R: Read + Seek> Seek for Reader<R> {
                 } else {
                     self.position
                         .checked_sub(offset.unsigned_abs())
-                        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek to negative offset"))?
+                        .ok_or(Error::NegativeSeek)
+                        .map_err(io::Error::from)?
                 }
             }
         };

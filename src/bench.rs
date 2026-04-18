@@ -49,14 +49,6 @@ impl Decoder {
     pub fn decode(&mut self, model: &mut Model, input: &mut &[u8]) -> u8 {
         self.0.decode(&mut model.0, input)
     }
-
-    pub fn finalize_haiku(&mut self, input: &mut &[u8]) {
-        self.0.finalize_haiku(input);
-    }
-
-    pub fn finalize_sonnet(&mut self) {
-        self.0.finalize_sonnet();
-    }
 }
 
 /// Thin wrapper around the internal adaptive frequency `Model`.

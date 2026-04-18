@@ -18,9 +18,6 @@ const_assert!(FAST_NMAX < NMAX);
 
 /// Rolling Adler-32 checksum state.
 ///
-/// Maintains the two 16-bit halves (`a` and `b`) and the total byte count,
-/// supporting incremental updates and combination of independent checksums.
-///
 /// # Examples
 ///
 /// ```text
@@ -31,7 +28,6 @@ const_assert!(FAST_NMAX < NMAX);
 pub(crate) struct Adler32 {
     a: u32,
     b: u32,
-    len: usize,
 }
 
 impl Adler32 {
@@ -41,20 +37,18 @@ impl Adler32 {
         Self {
             a: 1,
             b: 0,
-            len: 0,
         }
     }
 
-    /// Restores a checksum from a previously computed value and byte count.
+    /// Restores a rolling checksum from a previously stored value.
     ///
-    /// Used for cold-start resume: load the cumulative checksum from a stored
-    /// footer and continue updating from there.
+    /// Used to resume hashing across Sonnet boundaries: load the cumulative
+    /// checksum from a footer and continue updating from there.
     #[must_use]
-    pub(crate) const fn from_checksum(checksum: u32, len: usize) -> Self {
+    pub(crate) const fn from_checksum(checksum: u32) -> Self {
         Self {
             a: checksum & 0xFFFF,
             b: checksum >> 16,
-            len,
         }
     }
 
@@ -83,50 +77,6 @@ impl Adler32 {
             self.b = (self.b + (self.a * (n as u32) + b)) % MOD_ADLER;
             self.a = (self.a + a) % MOD_ADLER;
         }
-
-        self.len += data.len();
-    }
-
-    /// Combines two independently computed checksums into one, as if the
-    /// underlying data had been checksummed in a single pass.
-    ///
-    /// This enables parallel checksum computation: split the data, compute
-    /// each part separately, then combine.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// let data = b"Hello, world!";
-    /// let (left, right) = data.split_at(5);
-    ///
-    /// let mut a = Adler32::new();
-    /// a.update(left);
-    /// let mut b = Adler32::new();
-    /// b.update(right);
-    ///
-    /// let mut whole = Adler32::new();
-    /// whole.update(data);
-    ///
-    /// assert_eq!(a.combine(&b).checksum(), whole.checksum());
-    /// ```
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn combine(self, other: &Self) -> Self {
-        let a1 = u64::from(self.a);
-        let b1 = u64::from(self.b);
-        let a2 = u64::from(other.a);
-        let b2 = u64::from(other.b);
-        let len2 = other.len as u64 % u64::from(MOD_ADLER);
-
-        let m = u64::from(MOD_ADLER);
-        let a = (a1 + a2 + m - 1) % m;
-        let b = (b1 + b2 + (a1 + m - 1) * len2) % m;
-
-        Self {
-            a: a as u32,
-            b: b as u32,
-            len: self.len + other.len,
-        }
     }
 
     /// Returns the final 32-bit checksum (`b << 16 | a`).
@@ -145,7 +95,6 @@ impl Adler32 {
             self.a = (self.a + u32::from(*byte)) % MOD_ADLER;
             self.b = (self.b + self.a) % MOD_ADLER;
         }
-        self.len += data.len();
     }
 }
 
@@ -174,10 +123,10 @@ mod test {
             let mut original = super::Adler32::new();
             original.update(&data);
 
-            let restored = super::Adler32::from_checksum(original.checksum(), data.len());
+            let restored = super::Adler32::from_checksum(original.checksum());
             prop_assert_eq!(restored.checksum(), original.checksum());
 
-            // Verify that continued updates produce the same result.
+            // Continued updates on the restored state must match the original.
             let more = b"extra data";
             let mut from_original = original;
             from_original.update(more);
@@ -197,21 +146,5 @@ mod test {
           prop_assert_eq!(optimized.checksum(), naive.checksum());
         }
 
-        #[test]
-        fn test_combine(data in prop::collection::vec(any::<u8>(), 2..8_192)) {
-          let split = data.len() / 2;
-
-          let mut whole = super::Adler32::new();
-          whole.update(&data);
-
-          let mut first = super::Adler32::new();
-          first.update(&data[..split]);
-          let mut second = super::Adler32::new();
-          second.update(&data[split..]);
-
-          let combined = first.combine(&second);
-
-          prop_assert_eq!(combined.checksum(), whole.checksum());
-        }
     }
 }

@@ -5,7 +5,8 @@
 //! from a 4-symbol alphabet (LINE, EOH, EOS, EOO) per FORMAT.md Section 2.
 
 use crate::entropy;
-use crate::lz77::{Sequence, Token};
+use crate::error::{Error, Result};
+use crate::lz77::{self, Sequence, Token};
 use crate::model::{FreqModel, Model, TagModel};
 
 // ---------------------------------------------------------------------------
@@ -118,8 +119,96 @@ pub(crate) fn encode_terminator(enc: &mut entropy::Encoder, models: &mut ModelSe
 // Decoding
 // ---------------------------------------------------------------------------
 
+/// Result of decoding a Sonnet's entropy-coded region.
+pub(crate) struct DecodedSonnet {
+    /// Uncompressed bytes reconstructed from the token stream.
+    pub(crate) output: Vec<u8>,
+    /// Final adaptive-model state, carried forward by appenders resuming the
+    /// current Sonnet.
+    pub(crate) models: ModelSet,
+    /// `true` if an `EOO` terminator was encountered.
+    pub(crate) is_sealed: bool,
+}
+
+/// Decodes every token from a Sonnet's (or partial Sonnet's) data region.
+///
+/// Stops at the first `EOS`/`EOO` terminator. This single helper is reused by
+/// the streaming reader, random-access reader, and `Writer::open` cold-start
+/// resume path (FORMAT.md Section 10.1).
+///
+/// # Errors
+///
+/// Propagates any error from [`decode_token`], plus
+/// [`Error::MatchDistanceOutOfRange`] if a match reaches beyond the start of
+/// the Sonnet.
+pub(crate) fn decode_sonnet_data(data: &[u8]) -> Result<DecodedSonnet> {
+    let mut dec = entropy::Decoder::new();
+    let mut models = ModelSet::new();
+    let mut lz77_dec = lz77::Decoder::new();
+    let mut input: &[u8] = data;
+    let mut output = Vec::new();
+    let mut is_sealed = false;
+
+    // Safety bound: each token consumes at least one input bit, and each LINE
+    // token produces at least one uncompressed byte, so we can't have more
+    // tokens than bits in the input region.
+    let max_tokens = data.len() * 8;
+    for _ in 0..max_tokens {
+        if input.is_empty() && !dec.has_buffered_bits() {
+            break;
+        }
+        match decode_token(&mut dec, &mut models, &mut input)? {
+            DecodedToken::Line(t) => {
+                check_match_distance(t.seq, output.len())?;
+                let lits = &t.literals[..t.seq.literal_len as usize];
+                lz77_dec.decode(t.seq, lits, &mut output);
+            }
+            DecodedToken::EndOfHaiku => {
+                dec.finalize_haiku(&mut input);
+            }
+            DecodedToken::EndOfSonnet => break,
+            DecodedToken::EndOfOpus => {
+                is_sealed = true;
+                break;
+            }
+        }
+    }
+
+    Ok(DecodedSonnet {
+        output,
+        models,
+        is_sealed,
+    })
+}
+
+/// Validates that a match's distance does not reach beyond the start of the
+/// current Sonnet (FORMAT.md §6). The match copy happens AFTER the token's
+/// literals are emitted, so the valid range is `pre_token_emitted + literal_len`.
+fn check_match_distance(seq: Sequence, pre_token_emitted: usize) -> Result<()> {
+    if seq.match_len > 0 {
+        let at_match = pre_token_emitted + usize::from(seq.literal_len);
+        if usize::from(seq.match_distance) > at_match {
+            return Err(Error::MatchDistanceOutOfRange {
+                distance: seq.match_distance,
+                emitted: at_match as u64,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Decodes one token from the entropy decoder (FORMAT.md Section 2).
-pub(crate) fn decode_token(dec: &mut entropy::Decoder, models: &mut ModelSet, input: &mut &[u8]) -> DecodedToken {
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidLine`] for a `LINE` token with both `literal_len = 0`
+/// and `match_len = 0`, or [`Error::InvalidMatchDistance`] for a match with
+/// `match_distance = 0`.
+pub(crate) fn decode_token(
+    dec: &mut entropy::Decoder,
+    models: &mut ModelSet,
+    input: &mut &[u8],
+) -> Result<DecodedToken> {
     let tag = dec.decode(&mut models.tag, input);
 
     match tag {
@@ -127,10 +216,18 @@ pub(crate) fn decode_token(dec: &mut entropy::Decoder, models: &mut ModelSet, in
             let literal_len = dec.decode(&mut models.lit_len, input);
             let match_len = dec.decode(&mut models.match_len, input);
 
+            if literal_len == 0 && match_len == 0 {
+                return Err(Error::InvalidLine);
+            }
+
             let match_distance = if match_len > 0 {
                 let lo = dec.decode(&mut models.dist_lo, input);
                 let hi = dec.decode(&mut models.dist_hi, input);
-                u16::from(lo) | (u16::from(hi) << 8)
+                let distance = u16::from(lo) | (u16::from(hi) << 8);
+                if distance == 0 {
+                    return Err(Error::InvalidMatchDistance);
+                }
+                distance
             } else {
                 0
             };
@@ -140,19 +237,19 @@ pub(crate) fn decode_token(dec: &mut entropy::Decoder, models: &mut ModelSet, in
                 *b = dec.decode(&mut models.literals, input);
             }
 
-            DecodedToken::Line(Token {
+            Ok(DecodedToken::Line(Token {
                 seq: Sequence {
                     literal_len,
                     match_len,
                     match_distance,
                 },
                 literals,
-            })
+            }))
         }
-        TAG_EOH => DecodedToken::EndOfHaiku,
-        TAG_EOS => DecodedToken::EndOfSonnet,
+        TAG_EOH => Ok(DecodedToken::EndOfHaiku),
+        TAG_EOS => Ok(DecodedToken::EndOfSonnet),
         // TAG_EOO is the only remaining value from the 4-symbol tag model.
-        _ => DecodedToken::EndOfOpus,
+        _ => Ok(DecodedToken::EndOfOpus),
     }
 }
 
@@ -181,7 +278,7 @@ mod tests {
         let mut dec_models = ModelSet::new();
         let mut input: &[u8] = &compressed;
 
-        match decode_token(&mut dec, &mut dec_models, &mut input) {
+        match decode_token(&mut dec, &mut dec_models, &mut input).unwrap() {
             DecodedToken::Line(t) => t,
             _ => panic!("expected Line token"),
         }
@@ -199,7 +296,7 @@ mod tests {
         let mut dec_models = ModelSet::new();
         let mut input: &[u8] = &compressed;
 
-        let decoded = decode_token(&mut dec, &mut dec_models, &mut input);
+        let decoded = decode_token(&mut dec, &mut dec_models, &mut input).unwrap();
         match (tag, decoded) {
             (TAG_EOH, DecodedToken::EndOfHaiku)
             | (TAG_EOS, DecodedToken::EndOfSonnet)
@@ -285,7 +382,7 @@ mod tests {
         let mut decoded_tokens = Vec::new();
 
         loop {
-            match decode_token(&mut dec, &mut dec_models, &mut input) {
+            match decode_token(&mut dec, &mut dec_models, &mut input).unwrap() {
                 DecodedToken::Line(t) => decoded_tokens.push(t),
                 DecodedToken::EndOfSonnet => break,
                 other => panic!(
@@ -344,7 +441,7 @@ mod tests {
         let mut decoded_tokens = Vec::new();
 
         loop {
-            match decode_token(&mut dec, &mut dec_models, &mut input) {
+            match decode_token(&mut dec, &mut dec_models, &mut input).unwrap() {
                 DecodedToken::Line(t) => decoded_tokens.push(t),
                 DecodedToken::EndOfSonnet => break,
                 other => panic!(
@@ -384,6 +481,9 @@ mod tests {
             match_distance in 1u16..=65_535,
             literal_data in prop::collection::vec(any::<u8>(), 255),
         ) {
+            // FORMAT.md §2.2 forbids LINE tokens with both lengths zero.
+            prop_assume!(literal_len > 0 || match_len > 0);
+
             let mut literals = [0u8; 255];
             literals.copy_from_slice(&literal_data);
             let token = Token {
@@ -400,5 +500,43 @@ mod tests {
             let len = token.seq.literal_len as usize;
             prop_assert_eq!(&token.literals[..len], &decoded.literals[..len]);
         }
+    }
+
+    #[test]
+    fn decode_rejects_invalid_line() {
+        // Encode a synthetic LINE token with literal_len=0, match_len=0.
+        let mut enc = entropy::Encoder::new();
+        let mut enc_models = ModelSet::new();
+        let mut compressed = Vec::new();
+        enc.encode(TAG_LINE, &mut enc_models.tag, &mut compressed);
+        enc.encode(0, &mut enc_models.lit_len, &mut compressed);
+        enc.encode(0, &mut enc_models.match_len, &mut compressed);
+        enc.finalize_sonnet(&mut compressed);
+
+        let mut dec = entropy::Decoder::new();
+        let mut dec_models = ModelSet::new();
+        let mut input: &[u8] = &compressed;
+
+        assert!(matches!(decode_token(&mut dec, &mut dec_models, &mut input), Err(Error::InvalidLine),));
+    }
+
+    #[test]
+    fn decode_rejects_zero_distance() {
+        // Encode a LINE token with match_len>0 but match_distance=0.
+        let mut enc = entropy::Encoder::new();
+        let mut enc_models = ModelSet::new();
+        let mut compressed = Vec::new();
+        enc.encode(TAG_LINE, &mut enc_models.tag, &mut compressed);
+        enc.encode(0, &mut enc_models.lit_len, &mut compressed);
+        enc.encode(5, &mut enc_models.match_len, &mut compressed);
+        enc.encode(0, &mut enc_models.dist_lo, &mut compressed);
+        enc.encode(0, &mut enc_models.dist_hi, &mut compressed);
+        enc.finalize_sonnet(&mut compressed);
+
+        let mut dec = entropy::Decoder::new();
+        let mut dec_models = ModelSet::new();
+        let mut input: &[u8] = &compressed;
+
+        assert!(matches!(decode_token(&mut dec, &mut dec_models, &mut input), Err(Error::InvalidMatchDistance),));
     }
 }

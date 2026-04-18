@@ -16,17 +16,14 @@ documentation   = "https://docs.rs/lzr"
 include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
-# arbitrary-int = "=2.1.1"
-# clap = { version = "=4.6.0", features = ["derive"] }
-# rayon = "=1.11.0"
-# rustc-hash = "=2.1.2"
+clap = { version = "=4.6.1", features = ["derive"] }
 lipsum = { version = "=0.9.1", optional = true }
 static_assertions = "=1.1.0"
 thiserror = "=2.0.18"
 wabi_tree = "=0.1.2"
 
 [dev-dependencies]
-# assert_cmd = "=2.2.0"
+assert_cmd = "=2.2.1"
 criterion = "=0.8.2"
 lipsum = "=0.9.1"
 pretty_assertions = "=1.4.1"

@@ -8,11 +8,13 @@
 //! Call [`Write::flush`] to create a Haiku boundary (durability point).
 //! Call [`Writer::seal`] to finalize and close the Opus.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Seek, Write};
 
 use crate::adler32::Adler32;
 use crate::codec::{self, ModelSet, TAG_EOH, TAG_EOO, TAG_EOS};
 use crate::entropy;
+use crate::error::{Error, Result};
 use crate::lz77;
 use crate::sonnet::{self, Footer, INVOCATION, INVOCATION_LEN, MAX_FOOTER_SIZE, SONNET_SIZE};
 
@@ -77,35 +79,42 @@ struct WriterState<W: Write> {
     sonnet_bytes: u64,
     sonnet_lines: u64,
 
-    // Decoder mirror: tracks the sliding window so we can resolve match bytes
-    // for accurate line counting and checksumming.
-    lz77_dec: lz77::Decoder,
-    decode_buf: Vec<u8>,
+    /// Input bytes fed but not yet reflected in `checksum` / `sonnet_bytes` /
+    /// `sonnet_lines`. Each emitted token drains `literal_len + match_len`
+    /// bytes from the front; remaining bytes naturally carry over when the
+    /// encoder is reset at a Sonnet boundary, mirroring `lz77_enc`'s own
+    /// `unconsumed_input`.
+    pending: VecDeque<u8>,
+    /// Reusable contiguous buffer for the bytes drained from `pending` per
+    /// token; kept as a field so `Adler32::update` and `count_lines` can run
+    /// over a flat slice without allocating per token.
+    consume_buf: Vec<u8>,
 }
 
 impl<W: Write> Writer<W> {
-    /// Creates a new LZR file at the default compression level (6).
+    /// Creates a new LZR file at the default compression level
+    /// ([`crate::DEFAULT_LEVEL`]).
     ///
     /// # Errors
     ///
-    /// Returns an error if writing the header fails.
-    pub fn new(dest: W) -> io::Result<Self> {
+    /// Returns [`Error::Io`] if writing the header fails.
+    pub fn new(dest: W) -> Result<Self> {
         Self::with_level(dest, lz77::DEFAULT_LEVEL)
     }
 
-    /// Creates a new LZR file at the given compression level (1–9).
+    /// Creates a new LZR file at the given compression level.
     ///
-    /// Levels 1–4 control how many candidate positions are checked for
-    /// matches (1 = fastest, 4 = best compression).
+    /// Levels are in `1..=4` and control how many candidate positions the
+    /// match finder checks per input byte (1 = fastest, 4 = best ratio).
     ///
     /// # Errors
     ///
-    /// Returns an error if writing the header fails.
+    /// Returns [`Error::Io`] if writing the header fails.
     ///
     /// # Panics
     ///
-    /// Panics if `level` is not in 1..=4.
-    pub fn with_level(mut dest: W, level: u8) -> io::Result<Self> {
+    /// Panics if `level` is not in `1..=4`.
+    pub fn with_level(mut dest: W, level: u8) -> Result<Self> {
         dest.write_all(&INVOCATION)?;
         dest.flush()?;
 
@@ -123,8 +132,8 @@ impl<W: Write> Writer<W> {
                 checksum: Adler32::new(),
                 sonnet_bytes: 0,
                 sonnet_lines: 0,
-                lz77_dec: lz77::Decoder::new(),
-                decode_buf: Vec::with_capacity(512),
+                pending: VecDeque::new(),
+                consume_buf: Vec::with_capacity(512),
             }),
         })
     }
@@ -136,9 +145,10 @@ impl<W: Write> Writer<W> {
     ///
     /// # Errors
     ///
-    /// Returns an error if writing to the destination fails.
-    pub fn seal(mut self) -> io::Result<W> {
-        let mut st = self.state.take().ok_or_else(|| io::Error::other("writer already consumed"))?;
+    /// Returns [`Error::WriterClosed`] if the writer has already been sealed,
+    /// or [`Error::Io`] if writing to the destination fails.
+    pub fn seal(mut self) -> Result<W> {
+        let mut st = self.state.take().ok_or(Error::WriterClosed)?;
 
         // Drain all remaining LZ77 data, finalizing Sonnets as needed.
         st.drain_lz77()?;
@@ -161,22 +171,26 @@ impl<W: Read + Write + Seek> Writer<W> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file is not a valid LZR file, is sealed, or
-    /// if any I/O operation fails.
+    /// Returns [`Error::TooSmall`], [`Error::InvalidMagic`],
+    /// [`Error::UnsupportedVersion`], [`Error::Sealed`], or [`Error::Io`] as
+    /// appropriate.
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
-    pub fn open(mut dest: W) -> io::Result<Self> {
+    pub fn open(mut dest: W) -> Result<Self> {
         let file_size = dest.seek(io::SeekFrom::End(0))?;
 
         if file_size < INVOCATION_LEN as u64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "file too small for LZR header"));
+            return Err(Error::TooSmall);
         }
 
         // Verify Invocation.
         dest.seek(io::SeekFrom::Start(0))?;
         let mut magic = [0u8; INVOCATION_LEN];
         dest.read_exact(&mut magic)?;
-        if magic != INVOCATION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "not an LZR file: invalid magic"));
+        if magic[..3] != INVOCATION[..3] {
+            return Err(Error::InvalidMagic);
+        }
+        if magic[3] != INVOCATION[3] {
+            return Err(Error::UnsupportedVersion(magic[3]));
         }
 
         let complete_sonnets = file_size / SONNET_SIZE as u64;
@@ -188,12 +202,8 @@ impl<W: Read + Write + Seek> Writer<W> {
             dest.seek(io::SeekFrom::Start(last_offset))?;
             let mut block_data = vec![0u8; SONNET_SIZE];
             dest.read_exact(&mut block_data)?;
-            let footer = sonnet::decode_footer(&block_data);
-            (
-                footer.bytes_count,
-                footer.lines_count,
-                Adler32::from_checksum(footer.adler32, footer.bytes_count as usize),
-            )
+            let footer = sonnet::decode_footer(&block_data)?;
+            (footer.bytes_count, footer.lines_count, Adler32::from_checksum(footer.adler32))
         } else {
             (0u64, 0u64, Adler32::new())
         };
@@ -207,8 +217,6 @@ impl<W: Read + Write + Seek> Writer<W> {
         };
 
         let mut models = ModelSet::new();
-        let mut sonnet_bytes = 0u64;
-        let mut sonnet_lines = 0u64;
 
         if partial_size > data_start {
             dest.seek(io::SeekFrom::Start(partial_offset + data_start as u64))?;
@@ -216,45 +224,14 @@ impl<W: Read + Write + Seek> Writer<W> {
             let mut partial_data = vec![0u8; data_len];
             dest.read_exact(&mut partial_data)?;
 
-            // Decode the partial Sonnet to restore model state and count bytes/lines.
-            let mut dec = entropy::Decoder::new();
-            let mut lz77_dec = lz77::Decoder::new();
-            let mut input: &[u8] = &partial_data;
-            let mut decoded_output = Vec::new();
-
-            let max_tokens = partial_data.len() * 8;
-            for _ in 0..max_tokens {
-                if input.is_empty() && !dec.has_buffered_bits() {
-                    break;
-                }
-                let token = codec::decode_token(&mut dec, &mut models, &mut input);
-                match token {
-                    codec::DecodedToken::Line(t) => {
-                        let lits = &t.literals[..t.seq.literal_len as usize];
-                        lz77_dec.decode(t.seq, lits, &mut decoded_output);
-
-                        let seq_bytes = u64::from(t.seq.literal_len) + u64::from(t.seq.match_len);
-                        let start = decoded_output.len() - seq_bytes as usize;
-                        checksum.update(&decoded_output[start..]);
-
-                        sonnet_bytes += seq_bytes;
-                        sonnet_lines += crate::count_lines(&decoded_output[start..]) as u64;
-                    }
-                    codec::DecodedToken::EndOfHaiku => {
-                        dec.finalize_haiku(&mut input);
-                    }
-                    codec::DecodedToken::EndOfSonnet => {
-                        // Should not happen in partial data — it would be a complete Sonnet.
-                        break;
-                    }
-                    codec::DecodedToken::EndOfOpus => {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "file is sealed; cannot append"));
-                    }
-                }
+            let decoded = codec::decode_sonnet_data(&partial_data)?;
+            if decoded.is_sealed {
+                return Err(Error::Sealed);
             }
-
-            total_bytes += sonnet_bytes;
-            total_lines += sonnet_lines;
+            models = decoded.models;
+            checksum.update(&decoded.output);
+            total_bytes += decoded.output.len() as u64;
+            total_lines += crate::count_lines(&decoded.output) as u64;
         }
 
         // Seek to end to append.
@@ -274,8 +251,8 @@ impl<W: Read + Write + Seek> Writer<W> {
                 checksum,
                 sonnet_bytes: 0,
                 sonnet_lines: 0,
-                lz77_dec: lz77::Decoder::new(),
-                decode_buf: Vec::with_capacity(512),
+                pending: VecDeque::new(),
+                consume_buf: Vec::with_capacity(512),
             }),
         })
     }
@@ -321,20 +298,17 @@ impl<W: Write> WriterState<W> {
         Ok(())
     }
 
-    /// Tracks a token's contribution to counters and checksum.
-    ///
-    /// Decodes the full token (literals + match) through the LZ77 decoder to
-    /// resolve back-reference bytes, ensuring newlines in matched regions are
-    /// counted and the checksum covers all uncompressed data.
+    /// Tracks a token's contribution to counters and checksum by draining the
+    /// exact bytes it emits from the `pending` input buffer. Each LINE token
+    /// consumes `literal_len + match_len` uncompressed bytes, in the same
+    /// order they were fed via `Write::write`, so no decoder mirror is needed.
     fn track_token(&mut self, token: &lz77::Token) {
-        let lits = &token.literals[..token.seq.literal_len as usize];
-
-        self.decode_buf.clear();
-        self.lz77_dec.decode(token.seq, lits, &mut self.decode_buf);
-
-        self.checksum.update(&self.decode_buf);
-        self.sonnet_bytes += self.decode_buf.len() as u64;
-        self.sonnet_lines += crate::count_lines(&self.decode_buf) as u64;
+        let n = usize::from(token.seq.literal_len) + usize::from(token.seq.match_len);
+        self.consume_buf.clear();
+        self.consume_buf.extend(self.pending.drain(..n));
+        self.checksum.update(&self.consume_buf);
+        self.sonnet_bytes += n as u64;
+        self.sonnet_lines += crate::count_lines(&self.consume_buf) as u64;
     }
 
     /// Flushes the encode buffer to dest (does NOT flush dest itself).
@@ -411,10 +385,12 @@ impl<W: Write> WriterState<W> {
         // Write footer and pad.
         self.write_footer_and_pad(false)?;
 
-        // Carry unconsumed input to next Sonnet.
+        // Carry unconsumed input to next Sonnet. The `pending` buffer already
+        // holds exactly these bytes (they haven't been drained since no token
+        // consumed them), so we only need to reset the LZ77 encoder and refeed.
         let carry = self.lz77_enc.unconsumed_input();
+        debug_assert_eq!(self.pending.len(), carry.len());
         self.lz77_enc.reset();
-        self.lz77_dec = lz77::Decoder::new();
         self.entropy_enc.reset();
         self.models.reset();
         self.sonnet_index += 1;
@@ -461,12 +437,13 @@ impl<W: Write> WriterState<W> {
 
 impl<W: Write> Write for Writer<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let st = self.state.as_mut().ok_or_else(|| io::Error::other("writer is sealed"))?;
+        let st = self.state.as_mut().ok_or(Error::WriterClosed).map_err(io::Error::from)?;
 
         if buf.is_empty() {
             return Ok(0);
         }
 
+        st.pending.extend(buf.iter().copied());
         st.lz77_enc.feed(buf);
         st.encode_tokens()?;
         st.maybe_finalize_sonnet()?;
@@ -480,7 +457,7 @@ impl<W: Write> Write for Writer<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let st = self.state.as_mut().ok_or_else(|| io::Error::other("writer is sealed"))?;
+        let st = self.state.as_mut().ok_or(Error::WriterClosed).map_err(io::Error::from)?;
 
         // Flush all remaining LZ77 data.
         for token in st.lz77_enc.flush() {

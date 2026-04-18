@@ -310,14 +310,6 @@ impl Encoder {
         self.finished = true;
     }
 
-    /// Emits any pending literals as a literal-only token.
-    pub(crate) fn drain(&mut self) -> Option<Token> {
-        if self.lit_len == 0 {
-            return None;
-        }
-        Some(self.emit_literals())
-    }
-
     /// Processes all remaining buffered data and returns the resulting tokens.
     pub(crate) fn flush(&mut self) -> Vec<Token> {
         self.finished = true;
@@ -622,42 +614,6 @@ mod tests {
     }
 
     #[test]
-    fn drain_without_finish() {
-        let data = lipsum_bytes(1024);
-
-        let mut enc = Encoder::new(DEFAULT_LEVEL);
-        enc.feed(&data);
-
-        let mut tokens_before_drain = Vec::new();
-        while let Some(token) = enc.next() {
-            tokens_before_drain.push(token);
-        }
-
-        if let Some(token) = enc.drain() {
-            tokens_before_drain.push(token);
-        }
-
-        let more = lipsum_bytes(512);
-        enc.feed(&more);
-        enc.finish();
-
-        let mut all_tokens = tokens_before_drain;
-        while let Some(token) = enc.next() {
-            all_tokens.push(token);
-        }
-
-        let mut dec = Decoder::new();
-        let mut decoded = Vec::new();
-        for token in &all_tokens {
-            dec.decode(token.seq, token_literals(token), &mut decoded);
-        }
-
-        let mut expected = data;
-        expected.extend_from_slice(&more);
-        assert_eq!(expected, decoded);
-    }
-
-    #[test]
     fn next_capped_basic() {
         let data = lipsum_bytes(1024);
         let mut enc = Encoder::new(DEFAULT_LEVEL);
@@ -807,9 +763,6 @@ mod tests {
             assert!(token.seq.literal_len <= 3);
             dec.decode(token.seq, token_literals(&token), &mut decoded);
         }
-        if let Some(token) = enc.drain() {
-            dec.decode(token.seq, token_literals(&token), &mut decoded);
-        }
 
         assert_eq!(data, decoded);
     }
@@ -826,28 +779,6 @@ mod tests {
         let mut enc2 = Encoder::new(DEFAULT_LEVEL);
         enc2.feed(b"");
         assert!(enc2.next().is_none());
-    }
-
-    #[test]
-    fn drain_returns_pending_literals() {
-        // Feed enough unique data that next() processes some bytes as literals,
-        // then returns None due to insufficient lookahead. drain() should return
-        // those pending literals.
-        let mut enc = Encoder::new(DEFAULT_LEVEL);
-        // 500 bytes of pseudo-random data — unlikely to find LZ77 matches.
-        #[allow(clippy::cast_possible_truncation)]
-        let data: Vec<u8> = (0..500u32).map(|i| ((i * 137 + 43) % 256) as u8).collect();
-        enc.feed(&data);
-
-        // Drain all available tokens (next returns None when lookahead < 258).
-        while enc.next().is_some() {}
-
-        // The encoder should have pending literals from the lookahead zone.
-        let drained = enc.drain();
-        assert!(drained.is_some(), "drain should return pending literals");
-        let token = drained.unwrap();
-        assert!(token.seq.literal_len > 0);
-        assert_eq!(token.seq.match_len, 0);
     }
 
     #[test]
