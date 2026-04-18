@@ -11,7 +11,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use crate::adler32::Adler32;
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::sonnet::{self, Footer, INVOCATION, INVOCATION_LEN, SONNET_SIZE};
+use crate::sonnet::{self, Footer, INVOCATION_LEN, SONNET_SIZE};
 
 /// Random-access decompression reader for the LZR format.
 ///
@@ -35,6 +35,8 @@ pub struct Reader<R: Read + Seek> {
     file_size: u64,
     sonnet_count: u64,
     is_sealed: bool,
+    /// Whether the Opus uses adaptive arithmetic coding (FORMAT.md §1.3 bit 0).
+    entropy_on: bool,
     footer_cache: HashMap<u64, Footer>,
     total_bytes: u64,
     total_lines: u64,
@@ -75,14 +77,9 @@ impl<R: Read + Seek> Reader<R> {
     #[allow(clippy::cast_possible_truncation)]
     pub fn new(mut source: R) -> Result<Self> {
         source.seek(SeekFrom::Start(0))?;
-        let mut magic = [0u8; INVOCATION_LEN];
-        source.read_exact(&mut magic)?;
-        if magic[..3] != INVOCATION[..3] {
-            return Err(Error::InvalidMagic);
-        }
-        if magic[3] != INVOCATION[3] {
-            return Err(Error::UnsupportedVersion(magic[3]));
-        }
+        let mut header = [0u8; INVOCATION_LEN];
+        source.read_exact(&mut header)?;
+        let entropy_on = sonnet::parse_invocation(header)?;
 
         let file_size = source.seek(SeekFrom::End(0))?;
         let sonnet_count = file_size / SONNET_SIZE as u64;
@@ -112,7 +109,7 @@ impl<R: Read + Seek> Reader<R> {
                 0
             };
             if partial_size > data_start {
-                let decoded = codec::decode_sonnet_data(&partial_data[data_start..])?;
+                let decoded = codec::decode_sonnet_data(&partial_data[data_start..], entropy_on)?;
                 total_bytes += decoded.output.len() as u64;
                 total_lines += crate::count_lines(&decoded.output) as u64;
                 is_sealed = decoded.is_sealed;
@@ -124,6 +121,7 @@ impl<R: Read + Seek> Reader<R> {
             file_size,
             sonnet_count,
             is_sealed,
+            entropy_on,
             footer_cache,
             total_bytes,
             total_lines,
@@ -154,6 +152,14 @@ impl<R: Read + Seek> Reader<R> {
     #[must_use]
     pub const fn is_sealed(&self) -> bool {
         self.is_sealed
+    }
+
+    /// Returns `true` if this Opus uses adaptive arithmetic coding (FORMAT.md
+    /// §1.3 flag bit 0), or `false` if it uses the raw byte-aligned token
+    /// encoding (§2.4).
+    #[must_use]
+    pub const fn is_entropy_coded(&self) -> bool {
+        self.entropy_on
     }
 
     /// Seeks to the start of the given line number (0-indexed).
@@ -379,7 +385,9 @@ impl<R: Read + Seek> Reader<R> {
             read_size
         };
 
-        let data = codec::decode_sonnet_data(&sonnet_data[data_start..data_end]).map_err(io::Error::from)?.output;
+        let data = codec::decode_sonnet_data(&sonnet_data[data_start..data_end], self.entropy_on)
+            .map_err(io::Error::from)?
+            .output;
 
         if sonnet_idx < self.sonnet_count {
             self.validate_sonnet_checksum(sonnet_idx, &data).map_err(io::Error::from)?;

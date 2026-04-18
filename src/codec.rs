@@ -115,6 +115,24 @@ pub(crate) fn encode_terminator(enc: &mut entropy::Encoder, models: &mut ModelSe
     enc.encode(tag, &mut models.tag, output);
 }
 
+/// Encodes one LINE token as byte-aligned bytes (FORMAT.md §2.4).
+pub(crate) fn encode_line_raw(token: &Token, output: &mut Vec<u8>) {
+    let seq = &token.seq;
+    output.push(TAG_LINE);
+    output.push(seq.literal_len);
+    output.push(seq.match_len);
+    if seq.match_len > 0 {
+        output.extend_from_slice(&seq.match_distance.to_le_bytes());
+    }
+    output.extend_from_slice(&token.literals[..seq.literal_len as usize]);
+}
+
+/// Encodes a raw-mode terminator tag (single byte, FORMAT.md §2.4).
+pub(crate) fn encode_terminator_raw(tag: u8, output: &mut Vec<u8>) {
+    debug_assert!(tag == TAG_EOH || tag == TAG_EOS || tag == TAG_EOO);
+    output.push(tag);
+}
+
 // ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------
@@ -136,12 +154,24 @@ pub(crate) struct DecodedSonnet {
 /// the streaming reader, random-access reader, and `Writer::open` cold-start
 /// resume path (FORMAT.md Section 10.1).
 ///
+/// `entropy` selects the token encoding per FORMAT.md §1.3 flag bit 0:
+/// `true` for adaptive arithmetic coding (§3), `false` for raw byte-aligned
+/// tokens (§2.4).
+///
 /// # Errors
 ///
-/// Propagates any error from [`decode_token`], plus
+/// Propagates any error from the token decoders, plus
 /// [`Error::MatchDistanceOutOfRange`] if a match reaches beyond the start of
 /// the Sonnet.
-pub(crate) fn decode_sonnet_data(data: &[u8]) -> Result<DecodedSonnet> {
+pub(crate) fn decode_sonnet_data(data: &[u8], entropy: bool) -> Result<DecodedSonnet> {
+    if entropy {
+        decode_sonnet_data_entropy(data)
+    } else {
+        decode_sonnet_data_raw(data)
+    }
+}
+
+fn decode_sonnet_data_entropy(data: &[u8]) -> Result<DecodedSonnet> {
     let mut dec = entropy::Decoder::new();
     let mut models = ModelSet::new();
     let mut lz77_dec = lz77::Decoder::new();
@@ -177,6 +207,39 @@ pub(crate) fn decode_sonnet_data(data: &[u8]) -> Result<DecodedSonnet> {
     Ok(DecodedSonnet {
         output,
         models,
+        is_sealed,
+    })
+}
+
+fn decode_sonnet_data_raw(data: &[u8]) -> Result<DecodedSonnet> {
+    let mut lz77_dec = lz77::Decoder::new();
+    let mut input: &[u8] = data;
+    let mut output = Vec::new();
+    let mut is_sealed = false;
+
+    while !input.is_empty() {
+        match decode_token_raw(&mut input)? {
+            DecodedToken::Line(t) => {
+                check_match_distance(t.seq, output.len())?;
+                let lits = &t.literals[..t.seq.literal_len as usize];
+                lz77_dec.decode(t.seq, lits, &mut output);
+            }
+            DecodedToken::EndOfHaiku => {
+                // Raw mode has no per-Haiku coder state to reset.
+            }
+            DecodedToken::EndOfSonnet => break,
+            DecodedToken::EndOfOpus => {
+                is_sealed = true;
+                break;
+            }
+        }
+    }
+
+    // Models are unused in raw mode; return a fresh set so callers that
+    // receive `DecodedSonnet` uniformly can still move them if needed.
+    Ok(DecodedSonnet {
+        output,
+        models: ModelSet::new(),
         is_sealed,
     })
 }
@@ -250,6 +313,70 @@ pub(crate) fn decode_token(
         TAG_EOS => Ok(DecodedToken::EndOfSonnet),
         // TAG_EOO is the only remaining value from the 4-symbol tag model.
         _ => Ok(DecodedToken::EndOfOpus),
+    }
+}
+
+/// Decodes one byte-aligned token (FORMAT.md §2.4).
+///
+/// # Errors
+///
+/// Returns [`Error::TruncatedInput`] if `input` ends mid-record,
+/// [`Error::InvalidLine`] for a `LINE` with both lengths zero,
+/// [`Error::InvalidMatchDistance`] for a match with zero distance, or a
+/// generic [`Error::InvalidLine`] for an unrecognised tag.
+pub(crate) fn decode_token_raw(input: &mut &[u8]) -> Result<DecodedToken> {
+    let tag = read_u8(input)?;
+
+    match tag {
+        TAG_LINE => {
+            let literal_len = read_u8(input)?;
+            let match_len = read_u8(input)?;
+            if literal_len == 0 && match_len == 0 {
+                return Err(Error::InvalidLine);
+            }
+            let match_distance = if match_len > 0 {
+                let lo = read_u8(input)?;
+                let hi = read_u8(input)?;
+                let distance = u16::from(lo) | (u16::from(hi) << 8);
+                if distance == 0 {
+                    return Err(Error::InvalidMatchDistance);
+                }
+                distance
+            } else {
+                0
+            };
+
+            let mut literals = [0u8; 255];
+            let n = literal_len as usize;
+            if input.len() < n {
+                return Err(Error::TruncatedInput);
+            }
+            literals[..n].copy_from_slice(&input[..n]);
+            *input = &input[n..];
+
+            Ok(DecodedToken::Line(Token {
+                seq: Sequence {
+                    literal_len,
+                    match_len,
+                    match_distance,
+                },
+                literals,
+            }))
+        }
+        TAG_EOH => Ok(DecodedToken::EndOfHaiku),
+        TAG_EOS => Ok(DecodedToken::EndOfSonnet),
+        TAG_EOO => Ok(DecodedToken::EndOfOpus),
+        _ => Err(Error::InvalidLine),
+    }
+}
+
+const fn read_u8(input: &mut &[u8]) -> Result<u8> {
+    match input.split_first() {
+        Some((&b, rest)) => {
+            *input = rest;
+            Ok(b)
+        }
+        None => Err(Error::TruncatedInput),
     }
 }
 
@@ -518,6 +645,92 @@ mod tests {
         let mut input: &[u8] = &compressed;
 
         assert!(matches!(decode_token(&mut dec, &mut dec_models, &mut input), Err(Error::InvalidLine),));
+    }
+
+    #[test]
+    fn raw_line_roundtrip() {
+        let token = Token {
+            seq: Sequence {
+                literal_len: 5,
+                match_len: 7,
+                match_distance: 42,
+            },
+            literals: {
+                let mut buf = [0u8; 255];
+                buf[..5].copy_from_slice(b"abcde");
+                buf
+            },
+        };
+        let mut encoded = Vec::new();
+        encode_line_raw(&token, &mut encoded);
+
+        let mut input: &[u8] = &encoded;
+        let decoded = decode_token_raw(&mut input).unwrap();
+        match decoded {
+            DecodedToken::Line(t) => {
+                assert_eq!(token.seq, t.seq);
+                assert_eq!(&token.literals[..5], &t.literals[..5]);
+            }
+            _ => panic!("expected Line"),
+        }
+        assert!(input.is_empty(), "raw token encoding should leave no trailing bytes");
+    }
+
+    #[test]
+    fn raw_terminator_roundtrip() {
+        for tag in [TAG_EOH, TAG_EOS, TAG_EOO] {
+            let mut encoded = Vec::new();
+            encode_terminator_raw(tag, &mut encoded);
+            assert_eq!(encoded.len(), 1);
+            let mut input: &[u8] = &encoded;
+            let decoded = decode_token_raw(&mut input).unwrap();
+            match (tag, decoded) {
+                (TAG_EOH, DecodedToken::EndOfHaiku)
+                | (TAG_EOS, DecodedToken::EndOfSonnet)
+                | (TAG_EOO, DecodedToken::EndOfOpus) => {}
+                _ => panic!("raw terminator mismatch for 0x{tag:02X}"),
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn roundtrip_random_line_raw(
+            literal_len in 0u8..=255,
+            match_len in prop::sample::select(
+                std::iter::once(0u8).chain(3..=255).collect::<Vec<_>>()
+            ),
+            match_distance in 1u16..=65_535,
+            literal_data in prop::collection::vec(any::<u8>(), 255),
+        ) {
+            prop_assume!(literal_len > 0 || match_len > 0);
+
+            let mut literals = [0u8; 255];
+            literals.copy_from_slice(&literal_data);
+            let token = Token {
+                seq: Sequence {
+                    literal_len,
+                    match_len,
+                    match_distance: if match_len > 0 { match_distance } else { 0 },
+                },
+                literals,
+            };
+
+            let mut encoded = Vec::new();
+            encode_line_raw(&token, &mut encoded);
+
+            let mut input: &[u8] = &encoded;
+            let decoded = decode_token_raw(&mut input).unwrap();
+            match decoded {
+                DecodedToken::Line(t) => {
+                    prop_assert_eq!(token.seq, t.seq);
+                    let len = token.seq.literal_len as usize;
+                    prop_assert_eq!(&token.literals[..len], &t.literals[..len]);
+                }
+                _ => prop_assert!(false, "expected Line"),
+            }
+            prop_assert!(input.is_empty());
+        }
     }
 
     #[test]

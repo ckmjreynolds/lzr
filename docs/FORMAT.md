@@ -120,14 +120,31 @@ an `EOO` tag and a Coda footer (`cumulative_bytes = 0`, `cumulative_lines = 0`,
 
 ### 1.3 Invocation
 
-The **Invocation** is the first 4 bytes of every Opus:
+The **Invocation** is the first 5 bytes of every Opus:
 
-| Offset | Size    | Value          | Description          |
-|--------|---------|----------------|----------------------|
-| 0      | 3 bytes | `0x4C 0x5A 0x52` | Magic bytes: ASCII `"LZR"` |
-| 3      | 1 byte  | `0x00`         | Version byte (v1.0)  |
+| Offset | Size    | Value            | Description                 |
+|--------|---------|------------------|-----------------------------|
+| 0      | 3 bytes | `0x4C 0x5A 0x52` | Magic bytes: ASCII `"LZR"`  |
+| 3      | 1 byte  | `0x00`           | Version byte (v1.0)         |
+| 4      | 1 byte  | flags            | Format flags (see below)    |
 
-Decoders MUST validate the magic bytes and MUST reject unknown version bytes.
+#### Flags byte
+
+| Bit  | Meaning                                                                 |
+|------|-------------------------------------------------------------------------|
+| 0    | Entropy coding. `1` = adaptive arithmetic coding ([Section 3](#3-arithmetic-coding)); `0` = raw byte-aligned tokens ([Section 2.4](#24-raw-token-encoding)). |
+| 1–7  | Reserved. MUST be `0` in v1.0.                                          |
+
+Bit 0 is fixed for the entire Opus — every Sonnet uses the same encoding. Bit
+7 is the MSB.
+
+Decoders MUST:
+
+- Validate the magic bytes.
+- Reject unknown version bytes.
+- Reject files where any reserved flag bit (1–7) is set.
+- Use the encoding indicated by bit 0 directly; do NOT auto-detect the
+  Sonnet body format.
 
 ### 1.4 Sonnet
 
@@ -270,9 +287,54 @@ Terminator tokens encode **only** the tag symbol. No additional fields are encod
 An encoder MUST flush any pending literal bytes as a `LINE` token (with `match_len = 0`)
 before emitting a terminator tag.
 
+### 2.4 Raw Token Encoding
+
+When the Invocation flags bit 0 is `0`, tokens in a Sonnet's data region are
+written as byte-aligned records without arithmetic coding, adaptive models,
+bit packing, or Kireji. Sonnet size, padding, Couplet/Coda footers, and the
+Adler-32 checksum (Sections 1.4, 1.7, 8) are **unchanged**.
+
+Tag values are the same as in [Section 2.1](#21-tag-alphabet):
+
+| Tag     | Byte   |
+|---------|--------|
+| `LINE`  | `0x00` |
+| `EOH`   | `0x01` |
+| `EOS`   | `0x02` |
+| `EOO`   | `0x03` |
+
+**`LINE` record** (all fields are little-endian where applicable):
+
+```
+tag (u8 = 0x00) | literal_len (u8) | match_len (u8) | [match_distance (u16 LE) iff match_len > 0] | literals[literal_len]
+```
+
+**`EOH` / `EOS` / `EOO`**: the tag byte alone. No Kireji (Section 1.6) is
+written; the encoder does not append resync padding
+([Section 3.4](#34-finalization-kireji)). Because tokens are already
+byte-aligned, the decoder can proceed directly to the next record or to the
+Sonnet footer.
+
+All per-token constraints from [Section 2.2](#22-line-token) apply unchanged:
+
+- Decoders MUST reject a `LINE` with `literal_len = 0` and `match_len = 0`.
+- Decoders MUST reject `match_len > 0` with `match_distance = 0`.
+- Decoders MUST reject `match_distance` greater than the bytes emitted so far
+  within the current Sonnet.
+
+The LZ77 sliding window and its reset at Sonnet boundaries
+([Section 1.4](#14-sonnet), [Section 6](#6-lz77-sliding-window)) apply
+identically in both raw and entropy-coded modes.
+
 ---
 
 ## 3. Arithmetic Coding
+
+This section applies only when the Invocation flags bit 0 is `1`. When it is
+`0`, the Sonnet body uses [Section 2.4](#24-raw-token-encoding) instead and
+no part of this section — including Kireji
+([Section 3.4](#34-finalization-kireji)) and the decoder finalization
+routines — is used.
 
 LZR uses the classic Witten/Neal/Cleary adaptive arithmetic coder with 16-bit precision and
 E3 (underflow) scaling. The algorithm is specified here to the level of detail required for
@@ -771,7 +833,7 @@ To seek to a target byte offset or line number within a single (non-concatenated
 1.  Compute the block index: target is in Sonnet N if the Couplet of Sonnet N-1 shows
     cumulative_bytes < target <= cumulative_bytes of Sonnet N's Couplet.
     (Use interpolation or binary search over Sonnet footers.)
-2.  Seek to file offset: 4 (Invocation) + N * 262144.
+2.  Seek to file offset: 5 (Invocation) + N * 262144.
 3.  Decompress Sonnet N from the beginning (reset models, clear window, init decoder).
 4.  Discard uncompressed bytes until reaching the target offset within the Sonnet.
 5.  Begin emitting output from the target position.
@@ -786,26 +848,33 @@ For line-based seeking, use `cumulative_lines` in the same manner.
 ### Encoder Requirements
 
 - Encoders MUST write a valid Invocation with a recognized version byte.
+- Encoders MUST write a flags byte with all reserved bits (1–7) cleared.
 - Encoders MUST NOT emit a `LINE` token with `literal_len = 0` and `match_len = 0`.
 - Encoders MUST flush pending literals as a `LINE` token before emitting any terminator tag
   (`EOH`, `EOS`, `EOO`).
 - Encoders MUST write correct cumulative footer values over uncompressed data.
 - Encoders MUST produce canonical (minimal-length) ULEB128 encodings in footer fields.
-- Encoders MUST pad the space between the last Kireji and the footer with `0x00` bytes.
+- Encoders MUST pad the space between the last Kireji (entropy mode) or the last
+  token byte (raw mode) and the footer with `0x00` bytes.
 - Non-final Sonnets MUST be exactly 262,144 compressed bytes.
 
 ### Decoder Requirements
 
 - Decoders MUST validate the Invocation magic bytes and reject unknown versions.
+- Decoders MUST reject any file where reserved flag bits (1–7) are set.
+- Decoders MUST select the token encoding (entropy — [Section 3](#3-arithmetic-coding) — or
+  raw — [Section 2.4](#24-raw-token-encoding)) from flags bit 0, without
+  auto-detection.
 - Decoders MUST reject `LINE` tokens with `literal_len = 0` and `match_len = 0`.
 - Decoders MUST reject `match_distance = 0` when `match_len > 0`.
 - Decoders MUST reject `match_distance` greater than the number of uncompressed bytes emitted
   so far within the current Sonnet.
 - Decoders MUST validate the Adler-32 checksum in each Couplet and Coda against the
   cumulative uncompressed data.
-- Decoders MUST reset all models and the LZ77 window at Sonnet boundaries.
-- Decoders MUST reset the arithmetic coder state at Haiku boundaries.
-- Decoders MUST NOT reset adaptive models at Haiku boundaries.
-- Decoders MUST byte-align the bit reader after decoding any terminator tag (`EOH`, `EOS`,
-  `EOO`), as described in [Section 3.7](#37-decoder-haiku-finalization).
+- Decoders MUST reset the LZ77 window at Sonnet boundaries.
+- In entropy mode, decoders MUST additionally reset all adaptive models at
+  Sonnet boundaries and the arithmetic coder state at Haiku boundaries, MUST
+  NOT reset adaptive models at Haiku boundaries, and MUST byte-align the bit
+  reader after decoding any terminator tag (`EOH`, `EOS`, `EOO`) as described
+  in [Section 3.7](#37-decoder-haiku-finalization).
 - Decoders SHOULD reject non-canonical ULEB128 encodings in footer fields.

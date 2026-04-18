@@ -16,15 +16,22 @@ use crate::codec::{self, ModelSet, TAG_EOH, TAG_EOO, TAG_EOS};
 use crate::entropy;
 use crate::error::{Error, Result};
 use crate::lz77;
-use crate::sonnet::{self, Footer, INVOCATION, INVOCATION_LEN, MAX_FOOTER_SIZE, SONNET_SIZE};
+use crate::sonnet::{self, Footer, INVOCATION_LEN, MAX_FOOTER_SIZE, SONNET_SIZE, flags};
 
-/// Upper bound: bytes per literal symbol in worst case (14 bits → 2 bytes).
-const PER_LIT_UPPER: usize = 2;
+/// Upper bound: bytes per literal symbol in the entropy stream (14 bits → 2 bytes).
+const ENTROPY_PER_LIT_UPPER: usize = 2;
 
-/// Upper bound: bytes for tag + `lit_len` + `match_len` + `dist_lo` + `dist_hi` (5 symbols x 2).
-const MATCH_UPPER: usize = 10;
+/// Upper bound: bytes for tag + `lit_len` + `match_len` + `dist_lo` + `dist_hi` in the
+/// entropy stream (5 symbols × 2 bytes).
+const ENTROPY_MATCH_UPPER: usize = 10;
 
-/// When remaining space drops below this, switch to capped literal mode.
+/// Bytes per literal in raw mode (exactly 1).
+const RAW_PER_LIT_UPPER: usize = 1;
+
+/// Bytes for tag + `lit_len` + `match_len` + `dist_lo` + `dist_hi` in raw mode.
+const RAW_MATCH_UPPER: usize = 5;
+
+/// When remaining capacity drops below this, switch to capped literal mode.
 const THRESHOLD: usize = 600;
 
 /// Flush `encode_buf` to dest when it exceeds this size.
@@ -60,9 +67,13 @@ struct WriterState<W: Write> {
     dest: W,
     sonnet_index: u64,
 
+    /// Whether this Opus uses adaptive arithmetic coding. Set from the level's
+    /// [`lz77::LevelConfig::entropy`] at construction; fixed for the Opus.
+    entropy_on: bool,
+
     /// Bytes written to dest within the current Sonnet.
     sonnet_offset: usize,
-    /// Small buffer collecting entropy encoder output between flushes.
+    /// Small buffer collecting token bytes between flushes to `dest`.
     encode_buf: Vec<u8>,
 
     // Compression pipeline.
@@ -104,8 +115,9 @@ impl<W: Write> Writer<W> {
 
     /// Creates a new LZR file at the given compression level.
     ///
-    /// Levels are in `1..=4` and control how many candidate positions the
-    /// match finder checks per input byte (1 = fastest, 4 = best ratio).
+    /// Levels are in `1..=9`. Levels 1–3 write a raw (byte-aligned) token
+    /// stream (FORMAT.md §2.4); levels 4–9 enable adaptive arithmetic coding
+    /// (FORMAT.md §3). See [`crate::DEFAULT_LEVEL`] for the default.
     ///
     /// # Errors
     ///
@@ -113,15 +125,23 @@ impl<W: Write> Writer<W> {
     ///
     /// # Panics
     ///
-    /// Panics if `level` is not in `1..=4`.
+    /// Panics if `level` is not in `1..=9`.
     pub fn with_level(mut dest: W, level: u8) -> Result<Self> {
-        dest.write_all(&INVOCATION)?;
+        let cfg = lz77::level_config(level);
+        let flags_byte = if cfg.entropy {
+            flags::ENTROPY
+        } else {
+            0
+        };
+        let invocation = sonnet::invocation(flags_byte);
+        dest.write_all(&invocation)?;
         dest.flush()?;
 
         Ok(Self {
             state: Some(WriterState {
                 dest,
                 sonnet_index: 0,
+                entropy_on: cfg.entropy,
                 sonnet_offset: INVOCATION_LEN,
                 encode_buf: Vec::with_capacity(FLUSH_THRESHOLD * 2),
                 lz77_enc: lz77::Encoder::new(level),
@@ -153,9 +173,13 @@ impl<W: Write> Writer<W> {
         // Drain all remaining LZ77 data, finalizing Sonnets as needed.
         st.drain_lz77()?;
 
-        // Encode EOO terminator and finalize (Kireji + byte-align).
-        codec::encode_terminator(&mut st.entropy_enc, &mut st.models, TAG_EOO, &mut st.encode_buf);
-        st.entropy_enc.finalize_sonnet(&mut st.encode_buf);
+        // Encode EOO terminator. In entropy mode, also flush the Kireji.
+        if st.entropy_on {
+            codec::encode_terminator(&mut st.entropy_enc, &mut st.models, TAG_EOO, &mut st.encode_buf);
+            st.entropy_enc.finalize_sonnet(&mut st.encode_buf);
+        } else {
+            codec::encode_terminator_raw(TAG_EOO, &mut st.encode_buf);
+        }
 
         // Write the Coda footer.
         st.write_footer_and_pad(true)?;
@@ -184,14 +208,9 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         // Verify Invocation.
         dest.seek(io::SeekFrom::Start(0))?;
-        let mut magic = [0u8; INVOCATION_LEN];
-        dest.read_exact(&mut magic)?;
-        if magic[..3] != INVOCATION[..3] {
-            return Err(Error::InvalidMagic);
-        }
-        if magic[3] != INVOCATION[3] {
-            return Err(Error::UnsupportedVersion(magic[3]));
-        }
+        let mut header = [0u8; INVOCATION_LEN];
+        dest.read_exact(&mut header)?;
+        let entropy_on = sonnet::parse_invocation(header)?;
 
         let complete_sonnets = file_size / SONNET_SIZE as u64;
         let partial_size = (file_size % SONNET_SIZE as u64) as usize;
@@ -224,7 +243,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             let mut partial_data = vec![0u8; data_len];
             dest.read_exact(&mut partial_data)?;
 
-            let decoded = codec::decode_sonnet_data(&partial_data)?;
+            let decoded = codec::decode_sonnet_data(&partial_data, entropy_on)?;
             if decoded.is_sealed {
                 return Err(Error::Sealed);
             }
@@ -237,13 +256,24 @@ impl<W: Read + Write + Seek> Writer<W> {
         // Seek to end to append.
         dest.seek(io::SeekFrom::End(0))?;
 
+        // Pick a compression level in the same mode (entropy on/off) as the
+        // file we're resuming. Levels are 1:1 with LevelConfig, so we pick the
+        // default within the right mode.
+        let resume_level = if entropy_on {
+            lz77::DEFAULT_LEVEL
+        } else {
+            // L3: raw, lazy, widest-finder raw tier.
+            3
+        };
+
         Ok(Self {
             state: Some(WriterState {
                 dest,
                 sonnet_index: complete_sonnets,
+                entropy_on,
                 sonnet_offset: partial_size,
                 encode_buf: Vec::with_capacity(FLUSH_THRESHOLD * 2),
-                lz77_enc: lz77::Encoder::new(lz77::DEFAULT_LEVEL),
+                lz77_enc: lz77::Encoder::new(resume_level),
                 entropy_enc: entropy::Encoder::new(),
                 models,
                 total_bytes,
@@ -264,9 +294,32 @@ impl<W: Write> WriterState<W> {
         self.sonnet_offset + self.encode_buf.len()
     }
 
-    /// Upper-bound bytes needed to finalize (terminator + Kireji).
+    /// Per-literal upper bound in the current encoding mode.
+    const fn per_lit_upper(&self) -> usize {
+        if self.entropy_on {
+            ENTROPY_PER_LIT_UPPER
+        } else {
+            RAW_PER_LIT_UPPER
+        }
+    }
+
+    /// Per-match-header upper bound in the current encoding mode.
+    const fn match_upper(&self) -> usize {
+        if self.entropy_on {
+            ENTROPY_MATCH_UPPER
+        } else {
+            RAW_MATCH_UPPER
+        }
+    }
+
+    /// Upper-bound bytes needed to finalize (terminator + any trailing coder
+    /// state). In raw mode this is just the 1-byte terminator. In entropy
+    /// mode, add the Kireji plus whatever bits are buffered.
     #[allow(clippy::cast_possible_truncation)]
     fn compute_tail_bytes(&self) -> usize {
+        if !self.entropy_on {
+            return 1;
+        }
         let terminator_cost = 2; // 1 tag symbol, worst case 2 bytes
         let pending = self.entropy_enc.pending_bits();
         let buffered = u64::from(self.entropy_enc.bits_in_buffer());
@@ -287,7 +340,7 @@ impl<W: Write> WriterState<W> {
         self.lz77_enc.finish();
         loop {
             self.encode_tokens()?;
-            if self.remaining_capacity() < MATCH_UPPER + PER_LIT_UPPER {
+            if self.remaining_capacity() < self.match_upper() + self.per_lit_upper() {
                 self.finalize_sonnet()?;
                 // finalize_sonnet resets the encoder; re-finish so it can drain carry data.
                 self.lz77_enc.finish();
@@ -321,6 +374,24 @@ impl<W: Write> WriterState<W> {
         Ok(())
     }
 
+    /// Encodes a single LINE token through the mode-appropriate codec path.
+    fn encode_line_buf(&mut self, token: &lz77::Token) {
+        if self.entropy_on {
+            codec::encode_line(&mut self.entropy_enc, &mut self.models, token, &mut self.encode_buf);
+        } else {
+            codec::encode_line_raw(token, &mut self.encode_buf);
+        }
+    }
+
+    /// Encodes a terminator tag through the mode-appropriate codec path.
+    fn encode_terminator_buf(&mut self, tag: u8) {
+        if self.entropy_on {
+            codec::encode_terminator(&mut self.entropy_enc, &mut self.models, tag, &mut self.encode_buf);
+        } else {
+            codec::encode_terminator_raw(tag, &mut self.encode_buf);
+        }
+    }
+
     /// Main encoding loop: pulls LZ77 tokens and entropy-encodes them,
     /// respecting the Sonnet boundary.
     #[allow(clippy::cast_possible_truncation)]
@@ -333,7 +404,7 @@ impl<W: Write> WriterState<W> {
             }
 
             let token = if remaining < THRESHOLD {
-                let max_lits = remaining.saturating_sub(MATCH_UPPER) / PER_LIT_UPPER;
+                let max_lits = remaining.saturating_sub(self.match_upper()) / self.per_lit_upper();
                 let max_lits = max_lits.min(255) as u8;
                 if max_lits == 0 {
                     break;
@@ -346,7 +417,7 @@ impl<W: Write> WriterState<W> {
             match token {
                 Some(t) => {
                     self.track_token(&t);
-                    codec::encode_line(&mut self.entropy_enc, &mut self.models, &t, &mut self.encode_buf);
+                    self.encode_line_buf(&t);
 
                     if self.encode_buf.len() >= FLUSH_THRESHOLD {
                         self.flush_encode_buf()?;
@@ -364,23 +435,19 @@ impl<W: Write> WriterState<W> {
     /// token (one literal, no match). Without this threshold, the encoder would
     /// stall with a few unusable bytes remaining.
     fn maybe_finalize_sonnet(&mut self) -> io::Result<()> {
-        if self.remaining_capacity() < MATCH_UPPER + PER_LIT_UPPER {
+        if self.remaining_capacity() < self.match_upper() + self.per_lit_upper() {
             self.finalize_sonnet()?;
         }
         Ok(())
     }
 
-    /// Finalizes the current Sonnet: writes EOS, Kireji, padding, Couplet.
-    ///
-    /// Both callers (`maybe_finalize_sonnet` and `drain_lz77`) only invoke this
-    /// when `remaining_capacity() < MATCH_UPPER + PER_LIT_UPPER` (< 12 bytes).
-    /// Any pending literals in the encoder are carried to the next Sonnet via
-    /// `unconsumed_input()` — they're included in that slice and restored after
-    /// the reset.
+    /// Finalizes the current Sonnet: writes EOS (+ Kireji if entropy is on),
+    /// writes padding + Couplet, and resets per-Sonnet state.
     fn finalize_sonnet(&mut self) -> io::Result<()> {
-        // EOS tag + Kireji (byte-aligned for Sonnet boundary).
-        codec::encode_terminator(&mut self.entropy_enc, &mut self.models, TAG_EOS, &mut self.encode_buf);
-        self.entropy_enc.finalize_sonnet(&mut self.encode_buf);
+        self.encode_terminator_buf(TAG_EOS);
+        if self.entropy_on {
+            self.entropy_enc.finalize_sonnet(&mut self.encode_buf);
+        }
 
         // Write footer and pad.
         self.write_footer_and_pad(false)?;
@@ -462,12 +529,15 @@ impl<W: Write> Write for Writer<W> {
         // Flush all remaining LZ77 data.
         for token in st.lz77_enc.flush() {
             st.track_token(&token);
-            codec::encode_line(&mut st.entropy_enc, &mut st.models, &token, &mut st.encode_buf);
+            st.encode_line_buf(&token);
         }
 
-        // EOH tag + Kireji + trailing resync bytes.
-        codec::encode_terminator(&mut st.entropy_enc, &mut st.models, TAG_EOH, &mut st.encode_buf);
-        st.entropy_enc.finalize_haiku(&mut st.encode_buf);
+        // EOH tag; in entropy mode also emit Kireji + resync padding so the
+        // decoder can align to the next Haiku.
+        st.encode_terminator_buf(TAG_EOH);
+        if st.entropy_on {
+            st.entropy_enc.finalize_haiku(&mut st.encode_buf);
+        }
 
         // Write to dest and flush to disk (durability point).
         st.flush_encode_buf()?;

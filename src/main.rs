@@ -24,8 +24,9 @@ struct Cli {
 enum Command {
     /// Compress INPUT to OUTPUT. Use `-` for stdin or stdout.
     Compress {
-        /// Compression level (1-4, default 4).
-        #[arg(short, long, default_value_t = lzr::DEFAULT_LEVEL)]
+        /// Compression level (1-9). Levels 1-3 write raw tokens (no entropy
+        /// coding); levels 4-9 enable adaptive arithmetic coding.
+        #[arg(short, long, default_value_t = lzr::DEFAULT_LEVEL, value_parser = clap::value_parser!(u8).range(1..=9))]
         level: u8,
         /// Input path, or `-` for stdin.
         input: PathBuf,
@@ -104,8 +105,14 @@ fn info(file: &Path) -> io::Result<()> {
     } else {
         "unsealed"
     };
+    let encoding = if r.is_entropy_coded() {
+        "entropy"
+    } else {
+        "raw"
+    };
     println!("file:     {}", file.display());
     println!("state:    {state}");
+    println!("encoding: {encoding}");
     println!("bytes:    {}", r.len());
     println!("lines:    {}", r.lines());
     Ok(())

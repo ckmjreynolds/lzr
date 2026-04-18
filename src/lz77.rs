@@ -5,15 +5,17 @@
 //! u128 prefix keys and range queries for match finding within a 64 KB sliding
 //! window.
 //!
-//! Compression levels 1–4 control how many candidate positions are checked
-//! when an exact 16-byte prefix match is found (1 = newest only, 4 = all four
-//! stored positions).
+//! Compression levels 1–9 are defined in [`LEVELS`] and control the match
+//! finder breadth ([`LevelConfig::max_scan`]), per-key packed-position depth
+//! ([`LevelConfig::depth`]), the parser (greedy vs lazy, see
+//! [`LevelConfig::lazy`]), and whether the output stream is arithmetic-coded
+//! ([`LevelConfig::entropy`]).
 //!
 //! # Pipeline
 //!
 //! ```text
-//! Encode:  Bytes → LZ77 Encoder  → Arithmetic Coder
-//! Decode:  Arithmetic Decoder    → LZ77 Decoder → Bytes
+//! Encode:  Bytes → LZ77 Encoder  → {Arithmetic Coder | raw bytes}
+//! Decode:  {Arithmetic Decoder | raw bytes} → LZ77 Decoder → Bytes
 //! ```
 
 use static_assertions::assert_eq_size;
@@ -34,17 +36,104 @@ pub(crate) const MAX_LITERALS: usize = 255;
 /// Minimum lookahead required in streaming mode before emitting tokens.
 const LOOKAHEAD_MIN: usize = MAX_MATCH + MIN_MATCH;
 
-/// Maximum candidates checked per scan direction during range queries.
-const MAX_SCAN: usize = 16;
-
-/// Default compression level.
-pub(crate) const DEFAULT_LEVEL: u8 = 4;
-
 /// Minimum compression level.
 pub(crate) const MIN_LEVEL: u8 = 1;
 
 /// Maximum compression level.
-pub(crate) const MAX_LEVEL: u8 = 4;
+pub(crate) const MAX_LEVEL: u8 = 9;
+
+/// Default compression level (matches the gzip convention).
+pub(crate) const DEFAULT_LEVEL: u8 = 6;
+
+/// Per-level configuration of the encoder and the on-disk format.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LevelConfig {
+    /// If `true`, tokens are arithmetic-coded (FORMAT.md §3). If `false`,
+    /// tokens are written byte-aligned (FORMAT.md §2.4).
+    pub(crate) entropy: bool,
+    /// Whether the parser peeks one position ahead before committing a match.
+    pub(crate) lazy: bool,
+    /// Neighbors to inspect per direction in the B+tree range scan.
+    pub(crate) max_scan: usize,
+    /// Packed-position slots to check per visited key (1..=4).
+    pub(crate) depth: usize,
+}
+
+const LEVELS: [LevelConfig; 9] = [
+    // L1: raw, greedy, tiny finder
+    LevelConfig {
+        entropy: false,
+        lazy: false,
+        max_scan: 4,
+        depth: 1,
+    },
+    // L2: raw, lazy
+    LevelConfig {
+        entropy: false,
+        lazy: true,
+        max_scan: 4,
+        depth: 1,
+    },
+    // L3: raw, lazy, wider finder
+    LevelConfig {
+        entropy: false,
+        lazy: true,
+        max_scan: 64,
+        depth: 2,
+    },
+    // L4: entropy, greedy, tiny finder
+    LevelConfig {
+        entropy: true,
+        lazy: false,
+        max_scan: 4,
+        depth: 1,
+    },
+    // L5: entropy, lazy
+    LevelConfig {
+        entropy: true,
+        lazy: true,
+        max_scan: 4,
+        depth: 1,
+    },
+    // L6 (default): entropy, lazy, balanced finder
+    LevelConfig {
+        entropy: true,
+        lazy: true,
+        max_scan: 32,
+        depth: 2,
+    },
+    // L7: entropy, lazy, deeper
+    LevelConfig {
+        entropy: true,
+        lazy: true,
+        max_scan: 64,
+        depth: 3,
+    },
+    // L8: entropy, lazy, max current finder
+    LevelConfig {
+        entropy: true,
+        lazy: true,
+        max_scan: 128,
+        depth: 4,
+    },
+    // L9: entropy, lazy, widest scan
+    LevelConfig {
+        entropy: true,
+        lazy: true,
+        max_scan: 256,
+        depth: 4,
+    },
+];
+
+/// Returns the configuration for the given compression level.
+///
+/// # Panics
+///
+/// Panics if `level` is outside `1..=9`.
+pub(crate) const fn level_config(level: u8) -> LevelConfig {
+    assert!(level >= MIN_LEVEL && level <= MAX_LEVEL, "compression level must be 1..=9");
+    LEVELS[(level - 1) as usize]
+}
 
 // ===========================================================================
 // Types
@@ -130,15 +219,19 @@ const fn pack_position(packed: u128, pos: u32) -> u128 {
 /// Sonnet boundaries.
 struct MatchFinder {
     index: OSBTreeMap<u128, u128>,
-    /// How many packed positions to check on exact-key match (1–4).
+    /// How many packed positions to check per visited key (1–4). Applied to
+    /// both the exact-key hit and every neighbor hit during the range scan.
     depth: usize,
+    /// Maximum neighbors to inspect per direction during the range scan.
+    max_scan: usize,
 }
 
 impl MatchFinder {
-    const fn new(level: u8) -> Self {
+    const fn new(cfg: LevelConfig) -> Self {
         Self {
             index: OSBTreeMap::new(),
-            depth: level as usize,
+            depth: cfg.depth,
+            max_scan: cfg.max_scan,
         }
     }
 
@@ -174,8 +267,9 @@ impl MatchFinder {
         let mut best_len = MIN_MATCH - 1;
         let mut best_dist = 0;
 
-        // Check exact key match — up to `depth` packed positions.
-        if let Some(&packed) = self.index.get(&key) {
+        // Try every visited key through this helper. Returns true when a full
+        // max_len match is found so the caller can short-circuit.
+        let try_packed = |packed: u128, best_len: &mut usize, best_dist: &mut usize| -> bool {
             for i in 0..self.depth {
                 let cand = unpack_position(packed, i) as usize;
                 if cand < min_pos || cand >= pos || cand < base {
@@ -183,63 +277,51 @@ impl MatchFinder {
                 }
                 let ci = cand - base;
                 let len = common_prefix_len(&buf[ci..], &buf[buf_pos..], max_len);
-                if len > best_len {
-                    best_len = len;
-                    best_dist = pos - cand;
-                    if best_len == max_len {
-                        return (best_dist, best_len);
+                if len > *best_len {
+                    *best_len = len;
+                    *best_dist = pos - cand;
+                    if *best_len == max_len {
+                        return true;
                     }
                 }
             }
+            false
+        };
+
+        // Exact key match.
+        if let Some(&packed) = self.index.get(&key) {
+            if try_packed(packed, &mut best_len, &mut best_dist) {
+                return (best_dist, best_len);
+            }
         }
 
-        // Range scan: check neighbors with different prefixes (newest position only).
+        // Forward range scan (keys > our key).
         let mut checked = 0;
-
-        // Forward (keys > our key).
         for (&candidate_key, &packed) in self.index.range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
         {
-            if checked >= MAX_SCAN {
+            if checked >= self.max_scan {
                 break;
             }
             if common_prefix_u128(key, candidate_key) < MIN_MATCH {
                 break;
             }
-            let cand = unpack_position(packed, 0) as usize;
-            if cand >= min_pos && cand < pos && cand >= base {
-                let ci = cand - base;
-                let len = common_prefix_len(&buf[ci..], &buf[buf_pos..], max_len);
-                if len > best_len {
-                    best_len = len;
-                    best_dist = pos - cand;
-                    if best_len == max_len {
-                        return (best_dist, best_len);
-                    }
-                }
+            if try_packed(packed, &mut best_len, &mut best_dist) {
+                return (best_dist, best_len);
             }
             checked += 1;
         }
 
-        // Backward (keys < our key).
+        // Backward range scan (keys < our key).
         checked = 0;
         for (&candidate_key, &packed) in self.index.range(..key).rev() {
-            if checked >= MAX_SCAN {
+            if checked >= self.max_scan {
                 break;
             }
             if common_prefix_u128(key, candidate_key) < MIN_MATCH {
                 break;
             }
-            let cand = unpack_position(packed, 0) as usize;
-            if cand >= min_pos && cand < pos && cand >= base {
-                let ci = cand - base;
-                let len = common_prefix_len(&buf[ci..], &buf[buf_pos..], max_len);
-                if len > best_len {
-                    best_len = len;
-                    best_dist = pos - cand;
-                    if best_len == max_len {
-                        return (best_dist, best_len);
-                    }
-                }
+            if try_packed(packed, &mut best_len, &mut best_dist) {
+                return (best_dist, best_len);
             }
             checked += 1;
         }
@@ -260,11 +342,14 @@ impl MatchFinder {
 // Encoder
 // ===========================================================================
 
-/// Greedy streaming LZ77 encoder with B+tree match finding.
+/// Streaming LZ77 encoder with a B+tree match finder.
 ///
 /// Data is fed incrementally via [`feed`](Self::feed). Call
 /// [`next`](Self::next) to pull tokens. Call [`finish`](Self::finish)
 /// to signal end of input, then drain remaining tokens with `next`.
+///
+/// Parsing strategy (greedy vs lazy) is controlled by the compression level
+/// passed to [`new`](Self::new).
 pub(crate) struct Encoder {
     buf: Vec<u8>,
     base: usize,
@@ -273,24 +358,26 @@ pub(crate) struct Encoder {
     lit_len: usize,
     finder: MatchFinder,
     finished: bool,
+    lazy: bool,
 }
 
 impl Encoder {
-    /// Creates a new encoder at the given compression level (1–4).
+    /// Creates a new encoder at the given compression level (1–9).
     ///
     /// # Panics
     ///
-    /// Panics if `level` is not in `1..=4`.
+    /// Panics if `level` is not in `1..=9`.
     pub(crate) fn new(level: u8) -> Self {
-        assert!((MIN_LEVEL..=MAX_LEVEL).contains(&level), "compression level must be {MIN_LEVEL}–{MAX_LEVEL}");
+        let cfg = level_config(level);
         Self {
             buf: Vec::with_capacity(2 * WINDOW_SIZE + MAX_MATCH),
             base: 0,
             pos: 0,
             lit_start: 0,
             lit_len: 0,
-            finder: MatchFinder::new(level),
+            finder: MatchFinder::new(cfg),
             finished: false,
+            lazy: cfg.lazy,
         }
     }
 
@@ -382,10 +469,28 @@ impl Encoder {
                 return None;
             }
 
-            let (dist, mlen) = self.finder.find_match(self.pos, &self.buf, self.base);
+            let (mut dist, mut mlen) = self.finder.find_match(self.pos, &self.buf, self.base);
+            self.finder.insert(self.pos, &self.buf, self.base);
 
             if mlen >= MIN_MATCH {
-                self.finder.insert(self.pos, &self.buf, self.base);
+                // Lazy matching (level-gated): peek at pos+1 for a strictly
+                // longer match. If found, emit pos as a literal and use pos+1's
+                // match instead. Looking further (lazy2+) was tested and gave
+                // <= 0.2 pts of ratio for a 10-17% encode slowdown.
+                if self.lazy {
+                    let next_pos = self.pos + 1;
+                    if next_pos < available && (self.finished || available - next_pos >= LOOKAHEAD_MIN) {
+                        let (dist2, mlen2) = self.finder.find_match(next_pos, &self.buf, self.base);
+                        if mlen2 > mlen {
+                            self.pos = next_pos;
+                            self.lit_len += 1;
+                            self.finder.insert(self.pos, &self.buf, self.base);
+                            dist = dist2;
+                            mlen = mlen2;
+                        }
+                    }
+                }
+
                 for i in 1..mlen {
                     self.finder.insert(self.pos + i, &self.buf, self.base);
                 }
@@ -393,7 +498,6 @@ impl Encoder {
                 return Some(self.emit_match(dist, mlen));
             }
 
-            self.finder.insert(self.pos, &self.buf, self.base);
             self.pos += 1;
             self.lit_len += 1;
         }
@@ -673,7 +777,7 @@ mod tests {
         #[test]
         fn all_levels_roundtrip(
             data in prop::collection::vec(any::<u8>(), 1..1_024),
-            level in 1u8..=4,
+            level in MIN_LEVEL..=MAX_LEVEL,
         ) {
             roundtrip_codec(&data, level);
         }

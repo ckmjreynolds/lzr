@@ -1,9 +1,10 @@
 //! Sonnet-level constants and footer handling for the LZR format.
 //!
 //! A **Sonnet** is a fixed-size block (256 KiB) — the unit of random access.
-//! The first Sonnet begins after the 4-byte Invocation header ([`INVOCATION`]).
-//! Every complete Sonnet ends with a variable-length footer (Couplet or Coda)
-//! containing cumulative counters.
+//! The first Sonnet begins after the 5-byte Invocation header
+//! ([`INVOCATION_MAGIC`] + [`VERSION`] + 1 flags byte). Every complete Sonnet
+//! ends with a variable-length footer (Couplet or Coda) containing cumulative
+//! counters.
 //!
 //! # Footer layout (Couplet / Coda)
 //!
@@ -15,17 +16,54 @@
 //! first, then backs up `footer_len` bytes to parse the footer fields.
 //! All counts are **cumulative** from the start of the Opus.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::uleb128;
 
 /// Fixed Sonnet size: 256 KiB (262,144 bytes).
 pub(crate) const SONNET_SIZE: usize = 256 * 1024;
 
-/// Invocation header: magic bytes + version (FORMAT.md Section 1.3).
-pub(crate) const INVOCATION: [u8; 4] = *b"LZR\0";
+/// Invocation magic bytes (FORMAT.md Section 1.3).
+pub(crate) const INVOCATION_MAGIC: [u8; 3] = *b"LZR";
 
-/// Length of the Invocation header in bytes.
-pub(crate) const INVOCATION_LEN: usize = INVOCATION.len();
+/// Current format version byte.
+pub(crate) const VERSION: u8 = 0x00;
+
+/// Length of the Invocation header in bytes: 3 magic + 1 version + 1 flags.
+pub(crate) const INVOCATION_LEN: usize = 5;
+
+/// Flags byte bit definitions (FORMAT.md Section 1.3).
+pub(crate) mod flags {
+    /// Bit 0: `1` = adaptive arithmetic coding; `0` = raw byte-aligned tokens.
+    pub(crate) const ENTROPY: u8 = 0b0000_0001;
+
+    /// Mask of reserved bits that MUST be zero in v1.0.
+    pub(crate) const RESERVED: u8 = 0b1111_1110;
+}
+
+/// Builds an Invocation header with the given flags byte.
+pub(crate) const fn invocation(flags: u8) -> [u8; INVOCATION_LEN] {
+    [INVOCATION_MAGIC[0], INVOCATION_MAGIC[1], INVOCATION_MAGIC[2], VERSION, flags]
+}
+
+/// Validates a 5-byte Invocation header and returns the entropy-mode flag.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidMagic`] if the magic bytes don't match or a
+/// reserved flag bit is set, or [`Error::UnsupportedVersion`] if the version
+/// byte is unknown.
+pub(crate) const fn parse_invocation(header: [u8; INVOCATION_LEN]) -> Result<bool> {
+    if header[0] != INVOCATION_MAGIC[0] || header[1] != INVOCATION_MAGIC[1] || header[2] != INVOCATION_MAGIC[2] {
+        return Err(Error::InvalidMagic);
+    }
+    if header[3] != VERSION {
+        return Err(Error::UnsupportedVersion(header[3]));
+    }
+    if header[4] & flags::RESERVED != 0 {
+        return Err(Error::InvalidMagic);
+    }
+    Ok(header[4] & flags::ENTROPY != 0)
+}
 
 /// Maximum footer size: 9 (max uleb128) + 9 + 4 (adler32) + 1 (len) = 23.
 pub(crate) const MAX_FOOTER_SIZE: usize = 9 + 9 + 4 + 1;

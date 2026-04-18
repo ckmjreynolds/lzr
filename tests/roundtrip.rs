@@ -213,17 +213,70 @@ fn multiple_writes() {
 #[allow(clippy::cast_possible_truncation)]
 fn all_levels_roundtrip() {
     let data: Vec<u8> = (0..10_000u16).map(|i| (i % 256) as u8).collect();
-    for level in 1..=4u8 {
+    for level in 1..=9u8 {
         let buf = Vec::new();
         let mut w = Writer::with_level(buf, level).unwrap();
         w.write_all(&data).unwrap();
         let buf = w.seal().unwrap();
 
         let mut r = Reader::new(Cursor::new(buf)).unwrap();
+        // Levels 1-3 write raw tokens; 4-9 use entropy coding.
+        assert_eq!(r.is_entropy_coded(), level >= 4, "level {level} encoding mismatch");
         let mut output = Vec::new();
         r.read_to_end(&mut output).unwrap();
         assert_eq!(data, output, "roundtrip failed at level {level}");
     }
+}
+
+#[test]
+fn raw_mode_multi_sonnet_roundtrip() {
+    // Raw-mode tokens are ~2x larger per literal than entropy-coded, so much
+    // less raw input fits in a Sonnet — this easily crosses the 256 KiB boundary.
+    let data = numbered_lines(400 * 1024);
+    for level in 1..=3u8 {
+        let buf = Vec::new();
+        let mut w = Writer::with_level(buf, level).unwrap();
+        w.write_all(&data).unwrap();
+        let buf = w.seal().unwrap();
+
+        let mut r = Reader::new(Cursor::new(buf)).unwrap();
+        assert!(!r.is_entropy_coded());
+        let mut output = Vec::new();
+        r.read_to_end(&mut output).unwrap();
+        assert_eq!(data, output, "raw multi-sonnet roundtrip failed at level {level}");
+    }
+}
+
+#[test]
+fn raw_mode_seek_and_line_count() {
+    let line = b"the quick brown fox jumps over the lazy dog\n";
+    let mut data = Vec::new();
+    for _ in 0..200 {
+        data.extend_from_slice(line);
+    }
+
+    let buf = Vec::new();
+    let mut w = Writer::with_level(buf, 3).unwrap(); // raw + lazy + wider finder
+    w.write_all(&data).unwrap();
+    let buf = w.seal().unwrap();
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    assert!(!r.is_entropy_coded());
+    assert_eq!(r.len(), data.len() as u64);
+    assert_eq!(r.lines(), 200);
+
+    // Seek to the 100th line and confirm the content.
+    let offset = r.seek_to_line(100).unwrap();
+    let mut buf_line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if r.read(&mut byte).unwrap() == 0 || byte[0] == b'\n' {
+            break;
+        }
+        buf_line.push(byte[0]);
+    }
+    assert_eq!(std::str::from_utf8(&buf_line).unwrap(), &std::str::from_utf8(line).unwrap()[..line.len() - 1]);
+    assert_eq!(offset, 100 * line.len() as u64);
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +437,35 @@ fn reader_invalid_file() {
     // Bad magic.
     let result = Reader::new(Cursor::new(vec![0u8; 100]));
     assert!(result.is_err());
+}
+
+#[test]
+fn reader_rejects_reserved_flag_bits() {
+    // Valid magic + version, but reserved flag bit 1 is set.
+    let mut bad = vec![b'L', b'Z', b'R', 0x00, 0b0000_0010];
+    bad.resize(262_144, 0);
+    let result = Reader::new(Cursor::new(bad));
+    assert!(result.is_err(), "reader must reject reserved flag bits");
+}
+
+#[test]
+fn reader_detects_raw_mode_corruption() {
+    // Raw-mode file: corrupting a byte inside a LINE record's length field
+    // should yield a typed decode error rather than silent corruption.
+    let data = numbered_lines(600 * 1024);
+    let buf = Vec::new();
+    let mut w = Writer::with_level(buf, 3).unwrap();
+    w.write_all(&data).unwrap();
+    let mut buf = w.seal().unwrap();
+
+    // Skip past the 5-byte header and corrupt a byte deep into the token stream.
+    buf[1024] ^= 0xFF;
+
+    let mut r = Reader::new(Cursor::new(buf)).unwrap();
+    assert!(!r.is_entropy_coded());
+    let mut output = Vec::new();
+    let err = r.read_to_end(&mut output).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "unexpected error: {err:?}");
 }
 
 #[test]
