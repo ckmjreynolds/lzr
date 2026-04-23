@@ -7,19 +7,28 @@
 /// Byte vocabulary: one symbol per possible byte value.
 pub(crate) const VOCAB: usize = 256;
 
-/// Model width. Must be divisible by 256 for k-quant alignment (CLAUDE.md).
-pub(crate) const D_MODEL: usize = 256;
+/// Model width. Must be divisible by 256 for k-quant alignment (CLAUDE.md)
+/// and `≤ 512` so every tensor's `in_dim` stays within the TL1 NEON kernel's
+/// `i16`-accumulator bound (`TL1_MAX_IN_DIM`). Bumping beyond 512 requires
+/// widening the LUT-kernel accumulators to `i32` or adding periodic flush.
+pub(crate) const D_MODEL: usize = 512;
 
-/// Number of transformer blocks.
-pub(crate) const N_LAYERS: usize = 2;
+/// Number of transformer blocks. `L = 6` at `D = 512`, `MLP_MULT = 1` gives
+/// ~11 M ternary weights — the first "real" training target above the
+/// ~1 M TINY smoke-test config.
+pub(crate) const N_LAYERS: usize = 6;
 
 /// Attention heads per layer. `D_MODEL` must be divisible by `N_HEADS`.
-pub(crate) const N_HEADS: usize = 4;
+/// `HEAD_DIM = 64` is the standard RoPE-scale-friendly choice.
+pub(crate) const N_HEADS: usize = 8;
 
 /// Per-head dimension. Derived constraint: `N_HEADS * HEAD_DIM == D_MODEL`.
 pub(crate) const HEAD_DIM: usize = D_MODEL / N_HEADS;
 
-/// MLP hidden-size multiplier relative to `D_MODEL`.
+/// MLP hidden-size multiplier relative to `D_MODEL`. Held at 1 so that `w2`'s
+/// `in_dim = D_FF` stays within the LUT kernel bounds; moving to the
+/// conventional `4×` (or `SwiGLU`'s `~2.67×`) requires extending the LUT
+/// kernel's supported `in_dim`.
 pub(crate) const MLP_MULT: usize = 1;
 
 /// `SwiGLU` MLP hidden width.

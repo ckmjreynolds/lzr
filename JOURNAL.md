@@ -13,6 +13,48 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-04-23 — TL1/TL2 LUT kernels; TINY training smoke test; arch bumped to ~11M
+
+CDR/Claude ported `bitnet.cpp`'s TL1 (ARM NEON) and TL2 (x86_64 AVX2) lookup-table matvec kernels into `src/bitnet.rs`, ran an aborted 1M-parameter training smoke test to exercise the pipeline end-to-end, and bumped `src/arch.rs` to a ~11M configuration as the target for the first real training run. The I2_S direct-SIMD kernel stays as the scalar correctness oracle and the fallback on architectures without a LUT path.
+
+### Why LUT kernels, why now
+
+The 2026-04-21 feasibility retrospective sized the Rust budget gap at 2–3× over the 53 hr Zen 2 ceiling for MEDIUM (≈20M params). Matvec dominates wall time at the ≥10M scale where memorization stops being trivial, so kernel throughput is the highest-leverage runtime lever before hitting the ceiling. Microsoft's published TL1/TL2 numbers show ~2× kernel throughput over I2_S direct-SIMD, which translates roughly 1:1 into end-to-end speedup at matvec-dominated scales.
+
+### Why TL1 on ARM, TL2 on x86 — answering "why not TL2 on NEON"
+
+The table-lookup primitive shape differs by ISA. ARM's `vqtbl1q_u8` is a 16-entry lookup across 16 lanes — a perfect fit for K=2 (9 valid entries fit in the 16 slots). x86's `_mm256_shuffle_epi8` (`pshufb`) is also 16-entry per 128-bit lane, but K=3 packs 27 valid entries and needs a paired `pshufb` + blend across two 16-byte sub-LUTs; the extra blend pays back because each 6-bit index encodes 1.5× more weights than a 4-bit K=2 index. TL2-on-NEON is feasible via `vqtbl4q_u8` (64-entry table across 4 registers) but burns 4× the register budget for the LUT; TL1-on-AVX2 is feasible but leaves 1.5× weights-per-shuffle on the table. Matching `bitnet.cpp` arch-by-arch is the right call.
+
+### Design: I2_S on disk, LUT in RAM
+
+On-disk weight format stays I2_S so trained checkpoints don't need to know which LUT kernel will consume them. At `Weights::from_bytes` time, a one-shot `repack_i2s_to_lut` builds the arch-preferred LUT buffer; the I2_S bytes are then dropped on LUT-supporting architectures, saving `PACKED_WEIGHTS_LEN` of dead RSS. `lut_supports(out_dim, in_dim)` is a compile-time `const` assertion run against every tensor shape in `weights.rs` — the build fails if any matrix slips outside the kernel's supported range. Current bounds: `in_dim ≤ 512` for TL1 and `in_dim ≤ 768` for TL2, both set by `i16` accumulator overflow (worst-case `|acc| ≤ 63 · in_dim` for TL1 and `32 · in_dim` for TL2).
+
+Activation precision reduces by 1 bit on TL1 (`x_q >> 1`, range `[-64, 63]`) and 2 bits on TL2 (`x_q >> 2`, range `[-32, 31]`), so partial-sum magnitudes `|Σ wᵢ·xᵢ|` with `K ∈ {2, 3}` ternary weights stay in i8 range. The row-end scale compensates with a ×2 (TL1) or ×4 (TL2) factor. Training quantization remains 8-bit absmax; this creates a small train/inference mismatch that will need a QAT-side `--activation-bits` knob at scale-up.
+
+### Kernel structure
+
+- **TL1 NEON**: 16-output-row tiles. Packing co-locates 16 output rows at each activation-pair position (2 pairs per 16-byte block, nibble-interleaved). One shared 16-entry LUT per pair is broadcast across 16 lanes by a single `vqtbl1q_s8` → 32 MAC-equivalents per shuffle. Uses baseline NEON only (no dotprod dependency).
+- **TL2 AVX2**: 32-output-row tiles. Two 16-byte sub-LUTs per triple (entries 0..15 and 16..31, with 27..31 zero-padded). Paired `vpshufb` + MSB-sentinel routing (`idx | 0x80` on the low path when `idx ≥ 16`; `idx − 16` yields negative → zero return on the high path when `idx < 16`) → OR-combine yields 32 i8 partial sums for 96 MAC-equivalents per pair of shuffles. AVX2 path carries a `// UNVERIFIED ON X86` header — the M3 dev box can't run it; first execution will be on CI or the judging machine. Cross-compile to `x86_64-unknown-linux-gnu` is clean.
+- **LUT build hoisted to `Scratch.lut`** in `model.rs::step`, built once per `quantize_into` and reused across the matvecs that share the activation (Q/K/V share one build, w1/w3 share another) — 4 LUT builds per layer per token instead of 7.
+
+### Results at TINY scale (D=256, L=2, ~1M params)
+
+End-to-end encode: 0.99 s → 0.97 s per 16 KiB (median of 5 runs) after TL1 + LUT hoisting. ~2% speedup. The modest gain is expected at TINY because matvec is only ~10% of wall time at this scale; the projected gain at ≥10M is ~1.7–1.9× end-to-end. 34 unit tests green (including random-input diff-tests of TL1 NEON vs TL1 scalar bit-exactly, and worst-case-bound assertions of TL1 and TL2 vs I2_S scalar). `./build.sh` clean on submission and dev feature sets; x86_64 cross-compile clean.
+
+### Training smoke test: pipeline end-to-end works; eval harness is noisy
+
+A brief 12 K-step TINY training run (2026-04-23, `training.log`) confirmed the candle-nn training loop, Metal backend, checkpoint format, and codec roundtrip all work end-to-end. Loss descended 5.55 → ~2.1 nats in ~2500 steps, LR cosine schedule ramped cleanly, all checkpoints roundtripped OK.
+
+The run surfaced an eval-side methodology issue that had been invisible in previous smoke tests: codec bpb at each checkpoint is measured on a randomly-offset 16 KiB window of enwik9, so neighboring checkpoints with near-identical train loss show bpb 2.46 vs 3.78 purely from content variance (XML boilerplate vs rare-article prose in different offsets). This makes `--stop-after-stale-ckpts` plateau detection fire on noise rather than on model quality. Fix is deferred until the first real training run and will consist of: a fixed panel of ~5 eval offsets reporting the mean, plus a held-out eval-loss pass over a fixed ~1 MB slice for plateau detection. The TINY run itself was aborted — its purpose was to test the code, not to train a usable model.
+
+### Arch bumped to ~11M for next run
+
+`src/arch.rs` updated: `D_MODEL = 512`, `N_LAYERS = 6`, `N_HEADS = 8`, `HEAD_DIM = 64`, `MLP_MULT = 1`, `CONTEXT_LEN = 256`. Approximately 11.01 M ternary weights plus 158 K f32 parameters (token embedding, per-row scales, RMSNorm weights). Packed weight file size: ~3.23 MiB. Every tensor has `in_dim = 512`, squarely inside both TL1 (≤ 512) and TL2 (≤ 768) kernel bounds.
+
+Held `MLP_MULT = 1` rather than the conventional `4×` (or `SwiGLU`'s `2.67×`) so `w2`'s `in_dim` stays at 512. Moving to a wider MLP requires widening the LUT-kernel accumulators from `i16` to `i32` (or adding periodic `i16 → i32` flush), which is a kernel change not worth making before a shape-sensitive benchmark says it's needed. Six layers at `D = 512` with narrow MLP is unconventional but still produces a reasonable transformer at the target capacity; the trade-off is explicit and reversible.
+
+---
+
 ## 2026-04-18 → 2026-04-21 — Python feasibility retrospective
 
 Over three days in the now-retired `lzr-train` repo (Python + MLX on an Apple M3 Pro), CDR/Claude tested the core bet for a Hutter Prize attempt: whether a small byte-level transformer, trained to memorize `enwik9` and used as the probability model of an arithmetic coder, can beat the current record of 110,793,128 bytes combined (compressor + decompressor + archive). Three days were budgeted for a go/no-go signal before committing to the Rust submission path; the findings below informed the architecture now planned in this repo (`lzr`).
