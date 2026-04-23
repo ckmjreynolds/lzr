@@ -13,7 +13,9 @@
 use crate::arch::{
     CONTEXT_LEN, D_FF, D_MODEL, HEAD_DIM, N_HEADS, N_LAYERS, RMS_EPS, VOCAB, rope_cos_sin_tables,
 };
-use crate::bitnet::{matvec_ternary, quantize_activations};
+use crate::bitnet::{
+    build_lut, lut_scratch_bytes, matvec_ternary, matvec_ternary_lut, quantize_activations,
+};
 use crate::kv_cache::KvCache;
 use crate::weights::{TernaryMatrix, Weights};
 
@@ -35,6 +37,13 @@ pub(crate) struct Scratch {
     mlp_gate: Vec<f32>,
     mlp_up: Vec<f32>,
     xq_ff: Vec<i8>,
+    /// Arch-preferred LUT scratch, sized for the widest activation vector
+    /// (`max(D_MODEL, D_FF)`). Zero-length on architectures without a LUT
+    /// kernel. `build_lut` writes only the valid entries per group; callers
+    /// must keep the bytes zero-initialized (they are zero-initialized once
+    /// at `Scratch::new` and the written entries are deterministic per
+    /// activation so no explicit re-zero is needed).
+    lut: Vec<i8>,
     logits: [f32; VOCAB],
     rope_cos: Vec<f32>,
     rope_sin: Vec<f32>,
@@ -65,6 +74,7 @@ impl Scratch {
             mlp_gate: vec![0.0; D_FF],
             mlp_up: vec![0.0; D_FF],
             xq_ff: vec![0; D_FF],
+            lut: vec![0i8; lut_scratch_bytes(D_MODEL.max(D_FF))],
             logits: [0.0; VOCAB],
             rope_cos,
             rope_sin,
@@ -123,9 +133,24 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-fn matvec(mat: &TernaryMatrix<'_>, x: &[f32], xq_buf: &mut [i8], out: &mut [f32]) {
-    let x_scale = quantize_activations(x, xq_buf);
-    matvec_ternary(mat.packed, mat.scale, xq_buf, x_scale, out);
+/// Quantize activations once and return the (xq buffer, scale) so multiple
+/// matmuls with the same input can share the work.
+fn quantize_into<'a>(x: &[f32], xq_buf: &'a mut [i8]) -> (&'a [i8], f32) {
+    let scale = quantize_activations(x, xq_buf);
+    (xq_buf, scale)
+}
+
+/// Run a matvec against `mat`, picking the arch-preferred LUT kernel when
+/// the Weights loader populated one and falling back to the `I2_S` direct
+/// path otherwise. `lut` must already have been filled from `x_q` via
+/// `build_lut` — sharing that build across matvecs that consume the same
+/// activation (Q/K/V, w1/w3) is the point of hoisting it out here.
+fn matvec_prequant(mat: &TernaryMatrix<'_>, x_q: &[i8], lut: &[i8], x_scale: f32, out: &mut [f32]) {
+    if mat.lut_packed.is_empty() {
+        matvec_ternary(mat.packed, mat.scale, x_q, x_scale, out);
+    } else {
+        matvec_ternary_lut(mat.lut_packed, mat.scale, lut, x_scale, x_q.len(), out);
+    }
 }
 
 /// Byte-level `BitNet` transformer — owns weights, KV cache, and scratch.
@@ -151,6 +176,12 @@ impl ByteTransformer {
     }
 
     /// Advance state with `token` and return logits predicting the next byte.
+    ///
+    /// The `(xq_*, xs_*)` binding pairs pass pre-quantized inputs to the
+    /// matvec kernels so that Q/K/V share one quant, as do w1/w3. clippy's
+    /// `similar_names` warns on these by default but the pairing reads more
+    /// clearly than unique-per-call names.
+    #[allow(clippy::similar_names)]
     pub(crate) fn step(&mut self, token: u8) -> &[f32; VOCAB] {
         let scratch = &mut self.scratch;
         // Embedding lookup.
@@ -165,9 +196,15 @@ impl ByteTransformer {
             scratch.residual.copy_from_slice(&scratch.x);
             rmsnorm(&scratch.x, layer.attn_norm, &mut scratch.normed);
 
-            matvec(&layer.q, &scratch.normed, &mut scratch.xq, &mut scratch.q);
-            matvec(&layer.k, &scratch.normed, &mut scratch.xq, &mut scratch.k);
-            matvec(&layer.v, &scratch.normed, &mut scratch.xq, &mut scratch.v);
+            // Quantize the norm output once; Q / K / V all consume it.
+            // Build the LUT once, reuse across the three matvecs.
+            let (xq_norm, xs_norm) = quantize_into(&scratch.normed, &mut scratch.xq);
+            let lut_len = lut_scratch_bytes(xq_norm.len());
+            build_lut(xq_norm, &mut scratch.lut[..lut_len]);
+            let lut = &scratch.lut[..lut_len];
+            matvec_prequant(&layer.q, xq_norm, lut, xs_norm, &mut scratch.q);
+            matvec_prequant(&layer.k, xq_norm, lut, xs_norm, &mut scratch.k);
+            matvec_prequant(&layer.v, xq_norm, lut, xs_norm, &mut scratch.v);
 
             // Push pre-RoPE K, V to the ring buffer.
             self.kv.layers[li].push(&scratch.k, &scratch.v);
@@ -195,7 +232,11 @@ impl ByteTransformer {
             );
 
             // Output projection + residual.
-            matvec(&layer.o, &scratch.attn_out, &mut scratch.xq, &mut scratch.x);
+            let (xq_attn, xs_attn) = quantize_into(&scratch.attn_out, &mut scratch.xq);
+            let lut_len = lut_scratch_bytes(xq_attn.len());
+            build_lut(xq_attn, &mut scratch.lut[..lut_len]);
+            let lut = &scratch.lut[..lut_len];
+            matvec_prequant(&layer.o, xq_attn, lut, xs_attn, &mut scratch.x);
             for (x, r) in scratch.x.iter_mut().zip(scratch.residual.iter()) {
                 *x += r;
             }
@@ -204,18 +245,14 @@ impl ByteTransformer {
             scratch.residual.copy_from_slice(&scratch.x);
             rmsnorm(&scratch.x, layer.mlp_norm, &mut scratch.normed);
 
-            matvec(
-                &layer.w1,
-                &scratch.normed,
-                &mut scratch.xq,
-                &mut scratch.mlp_gate,
-            );
-            matvec(
-                &layer.w3,
-                &scratch.normed,
-                &mut scratch.xq,
-                &mut scratch.mlp_up,
-            );
+            // Quantize norm output once; w1 and w3 share it. One LUT build.
+            let (xq_norm, xs_norm) = quantize_into(&scratch.normed, &mut scratch.xq);
+            let lut_len = lut_scratch_bytes(xq_norm.len());
+            build_lut(xq_norm, &mut scratch.lut[..lut_len]);
+            let lut = &scratch.lut[..lut_len];
+            matvec_prequant(&layer.w1, xq_norm, lut, xs_norm, &mut scratch.mlp_gate);
+            matvec_prequant(&layer.w3, xq_norm, lut, xs_norm, &mut scratch.mlp_up);
+
             for ((h, &g), &u) in scratch
                 .mlp_hidden
                 .iter_mut()
@@ -225,21 +262,21 @@ impl ByteTransformer {
                 *h = silu(g) * u;
             }
 
-            matvec(
-                &layer.w2,
-                &scratch.mlp_hidden,
-                &mut scratch.xq_ff,
-                &mut scratch.x,
-            );
+            let (xq_hid, xs_hid) = quantize_into(&scratch.mlp_hidden, &mut scratch.xq_ff);
+            let lut_len = lut_scratch_bytes(xq_hid.len());
+            build_lut(xq_hid, &mut scratch.lut[..lut_len]);
+            let lut = &scratch.lut[..lut_len];
+            matvec_prequant(&layer.w2, xq_hid, lut, xs_hid, &mut scratch.x);
             for (x, r) in scratch.x.iter_mut().zip(scratch.residual.iter()) {
                 *x += r;
             }
         }
 
-        // Tied-embedding output head: logit[i] = x · tok_emb[i].
+        // Tied-embedding output head: logit[i] = x · tok_emb[i]. D_MODEL
+        // is divisible by 16 so the SIMD dot kicks in.
         for (i, logit) in scratch.logits.iter_mut().enumerate() {
             let row = &tok_emb[i * D_MODEL..(i + 1) * D_MODEL];
-            *logit = scratch.x.iter().zip(row.iter()).map(|(a, b)| a * b).sum();
+            *logit = dot_f32(&scratch.x, row);
         }
 
         &scratch.logits
@@ -275,7 +312,6 @@ fn compute_attention(
 ) {
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
-    // Per-head weighted value sum. Accumulate per-head in an f32 buffer.
     for h in 0..N_HEADS {
         let head_off = h * HEAD_DIM;
         let q_head = &q[head_off..head_off + HEAD_DIM];
@@ -285,15 +321,10 @@ fn compute_attention(
         let mut count: usize = 0;
         for (logical_pos, k_slot, _v_slot) in layer.entries() {
             let k_head_pre = &k_slot[head_off..head_off + HEAD_DIM];
-            k_rot_buf[head_off..head_off + HEAD_DIM].copy_from_slice(k_head_pre);
-            apply_rope_head(
-                &mut k_rot_buf[head_off..head_off + HEAD_DIM],
-                logical_pos,
-                rope_cos,
-                rope_sin,
-            );
-            let k_head = &k_rot_buf[head_off..head_off + HEAD_DIM];
-            let dot: f32 = q_head.iter().zip(k_head).map(|(a, b)| a * b).sum();
+            let k_head_rot = &mut k_rot_buf[head_off..head_off + HEAD_DIM];
+            k_head_rot.copy_from_slice(k_head_pre);
+            rope_head_inplace(k_head_rot, logical_pos, rope_cos, rope_sin);
+            let dot = dot_f32(q_head, k_head_rot);
             let s = dot * scale;
             attn_scores[count] = s;
             if s > max_score {
@@ -302,7 +333,10 @@ fn compute_attention(
             count += 1;
         }
 
-        // Softmax over attn_scores[..count].
+        // Softmax over attn_scores[..count]. `f32::exp` on Apple's libm is
+        // fast enough (~1 ns); a polynomial NEON-SIMD exp was tried and
+        // gave no measurable speedup at this model size while trading
+        // ~1e-6 relative error for the gain that wasn't there.
         let mut sum = 0.0_f32;
         for s in &mut attn_scores[..count] {
             *s = (*s - max_score).exp();
@@ -321,9 +355,187 @@ fn compute_attention(
         for (idx, (_pos, _k, v_slot)) in layer.entries().enumerate() {
             let v_head = &v_slot[head_off..head_off + HEAD_DIM];
             let w = attn_scores[idx];
-            for (o, &v) in out_head.iter_mut().zip(v_head.iter()) {
-                *o = w.mul_add(v, *o);
-            }
+            axpy_head(out_head, w, v_head);
+        }
+    }
+}
+
+// --- Hot-path helpers -------------------------------------------------------
+//
+// Each of these has a NEON path (for aarch64) and a scalar fallback. The
+// inner loops run `~CONTEXT_LEN * N_HEADS * N_LAYERS` times per encoded /
+// decoded byte — this is where most of the inference wall-clock lives
+// outside the matvec kernels.
+
+/// Apply half-dim `RoPE` to one head in place.
+#[inline]
+fn rope_head_inplace(v: &mut [f32], pos: usize, cos_tab: &[f32], sin_tab: &[f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline ABI.
+        #[allow(unsafe_code)]
+        unsafe {
+            neon_rope_head(v, pos, cos_tab, sin_tab);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    apply_rope_head(v, pos, cos_tab, sin_tab);
+}
+
+/// Dot product of two f32 slices. Length must be divisible by 16; both
+/// `HEAD_DIM = 64` and `D_MODEL = 256` satisfy this.
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len() % 16, 0);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        #[allow(unsafe_code)]
+        unsafe {
+            return neon_dot_f32(a, b);
+        }
+    }
+    #[allow(unreachable_code)]
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// `out += w * v`, element-wise, 64 f32 lanes.
+#[inline]
+fn axpy_head(out: &mut [f32], w: f32, v: &[f32]) {
+    debug_assert_eq!(out.len(), HEAD_DIM);
+    debug_assert_eq!(v.len(), HEAD_DIM);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        #[allow(unsafe_code)]
+        unsafe {
+            neon_axpy_head(out, w, v);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for (o, &x) in out.iter_mut().zip(v.iter()) {
+            *o = w.mul_add(x, *o);
+        }
+    }
+}
+
+/// NEON: half-dim `RoPE` on one head in place.
+///
+/// Rotates pairs `(v[j], v[j + HEAD_DIM/2])` by the per-j angle at
+/// `position = pos`, 4 pairs per iteration. `HEAD_DIM` is a const so the
+/// loop-trip count is known at compile time; LLVM can unroll and schedule
+/// the FMA dependency chain across lanes.
+// Single-letter names follow the 2×2 rotation-matrix convention: `(a, b)
+// are the two halves of the head, `(c, s)` are cos / sin.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code, clippy::many_single_char_names, clippy::similar_names)]
+unsafe fn neon_rope_head(v: &mut [f32], pos: usize, cos_tab: &[f32], sin_tab: &[f32]) {
+    use std::arch::aarch64::{vfmaq_f32, vld1q_f32, vmulq_f32, vnegq_f32, vst1q_f32};
+    debug_assert_eq!(v.len(), HEAD_DIM);
+    let half = HEAD_DIM / 2;
+    let row = pos * half;
+    // SAFETY: callers guarantee slice lengths.
+    unsafe {
+        let mut j = 0;
+        while j + 4 <= half {
+            let c = vld1q_f32(cos_tab.as_ptr().add(row + j));
+            let s = vld1q_f32(sin_tab.as_ptr().add(row + j));
+            let a = vld1q_f32(v.as_ptr().add(j));
+            let b = vld1q_f32(v.as_ptr().add(j + half));
+            // new_a = a*c - b*s      = fma(-b*s, something)  — simpler to do:
+            //   new_a = (a * c) + (-b) * s via vfmaq
+            let neg_b = vnegq_f32(b);
+            let new_a = vfmaq_f32(vmulq_f32(a, c), neg_b, s);
+            // new_b = a*s + b*c
+            let new_b = vfmaq_f32(vmulq_f32(b, c), a, s);
+            vst1q_f32(v.as_mut_ptr().add(j), new_a);
+            vst1q_f32(v.as_mut_ptr().add(j + half), new_b);
+            j += 4;
+        }
+        // Tail path — scalar — for any leftover lanes. With HEAD_DIM = 64
+        // and half = 32 (divisible by 4) this is dead code but kept for
+        // robustness if HEAD_DIM ever changes.
+        while j < half {
+            let c = *cos_tab.as_ptr().add(row + j);
+            let s = *sin_tab.as_ptr().add(row + j);
+            let a = v[j];
+            let b = v[j + half];
+            v[j] = a.mul_add(c, -(b * s));
+            v[j + half] = a.mul_add(s, b * c);
+            j += 1;
+        }
+    }
+}
+
+/// NEON: f32 dot product for any length divisible by 16. 4-way unrolled
+/// FMA with 4 independent accumulators to hide the FMA pipeline latency.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn neon_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
+    debug_assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len() % 16, 0);
+    // SAFETY: callers guarantee lengths; NEON is baseline on aarch64.
+    unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let mut off = 0;
+        while off + 16 <= a.len() {
+            let a0 = vld1q_f32(a.as_ptr().add(off));
+            let a1 = vld1q_f32(a.as_ptr().add(off + 4));
+            let a2 = vld1q_f32(a.as_ptr().add(off + 8));
+            let a3 = vld1q_f32(a.as_ptr().add(off + 12));
+            let b0 = vld1q_f32(b.as_ptr().add(off));
+            let b1 = vld1q_f32(b.as_ptr().add(off + 4));
+            let b2 = vld1q_f32(b.as_ptr().add(off + 8));
+            let b3 = vld1q_f32(b.as_ptr().add(off + 12));
+            acc0 = vfmaq_f32(acc0, a0, b0);
+            acc1 = vfmaq_f32(acc1, a1, b1);
+            acc2 = vfmaq_f32(acc2, a2, b2);
+            acc3 = vfmaq_f32(acc3, a3, b3);
+            off += 16;
+        }
+        let s01 = vaddq_f32(acc0, acc1);
+        let s23 = vaddq_f32(acc2, acc3);
+        vaddvq_f32(vaddq_f32(s01, s23))
+    }
+}
+
+/// NEON: `out += w * v` over 64 f32 lanes. Unrolled 4× for ILP.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code)]
+unsafe fn neon_axpy_head(out: &mut [f32], w: f32, v: &[f32]) {
+    use std::arch::aarch64::{vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32};
+    debug_assert_eq!(out.len(), HEAD_DIM);
+    debug_assert_eq!(v.len(), HEAD_DIM);
+    // SAFETY: callers guarantee lengths; NEON is baseline on aarch64.
+    unsafe {
+        let wv = vdupq_n_f32(w);
+        let mut off = 0;
+        while off + 16 <= HEAD_DIM {
+            let o0 = vld1q_f32(out.as_ptr().add(off));
+            let o1 = vld1q_f32(out.as_ptr().add(off + 4));
+            let o2 = vld1q_f32(out.as_ptr().add(off + 8));
+            let o3 = vld1q_f32(out.as_ptr().add(off + 12));
+            let v0 = vld1q_f32(v.as_ptr().add(off));
+            let v1 = vld1q_f32(v.as_ptr().add(off + 4));
+            let v2 = vld1q_f32(v.as_ptr().add(off + 8));
+            let v3 = vld1q_f32(v.as_ptr().add(off + 12));
+            vst1q_f32(out.as_mut_ptr().add(off), vfmaq_f32(o0, wv, v0));
+            vst1q_f32(out.as_mut_ptr().add(off + 4), vfmaq_f32(o1, wv, v1));
+            vst1q_f32(out.as_mut_ptr().add(off + 8), vfmaq_f32(o2, wv, v2));
+            vst1q_f32(out.as_mut_ptr().add(off + 12), vfmaq_f32(o3, wv, v3));
+            off += 16;
         }
     }
 }

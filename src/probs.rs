@@ -1,7 +1,8 @@
 //! Logits → CDF conversion for the arithmetic coder.
 //!
-//! Softmax is computed in `f64` for numerical stability, then the 65 536-count
-//! total mass is distributed deterministically:
+//! Softmax is computed in `f32` (one `f32::exp` per symbol is ~2× faster
+//! than `f64::exp` and plenty precise for a 256-symbol, 16-bit CDF quant
+//! step). The 65 536-count total mass is distributed deterministically:
 //!
 //! 1. Every symbol gets at least one count (prevents zero-probability
 //!    symbols, which the AC cannot represent).
@@ -29,21 +30,21 @@ const EXTRA: u32 = TOTAL - VOCAB as u32;
 /// - `VOCAB as u32`: `VOCAB = 256` fits in u32.
 /// - `(p * EXTRA).floor() as u32`: `p ∈ [0, 1]`, product ∈ `[0, EXTRA]`, so
 ///   neither truncation nor sign loss is possible.
-/// - `p * f64::from(EXTRA)` is lossless on the u32 → f64 side.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn logits_to_cdf(logits: &[f32; VOCAB]) -> [u32; 257] {
-    // f64 softmax (max-shift for numerical stability).
-    let mut max = f64::NEG_INFINITY;
+    // f32 softmax (max-shift for numerical stability). A 16-bit CDF can
+    // distinguish ~10⁵ probability levels; f32's 23-bit mantissa is well
+    // over the resolution we quantize to.
+    let mut max = f32::NEG_INFINITY;
     for &l in logits {
-        let l64 = f64::from(l);
-        if l64 > max {
-            max = l64;
+        if l > max {
+            max = l;
         }
     }
-    let mut probs = [0.0_f64; VOCAB];
-    let mut sum = 0.0_f64;
+    let mut probs = [0.0_f32; VOCAB];
+    let mut sum = 0.0_f32;
     for (i, &l) in logits.iter().enumerate() {
-        let e = (f64::from(l) - max).exp();
+        let e = (l - max).exp();
         probs[i] = e;
         sum += e;
     }
@@ -57,10 +58,15 @@ pub(crate) fn logits_to_cdf(logits: &[f32; VOCAB]) -> [u32; 257] {
     }
 
     // Base-1 allocation + proportional.
+    //
+    // `EXTRA as f32` looks like a precision-loss hazard on paper but
+    // `EXTRA = 65 280` easily fits in f32's 23-bit mantissa.
+    #[allow(clippy::cast_precision_loss)]
+    let extra_f = EXTRA as f32;
     let mut counts = [1u32; VOCAB];
     let mut allocated: u32 = VOCAB as u32;
     for (i, &p) in probs.iter().enumerate() {
-        let add = (p * f64::from(EXTRA)).floor() as u32;
+        let add = (p * extra_f).floor() as u32;
         counts[i] += add;
         allocated += add;
     }

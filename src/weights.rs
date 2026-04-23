@@ -26,9 +26,10 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::arch::{
-    D_MODEL, N_LAYERS, PACKED_QKVO_BYTES, PACKED_W1_BYTES, PACKED_W2_BYTES, PACKED_W3_BYTES,
+    D_FF, D_MODEL, N_LAYERS, PACKED_QKVO_BYTES, PACKED_W1_BYTES, PACKED_W2_BYTES, PACKED_W3_BYTES,
     PACKED_WEIGHTS_LEN, SCALE_QKVO_F32S, SCALE_W1_F32S, SCALE_W2_F32S, SCALE_W3_F32S, VOCAB,
 };
+use crate::bitnet::{lut_packed_bytes, lut_supports, repack_i2s_to_lut};
 
 /// 8-byte ASCII magic for checkpoint files.
 pub(crate) const CKPT_MAGIC: &[u8; 8] = b"LZRCKPT1";
@@ -40,6 +41,34 @@ const SCALE_QKVO_BYTES: usize = SCALE_QKVO_F32S * 4;
 const SCALE_W1_BYTES: usize = SCALE_W1_F32S * 4;
 const SCALE_W2_BYTES: usize = SCALE_W2_F32S * 4;
 const SCALE_W3_BYTES: usize = SCALE_W3_F32S * 4;
+
+/// Per-matrix LUT buffer sizes (0 on architectures without a LUT kernel).
+///
+/// The LUT is built once at load time from the `I2_S` packed bytes already
+/// in the file. Total RSS impact: `+LUT_TOTAL_BYTES` alongside the `I2_S`
+/// buffer.
+const LUT_QKVO_BYTES: usize = lut_packed_bytes(D_MODEL, D_MODEL);
+const LUT_W1_BYTES: usize = lut_packed_bytes(D_FF, D_MODEL);
+const LUT_W2_BYTES: usize = lut_packed_bytes(D_MODEL, D_FF);
+const LUT_W3_BYTES: usize = lut_packed_bytes(D_FF, D_MODEL);
+const LUT_LAYER_BYTES: usize = 4 * LUT_QKVO_BYTES + LUT_W1_BYTES + LUT_W2_BYTES + LUT_W3_BYTES;
+const LUT_TOTAL_BYTES: usize = N_LAYERS * LUT_LAYER_BYTES;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const _: () = {
+    assert!(
+        lut_supports(D_MODEL, D_MODEL),
+        "LUT kernel does not support Q/K/V/O shapes — widen the supported range"
+    );
+    assert!(
+        lut_supports(D_FF, D_MODEL),
+        "LUT kernel does not support w1/w3 shapes"
+    );
+    assert!(
+        lut_supports(D_MODEL, D_FF),
+        "LUT kernel does not support w2 shapes"
+    );
+};
 
 #[derive(Clone, Copy, Debug)]
 struct LayerLayout {
@@ -123,10 +152,15 @@ const _: () = {
     );
 };
 
-/// One ternary matrix: packed weights + per-row scale.
+/// One ternary matrix: I2_S-packed weights + arch-preferred LUT-packed
+/// weights + per-row scale.
+///
+/// `lut_packed` is an empty slice on architectures without a LUT kernel; the
+/// inference path must check and fall back to `packed` + scalar matvec.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TernaryMatrix<'a> {
     pub packed: &'a [u8],
+    pub lut_packed: &'a [u8],
     pub scale: &'a [f32],
 }
 
@@ -154,8 +188,12 @@ pub(crate) struct LayerView<'a> {
 pub(crate) struct Weights {
     f32s: Vec<f32>,
     packed: Vec<u8>,
+    /// Arch-preferred LUT packing (`TL1` on aarch64, `TL2` on `x86_64`,
+    /// empty elsewhere). Built once at load time from `packed`.
+    lut: Vec<u8>,
     f32_ix: F32Index,
-    pk_ix: [PackedIndex; N_LAYERS],
+    pk_ix: [TensorIndex; N_LAYERS],
+    lut_ix: [TensorIndex; N_LAYERS],
 }
 
 #[derive(Debug)]
@@ -177,8 +215,11 @@ struct LayerF32Index {
     w3_scale: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PackedIndex {
+/// Per-layer byte offsets into either the `I2_S` `packed` buffer or the
+/// arch-preferred `lut` buffer. The seven fields mirror the seven ternary
+/// tensors in each transformer block.
+#[derive(Clone, Copy, Debug, Default)]
+struct TensorIndex {
     q: usize,
     k: usize,
     v: usize,
@@ -204,6 +245,7 @@ impl Weights {
         }
         let mut f32s = Vec::with_capacity(PACKED_WEIGHTS_LEN / 4);
         let mut packed = Vec::with_capacity(PACKED_WEIGHTS_LEN);
+        let mut lut = Vec::with_capacity(LUT_TOTAL_BYTES);
 
         let tok_emb_off = f32s.len();
         read_f32s(buf, 0, VOCAB * D_MODEL, &mut f32s);
@@ -219,97 +261,121 @@ impl Weights {
             w2_scale: 0,
             w3_scale: 0,
         }; N_LAYERS];
-        let mut layers_pk: [PackedIndex; N_LAYERS] = [PackedIndex {
-            q: 0,
-            k: 0,
-            v: 0,
-            o: 0,
-            w1: 0,
-            w2: 0,
-            w3: 0,
-        }; N_LAYERS];
+        let mut layers_pk: [TensorIndex; N_LAYERS] = [TensorIndex::default(); N_LAYERS];
+        let mut layers_lut: [TensorIndex; N_LAYERS] = [TensorIndex::default(); N_LAYERS];
 
         for (i, layout) in LAYERS.iter().enumerate() {
             layers_f32[i].attn_norm = f32s.len();
             read_f32s(buf, layout.attn_norm, D_MODEL, &mut f32s);
 
-            (layers_pk[i].q, layers_f32[i].q_scale) = read_pk_scale(
+            (layers_pk[i].q, layers_lut[i].q, layers_f32[i].q_scale) = read_pk_scale(
                 buf,
                 &mut packed,
+                &mut lut,
                 &mut f32s,
                 layout.q_packed,
                 PACKED_QKVO_BYTES,
                 layout.q_scale,
                 SCALE_QKVO_F32S,
+                D_MODEL,
+                D_MODEL,
             );
-            (layers_pk[i].k, layers_f32[i].k_scale) = read_pk_scale(
+            (layers_pk[i].k, layers_lut[i].k, layers_f32[i].k_scale) = read_pk_scale(
                 buf,
                 &mut packed,
+                &mut lut,
                 &mut f32s,
                 layout.k_packed,
                 PACKED_QKVO_BYTES,
                 layout.k_scale,
                 SCALE_QKVO_F32S,
+                D_MODEL,
+                D_MODEL,
             );
-            (layers_pk[i].v, layers_f32[i].v_scale) = read_pk_scale(
+            (layers_pk[i].v, layers_lut[i].v, layers_f32[i].v_scale) = read_pk_scale(
                 buf,
                 &mut packed,
+                &mut lut,
                 &mut f32s,
                 layout.v_packed,
                 PACKED_QKVO_BYTES,
                 layout.v_scale,
                 SCALE_QKVO_F32S,
+                D_MODEL,
+                D_MODEL,
             );
-            (layers_pk[i].o, layers_f32[i].o_scale) = read_pk_scale(
+            (layers_pk[i].o, layers_lut[i].o, layers_f32[i].o_scale) = read_pk_scale(
                 buf,
                 &mut packed,
+                &mut lut,
                 &mut f32s,
                 layout.o_packed,
                 PACKED_QKVO_BYTES,
                 layout.o_scale,
                 SCALE_QKVO_F32S,
+                D_MODEL,
+                D_MODEL,
             );
 
             layers_f32[i].mlp_norm = f32s.len();
             read_f32s(buf, layout.mlp_norm, D_MODEL, &mut f32s);
 
-            (layers_pk[i].w1, layers_f32[i].w1_scale) = read_pk_scale(
+            (layers_pk[i].w1, layers_lut[i].w1, layers_f32[i].w1_scale) = read_pk_scale(
                 buf,
                 &mut packed,
+                &mut lut,
                 &mut f32s,
                 layout.w1_packed,
                 PACKED_W1_BYTES,
                 layout.w1_scale,
                 SCALE_W1_F32S,
+                D_FF,
+                D_MODEL,
             );
-            (layers_pk[i].w2, layers_f32[i].w2_scale) = read_pk_scale(
+            (layers_pk[i].w2, layers_lut[i].w2, layers_f32[i].w2_scale) = read_pk_scale(
                 buf,
                 &mut packed,
+                &mut lut,
                 &mut f32s,
                 layout.w2_packed,
                 PACKED_W2_BYTES,
                 layout.w2_scale,
                 SCALE_W2_F32S,
+                D_MODEL,
+                D_FF,
             );
-            (layers_pk[i].w3, layers_f32[i].w3_scale) = read_pk_scale(
+            (layers_pk[i].w3, layers_lut[i].w3, layers_f32[i].w3_scale) = read_pk_scale(
                 buf,
                 &mut packed,
+                &mut lut,
                 &mut f32s,
                 layout.w3_packed,
                 PACKED_W3_BYTES,
                 layout.w3_scale,
                 SCALE_W3_F32S,
+                D_FF,
+                D_MODEL,
             );
+        }
+
+        // Once the LUT buffer is built, the I2_S `packed` bytes are dead
+        // RSS on LUT-supported arches (aarch64 / x86_64) — `matvec_prequant`
+        // always routes to the LUT kernel there. Drop them. On unsupported
+        // arches `lut` stayed empty and `packed` is the live buffer.
+        if !lut.is_empty() {
+            packed = Vec::new();
         }
 
         Ok(Self {
             f32s,
             packed,
+            lut,
             f32_ix: F32Index {
                 tok_emb: tok_emb_off,
                 layers: layers_f32,
             },
             pk_ix: layers_pk,
+            lut_ix: layers_lut,
         })
     }
 
@@ -347,35 +413,53 @@ impl Weights {
     pub(crate) fn layer(&self, i: usize) -> LayerView<'_> {
         let f = &self.f32_ix.layers[i];
         let p = &self.pk_ix[i];
+        let l = &self.lut_ix[i];
+        // Returns `&[]` on arches where the I2_S buffer was dropped after
+        // LUT conversion (so the caller's `lut_packed.is_empty()` dispatch
+        // picks the LUT kernel instead).
+        let pk = |off: usize, len: usize| -> &[u8] {
+            if self.packed.is_empty() {
+                &[]
+            } else {
+                &self.packed[off..off + len]
+            }
+        };
         LayerView {
             attn_norm: &self.f32s[f.attn_norm..f.attn_norm + D_MODEL],
             q: TernaryMatrix {
-                packed: &self.packed[p.q..p.q + PACKED_QKVO_BYTES],
+                packed: pk(p.q, PACKED_QKVO_BYTES),
+                lut_packed: &self.lut[l.q..l.q + LUT_QKVO_BYTES],
                 scale: &self.f32s[f.q_scale..f.q_scale + SCALE_QKVO_F32S],
             },
             k: TernaryMatrix {
-                packed: &self.packed[p.k..p.k + PACKED_QKVO_BYTES],
+                packed: pk(p.k, PACKED_QKVO_BYTES),
+                lut_packed: &self.lut[l.k..l.k + LUT_QKVO_BYTES],
                 scale: &self.f32s[f.k_scale..f.k_scale + SCALE_QKVO_F32S],
             },
             v: TernaryMatrix {
-                packed: &self.packed[p.v..p.v + PACKED_QKVO_BYTES],
+                packed: pk(p.v, PACKED_QKVO_BYTES),
+                lut_packed: &self.lut[l.v..l.v + LUT_QKVO_BYTES],
                 scale: &self.f32s[f.v_scale..f.v_scale + SCALE_QKVO_F32S],
             },
             o: TernaryMatrix {
-                packed: &self.packed[p.o..p.o + PACKED_QKVO_BYTES],
+                packed: pk(p.o, PACKED_QKVO_BYTES),
+                lut_packed: &self.lut[l.o..l.o + LUT_QKVO_BYTES],
                 scale: &self.f32s[f.o_scale..f.o_scale + SCALE_QKVO_F32S],
             },
             mlp_norm: &self.f32s[f.mlp_norm..f.mlp_norm + D_MODEL],
             w1: TernaryMatrix {
-                packed: &self.packed[p.w1..p.w1 + PACKED_W1_BYTES],
+                packed: pk(p.w1, PACKED_W1_BYTES),
+                lut_packed: &self.lut[l.w1..l.w1 + LUT_W1_BYTES],
                 scale: &self.f32s[f.w1_scale..f.w1_scale + SCALE_W1_F32S],
             },
             w2: TernaryMatrix {
-                packed: &self.packed[p.w2..p.w2 + PACKED_W2_BYTES],
+                packed: pk(p.w2, PACKED_W2_BYTES),
+                lut_packed: &self.lut[l.w2..l.w2 + LUT_W2_BYTES],
                 scale: &self.f32s[f.w2_scale..f.w2_scale + SCALE_W2_F32S],
             },
             w3: TernaryMatrix {
-                packed: &self.packed[p.w3..p.w3 + PACKED_W3_BYTES],
+                packed: pk(p.w3, PACKED_W3_BYTES),
+                lut_packed: &self.lut[l.w3..l.w3 + LUT_W3_BYTES],
                 scale: &self.f32s[f.w3_scale..f.w3_scale + SCALE_W3_F32S],
             },
         }
@@ -457,23 +541,47 @@ fn read_f32s(buf: &[u8], offset: usize, count: usize, out: &mut Vec<f32>) {
     }
 }
 
-/// Copy one `packed + scale` pair from `buf` into the parsed buffers.
-/// Returns `(packed_offset, scale_offset)` into `packed` / `f32s` so the
-/// caller can record indices into its layer tables.
+/// Copy one `packed + scale` pair from `buf` into the parsed buffers and
+/// build the arch-preferred LUT-packed bytes.
+///
+/// Returns `(packed_offset, lut_offset, scale_offset)` into the respective
+/// buffers so the caller can record indices into its layer tables.
+///
+/// The 10-argument signature (`#[allow(clippy::too_many_arguments)]`) mirrors
+/// the literal weight-file layout — factoring it would hide more than it
+/// helps.
+#[allow(clippy::too_many_arguments)]
 fn read_pk_scale(
     buf: &[u8],
     packed: &mut Vec<u8>,
+    lut: &mut Vec<u8>,
     f32s: &mut Vec<f32>,
     packed_src: usize,
     packed_len: usize,
     scale_src: usize,
     scale_count: usize,
-) -> (usize, usize) {
+    out_dim: usize,
+    in_dim: usize,
+) -> (usize, usize, usize) {
     let pk_off = packed.len();
     packed.extend_from_slice(&buf[packed_src..packed_src + packed_len]);
+
+    let lut_off = lut.len();
+    let lut_len = lut_packed_bytes(out_dim, in_dim);
+    if lut_len > 0 {
+        lut.resize(lut_off + lut_len, 0);
+        let i2s_bytes = &packed[pk_off..pk_off + packed_len];
+        repack_i2s_to_lut(
+            i2s_bytes,
+            &mut lut[lut_off..lut_off + lut_len],
+            out_dim,
+            in_dim,
+        );
+    }
+
     let scale_off = f32s.len();
     read_f32s(buf, scale_src, scale_count, f32s);
-    (pk_off, scale_off)
+    (pk_off, lut_off, scale_off)
 }
 
 #[cfg(feature = "training")]
@@ -492,18 +600,23 @@ mod tests {
         let buf = vec![0u8; PACKED_WEIGHTS_LEN];
         let w = Weights::from_bytes(&buf).unwrap();
         assert_eq!(w.tok_emb().len(), VOCAB * D_MODEL);
+        // On LUT-supported arches (aarch64 / x86_64) the I2_S `packed`
+        // bytes are dropped after conversion; the live buffer is `lut`.
+        // On other arches it's the opposite. Exactly one is populated.
         for i in 0..N_LAYERS {
             let lv = w.layer(i);
             assert_eq!(lv.attn_norm.len(), D_MODEL);
             assert_eq!(lv.mlp_norm.len(), D_MODEL);
-            assert_eq!(lv.q.packed.len(), PACKED_QKVO_BYTES);
             assert_eq!(lv.q.scale.len(), SCALE_QKVO_F32S);
-            assert_eq!(lv.w1.packed.len(), PACKED_W1_BYTES);
             assert_eq!(lv.w1.scale.len(), SCALE_W1_F32S);
-            assert_eq!(lv.w2.packed.len(), PACKED_W2_BYTES);
             assert_eq!(lv.w2.scale.len(), SCALE_W2_F32S);
-            assert_eq!(lv.w3.packed.len(), PACKED_W3_BYTES);
             assert_eq!(lv.w3.scale.len(), SCALE_W3_F32S);
+            for mat in [&lv.q, &lv.k, &lv.v, &lv.o, &lv.w1, &lv.w2, &lv.w3] {
+                assert!(
+                    !mat.packed.is_empty() || !mat.lut_packed.is_empty(),
+                    "at least one ternary buffer must be populated"
+                );
+            }
         }
     }
 
