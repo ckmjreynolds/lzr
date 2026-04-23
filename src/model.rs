@@ -100,7 +100,8 @@ fn apply_rope_multihead(vec: &mut [f32], pos: usize, cos_tab: &[f32], sin_tab: &
 }
 
 // `n` is at most `D_MODEL` (256 in the shipped model) so `usize -> f32` is
-// exact.
+// exact. The `ss += v * v` accumulator uses `mul_add` for one-ulp accuracy
+// (RMSNorm is sensitive to drift with long inner sums).
 #[allow(clippy::cast_precision_loss)]
 fn rmsnorm(x: &[f32], weight: &[f32], out: &mut [f32]) {
     debug_assert_eq!(x.len(), weight.len());
@@ -108,7 +109,7 @@ fn rmsnorm(x: &[f32], weight: &[f32], out: &mut [f32]) {
     let n = x.len();
     let mut ss = 0.0_f32;
     for &v in x {
-        ss += v * v;
+        ss = v.mul_add(v, ss);
     }
     let scale = (ss / n as f32 + RMS_EPS).sqrt().recip();
     for i in 0..n {

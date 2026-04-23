@@ -1,6 +1,15 @@
 //! Transformer-based compression CLI — Hutter Prize attempt.
 
-#![forbid(unsafe_code)]
+// NEON dot-product intrinsics (`vdotq_s32` / ARMv8.2 SDOT) are still behind
+// an unstable feature gate as of Rust 1.85 — they give the matvec kernel a
+// 4× throughput win over the `vmull_s8` + `vpadalq_s16` fallback on Apple
+// Silicon. Training already requires nightly for coverage anyway, so we
+// enable the feature here and run the whole toolchain on nightly.
+#![cfg_attr(all(target_arch = "aarch64"), feature(stdarch_neon_dotprod))]
+#![deny(unsafe_code)]
+// Require explicit `unsafe { }` blocks inside `unsafe fn` — modern
+// Rust 2024 safety discipline.
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(unused)]
 #![warn(clippy::all)]
 #![allow(clippy::missing_docs_in_private_items)]

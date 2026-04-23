@@ -1,0 +1,13 @@
+# Local build configuration.
+#
+# The BitNet matvec kernel leans on LLVM auto-vectorization. CLAUDE.md /
+# JOURNAL.md 2026-04-21 found that `RUSTFLAGS=-C target-cpu=native` was
+# required to hit ~75 GOPS on Apple NEON; without it the compiler emits
+# baseline-ISA code that stalls the inner loop.
+#
+# For the Hutter submission build we'll override this to `target-cpu=znver2`
+# (or a narrower feature set like `target-feature=+avx2,+fma`) since the
+# judging machine is fixed at 2021-era AMD Ryzen. For local development /
+# training on Apple silicon, `native` is correct.
+[build]
+rustflags = ["-C", "target-cpu=native"]
