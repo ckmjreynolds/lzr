@@ -29,7 +29,6 @@ mod ac;
 mod arch;
 mod bitnet;
 mod codec;
-mod kv_cache;
 mod model;
 mod probs;
 mod weights;

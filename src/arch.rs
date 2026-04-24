@@ -1,56 +1,53 @@
-//! Architecture constants for the byte-level `BitNet` transformer.
+//! Architecture constants for the byte-level RWKV v4 model.
 //!
-//! These constants define the submission model's shape and pin the exact
-//! packed weights layout. They are `const` so the weight-file length check
-//! at the `include_bytes!` site can be a compile-time assertion.
+//! RWKV v4 replaces transformer attention with linear-time-mix over a
+//! learned time-decay state. There is no KV cache, no `RoPE`; inference
+//! progresses in O(1) per token regardless of stream length. Model state
+//! at each layer is five `D_MODEL`-sized vectors (`shifted_x_tm`,
+//! `shifted_x_cm`, `aa`, `bb`, `pp`) — the pp vector lives in log-space
+//! for the WKV numerical-stability trick.
+//!
+//! Constants are `const` so that the weight-file length check at the
+//! `include_bytes!` site is a compile-time assertion.
 
 /// Byte vocabulary: one symbol per possible byte value.
 pub(crate) const VOCAB: usize = 256;
 
 /// Model width. Must be divisible by 256 for k-quant alignment (CLAUDE.md)
-/// and `≤ 512` so every tensor's `in_dim` stays within the TL1 NEON kernel's
-/// `i16`-accumulator bound (`TL1_MAX_IN_DIM`). Bumping beyond 512 requires
-/// widening the LUT-kernel accumulators to `i32` or adding periodic flush.
-pub(crate) const D_MODEL: usize = 512;
+/// and `≤ 512` so every ternary matrix's `in_dim` stays within the TL1 NEON
+/// kernel's i16-accumulator bound. Bumping beyond 512 requires widening
+/// the LUT-kernel accumulators to i32 or adding periodic flush.
+///
+/// `D_MODEL = 256`, `N_LAYERS = 4`, `CM_MULT = 1` yields ~1.84M ternary
+/// weights + ~82K f32 parameters — the ~2M scale-up from the first 1M
+/// RWKV run (plateaued near train loss 1.24 nats / ~1.8 bpb equivalent;
+/// see `JOURNAL.md` 2026-04-24). Staying at `D_MODEL = 256` keeps every
+/// matvec inside the current LUT-kernel accumulator bound; depth is the
+/// only axis that moved.
+pub(crate) const D_MODEL: usize = 256;
 
-/// Number of transformer blocks. `L = 6` at `D = 512`, `MLP_MULT = 1` gives
-/// ~11 M ternary weights — the first "real" training target above the
-/// ~1 M TINY smoke-test config.
-pub(crate) const N_LAYERS: usize = 6;
+/// Number of RWKV blocks. Each block is one time-mix + one channel-mix.
+pub(crate) const N_LAYERS: usize = 4;
 
-/// Attention heads per layer. `D_MODEL` must be divisible by `N_HEADS`.
-/// `HEAD_DIM = 64` is the standard RoPE-scale-friendly choice.
-pub(crate) const N_HEADS: usize = 8;
+/// Channel-mix hidden-size multiplier relative to `D_MODEL`. RWKV v4
+/// traditionally uses `4×`, but `D_FF = 4·D_MODEL = 2048` would exceed
+/// both TL1 (`≤ 512`) and TL2 (`≤ 768`) accumulator bounds on the
+/// channel-mix V projection (`in_dim = D_FF`). Hold at `1×` for the
+/// initial model; widening requires kernel changes.
+pub(crate) const CM_MULT: usize = 1;
 
-/// Per-head dimension. Derived constraint: `N_HEADS * HEAD_DIM == D_MODEL`.
-pub(crate) const HEAD_DIM: usize = D_MODEL / N_HEADS;
+/// Channel-mix hidden width.
+pub(crate) const D_FF: usize = D_MODEL * CM_MULT;
 
-/// MLP hidden-size multiplier relative to `D_MODEL`. Held at 1 so that `w2`'s
-/// `in_dim = D_FF` stays within the LUT kernel bounds; moving to the
-/// conventional `4×` (or `SwiGLU`'s `~2.67×`) requires extending the LUT
-/// kernel's supported `in_dim`.
-pub(crate) const MLP_MULT: usize = 1;
-
-/// `SwiGLU` MLP hidden width.
-pub(crate) const D_FF: usize = D_MODEL * MLP_MULT;
-
-/// Training sequence length and inference context window.
-pub(crate) const CONTEXT_LEN: usize = 256;
-
-/// `RoPE` base frequency.
-pub(crate) const ROPE_THETA: f32 = 10_000.0;
-
-/// `RMSNorm` numerical stability epsilon.
+/// `RMSNorm` numerical stability epsilon. RWKV v4 originally uses
+/// `LayerNorm`; we use `RMSNorm` to match the kernel path already built
+/// out and to save the per-norm bias parameter.
 pub(crate) const RMS_EPS: f32 = 1.0e-5;
 
 const _: () = {
     assert!(
         D_MODEL % 256 == 0,
         "D_MODEL must be divisible by 256 (CLAUDE.md)"
-    );
-    assert!(
-        N_HEADS * HEAD_DIM == D_MODEL,
-        "N_HEADS * HEAD_DIM must equal D_MODEL"
     );
     assert!(D_MODEL % 32 == 0, "matmul inner loop unrolls by 32");
 };
@@ -61,53 +58,49 @@ pub(crate) const fn packed_bytes(out_dim: usize, in_dim: usize) -> usize {
     (out_dim * in_dim).div_ceil(4)
 }
 
-/// Per-layer ternary matrix sizes.
-///
-/// Q / K / V / O are `D_MODEL × D_MODEL`; `SwiGLU` `w1 / w3` are `D_FF × D_MODEL`,
-/// and `w2` is `D_MODEL × D_FF`.
-pub(crate) const PACKED_QKVO_BYTES: usize = packed_bytes(D_MODEL, D_MODEL);
-pub(crate) const SCALE_QKVO_F32S: usize = D_MODEL;
-pub(crate) const PACKED_W1_BYTES: usize = packed_bytes(D_FF, D_MODEL);
-pub(crate) const PACKED_W3_BYTES: usize = packed_bytes(D_FF, D_MODEL);
-pub(crate) const PACKED_W2_BYTES: usize = packed_bytes(D_MODEL, D_FF);
-pub(crate) const SCALE_W1_F32S: usize = D_FF;
-pub(crate) const SCALE_W3_F32S: usize = D_FF;
-pub(crate) const SCALE_W2_F32S: usize = D_MODEL;
+// Per-layer ternary matrix sizes.
+//
+// Time-mix has four projections: receptance `R`, key `K`, value `V`,
+// output `O`. All are `D_MODEL × D_MODEL`.
+pub(crate) const PACKED_TM_BYTES: usize = packed_bytes(D_MODEL, D_MODEL);
+pub(crate) const SCALE_TM_F32S: usize = D_MODEL;
 
-/// Compute the cos / sin tables used by `RoPE` for every `(position, j)` pair
-/// with `position ∈ [0, CONTEXT_LEN)` and `j ∈ [0, HEAD_DIM / 2)`.
-///
-/// Both tables are `CONTEXT_LEN * HEAD_DIM/2` long, in row-major
-/// `(position, j)` order. Shared between the candle-nn training forward pass
-/// and the pure-Rust inference kernel so numerics stay aligned.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-pub(crate) fn rope_cos_sin_tables() -> (Vec<f32>, Vec<f32>) {
-    let half = HEAD_DIM / 2;
-    let mut cos = vec![0.0_f32; CONTEXT_LEN * half];
-    let mut sin = vec![0.0_f32; CONTEXT_LEN * half];
-    for pos in 0..CONTEXT_LEN {
-        for j in 0..half {
-            let freq = 1.0_f64 / f64::from(ROPE_THETA).powf(2.0 * j as f64 / HEAD_DIM as f64);
-            let angle = pos as f64 * freq;
-            cos[pos * half + j] = angle.cos() as f32;
-            sin[pos * half + j] = angle.sin() as f32;
-        }
-    }
-    (cos, sin)
-}
+// Channel-mix has three projections: key `K` (expansion to `D_FF`),
+// value `V` (contraction back to `D_MODEL`), receptance `R`
+// (`D_MODEL × D_MODEL`).
+pub(crate) const PACKED_CM_K_BYTES: usize = packed_bytes(D_FF, D_MODEL);
+pub(crate) const SCALE_CM_K_F32S: usize = D_FF;
+pub(crate) const PACKED_CM_V_BYTES: usize = packed_bytes(D_MODEL, D_FF);
+pub(crate) const SCALE_CM_V_F32S: usize = D_MODEL;
+pub(crate) const PACKED_CM_R_BYTES: usize = packed_bytes(D_MODEL, D_MODEL);
+pub(crate) const SCALE_CM_R_F32S: usize = D_MODEL;
 
 /// Total on-disk bytes for the embedded packed weights blob.
 ///
-/// Layout: `tok_emb` (f32) + per layer: `attn_norm` (f32), Q/K/V/O (each packed + f32 scale),
-/// `mlp_norm` (f32), w1/w2/w3 (each packed + f32 scale).
+/// Layout per layer:
+///   `tm_norm` (f32), `tm_mix_r` (f32), `tm_mix_k` (f32), `tm_mix_v` (f32),
+///   `time_decay` (f32), `time_first` (f32), `tm_R` + scale, `tm_K` + scale,
+///   `tm_V` + scale, `tm_O` + scale,
+///   `cm_norm` (f32), `cm_mix_k` (f32), `cm_mix_r` (f32),
+///   `cm_K` + scale, `cm_V` + scale, `cm_R` + scale.
+///
+/// Plus global: `tok_emb` (f32), initial `ln0` (f32), final `ln_f` (f32).
 pub(crate) const PACKED_WEIGHTS_LEN: usize = {
     let tok_emb = VOCAB * D_MODEL * 4;
-    let attn_norm = D_MODEL * 4;
-    let mlp_norm = D_MODEL * 4;
-    let qkvo_one = PACKED_QKVO_BYTES + SCALE_QKVO_F32S * 4;
-    let w1 = PACKED_W1_BYTES + SCALE_W1_F32S * 4;
-    let w2 = PACKED_W2_BYTES + SCALE_W2_F32S * 4;
-    let w3 = PACKED_W3_BYTES + SCALE_W3_F32S * 4;
-    let per_layer = attn_norm + 4 * qkvo_one + mlp_norm + w1 + w2 + w3;
-    tok_emb + N_LAYERS * per_layer
+    let ln0 = D_MODEL * 4;
+    let ln_f = D_MODEL * 4;
+
+    let tm_norm = D_MODEL * 4;
+    let tm_mix = 3 * D_MODEL * 4; // time_mix_r, time_mix_k, time_mix_v
+    let wkv_params = 2 * D_MODEL * 4; // time_decay, time_first
+    let tm_proj = 4 * (PACKED_TM_BYTES + SCALE_TM_F32S * 4);
+
+    let cm_norm = D_MODEL * 4;
+    let cm_mix = 2 * D_MODEL * 4; // channel_mix_k, channel_mix_r
+    let cm_k = PACKED_CM_K_BYTES + SCALE_CM_K_F32S * 4;
+    let cm_v = PACKED_CM_V_BYTES + SCALE_CM_V_F32S * 4;
+    let cm_r = PACKED_CM_R_BYTES + SCALE_CM_R_F32S * 4;
+
+    let per_layer = tm_norm + tm_mix + wkv_params + tm_proj + cm_norm + cm_mix + cm_k + cm_v + cm_r;
+    tok_emb + ln0 + ln_f + N_LAYERS * per_layer
 };

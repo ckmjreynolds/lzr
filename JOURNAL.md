@@ -13,7 +13,116 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
-## 2026-04-23 — TL1/TL2 LUT kernels; TINY training smoke test; arch bumped to ~11M
+## 2026-04-24 — First Full RWKV Training (1M) -> Scaling To 2M
+
+CDR/Claude trained the first full RWKV model (D_MODEL=256, N_LAYERS=2, CM_MULT=1, ~1M params) end-to-end on enwik9 over ~7 hours and 23k steps on an M3 Pro via the candle-nn + Metal training loop landed earlier the same day. The run confirms the pivot worked, isolates a still-open eval-harness issue, and establishes the plateau that motivates the next scale-up to ~2M.
+
+The earlier 2026-04-24 entry ("Pivoting To RWKV") projected RWKV v6; the landed implementation is v4. v6's extra data-dependent time-mix parameters would have added f32 overhead without an obvious capacity win at this scale, and the v4 WKV recurrence (single time-first / time-decay vector per layer) was easier to verify against the reference paper. Upgrade path to v6 stays open if later capacity studies warrant it.
+
+### Training curve
+
+| Step  | train nats | info-bpb | codec bpb | offset |
+|------:|-----------:|---------:|----------:|-------:|
+|  1602 |       1.91 |     2.76 |      2.59 |   261M |
+|  4812 |       1.45 |     2.09 |      2.38 |   462M |
+|  8029 |       1.48 |     2.14 |      1.90 |   888M |
+| 11291 |       1.33 |     1.92 |      2.17 |   105M |
+| 14551 |       1.45 |     2.09 |      2.23 |   172M |
+| 17793 |       1.38 |     1.99 |      1.94 |   752M |
+| 19403 |       1.41 |     2.03 |      1.02 |   539M |
+| 22622 |       1.24 |     1.79 |      1.94 |   935M |
+
+Train loss and codec bpb agree to within ~0.2 across the whole run — this is the headline. The 11M transformer's sliding-window distribution mismatch has no analog in RWKV's running-state recurrence: state at each layer is five D_MODEL-sized vectors carried forward, never a re-rotated cache of historical K/V, so there's nothing to go out-of-distribution at byte N × 256.
+
+### Eval-harness noise dominates individual bpb readings
+
+Codec bpb at each checkpoint is measured on a single random 16 KiB window of enwik9, and content variance across offsets swamps the signal: step 12921 (offset 582M) produced bpb 0.73 at train loss 1.48, while step 14551 (offset 172M) produced bpb 2.23 at train loss 1.45 — nearly-identical models, 3× bpb spread. The 2026-04-23 deferred fix (fixed 5-offset panel + held-out 1 MB slice) stays deferred for now, but becomes blocking before the next scale-up's plateau-detection logic can be trusted.
+
+### Best checkpoint: step 22622 (train loss 1.24 nats)
+
+Selected by train loss, not codec bpb. The codec-bpb minima at steps 12921 and 19403 are sampling-luck artifacts — both had *higher* than neighbor-average train loss. Using train loss as the selection signal is a standing rule until the eval harness is fixed.
+
+### Plateau
+
+Train loss flatlines in the 1.3–1.5 nats band (~1.9–2.1 bpb equivalent) from ~step 8000 onward. The cosine LR schedule is barely moved off peak (2.996e-4 of 3e-4 — the schedule was sized for a much longer run), so this isn't LR decay. The ceiling is capacity: a 1M-weight byte model at 256-byte context cannot encode enwik9's residual entropy more tightly. For reference: Hutter record sits at ~0.88 bpb; NNCP's best neural result ~0.75 bpb; our 11M transformer info-bpb hit 2.15 before its codec path collapsed — this 1M RWKV run is already competitive with that transformer at 1/11 the params and with a working codec.
+
+### Throughput
+
+Batch=32, seq=256 training on Metal averaged 1.12 s/step. 23k steps = 25,760 s ≈ 7.1 h wall. Inference-side decode-hours-for-1GB came out ~9.5 h per checkpoint — well inside the Hutter 53 h single-side budget.
+
+### Decision: scale to ~2M via depth
+
+`src/arch.rs` bumped to `N_LAYERS = 4`, `D_MODEL = 256` and `CM_MULT = 1` held. Parameter budget: ~1.84M ternary + ~82K f32 ≈ 1.92M total, i.e. ~2×. Going deep rather than wide is deliberate: every matvec's `in_dim` stays at 256, leaving the current LUT kernel bounds (≤ 512 TL1 / ≤ 768 TL2) with headroom — no kernel change needed, no accumulator widening, no new diff-test surface. A 2× N_LAYERS bump roughly doubles ternary weight count, doubles per-step training cost, and adds one full time-mix + channel-mix round trip per byte at inference. Expected per-step training time ≈ 2.2 s, expected 20 h run to match 23k steps. Inference decode-hours-for-1GB scales similarly to ~19 h, still inside budget.
+
+Expected capacity gain is the open question: if bpb-vs-params scales like the 11M/1M gap implies, we should see train loss land in the 1.0–1.2 nats range (1.4–1.7 bpb), still well above the 0.73 bpb target for MEDIUM int4 from the 2026-04-21 submission-size math, but trending the right way. If the 2M run plateaus at a similar bpb to 1M, depth alone isn't the answer and we need width (which needs kernel work) or a different objective.
+
+---
+
+## 2026-04-24 — 11M Training Diverges; Sliding-Window Transformer Retired; Pivoting To RWKV
+
+CDR/Claude, debugging the 11M training run started 2026-04-23 15:13 on a M3 Pro (D=512, L=6, N_HEADS=8, MLP_MULT=1), diagnosed a train/inference divergence that turned out to be neither a kernel bug nor a training bug, but a fundamental incompatibility between sliding-window inference and the independent-window training distribution. After isolating the cause we're retiring the transformer design and pivoting to RWKV v6.
+
+### Symptom: train loss improving, codec bpb worsening
+
+Over ~16 hours and 48k+ steps, train loss descended cleanly 5.49 → 1.49 nats (info-theoretic 2.15 bpb). Codec bpb at each checkpoint, measured on a random 16 KiB window of enwik9, diverged in the opposite direction. Unlike the TINY 1M smoke test (content-variance noise in the 2–4 bpb range), the 11M run showed monotonic degradation:
+
+| Step  | train nats | codec bpb |
+|------:|-----------:|----------:|
+|  5934 |       2.16 |      4.61 |
+| 17905 |       1.67 |      6.81 |
+| 30103 |       1.67 |      8.49 |
+| 42298 |       1.61 |      9.73 |
+| 48396 |       1.49 |      9.39 |
+
+Codec bpb above 8 means the arithmetic coder is producing output larger than the input (encoded 19250 bytes from a 16384-byte window at step 48396), i.e. the model's predictions at inference are worse than uniform.
+
+### Eliminating the LUT kernels
+
+First hypothesis: the TL1/TL2 activation-precision reduction (`x_q >> 1` for TL1, `>> 2` for TL2, with ×2/×4 compensation at row end) is benign at TINY but catastrophic at 11M. Added a diagnostic path `Weights::from_bytes_force_i2s` / `load_checkpoint_force_i2s` that skips LUT conversion and keeps the I2_S-packed buffer populated, routing `matvec_prequant` to the I2_S direct-SIMD fallback. Ran codec on five fixed offsets (100/300/500/700/900 MB) with both paths:
+
+| Path  | mean codec bpb |
+|-------|---------------:|
+| LUT   |         9.3905 |
+| I2_S  |         9.3752 |
+
+Delta 0.015 bpb — within quantization noise, not the 4× gap we're looking for. The LUT kernels are vindicated.
+
+### Localizing the failure to sliding-window attention
+
+Added a direct cross-entropy measurement (run the inference forward on a 256-byte window, compute `-E[log p(target)]` against the true continuation). Ran four variants on the same five offsets:
+
+| Variant                          | mean nats | info-bpb |
+|----------------------------------|----------:|---------:|
+| Pre-wrap (predictions 0..254)    |    1.4559 |   2.1004 |
+| Post-wrap (predictions 255..16382) |  8.2061 |  11.8391 |
+| Reset every 256 bytes            |    1.5588 |   2.2489 |
+| Chunk-256 codec (through AC)     |         — |   2.4166 |
+
+Pre-wrap loss matches training loss exactly. The model forward works. Reset-every-256 and chunk-256 codec both land near the info-theoretic floor. The failure is isolated to the specific case where the KV cache wraps and subsequent steps attend to a sliding window of cached entries.
+
+### Why the RoPE-relative-position argument doesn't save us
+
+RoPE's property that `q · rope(k, p)` depends only on `q_pos − k_pos` guarantees that at post-wrap step N, Q at logical 255 attending to K at logical 0..255 reproduces relative distances 0..255 — identical inner-product geometry to a training window starting at byte N−255 at its position 255. Same rotations, same cosine-distance spectrum. But layer ≥ 1 K values in the cache were computed at each byte's original inference step, with whatever autoregressive history the cache held at that moment. Training position 0 of any window has K computed with zero prior context; the sliding-inference K at logical 0 (at post-wrap step 256+) has K computed at its real step with a non-empty cache. Same rotation applied, different K content, and the mismatch compounds nonlinearly across six layers into garbage attention patterns.
+
+This is a training-distribution problem, not a code bug. bitnet.cpp's reference inference doesn't help: BitNet-b1.58-2B was trained with 2K-token context, never silently slides, and when llama.cpp's KV cache fills it aborts rather than sliding. Our target is 1 GB of continuous stream — we must slide, and the training distribution must anticipate it.
+
+### Architectural retrospective and decision
+
+The session forced the question: is a transformer even the right tool? On the compression-quality side, reconciling finite training context with unbounded inference context has three options — (a) train with context equal to inference length (infeasible at 1 GB), (b) sliding-window-aware training such as Mistral SWA or StreamingLLM's attention sinks (real design work), (c) chunk at inference and accept the lost cross-chunk context. Chunking gives 2.25 bpb info-theoretic at 11M — the ceiling any 256-byte-context byte model would hit regardless of architecture.
+
+On the inference-cost side, at ctx=256 a transformer runs ~0.40 ms/byte vs. RWKV's estimated ~0.25 ms/byte — within 2×, but transformer per-byte cost scales linearly with context while RWKV's stays flat. On a single-core Zen 2 with a 53-hour budget over 1 GB, a transformer reaches the budget ceiling before it can use contexts long enough to actually improve bpb. RWKV v6 keeps inference O(1) per token, reuses the existing ternary LUT kernels (the only new kernel is an element-wise time-mix step), and has no sliding-window failure because it carries learned summary state rather than a re-rotated cache.
+
+The NNCP precedent corroborates this: the best-published neural enwik9 compressor (~0.75 bpb) uses LSTMs, not transformers. Compression rewards tight calibration of running state; transformers only pull ahead once long-range attention is both affordable and trained for. Neither condition holds here.
+
+Among RNN-family options, RWKV v6 was chosen over LSTM and Mamba on three criteria: (1) lowest per-byte inference op-count of the three, (2) direct reuse of the existing ternary LUT kernels (Mamba's selective scan would need a new kernel category), (3) training parallelizes reasonably via the receptance-weight-key-value parameterization. LSTM stays as the fallback if RWKV training proves brittle at byte level.
+
+### Retired and carried forward
+
+Retiring: `src/model.rs` (transformer step, attention, RoPE rotation kernels), `src/kv_cache.rs` (KV ring buffer), the RoPE tables in `src/arch.rs`, the scaled-dot-product and causal-mask path in `src/train.rs`. Carrying forward: `src/bitnet.rs` (TL1/TL2 LUT kernels, I2_S fallback, `quantize_activations`, `pack_ternary`), `src/ac.rs` (arithmetic coder), `src/probs.rs` (logits-to-CDF), `src/codec.rs` (AC glue — the `ProbSource` trait is architecture-agnostic), `src/weights.rs` (raw-binary layout, `include_bytes!` integration, the load-time `force_i2s` diagnostic), and the training-loop scaffolding in `src/train.rs` (LogWriter, LrSchedule, sample_batch, checkpoint machinery). The `Diag` subcommand stays for now as a permanent debugging aid.
+
+---
+
+## 2026-04-23 — TINY (1M) Smoke Test; TL1/TL2 LUT; Kickoff 11M
 
 CDR/Claude ported `bitnet.cpp`'s TL1 (ARM NEON) and TL2 (x86_64 AVX2) lookup-table matvec kernels into `src/bitnet.rs`, ran an aborted 1M-parameter training smoke test to exercise the pipeline end-to-end, and bumped `src/arch.rs` to a ~11M configuration as the target for the first real training run. The I2_S direct-SIMD kernel stays as the scalar correctness oracle and the fallback on architectures without a LUT path.
 

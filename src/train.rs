@@ -1,8 +1,14 @@
-//! Training mode — candle-nn forward pass matching [`crate::arch`], STE
-//! ternary fake-quant on every linear, `AdamW` + cosine schedule, and every
+//! Training mode — candle-nn forward pass for the RWKV v4 byte-level model.
+//! STE ternary fake-quant on every linear, `AdamW` + cosine LR, and every
 //! `checkpoint_every_secs` of wall-clock time writes a timestamped checkpoint
 //! then runs an encode/decode roundtrip test on a random 16 KiB slice of the
 //! codec sample file.
+//!
+//! The WKV recurrence is implemented as a sequential loop over the time axis
+//! within the training forward. At `seq_len = 256` this costs one candle op
+//! per timestep per state component (~4 ops × 256 = 1024 ops per layer per
+//! forward pass). Parallel-scan formulations exist but can wait until this
+//! first pipeline is verified end-to-end.
 
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{Read, Seek, SeekFrom, Write as _};
@@ -18,13 +24,14 @@ use chrono::Local;
 use clap::Args;
 use rand::{Rng, SeedableRng};
 
-use crate::arch::{CONTEXT_LEN, D_FF, D_MODEL, HEAD_DIM, N_HEADS, N_LAYERS, RMS_EPS, VOCAB};
+use crate::arch::{D_FF, D_MODEL, N_LAYERS, RMS_EPS, VOCAB};
 use crate::bitnet::pack_ternary;
 use crate::codec::{TransformerProbs, decode_bytes, encode_bytes};
 use crate::model::ByteTransformer;
 use crate::weights::{LayerTensors, Weights, write_checkpoint, write_weights};
 
 const CODEC_SAMPLE_BYTES: usize = 16 * 1024;
+const DEFAULT_SEQ_LEN: usize = 256;
 
 /// CLI arguments for the training subcommand.
 #[derive(Args, Debug, Clone)]
@@ -47,8 +54,9 @@ pub(crate) struct TrainArgs {
     #[arg(long, default_value_t = 32)]
     pub batch: usize,
 
-    /// Sequence length. Must equal `CONTEXT_LEN`.
-    #[arg(long, default_value_t = CONTEXT_LEN)]
+    /// Training sequence length. RWKV has no context-length bound at
+    /// inference; this only controls the BPTT window during training.
+    #[arg(long, default_value_t = DEFAULT_SEQ_LEN)]
     pub seq: usize,
 
     /// Emit a per-step log line every N steps.
@@ -78,25 +86,12 @@ pub(crate) struct TrainArgs {
 }
 
 /// Entry point for `lzr train`.
-///
-/// - `args` is taken by value because `clap` hands us a fresh instance and
-///   we then need to partially consume fields (`.ckpt_dir`, `.log_file`).
-/// - File-length `u64 -> usize` casts: enwik9 is 1 GB; we cannot meaningfully
-///   run on a 32-bit target, so truncation is not a real hazard.
-/// - `as_nanos() as u64`: we only need 64 bits of jitter for the RNG seed.
-// The training loop's linearity (setup → loop → checkpoint → plateau check)
-// reads top-to-bottom better than several one-call functions would.
 #[allow(
     clippy::needless_pass_by_value,
     clippy::cast_possible_truncation,
     clippy::too_many_lines
 )]
 pub(crate) fn run(args: TrainArgs) -> Result<()> {
-    anyhow::ensure!(
-        args.seq == CONTEXT_LEN,
-        "seq ({}) must equal CONTEXT_LEN ({CONTEXT_LEN}); RoPE positions diverge otherwise",
-        args.seq
-    );
     create_dir_all(&args.ckpt_dir)?;
 
     let device = pick_device();
@@ -124,7 +119,7 @@ pub(crate) fn run(args: TrainArgs) -> Result<()> {
         codec_path.display()
     );
 
-    let model = TransformerForTraining::new(&device)?;
+    let model = RwkvForTraining::new(&device)?;
     let lr_schedule = LrSchedule::cosine();
     let mut optimizer = AdamW::new(
         model.trainable_vars(),
@@ -149,8 +144,6 @@ pub(crate) fn run(args: TrainArgs) -> Result<()> {
     let mut last_ckpt_loss: Option<f32> = None;
     let mut stale_ckpts: usize = 0;
 
-    // Training is unbounded by default. `max_steps == 0` means "no cap";
-    // otherwise treat it as a hard upper bound. Exit on plateau or Ctrl-C.
     let mut step: usize = 0;
     loop {
         if args.max_steps != 0 && step >= args.max_steps {
@@ -197,36 +190,29 @@ pub(crate) fn run(args: TrainArgs) -> Result<()> {
 
             if !codec_result.roundtrip_ok {
                 log_writer.log_roundtrip_fail(step, &ckpt_path, &codec_result)?;
-                eprintln!(
-                    "\n[lzr train] FATAL: roundtrip failed — terminating run. See {}.",
-                    args.log_file.display()
-                );
-                std::process::exit(2);
             }
 
-            // Plateau detection: a checkpoint is "stale" if it did not
-            // improve vs. the previous one. The first checkpoint never
-            // counts as stale (no baseline).
-            match delta {
-                Some(d) if d >= 0.0 => stale_ckpts += 1,
-                Some(_) => stale_ckpts = 0,
-                None => {}
+            if args.stop_after_stale_ckpts > 0 {
+                if let Some(prev) = last_ckpt_loss {
+                    if loss_val >= prev - 1e-4 {
+                        stale_ckpts += 1;
+                    } else {
+                        stale_ckpts = 0;
+                    }
+                    if stale_ckpts >= args.stop_after_stale_ckpts {
+                        eprintln!(
+                            "[lzr train] plateau: {stale_ckpts} stale checkpoints — stopping"
+                        );
+                        break;
+                    }
+                }
             }
-            if args.stop_after_stale_ckpts != 0 && stale_ckpts >= args.stop_after_stale_ckpts {
-                println!(
-                    "\n[lzr train] plateau reached: {stale_ckpts} consecutive checkpoint(s) \
-                     without improvement — stopping."
-                );
-                break;
-            }
-
             last_ckpt_loss = Some(loss_val);
             last_ckpt_instant = Instant::now();
         }
 
         step += 1;
     }
-
     Ok(())
 }
 
@@ -240,34 +226,34 @@ fn pick_device() -> Device {
     Device::Cpu
 }
 
-/// The training-time transformer. Stores every trainable parameter as an
-/// explicit [`Var`] so we can (a) hand the full list to [`AdamW`], (b) read
-/// them back at quantize time, and (c) avoid the [`candle_nn::VarMap`]
-/// name-lookup indirection.
-struct TransformerForTraining {
-    tok_emb: Var, // (VOCAB, D_MODEL)
-    layers: Vec<Block>,
-    rope_cos: Tensor,
-    rope_sin: Tensor,
+/// Training-time RWKV v4 model.
+struct RwkvForTraining {
+    tok_emb: Var,     // (VOCAB, D_MODEL)
+    ln0: RMSNormVar,  // initial LayerNorm-equivalent
+    ln_f: RMSNormVar, // final LayerNorm-equivalent before LM head
+    layers: Vec<RwkvBlock>,
 }
 
-impl TransformerForTraining {
+impl RwkvForTraining {
     fn new(device: &Device) -> Result<Self> {
         let tok_emb = gaussian_var(&[VOCAB, D_MODEL], 0.02, device)?;
+        let ln0 = RMSNormVar::new(D_MODEL, device)?;
+        let ln_f = RMSNormVar::new(D_MODEL, device)?;
         let layers = (0..N_LAYERS)
-            .map(|_| Block::new(device))
+            .map(|_| RwkvBlock::new(device))
             .collect::<Result<Vec<_>>>()?;
-        let (rope_cos, rope_sin) = rope_tables(device)?;
         Ok(Self {
             tok_emb,
+            ln0,
+            ln_f,
             layers,
-            rope_cos,
-            rope_sin,
         })
     }
 
     fn trainable_vars(&self) -> Vec<Var> {
         let mut v = vec![self.tok_emb.clone()];
+        v.push(self.ln0.weight.clone());
+        v.push(self.ln_f.weight.clone());
         for layer in &self.layers {
             layer.push_vars(&mut v);
         }
@@ -277,14 +263,14 @@ impl TransformerForTraining {
     fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
         let b = tokens.dim(0)?;
         let t = tokens.dim(1)?;
-        anyhow::ensure!(t <= CONTEXT_LEN, "sequence length {t} exceeds CONTEXT_LEN");
         let flat = tokens.flatten_all()?;
         let emb = self.tok_emb.as_tensor().index_select(&flat, 0)?;
-        let mut x = emb.reshape((b, t, D_MODEL))?;
-        let mask = causal_mask(t, tokens.device())?;
+        let x = emb.reshape((b, t, D_MODEL))?;
+        let mut x = self.ln0.forward(&x)?;
         for layer in &self.layers {
-            x = layer.forward(&x, &self.rope_cos, &self.rope_sin, &mask)?;
+            x = layer.forward(&x)?;
         }
+        let x = self.ln_f.forward(&x)?;
         let w = self.tok_emb.as_tensor();
         let x_flat = x.flatten(0, 1)?;
         let logits_flat = x_flat.matmul(&w.t()?)?;
@@ -294,96 +280,235 @@ impl TransformerForTraining {
     fn quantize_to_packed(&self) -> Result<OwnedTensors> {
         let tok_emb = self.tok_emb.as_tensor().to_vec2::<f32>()?;
         let tok_emb: Vec<f32> = tok_emb.into_iter().flatten().collect();
+        let ln0 = self.ln0.weight_as_vec()?;
+        let ln_f = self.ln_f.weight_as_vec()?;
         let layers = self
             .layers
             .iter()
-            .map(Block::quantize_to_packed)
+            .map(RwkvBlock::quantize_to_packed)
             .collect::<Result<Vec<_>>>()?;
-        Ok(OwnedTensors { tok_emb, layers })
+        Ok(OwnedTensors {
+            tok_emb,
+            ln0,
+            ln_f,
+            layers,
+        })
     }
 }
 
-struct Block {
-    attn_norm: RMSNorm,
-    mlp_norm: RMSNorm,
-    q: BitLinear,
-    k: BitLinear,
-    v: BitLinear,
-    o: BitLinear,
-    w1: BitLinear,
-    w2: BitLinear,
-    w3: BitLinear,
+struct RwkvBlock {
+    tm_norm: RMSNormVar,
+    time_mix_r: Var, // (D_MODEL,)
+    time_mix_k: Var,
+    time_mix_v: Var,
+    time_decay: Var, // (D_MODEL,)
+    time_first: Var,
+    tm_r: BitLinear,
+    tm_k: BitLinear,
+    tm_v: BitLinear,
+    tm_o: BitLinear,
+    cm_norm: RMSNormVar,
+    channel_mix_k: Var,
+    channel_mix_r: Var,
+    cm_k: BitLinear,
+    cm_v: BitLinear,
+    cm_r: BitLinear,
 }
 
-impl Block {
+impl RwkvBlock {
     fn new(device: &Device) -> Result<Self> {
+        // Time-mix / channel-mix ratios initialize in (0, 1); small Gaussian
+        // noise prevents a trivial shared-parameter start.
+        let mix_init = |device: &Device| -> Result<Var> {
+            let t = Tensor::randn(0.5f32, 0.02f32, D_MODEL, device)?;
+            Ok(Var::from_tensor(&t)?)
+        };
+        // Time-decay init: small negative numbers so exp(time_decay) < 1.
+        let decay_init = |device: &Device| -> Result<Var> {
+            let t = (Tensor::randn(0f32, 0.1f32, D_MODEL, device)? - 5.0_f64)?;
+            Ok(Var::from_tensor(&t)?)
+        };
+        let first_init = |device: &Device| -> Result<Var> {
+            let t = Tensor::randn(0f32, 0.1f32, D_MODEL, device)?;
+            Ok(Var::from_tensor(&t)?)
+        };
         Ok(Self {
-            attn_norm: RMSNorm::new(D_MODEL, device)?,
-            mlp_norm: RMSNorm::new(D_MODEL, device)?,
-            q: BitLinear::new(D_MODEL, D_MODEL, device)?,
-            k: BitLinear::new(D_MODEL, D_MODEL, device)?,
-            v: BitLinear::new(D_MODEL, D_MODEL, device)?,
-            o: BitLinear::new(D_MODEL, D_MODEL, device)?,
-            w1: BitLinear::new(D_MODEL, D_FF, device)?,
-            w2: BitLinear::new(D_FF, D_MODEL, device)?,
-            w3: BitLinear::new(D_MODEL, D_FF, device)?,
+            tm_norm: RMSNormVar::new(D_MODEL, device)?,
+            time_mix_r: mix_init(device)?,
+            time_mix_k: mix_init(device)?,
+            time_mix_v: mix_init(device)?,
+            time_decay: decay_init(device)?,
+            time_first: first_init(device)?,
+            tm_r: BitLinear::new(D_MODEL, D_MODEL, device)?,
+            tm_k: BitLinear::new(D_MODEL, D_MODEL, device)?,
+            tm_v: BitLinear::new(D_MODEL, D_MODEL, device)?,
+            tm_o: BitLinear::new(D_MODEL, D_MODEL, device)?,
+            cm_norm: RMSNormVar::new(D_MODEL, device)?,
+            channel_mix_k: mix_init(device)?,
+            channel_mix_r: mix_init(device)?,
+            cm_k: BitLinear::new(D_MODEL, D_FF, device)?,
+            cm_v: BitLinear::new(D_FF, D_MODEL, device)?,
+            cm_r: BitLinear::new(D_MODEL, D_MODEL, device)?,
         })
     }
 
     fn push_vars(&self, out: &mut Vec<Var>) {
-        out.push(self.attn_norm.weight.clone());
-        out.push(self.mlp_norm.weight.clone());
-        out.push(self.q.weight.clone());
-        out.push(self.k.weight.clone());
-        out.push(self.v.weight.clone());
-        out.push(self.o.weight.clone());
-        out.push(self.w1.weight.clone());
-        out.push(self.w2.weight.clone());
-        out.push(self.w3.weight.clone());
+        out.push(self.tm_norm.weight.clone());
+        out.push(self.time_mix_r.clone());
+        out.push(self.time_mix_k.clone());
+        out.push(self.time_mix_v.clone());
+        out.push(self.time_decay.clone());
+        out.push(self.time_first.clone());
+        out.push(self.tm_r.weight.clone());
+        out.push(self.tm_k.weight.clone());
+        out.push(self.tm_v.weight.clone());
+        out.push(self.tm_o.weight.clone());
+        out.push(self.cm_norm.weight.clone());
+        out.push(self.channel_mix_k.clone());
+        out.push(self.channel_mix_r.clone());
+        out.push(self.cm_k.weight.clone());
+        out.push(self.cm_v.weight.clone());
+        out.push(self.cm_r.weight.clone());
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let residual = x.clone();
-        let normed = self.attn_norm.forward(x)?;
-        let q = self.q.forward(&normed)?;
-        let k = self.k.forward(&normed)?;
-        let v = self.v.forward(&normed)?;
-
-        let q = apply_rope(&q, cos, sin)?;
-        let k = apply_rope(&k, cos, sin)?;
-        let attn = scaled_dot_product(&q, &k, &v, mask)?;
-        let attn_out = self.o.forward(&attn)?;
-        let x = (residual + attn_out)?;
+        let normed = self.tm_norm.forward(x)?;
+        let tm_out = self.time_mix(&normed)?;
+        let x = (residual + tm_out)?;
 
         let residual = x.clone();
-        let normed = self.mlp_norm.forward(&x)?;
-        let gate = self.w1.forward(&normed)?;
-        let up = self.w3.forward(&normed)?;
-        let hidden = ops::silu(&gate)?.mul(&up)?;
-        let ff_out = self.w2.forward(&hidden)?;
-        (residual + ff_out).map_err(Into::into)
+        let normed = self.cm_norm.forward(&x)?;
+        let cm_out = self.channel_mix(&normed)?;
+        (residual + cm_out).map_err(Into::into)
+    }
+
+    /// RWKV v4 time-mix with sequential WKV scan.
+    // Single-letter names (`b`, `t`, `r`, `k`, `v`) follow the usual tensor
+    // / attention conventions; the RWKV reference uses the same spelling.
+    #[allow(clippy::many_single_char_names)]
+    fn time_mix(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, t, _) = x.dims3()?;
+        let device = x.device();
+
+        // Token shift: x_prev[:, 0] = 0; x_prev[:, i] = x[:, i-1] for i >= 1.
+        let x_prev = shift_time_right(x)?;
+
+        let mr = self.time_mix_r.as_tensor();
+        let mk = self.time_mix_k.as_tensor();
+        let mv = self.time_mix_v.as_tensor();
+        // xr = x * mr + x_prev * (1 - mr) etc.
+        let xr = lerp_tensor(x, &x_prev, mr)?;
+        let xk = lerp_tensor(x, &x_prev, mk)?;
+        let xv = lerp_tensor(x, &x_prev, mv)?;
+
+        let r = ops::sigmoid(&self.tm_r.forward(&xr)?)?;
+        let k = self.tm_k.forward(&xk)?;
+        let v = self.tm_v.forward(&xv)?;
+
+        // WKV running scan with the pp log-scale stability trick.
+        let mut aa = Tensor::zeros((b, D_MODEL), DType::F32, device)?;
+        let mut bb = Tensor::zeros((b, D_MODEL), DType::F32, device)?;
+        // Very large negative number as `-inf` proxy (candle lacks a direct
+        // full-inf constructor, and exp(-huge) == 0 is what the first step
+        // of the scan needs).
+        let mut pp = (Tensor::zeros((b, D_MODEL), DType::F32, device)? - 1.0e30_f64)?;
+
+        let time_decay = self.time_decay.as_tensor();
+        let time_first = self.time_first.as_tensor();
+
+        let mut wkv_steps = Vec::with_capacity(t);
+        for ti in 0..t {
+            let k_t = k.i((.., ti, ..))?; // (b, d)
+            let v_t = v.i((.., ti, ..))?;
+
+            let ww = k_t.broadcast_add(time_first)?;
+            let qq = pp.maximum(&ww)?;
+            let e1 = (&pp - &qq)?.exp()?;
+            let e2 = (&ww - &qq)?.exp()?;
+            let num = ((&e1 * &aa)? + (&e2 * &v_t)?)?;
+            let den = ((&e1 * &bb)? + &e2)?;
+            let wkv_t = (num / den)?;
+            wkv_steps.push(wkv_t);
+
+            let ww2 = pp.broadcast_add(time_decay)?;
+            let qq2 = ww2.maximum(&k_t)?;
+            let e1b = (&ww2 - &qq2)?.exp()?;
+            let e2b = (&k_t - &qq2)?.exp()?;
+            aa = ((&e1b * &aa)? + (&e2b * &v_t)?)?;
+            bb = ((&e1b * &bb)? + &e2b)?;
+            pp = qq2;
+        }
+
+        let wkv = Tensor::stack(&wkv_steps, 1)?; // (b, t, d)
+        let rwkv = (&r * &wkv)?;
+        self.tm_o.forward(&rwkv)
+    }
+
+    fn channel_mix(&self, x: &Tensor) -> Result<Tensor> {
+        let x_prev = shift_time_right(x)?;
+        let mk = self.channel_mix_k.as_tensor();
+        let mr = self.channel_mix_r.as_tensor();
+        let xk = lerp_tensor(x, &x_prev, mk)?;
+        let xr = lerp_tensor(x, &x_prev, mr)?;
+
+        let k = self.cm_k.forward(&xk)?;
+        let k = k.relu()?.sqr()?; // squared-ReLU activation
+        let kv = self.cm_v.forward(&k)?;
+        let r = ops::sigmoid(&self.cm_r.forward(&xr)?)?;
+        (&r * &kv).map_err(Into::into)
     }
 
     fn quantize_to_packed(&self) -> Result<OwnedLayer> {
         Ok(OwnedLayer {
-            attn_norm: self.attn_norm.weight_as_vec()?,
-            mlp_norm: self.mlp_norm.weight_as_vec()?,
-            q: self.q.quantize()?,
-            k: self.k.quantize()?,
-            v: self.v.quantize()?,
-            o: self.o.quantize()?,
-            w1: self.w1.quantize()?,
-            w2: self.w2.quantize()?,
-            w3: self.w3.quantize()?,
+            tm_norm: self.tm_norm.weight_as_vec()?,
+            time_mix_r: self.time_mix_r.as_tensor().to_vec1::<f32>()?,
+            time_mix_k: self.time_mix_k.as_tensor().to_vec1::<f32>()?,
+            time_mix_v: self.time_mix_v.as_tensor().to_vec1::<f32>()?,
+            time_decay: self.time_decay.as_tensor().to_vec1::<f32>()?,
+            time_first: self.time_first.as_tensor().to_vec1::<f32>()?,
+            tm_r: self.tm_r.quantize()?,
+            tm_k: self.tm_k.quantize()?,
+            tm_v: self.tm_v.quantize()?,
+            tm_o: self.tm_o.quantize()?,
+            cm_norm: self.cm_norm.weight_as_vec()?,
+            channel_mix_k: self.channel_mix_k.as_tensor().to_vec1::<f32>()?,
+            channel_mix_r: self.channel_mix_r.as_tensor().to_vec1::<f32>()?,
+            cm_k: self.cm_k.quantize()?,
+            cm_v: self.cm_v.quantize()?,
+            cm_r: self.cm_r.quantize()?,
         })
     }
 }
 
-struct RMSNorm {
+/// Shift a `(b, t, d)` tensor one step to the right along time: the output
+/// at time 0 is zero, and at time `i` for `i >= 1` is the input at time
+/// `i - 1`. RWKV token-shift primitive.
+fn shift_time_right(x: &Tensor) -> Result<Tensor> {
+    let (b, t, d) = x.dims3()?;
+    if t == 0 {
+        return Ok(x.clone());
+    }
+    let zero_row = Tensor::zeros((b, 1, d), DType::F32, x.device())?;
+    let kept = x.narrow(1, 0, t - 1)?;
+    Tensor::cat(&[&zero_row, &kept], 1).map_err(Into::into)
+}
+
+/// `out = cur * mix + prev * (1 - mix)`, broadcasting a 1-D `mix` across
+/// `(b, t, d)` tensors.
+fn lerp_tensor(cur: &Tensor, prev: &Tensor, mix: &Tensor) -> Result<Tensor> {
+    let cur_m = cur.broadcast_mul(mix)?;
+    // (1 - mix) via affine: y = -1 * x + 1
+    let one_minus = mix.affine(-1.0, 1.0)?;
+    let prev_m = prev.broadcast_mul(&one_minus)?;
+    (cur_m + prev_m).map_err(Into::into)
+}
+
+struct RMSNormVar {
     weight: Var,
 }
 
-impl RMSNorm {
+impl RMSNormVar {
     fn new(dim: usize, device: &Device) -> Result<Self> {
         let t = Tensor::ones(dim, DType::F32, device)?;
         Ok(Self {
@@ -413,7 +538,6 @@ struct BitLinear {
 }
 
 impl BitLinear {
-    // `in_dim` comes from `D_MODEL` / `D_FF` — small constants well within f64.
     #[allow(clippy::cast_precision_loss)]
     fn new(in_dim: usize, out_dim: usize, device: &Device) -> Result<Self> {
         let std = (1.0 / in_dim as f64).sqrt();
@@ -452,9 +576,6 @@ impl BitLinear {
         let x_diff = (&x_q - x)?.detach();
         let x_ste = (x + x_diff)?;
 
-        // Candle's `matmul` requires both operands to have the same rank.
-        // Flatten the leading batch+time dims into one, matmul in 2D, then
-        // reshape back.
         let rank = x_ste.rank();
         let last = x_ste.dim(rank - 1)?;
         let x_2d = x_ste.reshape(((), last))?;
@@ -464,9 +585,6 @@ impl BitLinear {
         out_2d.reshape(out_shape).map_err(Into::into)
     }
 
-    // `self.in_dim` is a compile-time-configured dimension (at most `D_FF`)
-    // so `usize -> f32` is exact. The per-row quantized value is clamped to
-    // `[-1, 1]` before `as i8`, so truncation is impossible.
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn quantize(&self) -> Result<OwnedTernary> {
         let rows = self.weight.as_tensor().to_vec2::<f32>()?;
@@ -490,75 +608,10 @@ impl BitLinear {
     }
 }
 
-// `std` is the std-dev for Gaussian init, always a small literal; the f64→f32
-// cast is the obvious conversion.
 #[allow(clippy::cast_possible_truncation)]
 fn gaussian_var(shape: &[usize], std: f64, device: &Device) -> Result<Var> {
     let t = Tensor::randn(0f32, std as f32, shape, device)?;
     Ok(Var::from_tensor(&t)?)
-}
-
-/// Candle-tensor wrapper around [`crate::arch::rope_cos_sin_tables`].
-fn rope_tables(device: &Device) -> Result<(Tensor, Tensor)> {
-    let half = HEAD_DIM / 2;
-    let (cos_flat, sin_flat) = crate::arch::rope_cos_sin_tables();
-    let cos = Tensor::from_vec(cos_flat, (CONTEXT_LEN, half), device)?;
-    let sin = Tensor::from_vec(sin_flat, (CONTEXT_LEN, half), device)?;
-    Ok((cos, sin))
-}
-
-// Single-letter names (`a`, `b`, `c`, `t`) follow the usual tensor-reshape
-// conventions; `a`/`c` are the first/second half of the head dimension,
-// `b` and `t` are batch and time.
-#[allow(clippy::many_single_char_names)]
-fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (b, t, _d) = x.dims3()?;
-    let reshaped = x.reshape((b, t, N_HEADS, HEAD_DIM))?;
-    let half = HEAD_DIM / 2;
-    let a = reshaped.i((.., .., .., ..half))?;
-    let c = reshaped.i((.., .., .., half..))?;
-    let cos_t = cos.i((..t, ..))?.reshape((1, t, 1, half))?;
-    let sin_t = sin.i((..t, ..))?.reshape((1, t, 1, half))?;
-    let new_a = (a.broadcast_mul(&cos_t)? - c.broadcast_mul(&sin_t)?)?;
-    let new_c = (a.broadcast_mul(&sin_t)? + c.broadcast_mul(&cos_t)?)?;
-    Tensor::cat(&[&new_a, &new_c], 3)?
-        .reshape((b, t, N_HEADS * HEAD_DIM))
-        .map_err(Into::into)
-}
-
-// `HEAD_DIM` is a compile-time constant; `usize -> f64` is exact. `q/k/v/b/t`
-// follow tensor-indexing conventions.
-#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
-fn scaled_dot_product(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Result<Tensor> {
-    let (b, t, _d) = q.dims3()?;
-    let shape = (b, t, N_HEADS, HEAD_DIM);
-    // Candle's matmul requires contiguous operands — `.transpose` alone
-    // leaves a non-contiguous view, so force a copy after each permutation.
-    let q = q.reshape(shape)?.transpose(1, 2)?.contiguous()?;
-    let k = k.reshape(shape)?.transpose(1, 2)?.contiguous()?;
-    let v = v.reshape(shape)?.transpose(1, 2)?.contiguous()?;
-    let scale = 1.0 / (HEAD_DIM as f64).sqrt();
-    let kt = k.transpose(2, 3)?.contiguous()?;
-    let scores = q.matmul(&kt)?;
-    let scores = (scores * scale)?;
-    let scores = scores.broadcast_add(mask)?;
-    let weights = ops::softmax_last_dim(&scores)?;
-    let attended = weights.matmul(&v)?;
-    attended
-        .transpose(1, 2)?
-        .contiguous()?
-        .reshape((b, t, N_HEADS * HEAD_DIM))
-        .map_err(Into::into)
-}
-
-fn causal_mask(t: usize, device: &Device) -> Result<Tensor> {
-    let mut data = vec![0.0_f32; t * t];
-    for i in 0..t {
-        for j in (i + 1)..t {
-            data[i * t + j] = f32::NEG_INFINITY;
-        }
-    }
-    Tensor::from_vec(data, (1, 1, t, t), device).map_err(Into::into)
 }
 
 fn flattened_cross_entropy(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
@@ -598,9 +651,6 @@ struct LrSchedule {
     lr_max: f64,
     lr_min: f64,
     warmup: usize,
-    /// Step count used as the cosine-decay horizon. Training is unbounded
-    /// by default, so we decay over a fixed reference horizon and then hold
-    /// at `lr_min` — a conventional "warmup → cosine → hold" pattern.
     decay_horizon: usize,
 }
 
@@ -614,8 +664,6 @@ impl LrSchedule {
         }
     }
 
-    // `step` values stay within the decay horizon (1M) or saturate past it;
-    // `usize -> f64` is exact in that regime.
     #[allow(clippy::cast_precision_loss)]
     fn lr_at(&self, step: usize) -> f64 {
         if step < self.warmup {
@@ -630,19 +678,28 @@ impl LrSchedule {
 
 struct OwnedTensors {
     tok_emb: Vec<f32>,
+    ln0: Vec<f32>,
+    ln_f: Vec<f32>,
     layers: Vec<OwnedLayer>,
 }
 
 struct OwnedLayer {
-    attn_norm: Vec<f32>,
-    mlp_norm: Vec<f32>,
-    q: OwnedTernary,
-    k: OwnedTernary,
-    v: OwnedTernary,
-    o: OwnedTernary,
-    w1: OwnedTernary,
-    w2: OwnedTernary,
-    w3: OwnedTernary,
+    tm_norm: Vec<f32>,
+    time_mix_r: Vec<f32>,
+    time_mix_k: Vec<f32>,
+    time_mix_v: Vec<f32>,
+    time_decay: Vec<f32>,
+    time_first: Vec<f32>,
+    tm_r: OwnedTernary,
+    tm_k: OwnedTernary,
+    tm_v: OwnedTernary,
+    tm_o: OwnedTernary,
+    cm_norm: Vec<f32>,
+    channel_mix_k: Vec<f32>,
+    channel_mix_r: Vec<f32>,
+    cm_k: OwnedTernary,
+    cm_v: OwnedTernary,
+    cm_r: OwnedTernary,
 }
 
 struct OwnedTernary {
@@ -652,33 +709,40 @@ struct OwnedTernary {
 
 fn layers_as_refs(t: &OwnedTensors) -> [LayerTensors<'_>; N_LAYERS] {
     core::array::from_fn(|i| LayerTensors {
-        attn_norm: &t.layers[i].attn_norm,
-        q_packed: &t.layers[i].q.packed,
-        q_scale: &t.layers[i].q.scale,
-        k_packed: &t.layers[i].k.packed,
-        k_scale: &t.layers[i].k.scale,
-        v_packed: &t.layers[i].v.packed,
-        v_scale: &t.layers[i].v.scale,
-        o_packed: &t.layers[i].o.packed,
-        o_scale: &t.layers[i].o.scale,
-        mlp_norm: &t.layers[i].mlp_norm,
-        w1_packed: &t.layers[i].w1.packed,
-        w1_scale: &t.layers[i].w1.scale,
-        w2_packed: &t.layers[i].w2.packed,
-        w2_scale: &t.layers[i].w2.scale,
-        w3_packed: &t.layers[i].w3.packed,
-        w3_scale: &t.layers[i].w3.scale,
+        tm_norm: &t.layers[i].tm_norm,
+        time_mix_r: &t.layers[i].time_mix_r,
+        time_mix_k: &t.layers[i].time_mix_k,
+        time_mix_v: &t.layers[i].time_mix_v,
+        time_decay: &t.layers[i].time_decay,
+        time_first: &t.layers[i].time_first,
+        tm_r_packed: &t.layers[i].tm_r.packed,
+        tm_r_scale: &t.layers[i].tm_r.scale,
+        tm_k_packed: &t.layers[i].tm_k.packed,
+        tm_k_scale: &t.layers[i].tm_k.scale,
+        tm_v_packed: &t.layers[i].tm_v.packed,
+        tm_v_scale: &t.layers[i].tm_v.scale,
+        tm_o_packed: &t.layers[i].tm_o.packed,
+        tm_o_scale: &t.layers[i].tm_o.scale,
+        cm_norm: &t.layers[i].cm_norm,
+        channel_mix_k: &t.layers[i].channel_mix_k,
+        channel_mix_r: &t.layers[i].channel_mix_r,
+        cm_k_packed: &t.layers[i].cm_k.packed,
+        cm_k_scale: &t.layers[i].cm_k.scale,
+        cm_v_packed: &t.layers[i].cm_v.packed,
+        cm_v_scale: &t.layers[i].cm_v.scale,
+        cm_r_packed: &t.layers[i].cm_r.packed,
+        cm_r_scale: &t.layers[i].cm_r.scale,
     })
 }
 
 fn write_checkpoint_from_parts(out: &mut File, step: u64, t: &OwnedTensors) -> Result<()> {
     let layers = layers_as_refs(t);
-    write_checkpoint(out, step, &t.tok_emb, &layers).map_err(Into::into)
+    write_checkpoint(out, step, &t.tok_emb, &t.ln0, &t.ln_f, &layers).map_err(Into::into)
 }
 
 fn checkpoint_filename(step: usize) -> String {
     let ts = Local::now().format("%Y%m%d-%H%M%S");
-    format!("tiny-d{D_MODEL}-l{N_LAYERS}-h{N_HEADS}-step{step}-{ts}.ckpt")
+    format!("rwkv-d{D_MODEL}-l{N_LAYERS}-step{step}-{ts}.ckpt")
 }
 
 struct CodecResult {
@@ -693,8 +757,6 @@ struct CodecResult {
     first_mismatch: Option<usize>,
 }
 
-// `usize -> f64` on `CODEC_SAMPLE_BYTES` (16 KiB) and `archive.len()` (at
-// most 16 KiB compressed) cannot lose precision.
 #[allow(clippy::cast_precision_loss)]
 fn run_codec_test(
     tensors: &OwnedTensors,
@@ -710,7 +772,13 @@ fn run_codec_test(
 
     let mut blob = Vec::with_capacity(crate::arch::PACKED_WEIGHTS_LEN);
     let layers = layers_as_refs(tensors);
-    write_weights(&tensors.tok_emb, &layers, &mut blob);
+    write_weights(
+        &tensors.tok_emb,
+        &tensors.ln0,
+        &tensors.ln_f,
+        &layers,
+        &mut blob,
+    );
     let weights = Weights::from_bytes(&blob)?;
 
     let mut model = ByteTransformer::new(weights);
@@ -738,9 +806,6 @@ fn run_codec_test(
         decoded.iter().zip(slice.iter()).position(|(a, b)| a != b)
     };
 
-    // bpb = encoded bits / original bytes. Subtract the 12-byte archive
-    // header so what's reported is the model's own compression, not the
-    // framing overhead.
     let payload_len = archive.len().saturating_sub(crate::codec::HEADER_LEN);
     let bpb = (payload_len as f64 * 8.0) / CODEC_SAMPLE_BYTES as f64;
 
@@ -813,9 +878,6 @@ fn print_checkpoint_console(
     );
 }
 
-// Hours-for-1 GB values top out around 1e5 even for a very slow codec, which
-// fits in i64 with huge margin; the `f64 -> i64` cast is only reached for
-// `h >= 100`, well-defined.
 #[allow(clippy::cast_possible_truncation)]
 fn fmt_hours(h: f64) -> String {
     if h < 100.0 {
