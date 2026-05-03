@@ -13,6 +13,82 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-04-25 → 2026-05-03 — 8M RWKV Plateau; Metal Autorelease Fix; Scaling To 16M
+
+CDR/Claude attempted a sequence of scale-up runs over ~9 days on an M3 Pro, blocked initially by a candle Metal memory leak that masqueraded as "training getting OOM-killed", then landed an 8M (`D_MODEL=256, N_LAYERS=16, CM_MULT=1`) run end-to-end through plateau on 2026-05-03. The run plateaued at train loss 1.024 nats / ~1.48 info-bpb, the best checkpoint sits at step 14319, and the next scale step to 16M (N_LAYERS=32) is queued. This entry covers the leak hunt, the plumbing it forced into place, the 4M and 8M runs themselves, and the inference-budget tension at 16M.
+
+### Memory leak: ~6 MB/sec linear RSS climb on Metal
+
+Symptom appeared on the first 2M training attempt: kernel-killed several times with RSS growing past 100 GB. Repro pattern was a perfectly linear ~6 MB/sec RSS climb regardless of batch/seq settings, regardless of how often `device.synchronize()` was called between steps. Initial debugging chased two wrong leads:
+
+- **Suspected the autograd graph through WKV's 256-step recurrence.** Added truncated-BPTT (`--bptt-chunk` default 32, detaching `aa`/`bb`/`pp` at chunk boundaries inside `time_mix`). Cuts the autograd-graph chain from O(T²) to O(T·C) tensors. Real win for peak BPTT memory but did nothing for the linear leak rate.
+- **Suspected candle's Metal `private_buffers` pool having no cleanup hook.** `metal_backend/device.rs::drop_unused_buffers` only iterates `self.buffers` (CPU-shared pool), not `self.private_buffers` (GPU-private pool, which is the hot path for every kernel output). Vendored candle-core 0.10.2 into `vendor/`, patched `drop_unused_buffers` to also sweep `private_buffers`, plumbed it into `wait_until_completed`. Build went green, leak persisted unchanged. The pool patch was a real bug fix (the pool *did* grow monotonically) but wasn't the dominant leak source.
+
+Root cause turned up in candle issue [#2271](https://github.com/huggingface/candle/issues/2271), reported June 2024 with a clear repro of the same pattern (a tight `matmul` loop leaking GBs), still open as of March 2026. Maintainer LaurentMazare's second comment identifies it: the **ObjC autorelease pool is not draining**. Cocoa GUI apps drain the topmost autorelease pool every runloop tick; CLI Rust binaries have no runloop, so autoreleased Metal objects (`MTLCommandBuffer` instances, status snapshots, error objects, transient `NSData`) accumulate until process exit. His workaround is wrapping the per-iteration body in `objc2::rc::autoreleasepool(|| { ... })`. Applied to `train.rs`'s per-step body, RSS plateaus cleanly in the 1–3 GB range at 2M and 2–4 GB at 8M. Vendored candle-core was reverted; the fix is a single closure wrap on the consumer side.
+
+Lesson: search the dependency's issue tracker before writing speculative patches against vendored source. The 1M run from 2026-04-24 didn't hit this because at 1M scale the leak rate was small enough that runs completed before RSS pressure mattered; 2M was the first scale where the slope mattered.
+
+### Plumbing that landed alongside the leak hunt
+
+- **`--resume <ckpt>`** on `lzr train`. Loads weights from a checkpoint, rehydrates each ternary `BitLinear` as `unpack(packed)[i, j] · scale[i]` via `bitnet::unpack_i2s_to_rowmajor` and a new `Weights::load_checkpoint_force_i2s` helper (the regular load path drops the I2_S packed bytes after building the LUT buffer; resume needs them). Step counter resumes at `checkpoint.step + 1` so cosine LR + plateau detector see contiguous history. AdamW moments and the data-sampling RNG do not survive a resume — first dozen steps after restart show small loss bounce while the moments warm back up.
+- **Atomic checkpoint writes** via tempfile + rename. Eliminates the truncated-`.ckpt` failure mode if the trainer is killed mid-write.
+- **`--max-steps-this-run`** as a safety hatch. Counts from 0 every invocation, exits cleanly with a final checkpoint after N steps. Was the planned mitigation if the autorelease fix hadn't worked — left in as defense-in-depth.
+
+### 4M run (D_MODEL=256, N_LAYERS=8): aborted after ~1k steps
+
+A 4M scale step (~3.77M params) ran briefly on 2026-04-28 — last checkpoint at step 1058, train loss 1.839 nats. CDR pivoted to 8M without producing a clean plateau curve at 4M because at this point the autorelease fix was confirmed and the 8M run looked feasible inside a few days. 4M is therefore a missing data point in the scale series; the 1M → 2M → 4M → 8M trajectory has clean numbers only at 1M and 8M. Acceptable for now; if width-vs-depth scaling becomes an open question later, a clean 4M run is cheap to add.
+
+### 8M run (D_MODEL=256, N_LAYERS=16): 5 days, 19k steps, plateau 1.024 nats
+
+Started 2026-04-28 17:39, stopped 2026-05-03 ~09:53 after the user observed plateau. Per-step time ~5.4 s on M3 Pro Metal. Per-checkpoint codec test on 16 KiB of enwik9 still produces single-window noise too large to drive selection (best codec bpb 0.573 at step 17649, worst 3.029 at step 8989, no relationship to underlying model quality) — train loss is the only trustworthy signal until the 5-offset-panel + held-out-1-MB eval harness from 2026-04-23 lands.
+
+| step  | train nats | codec bpb |
+|------:|-----------:|----------:|
+|   323 |       1.98 |      3.96 |
+|   656 |       1.77 |      2.69 |
+|  2326 |       1.39 |      2.04 |
+|  5659 |       1.21 |      1.66 |
+|  8323 |       1.12 |      1.95 |
+| 10322 |       1.14 |      2.07 |
+| 13653 |       1.04 |      1.94 |
+| 14319 |   **1.02** |      1.94 |
+| 17649 |       1.17 |      0.57 |
+| 18981 |       1.22 |      0.71 |
+
+Best checkpoint **step 14319 at 1.024 nats / ~1.48 info-bpb**, archived under `checkpoints/keep/`. The 4,662 steps (~28 hours of training) after step 14319 produced no further improvement — train loss bounces in the 1.10–1.30 band with no descending trend. Plateau detector did not fire because per-checkpoint deltas oscillate ±0.1 around the trend, never accumulating three consecutive stale checkpoints; the plateau is real but invisible to the current monitor. Cosine LR was barely past warmup (`decay_horizon = 1M`, run reached step 19k), so the ceiling is capacity, not LR.
+
+### Diminishing returns: 8× more parameters → 17% loss reduction
+
+| scale | best train nats |
+|------:|----------------:|
+|    1M |            1.24 |
+|    8M |            1.02 |
+
+For an 8× parameter increase, train-loss improvement is 0.22 nats / ~17%. For comparison, the 1M → 11M leap (transformer, since-retired) projected ~0.7 nats from train-loss alone before the codec collapse made it moot. The 8M RWKV's leverage-per-parameter is much weaker — consistent with the reading that we're up against byte-level RWKV's representational ceiling at the current `D_MODEL=256, seq=256` regime, not the LR-decay or training-time ceiling. Width (`D_MODEL=512`) was not tried because it would commit every matvec to exactly the TL1 i16 accumulator bound with no further-width headroom and force kernel work; depth doubling stays inside the kernel envelope.
+
+### Inference budget reality check
+
+Per-checkpoint codec test reports `encode_hours_1gb` and `decode_hours_1gb` measured on M3 Pro CPU — the same code path the eventual x86 judging machine will run, modulo per-platform single-core throughput differences. Using these numbers as a relative scale signal:
+
+| layers | encode h/GB | decode h/GB | total h |
+|-------:|------------:|------------:|--------:|
+|      8 |        ~29  |        ~29  |     ~58 |
+|     16 |        ~54  |        ~54  |    ~108 |
+
+Both numbers are with the TL1-NEON LUT path active (`bitnet::matvec_ternary_lut` dispatches to `matvec_ternary_tl1_neon` on aarch64; LUT buffer is built at `Weights::from_bytes` time and the I2_S buffer is dropped to save RSS). Wall-clock scales linearly with N_LAYERS as expected — matvec is the dominant inference cost.
+
+The Hutter wall budget is `70,000 / Geekbench5` hours on the judging machine. For a Zen 2 single-core system around Geekbench5 ~1100 that's ~64 hours total (encode + decode, since the same binary handles both at 1× scoring). **8M is already over budget**: 108 hours > 64 hours by a factor of ~1.7×. 16M without further kernel speedup would project to ~216 hours — over by ~3.4×.
+
+Accepted as a known constraint for the 16M scale step. The matvec dominates so cleanly that the next round of optimization has to live in the matvec kernel itself: 2-row or 4-row output tile fusion across the TL1/TL2 inner loops to amortize the LUT load, tighter activation precision (4-bit or 5-bit rather than 7-bit), or eventually a non-LUT scheme. Outside scope of this entry.
+
+### Decision: scale to 16M (N_LAYERS=32)
+
+`src/arch.rs` bumped to `N_LAYERS = 32` from 16. Same axis-only-moves rationale as every prior step: width preferred-over-depth would be ~15% faster per step (WKV recurrence is sequential, so depth costs more per parameter than width does) but committing to `D_MODEL=512` puts every matvec exactly at the TL1 i16 accumulator bound with no further-width headroom. Holding 256 keeps the kernel-side spec book unchanged across the whole 1M → 16M trajectory.
+
+Parameter budget at `N_LAYERS=32`: ~14.68M ternary (`7·D_MODEL² = 458,752` per layer × 32) + ~197K f32 ≈ 14.88M total. Per-step training time projects to ~10.8 s on M3 Pro Metal (2× the 8M cost). 26k steps to plateau-territory ≈ 78 hours wall, plan for a 3.5-day run. The expectation going in is that train loss continues bending toward 0.9 nats give-or-take, with the open question being whether the eval harness can be fixed in time to confirm; if the 16M run plateaus near 0.95–1.0 it's a ~5–7% improvement on 8M and the diminishing-returns pattern from 1M→8M continues. If it plateaus at 8M's 1.024, depth has stopped paying off and the next scale step needs width or a different objective.
+
+---
+
 ## 2026-04-24 — First Full RWKV Training (1M) -> Scaling To 2M
 
 CDR/Claude trained the first full RWKV model (D_MODEL=256, N_LAYERS=2, CM_MULT=1, ~1M params) end-to-end on enwik9 over ~7 hours and 23k steps on an M3 Pro via the candle-nn + Metal training loop landed earlier the same day. The run confirms the pivot worked, isolates a still-open eval-harness issue, and establishes the plateau that motivates the next scale-up to ~2M.
