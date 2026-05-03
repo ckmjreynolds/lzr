@@ -502,10 +502,24 @@ impl Weights {
     /// Load weights from a checkpoint file (16-byte header + body).
     /// Returns `(weights, step)`.
     pub(crate) fn load_checkpoint<P: AsRef<Path>>(path: P) -> anyhow::Result<(Self, u64)> {
-        Self::load_checkpoint_inner(path)
+        Self::load_checkpoint_with_force(path, false)
     }
 
-    fn load_checkpoint_inner<P: AsRef<Path>>(path: P) -> anyhow::Result<(Self, u64)> {
+    /// Same as [`load_checkpoint`] but skips the LUT repack and preserves the
+    /// `I2_S` packed bytes. The training resume path needs the `I2_S` form so
+    /// it can call [`crate::bitnet::unpack_i2s_to_rowmajor`] and rehydrate
+    /// candle `Var`s from `ternary[i] * scale[row]`.
+    #[cfg(feature = "training")]
+    pub(crate) fn load_checkpoint_force_i2s<P: AsRef<Path>>(
+        path: P,
+    ) -> anyhow::Result<(Self, u64)> {
+        Self::load_checkpoint_with_force(path, true)
+    }
+
+    fn load_checkpoint_with_force<P: AsRef<Path>>(
+        path: P,
+        force_i2s: bool,
+    ) -> anyhow::Result<(Self, u64)> {
         let bytes = std::fs::read(path.as_ref())?;
         if bytes.len() != 16 + PACKED_WEIGHTS_LEN {
             anyhow::bail!(
@@ -518,7 +532,7 @@ impl Weights {
             anyhow::bail!("checkpoint magic mismatch");
         }
         let step = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let weights = Self::from_bytes_inner(&bytes[16..], false)?;
+        let weights = Self::from_bytes_inner(&bytes[16..], force_i2s)?;
         Ok((weights, step))
     }
 

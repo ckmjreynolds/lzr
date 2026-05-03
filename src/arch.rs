@@ -18,16 +18,20 @@ pub(crate) const VOCAB: usize = 256;
 /// kernel's i16-accumulator bound. Bumping beyond 512 requires widening
 /// the LUT-kernel accumulators to i32 or adding periodic flush.
 ///
-/// `D_MODEL = 256`, `N_LAYERS = 4`, `CM_MULT = 1` yields ~1.84M ternary
-/// weights + ~82K f32 parameters — the ~2M scale-up from the first 1M
-/// RWKV run (plateaued near train loss 1.24 nats / ~1.8 bpb equivalent;
-/// see `JOURNAL.md` 2026-04-24). Staying at `D_MODEL = 256` keeps every
-/// matvec inside the current LUT-kernel accumulator bound; depth is the
-/// only axis that moved.
+/// `D_MODEL = 256`, `N_LAYERS = 16`, `CM_MULT = 1` yields ~7.34M ternary
+/// weights (`7·D_MODEL² = 458752` per layer × 16 layers) plus ~131K f32
+/// parameters ≈ 7.47M total — fourth depth-only doubling on the
+/// 1M → 2M → 4M → 8M-class trajectory (see `JOURNAL.md` 2026-04-24
+/// for the original 1M baseline). Width preferred-over-depth would be
+/// ~15% faster per step (WKV recurrence is sequential, so depth costs
+/// more than width per parameter), but committing to `D_MODEL = 512`
+/// puts every matvec exactly at the TL1 i16 accumulator bound with no
+/// headroom for further width scaling. Staying at 256 keeps the
+/// kernel side of the spec book unchanged across all scale steps.
 pub(crate) const D_MODEL: usize = 256;
 
 /// Number of RWKV blocks. Each block is one time-mix + one channel-mix.
-pub(crate) const N_LAYERS: usize = 4;
+pub(crate) const N_LAYERS: usize = 16;
 
 /// Channel-mix hidden-size multiplier relative to `D_MODEL`. RWKV v4
 /// traditionally uses `4×`, but `D_FF = 4·D_MODEL = 2048` would exceed

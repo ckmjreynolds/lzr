@@ -42,10 +42,16 @@ serde_json  = { version = "=1.0.149", optional = true }
 
 # Apple-silicon training runs on Metal. Without this feature candle falls
 # back to CPU, which is orders of magnitude slower for the training forward
-# pass.
+# pass. `objc2` is non-optional but macOS-only: `train.rs` wraps the
+# per-step loop body in `objc2::rc::autoreleasepool` so Metal-allocated
+# NSObjects drain between steps, without which the process leaks ~6 MB/sec
+# on Apple Silicon (candle issue #2271). The macOS submission build pays a
+# small compile-time cost for objc2 even though it doesn't link against it
+# — keeps the manifest tractable without extra feature plumbing.
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "=0.10.2", optional = true, features = ["metal"] }
 candle-nn   = { version = "=0.10.2", optional = true, features = ["metal"] }
+objc2       = "=0.6.4"
 
 # Everywhere else (Linux / Windows): CPU-only build for now. When we have
 # CUDA hardware to test against, add a parallel block with `features = ["cuda"]`.

@@ -1212,6 +1212,7 @@ dependencies = [
  "chrono",
  "clap",
  "criterion",
+ "objc2",
  "pretty_assertions",
  "proptest",
  "rand",

@@ -25,13 +25,23 @@ use clap::Args;
 use rand::{Rng, SeedableRng};
 
 use crate::arch::{D_FF, D_MODEL, N_LAYERS, RMS_EPS, VOCAB};
-use crate::bitnet::pack_ternary;
+use crate::bitnet::{pack_ternary, unpack_i2s_to_rowmajor};
 use crate::codec::{TransformerProbs, decode_bytes, encode_bytes};
 use crate::model::ByteTransformer;
-use crate::weights::{LayerTensors, Weights, write_checkpoint, write_weights};
+use crate::weights::{
+    LayerTensors, LayerView, TernaryMatrix, Weights, write_checkpoint, write_weights,
+};
 
 const CODEC_SAMPLE_BYTES: usize = 16 * 1024;
 const DEFAULT_SEQ_LEN: usize = 256;
+
+/// Default truncated-BPTT chunk size. The WKV loop detaches `aa`/`bb`/`pp`
+/// from the autograd graph at every multiple of this many timesteps, so the
+/// in-memory BPTT graph caps at `chunk_size` deep instead of `seq_len` deep.
+/// State still propagates forward (RWKV's long-range memory is in the state,
+/// not the gradient path), so the model still sees full-`seq_len` context;
+/// only the gradient signal is bounded.
+const DEFAULT_BPTT_CHUNK: usize = 32;
 
 /// CLI arguments for the training subcommand.
 #[derive(Args, Debug, Clone)]
@@ -40,9 +50,18 @@ pub(crate) struct TrainArgs {
     pub input: PathBuf,
 
     /// Hard cap on optimizer steps (0 = unbounded; stop via Ctrl-C or the
-    /// stale-checkpoint plateau detector).
+    /// stale-checkpoint plateau detector). Counts globally — resuming
+    /// continues from the checkpoint's step toward this cap.
     #[arg(long, default_value_t = 0)]
     pub max_steps: usize,
+
+    /// Exit cleanly after this many optimizer steps within the **current
+    /// process**, after writing a final checkpoint. Counts from 0 every
+    /// invocation, so `--resume` resets it. 0 disables. Useful as a safety
+    /// hatch with a shell while-loop and `--resume` to cap per-process RSS
+    /// growth, e.g. if a future allocator regression resurfaces.
+    #[arg(long, default_value_t = 0)]
+    pub max_steps_this_run: usize,
 
     /// Stop training after this many *consecutive* checkpoints show no
     /// train-loss improvement vs. the previous one. Set to 0 to disable
@@ -58,6 +77,13 @@ pub(crate) struct TrainArgs {
     /// inference; this only controls the BPTT window during training.
     #[arg(long, default_value_t = DEFAULT_SEQ_LEN)]
     pub seq: usize,
+
+    /// Truncated-BPTT chunk size: detach WKV state from the autograd graph
+    /// every N timesteps. Caps peak training memory at O(`chunk · seq`)
+    /// tensors instead of O(`seq²`). 0 disables (full BPTT through the
+    /// whole sequence — large memory hit; not recommended at `seq ≥ 128`).
+    #[arg(long, default_value_t = DEFAULT_BPTT_CHUNK)]
+    pub bptt_chunk: usize,
 
     /// Emit a per-step log line every N steps.
     #[arg(long, default_value_t = 50)]
@@ -83,6 +109,13 @@ pub(crate) struct TrainArgs {
     /// RNG seed (derived from wall clock if omitted).
     #[arg(long)]
     pub seed: Option<u64>,
+
+    /// Resume training from a checkpoint file. Restores the candle `Var`s as
+    /// `ternary[i] · scale[row]` and continues the step counter from the
+    /// checkpoint's saved step. `AdamW` moments and the data-sampling RNG
+    /// stream are not stored in checkpoints, so those reset on resume.
+    #[arg(long)]
+    pub resume: Option<PathBuf>,
 }
 
 /// Entry point for `lzr train`.
@@ -119,7 +152,23 @@ pub(crate) fn run(args: TrainArgs) -> Result<()> {
         codec_path.display()
     );
 
-    let model = RwkvForTraining::new(&device)?;
+    let resume_step = if let Some(path) = &args.resume {
+        let (weights, step) = Weights::load_checkpoint_force_i2s(path)
+            .with_context(|| format!("loading resume checkpoint {}", path.display()))?;
+        eprintln!(
+            "[lzr train] resuming from {} @ step {step} (AdamW state, RNG, and plateau \
+             detector reset; weights initialised to ternary × per-row scale)",
+            path.display()
+        );
+        Some((weights, step))
+    } else {
+        None
+    };
+
+    let model = match &resume_step {
+        Some((weights, _)) => RwkvForTraining::from_weights(weights, &device, args.bptt_chunk)?,
+        None => RwkvForTraining::new(&device, args.bptt_chunk)?,
+    };
     let lr_schedule = LrSchedule::cosine();
     let mut optimizer = AdamW::new(
         model.trainable_vars(),
@@ -144,43 +193,82 @@ pub(crate) fn run(args: TrainArgs) -> Result<()> {
     let mut last_ckpt_loss: Option<f32> = None;
     let mut stale_ckpts: usize = 0;
 
-    let mut step: usize = 0;
+    // Resume continues the step counter from the checkpoint's recorded step
+    // so the cosine LR schedule and the plateau detector see a contiguous
+    // training history. We start at `step + 1` to avoid re-emitting a
+    // checkpoint at the same step on the very next pass.
+    let mut step: usize = resume_step.as_ref().map_or(0, |(_, s)| *s as usize + 1);
+    let run_start_step = step;
     loop {
         if args.max_steps != 0 && step >= args.max_steps {
+            break;
+        }
+        if args.max_steps_this_run != 0 && step - run_start_step >= args.max_steps_this_run {
             break;
         }
 
         let lr = lr_schedule.lr_at(step);
         optimizer.set_learning_rate(lr);
 
-        let (inputs, targets) = sample_batch(
-            &mut train_file,
-            train_len,
-            args.batch,
-            args.seq,
-            &mut rng,
-            &device,
-        )?;
-        let logits = model.forward(&inputs)?;
-        let loss = flattened_cross_entropy(&logits, &targets)?;
-        optimizer.backward_step(&loss)?;
-
-        let loss_val = loss.to_scalar::<f32>()?;
+        // The forward + backward + optimizer step runs inside an ObjC
+        // autorelease pool on macOS so Metal-allocated NSObjects (command
+        // buffers, status snapshots, error objects, etc.) drain when the
+        // closure returns instead of accumulating until process exit.
+        // Without this the process leaks ~6 MB/sec on Apple Silicon — see
+        // candle issue #2271. Block scope inside the closure also ensures
+        // `inputs`, `targets`, `logits`, `loss` drop before the synchronize,
+        // so their Arc<Buffer> strong counts are 1 by the time the buffer
+        // pool's reuse logic runs.
+        let loss_val = step_body(&device, || {
+            let (inputs, targets) = sample_batch(
+                &mut train_file,
+                train_len,
+                args.batch,
+                args.seq,
+                &mut rng,
+                &device,
+            )?;
+            let logits = model.forward(&inputs)?;
+            let loss = flattened_cross_entropy(&logits, &targets)?;
+            optimizer.backward_step(&loss)?;
+            let loss_val = loss.to_scalar::<f32>()?;
+            drop(loss);
+            drop(logits);
+            drop(inputs);
+            drop(targets);
+            device.synchronize()?;
+            Ok::<_, anyhow::Error>(loss_val)
+        })?;
 
         if step % args.log_every == 0 {
             log_writer.log_step(step, loss_val, lr, start.elapsed().as_secs_f64())?;
         }
 
-        let at_max_step = args.max_steps != 0 && step + 1 == args.max_steps;
+        // Force a checkpoint write on the last step before we exit — covers
+        // both the global `--max-steps` cap and the per-process
+        // `--max-steps-this-run` cap that the shell-wrapper restart pattern
+        // relies on. Otherwise an exit could land between scheduled
+        // checkpoints, losing all progress since the last one.
+        let at_max_step = (args.max_steps != 0 && step + 1 == args.max_steps)
+            || (args.max_steps_this_run != 0
+                && (step + 1) - run_start_step == args.max_steps_this_run);
         if last_ckpt_instant.elapsed().as_secs() >= args.checkpoint_every_secs || at_max_step {
             let ckpt_name = checkpoint_filename(step);
             let ckpt_path = args.ckpt_dir.join(&ckpt_name);
             let tensors = model.quantize_to_packed()?;
-            let mut f = File::create(&ckpt_path)
-                .with_context(|| format!("creating checkpoint {}", ckpt_path.display()))?;
-            write_checkpoint_from_parts(&mut f, step as u64, &tensors)?;
-            f.flush()?;
-            drop(f);
+            // Write to a sibling tempfile and rename — keeps a kill mid-write
+            // from leaving a truncated, unloadable checkpoint behind.
+            let tmp_path = ckpt_path.with_extension("ckpt.tmp");
+            {
+                let mut f = File::create(&tmp_path).with_context(|| {
+                    format!("creating checkpoint tempfile {}", tmp_path.display())
+                })?;
+                write_checkpoint_from_parts(&mut f, step as u64, &tensors)?;
+                f.flush()?;
+            }
+            std::fs::rename(&tmp_path, &ckpt_path).with_context(|| {
+                format!("renaming {} -> {}", tmp_path.display(), ckpt_path.display())
+            })?;
 
             let codec_result = run_codec_test(&tensors, &mut codec_file, codec_len, &mut rng)?;
             let delta = last_ckpt_loss.map(|prev| loss_val - prev);
@@ -226,16 +314,40 @@ fn pick_device() -> Device {
     Device::Cpu
 }
 
+/// Run one training step's body inside an `ObjC` autorelease pool on macOS.
+///
+/// Metal's `ObjC` objects (`MTLCommandBuffer`, status / error objects,
+/// transient `NSData` buffers, etc.) follow the autorelease convention —
+/// they're put into the topmost autorelease pool and only released when
+/// that pool drains. Cocoa GUI apps drain the pool every runloop tick;
+/// command-line Rust binaries have no runloop and would never drain
+/// without explicit help, so autoreleased Metal objects accumulate in RSS
+/// at ~6 MB/sec under our forward/backward workload (candle issue #2271).
+/// Wrapping the per-step body in `autoreleasepool` drains everything when
+/// the closure returns. On non-macOS builds this is a no-op.
+fn step_body<R>(_device: &Device, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    #[cfg(target_os = "macos")]
+    {
+        objc2::rc::autoreleasepool(|_| f())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        f()
+    }
+}
+
 /// Training-time RWKV v4 model.
 struct RwkvForTraining {
     tok_emb: Var,     // (VOCAB, D_MODEL)
     ln0: RMSNormVar,  // initial LayerNorm-equivalent
     ln_f: RMSNormVar, // final LayerNorm-equivalent before LM head
     layers: Vec<RwkvBlock>,
+    /// Truncated-BPTT chunk size; 0 disables truncation. See `DEFAULT_BPTT_CHUNK`.
+    bptt_chunk: usize,
 }
 
 impl RwkvForTraining {
-    fn new(device: &Device) -> Result<Self> {
+    fn new(device: &Device, bptt_chunk: usize) -> Result<Self> {
         let tok_emb = gaussian_var(&[VOCAB, D_MODEL], 0.02, device)?;
         let ln0 = RMSNormVar::new(D_MODEL, device)?;
         let ln_f = RMSNormVar::new(D_MODEL, device)?;
@@ -247,6 +359,25 @@ impl RwkvForTraining {
             ln0,
             ln_f,
             layers,
+            bptt_chunk,
+        })
+    }
+
+    /// Build a training-ready model from a loaded checkpoint. Each ternary
+    /// matrix is rehydrated as `unpack(packed)[i, j] · scale[i]`.
+    fn from_weights(w: &Weights, device: &Device, bptt_chunk: usize) -> Result<Self> {
+        let tok_emb = vec_to_var(w.tok_emb(), &[VOCAB, D_MODEL], device)?;
+        let ln0 = RMSNormVar::from_slice(w.ln0(), device)?;
+        let ln_f = RMSNormVar::from_slice(w.ln_f(), device)?;
+        let layers = (0..N_LAYERS)
+            .map(|i| RwkvBlock::from_layer(&w.layer(i), device))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            tok_emb,
+            ln0,
+            ln_f,
+            layers,
+            bptt_chunk,
         })
     }
 
@@ -268,7 +399,7 @@ impl RwkvForTraining {
         let x = emb.reshape((b, t, D_MODEL))?;
         let mut x = self.ln0.forward(&x)?;
         for layer in &self.layers {
-            x = layer.forward(&x)?;
+            x = layer.forward(&x, self.bptt_chunk)?;
         }
         let x = self.ln_f.forward(&x)?;
         let w = self.tok_emb.as_tensor();
@@ -352,6 +483,27 @@ impl RwkvBlock {
         })
     }
 
+    fn from_layer(lv: &LayerView<'_>, device: &Device) -> Result<Self> {
+        Ok(Self {
+            tm_norm: RMSNormVar::from_slice(lv.tm_norm, device)?,
+            time_mix_r: vec_to_var(lv.time_mix_r, &[D_MODEL], device)?,
+            time_mix_k: vec_to_var(lv.time_mix_k, &[D_MODEL], device)?,
+            time_mix_v: vec_to_var(lv.time_mix_v, &[D_MODEL], device)?,
+            time_decay: vec_to_var(lv.time_decay, &[D_MODEL], device)?,
+            time_first: vec_to_var(lv.time_first, &[D_MODEL], device)?,
+            tm_r: BitLinear::from_packed(&lv.tm_r, D_MODEL, D_MODEL, device)?,
+            tm_k: BitLinear::from_packed(&lv.tm_k, D_MODEL, D_MODEL, device)?,
+            tm_v: BitLinear::from_packed(&lv.tm_v, D_MODEL, D_MODEL, device)?,
+            tm_o: BitLinear::from_packed(&lv.tm_o, D_MODEL, D_MODEL, device)?,
+            cm_norm: RMSNormVar::from_slice(lv.cm_norm, device)?,
+            channel_mix_k: vec_to_var(lv.channel_mix_k, &[D_MODEL], device)?,
+            channel_mix_r: vec_to_var(lv.channel_mix_r, &[D_MODEL], device)?,
+            cm_k: BitLinear::from_packed(&lv.cm_k, D_MODEL, D_FF, device)?,
+            cm_v: BitLinear::from_packed(&lv.cm_v, D_FF, D_MODEL, device)?,
+            cm_r: BitLinear::from_packed(&lv.cm_r, D_MODEL, D_MODEL, device)?,
+        })
+    }
+
     fn push_vars(&self, out: &mut Vec<Var>) {
         out.push(self.tm_norm.weight.clone());
         out.push(self.time_mix_r.clone());
@@ -371,10 +523,10 @@ impl RwkvBlock {
         out.push(self.cm_r.weight.clone());
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, bptt_chunk: usize) -> Result<Tensor> {
         let residual = x.clone();
         let normed = self.tm_norm.forward(x)?;
-        let tm_out = self.time_mix(&normed)?;
+        let tm_out = self.time_mix(&normed, bptt_chunk)?;
         let x = (residual + tm_out)?;
 
         let residual = x.clone();
@@ -384,10 +536,16 @@ impl RwkvBlock {
     }
 
     /// RWKV v4 time-mix with sequential WKV scan.
+    ///
+    /// `bptt_chunk` truncates BPTT: `aa`/`bb`/`pp` are detached from the
+    /// autograd graph at every multiple of `bptt_chunk` timesteps, so each
+    /// `wkv_t` only backprops through at most `bptt_chunk` previous steps.
+    /// Setting it to 0 disables truncation (full BPTT through the entire
+    /// sequence — large memory hit).
     // Single-letter names (`b`, `t`, `r`, `k`, `v`) follow the usual tensor
     // / attention conventions; the RWKV reference uses the same spelling.
     #[allow(clippy::many_single_char_names)]
-    fn time_mix(&self, x: &Tensor) -> Result<Tensor> {
+    fn time_mix(&self, x: &Tensor, bptt_chunk: usize) -> Result<Tensor> {
         let (b, t, _) = x.dims3()?;
         let device = x.device();
 
@@ -419,6 +577,18 @@ impl RwkvBlock {
 
         let mut wkv_steps = Vec::with_capacity(t);
         for ti in 0..t {
+            // Truncated-BPTT: detach state at chunk boundaries (skipping
+            // ti=0 because the initial state is already a fresh leaf). After
+            // detach, `wkv_t` at this and following timesteps within the
+            // chunk only backprop as far as the chunk start, so the in-graph
+            // tensor count is bounded by `chunk · t / chunk = t` rather than
+            // `t · (t+1) / 2`.
+            if bptt_chunk > 0 && ti > 0 && ti % bptt_chunk == 0 {
+                aa = aa.detach();
+                bb = bb.detach();
+                pp = pp.detach();
+            }
+
             let k_t = k.i((.., ti, ..))?; // (b, d)
             let v_t = v.i((.., ti, ..))?;
 
@@ -516,6 +686,13 @@ impl RMSNormVar {
         })
     }
 
+    fn from_slice(src: &[f32], device: &Device) -> Result<Self> {
+        let t = Tensor::from_slice(src, src.len(), device)?;
+        Ok(Self {
+            weight: Var::from_tensor(&t)?,
+        })
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let squared = x.sqr()?;
         let mean = squared.mean_keepdim(candle_core::D::Minus1)?;
@@ -544,6 +721,46 @@ impl BitLinear {
         let weight = gaussian_var(&[out_dim, in_dim], std, device)?;
         Ok(Self {
             weight,
+            in_dim,
+            out_dim,
+        })
+    }
+
+    /// Resume-path constructor: rehydrate the unquantized `f32` weight tensor
+    /// as `ternary[i, j] · scale[i]` from the I2_S-packed checkpoint bytes.
+    /// The first `quantize()` call on the resumed model will reproduce a
+    /// ternary lattice with a slightly rescaled per-row absmean — within the
+    /// noise of one optimizer step.
+    fn from_packed(
+        mat: &TernaryMatrix<'_>,
+        in_dim: usize,
+        out_dim: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !mat.packed.is_empty(),
+            "from_packed: TernaryMatrix.packed is empty — load the checkpoint via \
+             Weights::load_checkpoint_force_i2s",
+        );
+        anyhow::ensure!(
+            mat.scale.len() == out_dim,
+            "from_packed: scale len {} != out_dim {}",
+            mat.scale.len(),
+            out_dim,
+        );
+        let mut tern = vec![0i8; out_dim * in_dim];
+        unpack_i2s_to_rowmajor(mat.packed, &mut tern, out_dim, in_dim);
+        let mut flat = vec![0f32; out_dim * in_dim];
+        for r in 0..out_dim {
+            let s = mat.scale[r];
+            let row = &mut flat[r * in_dim..(r + 1) * in_dim];
+            for (dst, t) in row.iter_mut().zip(&tern[r * in_dim..(r + 1) * in_dim]) {
+                *dst = f32::from(*t) * s;
+            }
+        }
+        let t = Tensor::from_vec(flat, (out_dim, in_dim), device)?;
+        Ok(Self {
+            weight: Var::from_tensor(&t)?,
             in_dim,
             out_dim,
         })
@@ -611,6 +828,17 @@ impl BitLinear {
 #[allow(clippy::cast_possible_truncation)]
 fn gaussian_var(shape: &[usize], std: f64, device: &Device) -> Result<Var> {
     let t = Tensor::randn(0f32, std as f32, shape, device)?;
+    Ok(Var::from_tensor(&t)?)
+}
+
+fn vec_to_var(src: &[f32], shape: &[usize], device: &Device) -> Result<Var> {
+    let expected: usize = shape.iter().product();
+    anyhow::ensure!(
+        src.len() == expected,
+        "vec_to_var: slice len {} != product of shape {expected}",
+        src.len(),
+    );
+    let t = Tensor::from_slice(src, shape, device)?;
     Ok(Var::from_tensor(&t)?)
 }
 
