@@ -18,21 +18,23 @@ pub(crate) const VOCAB: usize = 256;
 /// kernel's i16-accumulator bound. Bumping beyond 512 requires widening
 /// the LUT-kernel accumulators to i32 or adding periodic flush.
 ///
-/// `D_MODEL = 256`, `N_LAYERS = 32`, `CM_MULT = 1` yields ~14.68M ternary
-/// weights (`7·D_MODEL² = 458752` per layer × 32 layers) plus ~197K f32
-/// parameters ≈ 14.88M total — fifth depth-only doubling on the 1M → 2M
-/// → 4M → 8M → 16M-class trajectory. Same axis-only-moves rationale as
-/// every prior step: width preferred-over-depth would be ~15% faster per
-/// step but commits to `D_MODEL = 512` (exactly at the TL1 i16
-/// accumulator bound, no further-width headroom), so depth carries the
-/// scale-up. Inference budget is the open concern — see `JOURNAL.md`
-/// 2026-04-25 → 2026-05-03 for the 8M plateau analysis and the wall-time
-/// projection that says 16M needs additional matvec-kernel optimization
-/// to fit the Hutter budget.
+/// `D_MODEL = 256`, `N_LAYERS = 26`, `CM_MULT = 1` yields ~11.93M ternary
+/// weights (`7·D_MODEL² = 458752` per layer × 26 layers) plus ~173K f32
+/// parameters ≈ 12.10M total — partial depth bump from the 8M plateau
+/// (`N_LAYERS = 16`) on the 1M → 2M → 4M → 8M → 12M-class trajectory.
+/// Breaks the strict doubling cadence used through 8M because the full
+/// 16M step (`N_LAYERS = 32`) saturates the dev machine's training
+/// throughput. Width-preferred-over-depth would be ~15% faster per step
+/// but commits to `D_MODEL = 512` (exactly at the TL1 i16 accumulator
+/// bound, no further-width headroom), so depth still carries the
+/// scale-up. Inference budget remains the open concern — see
+/// `JOURNAL.md` 2026-04-25 → 2026-05-03 for the 8M plateau analysis and
+/// the wall-time projection that says ≥12M needs additional
+/// matvec-kernel optimization to fit the Hutter budget.
 pub(crate) const D_MODEL: usize = 256;
 
 /// Number of RWKV blocks. Each block is one time-mix + one channel-mix.
-pub(crate) const N_LAYERS: usize = 32;
+pub(crate) const N_LAYERS: usize = 26;
 
 /// Channel-mix hidden-size multiplier relative to `D_MODEL`. RWKV v4
 /// traditionally uses `4×`, but `D_FF = 4·D_MODEL = 2048` would exceed
