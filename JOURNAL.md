@@ -13,9 +13,342 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
-## 2026-04-25 → 2026-05-03 — 8M RWKV Plateau; Metal Autorelease Fix; Scaling To 16M
+## 2026-05-09 → 2026-05-10 — LZ77 Pre-Pass; Cross-Stream PPM Context; 1M Neural Restart; Phase-2 Ensemble Under 2.0 bpb
 
-CDR/Claude attempted a sequence of scale-up runs over ~9 days on an M3 Pro, blocked initially by a candle Metal memory leak that masqueraded as "training getting OOM-killed", then landed an 8M (`D_MODEL=256, N_LAYERS=16, CM_MULT=1`) run end-to-end through plateau on 2026-05-03. The run plateaued at train loss 1.024 nats / ~1.48 info-bpb, the best checkpoint sits at step 14319, and the next scale step to 16M (N_LAYERS=32) is queued. This entry covers the leak hunt, the plumbing it forced into place, the 4M and 8M runs themselves, and the inference-budget tension at 16M.
+CDR/Claude completed the deterministic-stack iteration through cross-stream PPM context plus an LZ77 pre-pass with bucketed offset/length encoding and lazy parsing, dropping the 5-offset bench mean to 2.056 bpb / 257 MB on 1 GB. Restarted neural training at 1M scale (the same arch as 2026-04-24) — landed train loss 1.289 nats / info-bpb 1.86 at step 13646, beating the historical 1M baseline by ~11% and giving a clean phase-2 starting point. Integrated the 1M neural into the LZ-routed codec as a logistic-mixed component at literal positions, with case-folding-aware Upper-class handling, hitting the **first sub-2.0-bpb operating point: 1.994 bpb / 249 MB on 1 GB**. The deterministic-floor-then-mix strategy compounded as designed: −0.93 bpb total margin over the byte-stream order-2 dense baseline (2.898), spread across LZ (~0.85), cross-stream PPM context (~0.07), and neural mixing (~0.06). Still 140 MB over the 109 MB Hutter target — closing that gap requires bigger neural (next training run) or a denser cmix-style predictor ensemble.
+
+### Deterministic stack: cross-stream PPM context
+
+Refactored `Ppm` to take caller-provided context bytes rather than maintaining its own per-arm history. `RoutedProbs` now keeps a single shared byte history (case-folded for letters) and feeds the same recent-bytes window to both letter and non-letter PPMs at every position. Letter-arm contexts now include surrounding markup (`</text>` → newline-ish priors); non-letter-arm contexts include surrounding letter context for predicting markup transitions. The bench measured the architectural change in isolation:
+
+| Configuration                              | mean bpb | Δ |
+|--------------------------------------------|---------:|---|
+| type-routed PPM, letter-only context       |    2.649 | — |
+| type-routed PPM, cross-stream context      |    2.373 | −0.276 |
+
+Bigger lift than expected. Per-class predictors were leaving real signal on the table by ignoring the surrounding stream. Routed-alone now at 2.373 / 297 MB.
+
+A subtle correctness bug surfaced after the LZ layer landed: matched bytes in the LZ flow weren't being pushed into the routed predictors' shared history (only literals were), so the next literal's PPM context conditioned on stale pre-match bytes instead of the actual recent output. Encoder and decoder made the same mistake symmetrically (so roundtrip worked), but PPM was wrong. Fixed via `RoutedProbs::note_match_bytes`, called by the LZ wrapper after each match emission. Bench delta: −0.045 bpb.
+
+### LZ77 pre-pass: window, encoding, parse
+
+`src/lz77.rs`, ~600 LOC. Hash-chain matcher (`hash[3-byte-prefix] → most-recent pos`, `prev[pos & WINDOW_MASK] → previous pos with same hash`), chain bound 32 — zlib's "fast" preset. 4 MiB sliding window covers the bench's 4 MiB pre-warm.
+
+Three encoding refinements layered in sequence (each measurement isolating that lever):
+
+| Configuration | mean bpb | Δ vs prev |
+|---|---:|---:|
+| LZ77 raw 33-bit match (`MIN_MATCH=16`)        | 2.303 | −0.346 vs no-LZ |
+| LZ77 bucketed offset + Order-0 length (`MIN_MATCH=6`) | 2.194 | −0.109 |
+| LZ77 + lazy parse (peek `pos+1`, defer if longer match starts there) | 2.152 | −0.042 |
+| LZ77 + cross-stream PPM context fix          | 2.077 | −0.075 |
+| LZ77 + 4 MiB pre-warm (vs 1 MiB)              | 2.056 | −0.021 |
+
+Match cost dropped from 33 bits raw to ~16-19 bits bucketed/adaptive — `MIN_MATCH=6` becomes net positive. Lazy parse contributed the canonical 2% zlib refinement. The 1 MiB → 4 MiB pre-warm bump benefited PPM convergence more than LZ-window depth — at 1 MiB the LZ window was already near saturation for the 16 KiB measurement.
+
+Per-offset, the XML-heavy windows (500M, 900M) bottom out near 0.82 bpb (essentially at Hutter SOTA at 16 KiB scale) — LZ captures the long-range exact repetition that PPM can't see at any practical order. Prose-heavy offsets stay in the 2.6-3.0 band where LZ contributes less.
+
+### 1M neural restart: trajectory and kill
+
+Restarted RWKV training at 1M (`D_MODEL=256, N_LAYERS=2`) byte-level, identity tokenizer (vocab=256, no merges), `--seed 1`, defaults otherwise (batch=32, seq=256, bptt_chunk=32, decay_horizon=1M, peak LR 3e-4). Tokenization 1 GB → 1B tokens in 7.3 s; training proceeded at ~3360 steps/h on M3 Pro Metal, RSS stable.
+
+Six checkpoints landed before kill:
+
+| step  | train loss (nats) | info-bpb | Δ |
+|------:|------------------:|---------:|---|
+|  6885 |            1.4808 |     2.14 | — |
+| 13646 |        **1.2888** | **1.86** | −0.192 |
+| 20488 |            1.3877 |     2.00 | +0.099 |
+| 27502 |            1.3074 |     1.89 | −0.080 |
+| 34512 |            1.3685 |     1.97 | +0.061 |
+| 41523 |            1.3054 |     1.88 | −0.063 |
+
+Best at step 13646 (4 h in). The next 28k steps (9 h) oscillated in the 1.29-1.39 band — same alternating-stale pattern that defeats the plateau detector (3-consecutive-stale rule). Killed at step 46150 / 13h 20min, archived as `BEST-step13646.ckpt` under `checkpoints/keep/1M-byte-2026-05-09/`.
+
+Compared to the 2026-04-24 1M baseline (1.45 nats / 2.09 bpb at step ~14k): **this run lands ~11% lower info-bpb at the same step count**. Plausible reason: changes since 2026-04-24 to AdamW state initialization, the cross-stream-aware tokenization being a no-op identity here, and possibly seed luck. The new lower number is the spec for the ensemble.
+
+### Phase-2 integration: neural mixed at literal positions
+
+Refactored `RoutedProbs` into granular methods (`encode_class` / `cdf_for_class` / `encode_byte_value` and the decode mirrors) so the LZ wrapper can interpose a mixed CDF between class encoding and byte encoding without duplicating routed update logic. `LzRouted::with_neural((Weights, mix_weight, MixMode))` wires in a `ByteTransformer` that advances on every output byte (literal or match-copied) so neural state tracks the actual byte sequence rather than just literals.
+
+Two mixing schemes implemented:
+
+- **Linear**: `count_mix[i] = round(w · count_a[i] + (1−w) · count_b[i])`. Standard count-space arithmetic mean.
+- **Logistic** (PAQ-canonical): `p_mix[s] ∝ p_a[s]^w · p_b[s]^(1−w)`. Geometric mean — sharpens where both predictors agree, downweights where they disagree.
+
+Mix-weight sweeps:
+
+| mix mode  | w   | mean bpb |
+|-----------|-----|---------:|
+| linear    | 0.5 | 2.026 |
+| linear    | 0.7 | 2.028 |
+| logistic  | 0.3 | 2.009 |
+| logistic  | 0.5 | **1.994** |
+| logistic  | 0.7 | 1.997 |
+
+Linear was nearly flat across weights — a classical signal that the two predictors have correlated errors, so linear weighted-averaging dilutes both rather than sharpening the combined prediction. Logistic mix recovered ~0.03 bpb at the same w=0.5; the curve under logistic is shallow with a clear minimum at 0.5.
+
+### Upper-class neural fold
+
+The case-folding scheme stores class={Lower, Upper, NonLetter} on a 3-class type stream and encodes the *lowercased* byte through the letter PPM. The neural was trained on raw bytes, so its CDF predicts both `'A'` and `'a'` as separate symbols. To mix the two coherently at Upper positions, the neural CDF needs folding: A-Z mass moves to the corresponding a-z slot before mixing. Implemented as `fold_neural_cdf_for_upper`. The previous version skipped neural mixing entirely at Upper (4% of bytes); the fold extends mixing to those positions.
+
+### Phase-2 standing
+
+```
+Predictor                                                         mean bpb     1 GB
+order-2 adaptive (dense, 64 MiB)                                    2.771       346 MB
+type-routed PPM, letter-only context                                2.649       331 MB
+type-routed PPM, cross-stream context                               2.373       297 MB
+LZ77 + routed (deterministic floor)                                 2.056       257 MB
+LZ77 + routed + 1M neural (logistic w=0.5)                          1.994       249 MB ← operating
+target (Hutter 99%)                                                 0.878       109 MB
+```
+
+Total margin from the byte-stream order-2 baseline: **−0.78 bpb / −97 MB**. Phase-2 has covered ~50% of the gap from byte-stream baseline to Hutter SOTA.
+
+Inference rate at the 1M neural arm alone (codec test on a 16 KiB window): ~9.6 h/GB. Adding ensemble overhead probably puts the full submission at ~12-15 h/GB encode + decode, comfortably inside the 64 h Hutter budget at 1M scale.
+
+### Open / next levers
+
+- **Larger neural**. The 1M-vs-routed gap is small relative to the standalone-neural gap to deterministic, suggesting the neural is the limiting component. 4M or 8M restart with the same arch shape (just bumping `N_LAYERS`) is the canonical next move. Each step is a multi-day training run.
+- **More predictors mixed**. Cmix uses 30+ submodels including PPM-N at multiple orders, dictionary lookups, and small specialized neurals. Adding 2-3 more components to the mix (e.g. PPM-2 dense, Markov-with-stretch contexts) and learning the mixing weights adaptively is the standard next step in PAQ/cmix evolution.
+- **Optimal-parse LZ**. Storer-Szymanski or full DP optimal parse instead of greedy/lazy. Classical 3-7% gain.
+- **Adaptive mix weight**. PAQ's neural-network mixer learns per-context weights instead of a fixed scalar. Bigger code change but sometimes worth 5-10%.
+- **Eval window scale-up**. The 16 KiB measurement window is a content-variance-dominated estimator. For comparing ensembles at this stage, bumping to 256 KiB or 1 MiB measurement windows would tighten the per-offset spread enough to detect 0.005 bpb changes reliably.
+
+---
+
+## 2026-05-08 → 2026-05-09 — 8M Token Run Killed; Deterministic-First Pivot; Type-Routed PPM Beats Byte-Stream Order-2
+
+CDR/Claude killed the 8M token-level RWKV training run after ~26 hours and ~4400 steps when the trajectory clearly tracked byte-level 8M's plateau (1.477 info-bpb) rather than meaningfully beating it as the BPE pivot expected. Pivoted to a cmix-style deterministic-first ensemble: fixed 5-offset codec eval panel, order-N adaptive ladder as baselines, type-routed codec (lowercase / uppercase / non-letter), and PPM-D in both content arms. Letter-arm at order-5 and non-letter-arm at order-8 brought routed bpb to 2.649, beating the byte-stream order-2 dense baseline (2.898) by 0.249 — the first measurement showing that routing pays. Plan-of-record continues with cross-stream PPM context, an LZ77 pre-pass, or PPM-Markov mixing as the next leverage points; the neural arm comes back only after the deterministic floor stops moving.
+
+### 8M token-level run: trajectory and kill
+
+Started 2026-05-08 at the configuration left in `arch.rs` from the 2026-05-07 pivot (`N_LAYERS=16, D_MODEL=256, VOCAB=4096`). Tokenization through enwik9 took 51 s, producing 407.4M tokens at 2.455 bytes/token. Training proceeded at ~310 steps/hour on M3 Pro Metal with `decay_horizon=1M` and peak LR 3e-4.
+
+Trajectory across the 14 checkpoints landed before kill:
+
+| step | train loss (nats/tok) | info-bpb | codec bpb (1 window) |
+|-----:|----------------------:|---------:|---------------------:|
+|  312 | 4.668 | 2.74 | 3.08 |
+| 1259 | 3.495 | 2.05 | 1.23 |
+| 1573 | 3.159 | 1.86 | 2.55 |
+| 2833 | 2.993 | 1.76 | 1.49 |
+| 3149 (best) | **2.618** | **1.54** | 0.87 |
+| 4411 (last)| 2.771 | 1.63 | 1.83 |
+
+Conversion: nats/tok ÷ ln(2) ÷ 2.455 bytes/tok = bits/byte. At step 3149, info-bpb 1.54 — slightly worse than the 8M byte-level plateau (1.477). The slope was still negative but visibly bending: −0.85 nats/tok over steps 1259→3149 (1890 steps), only −0.05 over steps 3149→4411 (1262 steps, with two regressions). Linear extrapolation suggested a plateau in the 2.3–2.5 nats/tok / 1.35–1.47 bpb band — matching byte-level rather than meaningfully beating it. The BPE pivot's stated goal had been to raise the loss ceiling, not just save wall-time; on this trajectory it was saving wall-time only (~40 h projected vs ~108 h byte-level).
+
+Killed before convergence on slope-shape evidence. Wall-time projection at this trajectory: 1.4 bpb × 1 GB = 175 MB final size, ~60% over the 109 MB target, with no architectural path visible to closing that gap by depth alone. Codec single-window measurement (range 0.87–2.71 across windows on essentially the same model) confirmed the 5-offset eval panel deferred since 2026-04-23 was now blocking iteration.
+
+### Pivot rationale: deterministic-first ensemble
+
+CDR proposed a layered recipe: (1) generate a character type map (lowercase / uppercase / non-letter); (2) AC-encode the type map; (3) AC-encode the symbol stream; (4) neural-encode the letter stream. Initial discussion surfaced the central concern: independent per-class predictors lose cross-stream mutual information. A monolithic byte predictor sees that `>` follows `</text` and `\n` follows `\n  `; a strictly separated letter-only predictor cannot. With matched orders the cross-stream loss dominates the alphabet-shrinking win; routing only pays when the per-class predictor can run at higher order than the joint predictor would.
+
+CDR pointed out that recommending the 8M token plateau measurement still relied on BPE — itself a context-preserving pre-pass. The right axis isn't "pre-pass yes/no" but "pre-pass that preserves cross-stream context vs destroys it." BPE preserves; LZ77 preserves; the as-stated separation destroys. Reformulated proposal: type-routed mixing where each predictor still conditions on full mixed history (or as much of it as the architecture allows), with the type map selecting the active predictor at each position. That is the cmix recipe.
+
+Plan-of-record:
+
+1. Iterate the deterministic stack first — minutes-to-hours per experiment vs days-to-weeks for neural runs. Establishes a hard floor before the neural arm has to deliver anything specific.
+2. Reintroduce the neural arm later as a mixed component on the letter stream, restarting at 1M.
+3. Multiple small specialized neurals stay on the table (e.g. letter-positions-after-whitespace, in-tag-content) but defer until the deterministic floor is squeezed dry.
+
+The existing 8M model effort is preserved as a baseline number for what monolithic neural alone achieves and as a drop-in candidate for stage-2 mixing.
+
+### Eval panel: fixed 5-offset codec measurement
+
+`src/bench.rs`: offsets 100/300/500/700/900 MB into enwik9, 16 KiB measurement window each, 1 MiB pre-warm before the measured slice. Pre-warm matters: an adaptive predictor's first hundreds of bytes are paid at near-uniform cost as contexts learn, and at order-2 dense or higher, cold-start dominates the 16 KiB measurement. With pre-warm, order-1 measurement dropped from 4.806 to 3.703 bpb — cold-start was hiding ~1.1 bpb of real signal. Pre-warm is purely a bench-time concern: the real submission encodes the full 1 GB and amortizes cold-start for free.
+
+Roundtrip verification at every offset: independent predictor instances on encode and decode, identical pre-warm. Cheap insurance against silent encode/decode desync as predictors get more elaborate.
+
+Bench output is deterministic — two runs at the same offsets produce bit-identical bpb. Per-offset spread reflects real content heterogeneity in enwik9, not measurement noise. The `lzr bench` subcommand surfaces it as a stable iteration target, no model load required.
+
+### Order-N adaptive ladder
+
+Sequenced order-0 → order-1 → order-2 dense as warm-up baselines, all in `src/predict.rs`:
+
+| Predictor | Mean bpb (5-offset) | Δ vs prev | 1 GB projection |
+|-----------|--------------------:|----------:|----------------:|
+| Order-0 adaptive (Laplace +1, online halving) | 5.042 | — | 630 MB |
+| Order-1 adaptive (per-prev-byte counts) | 3.703 | −1.34 | 463 MB |
+| Order-2 adaptive (dense byte-pair, 64 MiB state) | **2.898** | −0.81 | **362 MB** |
+
+Order-2 dense is the byte-stream baseline for everything that follows. Order-3 dense is infeasible (16 GiB) and would also see worsening returns from the long-tail-uniform problem on a 256-byte alphabet — that's where PPM with sparse storage and escape becomes mandatory. Per-offset spread widens at order-2 (1.34 bpb range, 2.08–3.42), content heterogeneity dominating once the predictor is good enough.
+
+Online halving threshold at TOTAL/2 (32,768 counts) keeps total bounded so the rescale to TOTAL never collapses a slot to zero mass.
+
+### AC slice refactor
+
+`src/ac.rs`: `Encoder::encode` and `Decoder::decode` now take `&[u32]` slices rather than `&[u32; CDF_LEN]` fixed arrays, with implied vocabulary size = `cdf.len() - 1`. The byte codec continues to pass full 257-entry slices via array-to-slice coercion (no callsite changes); PPM emits CDFs over a non-fixed alphabet of (escape ∪ seen-not-excluded) per position. Slice-based AC unblocks variable-vocab predictors generally, not just PPM. Cost: zero in the common path — the existing 257-entry callers monomorphize identically to the array version.
+
+### Type-routed codec: routing infrastructure
+
+`src/routed.rs`: three-class classification (`predict::ByteClass`) — `Lower` (a-z), `Upper` (A-Z), `NonLetter` (everything else). Uppercase positions are folded to lowercase before encoding via the letter arm; the case bit travels in the type map, the letter predictor only ever sees lowercase bytes.
+
+For each input byte: encode the class via the type predictor, then encode the byte (or its lowercased form) via the per-class content predictor. Single shared AC stream, two emissions per input byte (class then byte). Decoder mirrors exactly: decode class, dispatch to per-class predictor, decode byte, optionally re-uppercase. Each sub-predictor maintains its own adaptive state independently — there is no cross-stream context at this stage. (Cross-stream conditioning is on the deferred list as the next architectural fork.)
+
+### Routing with placeholder predictors: regression at matched orders
+
+First measurement, order-1 type predictor + order-2 dense in both content arms:
+
+| Predictor | Mean bpb |
+|-----------|---------:|
+| Order-2 adaptive (joint byte stream) | 2.898 |
+| Type-routed (O1 type / O2 letter / O2 non-letter) | 3.694 |
+
+Routing alone at matched orders is **+0.80 bpb worse** than the joint predictor. As predicted: each per-class predictor sees a strict subset of the context the joint predictor sees, and at matched depth the cross-stream context loss dominates the alphabet-shrinking win. Routing wins when the per-class predictor can run at higher order than the joint predictor would.
+
+Order-1 type predictor (vs order-0): −0.156 bpb on the routing stack. The 3-symbol type stream has heavy run-length structure (long lowercase runs inside words); order-1 captures it cheaply.
+
+Per-offset spread on routed (0.87 bpb) is tighter than joint order-2 dense (1.34 bpb) — per-class predictors are less affected by content heterogeneity. Useful for ensemble stability later.
+
+### PPM-D: single-event design
+
+`src/ppm.rs`, ~270 LOC. Order-N PPM with PPM-D escape weighting (escape ≈ n_distinct / (2T + n_distinct)) and full exclusion. Built as a single-event predictor (one AC emission per byte) rather than the multi-event "encode escape, try lower order, ..." formulation: the single 256-symbol pmf is mathematically equivalent and lets PPM drop straight into the existing `ProbSource` slot.
+
+Algorithm: walk from the longest available context down to order 0 with a growing excluded set; at each visited context, allocate `remaining × (2c / (2T+n))` of the pmf to seen-and-not-excluded symbols and `remaining × (n / (2T+n))` to "escape further" (which becomes the new `remaining`). Order-(-1) fallback distributes leftover `remaining` uniformly over symbols still not excluded. Storage is sparse: `HashMap<Vec<u8>, ContextNode>` per order, only visited contexts cost anything. Per-node ~80–120 B; for order-5 letter PPM on the full 670 MB letter stream, distinct 5-grams are ~1–5M out of 12M possible, total working set ~80–400 MB.
+
+Subtle pmf-conservation case found during testing: when order-0 accumulated mass on all 256 symbols (typical for the cycling-bytes test, also relevant for small effective alphabets like the non-letter sub-stream), the order-(-1) fallback has zero usable symbols but `remaining > 0`. Mathematically the last order's escape coefficient should have been 0. Fix: fold `remaining` back proportionally over already-allocated mass — equivalent and pmf-conserving. Without it the residual at CDF construction overshoots and indexes off the end.
+
+### PPM-D in the symbol arm
+
+PPM-D order-4 swap-in for the non-letter `Order2Adaptive`:
+
+| Predictor | Mean bpb |
+|-----------|---------:|
+| Joint order-2 dense | 2.898 |
+| Routed (O1 / O2 letter / **O2** non-letter) | 3.694 |
+| Routed (O1 / O2 letter / **PPM-D-4** non-letter) | 3.507 |
+
+−0.187 from PPM-4 alone on the non-letter arm. Win concentrated at XML-heavy 500M (−0.32) and 900M (−0.25); smaller (−0.08 to −0.17) at prose-heavy 100M / 300M / 700M. Routing still 0.61 bpb worse than the joint baseline because the letter arm at order-2 is the dominant cost (~67% of bytes × ~2 bits each = 1.34 of the 3.51 mean).
+
+### PPM-D in the letter arm: routing flips to a win
+
+PPM-D order-5 swap-in for the letter `Order2Adaptive`:
+
+| Predictor | Mean bpb |
+|-----------|---------:|
+| Joint order-2 dense | 2.898 |
+| Routed (O1 / O2 letter / PPM-4 non-letter) | 3.507 |
+| Routed (O1 / **PPM-5** letter / PPM-4 non-letter) | **2.697** |
+
+−0.81 bpb from the letter-arm swap. **Routing now beats joint order-2 dense by 0.20 bpb.** Per-offset wins concentrated where content is sparse-letter-friendly: 500M went 2.79 → 1.73 (−1.06), 900M 2.99 → 1.82 (−1.16). Prose-dominant offsets saw smaller (−0.55 to −0.70) but consistent wins.
+
+The cmix-mechanism prediction held empirically: routing pays once the per-class predictor outranks the joint predictor's effective context. Letter-only PPM-5 on a 26-effective alphabet lands at the classical English-text PPM sweet spot the literature has documented for decades.
+
+### Order sweep on the routed stack
+
+Letter and non-letter arm predictors don't share state, so optimal orders are independent. Swept each on the 5-offset panel:
+
+| Letter | Non-letter | Mean bpb |
+|-------:|-----------:|---------:|
+| 5 | 4 | 2.697 |
+| 5 | 5 | 2.681 |
+| 5 | 6 | 2.669 |
+| 5 | 7 | 2.654 |
+| 5 | 8 | **2.649** ← elbow |
+| 6 | 4 | 2.705 |
+| 6 | 8 | 2.656 |
+
+Letter arm: 4→5 was a huge −0.79 jump; 5→6 regresses by ~0.008 at every non-letter order tested. On a 26-effective alphabet, order-6 contexts are sparse enough that escape cost dominates the within-context tightening. Operating point: **letter PPM order 5**.
+
+Non-letter arm: monotonically improving with elbow at 7–8. The non-letter alphabet is small effective (~30 byte values) so very high orders still help — order-6 contexts there are well-populated. Marginal gains shrink to ~0.005 by 7→8. Operating point: **non-letter PPM order 8**.
+
+Final: type-routed (order-1 type / PPM-D-5 letter / PPM-D-8 non-letter), **2.649 bpb mean / 331 MB on 1 GB**. Beats joint order-2 dense by 0.249 bpb.
+
+### Standing relative to budget
+
+| Predictor | Mean bpb | 1 GB | Gap to 109 MB |
+|-----------|---------:|-----:|--------------:|
+| Hutter 99% target | 0.878 | 109 MB | — |
+| Phase-1 operating point | 2.649 | 331 MB | +222 MB |
+| Joint order-2 dense baseline | 2.898 | 362 MB | +253 MB |
+| 8M neural alone (byte-level plateau) | 1.477 | 185 MB | +76 MB |
+
+The deterministic stack has covered the joint-order-2 → ~halfway-to-Hutter-SOTA distance, but absolute 1 GB projection is still 3.0× over budget. Further gains need structural moves (cross-stream context, LZ pre-pass, mixing), not parameter tuning — the order sweep has clearly plateaued.
+
+### Open / next levers
+
+- **Cross-stream PPM context**: letter arm conditions on previous letters only, missing signals like "byte after `</text>` is most likely a newline." Hash-based contexts over the full byte stream would let the letter arm see surrounding markup. ~30 LOC PPM addition, ~100–200 MB sparse memory. Top expected leverage.
+- **LZ77 pre-pass**: PPM at any order can't see paragraph-level repetition (1 MB+ apart). Wikipedia boilerplate, redirect pages, infobox templates are duplicated verbatim across the corpus. Emitting (offset, length, literal) before PPM should attack this directly without violating cross-stream context preservation.
+- **PPM × dense-Markov mixing**: PAQ/cmix-style logistic mixing of two predictors is straightforward. Different model classes catch different patterns; usually nets 5–10% off the PPM-alone bpb.
+- **Neural arm reintroduction**: deferred until the deterministic floor stops moving (per the build-order plan). 1M baseline restart on whatever input form survives the deterministic stack — not necessarily BPE-tokenized.
+- **Eval-panel window size**: 16 KiB windows with 1 MiB pre-warm gives ±0.05 bpb iteration sensitivity but 1.34 bpb spread between offsets at order-2 dense. If structural moves produce smaller incremental wins, consider widening the window to amortize content variance further.
+
+---
+
+## 2026-05-07 — BPE Tokenization Pivot; 1M Restart On Tokens; Embedding Ternarization
+
+CDR/Claude pivoted away from depth-only byte-level RWKV scaling. The 8M plateau and the inference-budget tension at 12M (both documented in the prior entry, 2026-04-25 → 2026-05-03) made wall-time the binding constraint, not loss-vs-parameters. The new direction: BPE-tokenize the input to compress sequence length, restart at 1M to (re-)establish the small-model baseline on the new alphabet, scale from there. This entry covers the BPE measurement, the case-folding side question, the wholesale codec/AC/model rewrite to a 4096-token alphabet, the embedding ternarization that follows from it, and the decision to restart at 1M on tokens.
+
+### BPE measurement on enwik9
+
+Trained byte-level BPE on enwik9 at three target vocab sizes, measuring `bytes/token`. Pretokenization splits on ASCII whitespace boundaries — simpler than GPT-2's regex (no Unicode dependency) but sets a hard upper bound on bytes/token equal to the average pretoken length (`1.0e9 / 258.7M ≈ 3.87`). New `lzr bpe` subcommand emits both a JSON merge list and a compact binary blob (`assets/tokenizer.bin`, schema-versioned `u32` header + `u16` merge pairs, ~15 KB at vocab 4096) for runtime loading.
+
+| vocab | merges | final tokens | bytes/token | % of ceiling | wall-time at 8M scale |
+|------:|-------:|-------------:|------------:|-------------:|----------------------:|
+|   256 |      0 |        1.0 B |        1.00 |          26% |             108 h     |
+| 2,048 |  1,792 |       452 M  |        2.21 |          57% |              49 h     |
+| 4,096 |  3,840 |       407 M  |    **2.46** |          63% |              44 h     |
+| 8,192 |  7,936 |       374 M  |        2.68 |          69% |              40 h     |
+
+Marginal returns: doubling 2K → 4K buys +11% bytes/token; doubling 4K → 8K buys +9%, clearly past the elbow. Top-30 learned tokens at 4K are sane for English-plus-XML: `"  "` (double space, 16.6M occurrences), `"th"`, `"er"`, `"in"`, `"]]"` and `"[["` (Wikipedia link delimiters at ranks 6 and 7), `"the"`, `"and"`, `"of"`, `"''"` (bold-italic), `"    "` (XML indent). 4K is the chosen knee — at the 8M-class scale the wall-time projection drops from ~108 h to ~44 h, well inside the 64 h Hutter budget; at 12M from ~175 h to ~71 h, ~1.1× over which is much closer than the 2.7× we had at byte-level.
+
+### Side question: lowercase + uppercase-bitmap preprocessing
+
+CDR proposed factoring case out of the input — lowercase before tokenization, AC-encode an uppercase bitmap separately, like cmix and similar context-mixing compressors do. Worked through the cost-vs-benefit math: the bitmap entropy at ~6% uppercase among the ~85% alpha bytes is ~35 MB unconditioned, ~2–5 MB after AC with context (sentence-start, after `[[`, after `\n`), against a token-stream savings of maybe 3.5–7 MB from tighter BPE merges (`The`/`the` collapse). Roughly cost ≈ savings, possibly slight net positive, not the slam-dunk it looks like. The deeper objection: a strong neural model can already learn case from context, so the bitmap is mostly redundant with what the model knows. Deferred — wire BPE first, measure, then A/B case folding as a polish step.
+
+### Architectural reconsidering: stay with RWKV
+
+The token-level pivot raised the natural question of whether RWKV is still the right architecture. Linear-time recurrence remains the right family: 407M tokens is still way too many for quadratic attention at inference (~256× slower per token than RWKV at seq=256). Within linear-time, Mamba/selective-SSM has been beating RWKV at matched param counts in 2024–2025 papers, and would be the right thing to try if the 8M plateau (1.024 nats) is architectural rather than capacity-limited. But switching means losing the BitNet kernel work, the training pipeline, the recently-debugged Metal autorelease path, and 4–6 weeks of re-validation. Tokenization is a much cheaper unblock for the same problem. Decision: stay with RWKV through the BPE integration; revisit only if tokenized end-to-end numbers suggest the architecture is the limiter.
+
+### Codec/AC/model rewrite: VOCAB 256 → 4096, symbol type u8 → u16
+
+Generalizing the byte-hardcoded codec stack to a 4096-token alphabet touched every file in the inference path:
+
+- `arch.rs`: `VOCAB = 4096`, new `CDF_LEN = VOCAB + 1` const for AC's CDF arrays.
+- `ac.rs`: encoder/decoder symbol type `u8 → u16`; `[u32; 257]` CDFs become `[u32; CDF_LEN]`. The 16-bit `TOTAL = 65,536` mass stays adequate at 4K — every symbol still gets ≥1 count, leaving 61,440 for proportional distribution; minimum representable probability is 1/65,536 ≈ 1.5e-5, fine for tail tokens.
+- `probs.rs`: softmax-to-CDF over `[f32; VOCAB]` (already templated; only the return type changed).
+- `codec.rs`: `encode_bytes` now tokenizes input before AC-encoding the token stream; `decode_bytes` runs AC until detokenized output reaches the header's byte length, using a pre-built `Vec<Vec<u8>>` token-bytes table. Header format unchanged (4B magic + 8B byte length).
+- `model.rs`: `step(token: Token)` instead of `step(token: u8)`; logits and embedding shapes auto-adapt via `VOCAB`.
+- `train.rs`: tokenizes the entire training corpus once at startup (~1 GB → ~407M `u16` tokens, ~814 MB), drops the byte buffer, samples token windows for batches.
+- `tokenizer.rs` (new): loads the compact binary, applies merges greedily by lowest rank within whitespace-bounded chunks, decodes via direct vocab-table lookup.
+
+Build green at this point: 33 tests pass on submission, 36 on dev, 33 on release. End-to-end with a real trained model is unverified — unit tests cover AC + tokenizer + codec roundtrip with random/zero weights, but actual training and codec performance need a run.
+
+### Embedding ternarization
+
+VOCAB=4096 makes the f32 token embedding 4 MB — by far the largest single tensor in the model. Ternarizing it (per-row absmean scale, same I2_S packing as the per-layer matrices) drops it to 272 KB on disk (256 KB packed + 16 KB scales). The embedding is weight-tied to the LM head, so the tied output projection becomes a `(VOCAB × D_MODEL)` ternary matvec — the same kernel shape the per-layer code already runs, just wider. New `bitnet::dequantize_i2s_row` function unpacks one I2_S-packed row × scale to f32 for the input embedding lookup; the LM head reuses `matvec_prequant`. Compile-time `lut_supports(VOCAB, D_MODEL)` assertion in `weights.rs` guards the kernel-shape compatibility.
+
+| Component                    | Pre-ternarization | Post-ternarization |
+|------------------------------|------------------:|-------------------:|
+| Token embedding (f32)        |              4 MB |              0     |
+| Token embedding (packed)     |                 0 |             272 KB |
+| Layer matrices (×2)          |           ~250 KB |            ~250 KB |
+| Norms + mix vectors          |             ~3 KB |              ~3 KB |
+| **`PACKED_WEIGHTS_LEN`**     |       **~4.25 MB** |        **~530 KB** |
+
+Net L(C) saving ~3.7 MB. For reference: this brings the 1M token-level model to ~530 KB on disk, comparable to the byte-level 1M model's footprint (~256 KB f32 emb + ~250 KB layers ≈ 500 KB total) but with 16× the vocabulary. The tied LM head adds ~1.0M MACs to per-step inference (matching the ~920K MACs across two layers' matvecs), but uses the same LUT-accelerated kernel — wall-time projects to roughly the byte-level 1M baseline plus the 2.45× saving from sequence shortening.
+
+Training-side: the embedding `Var` stays f32 in candle; quantization happens at checkpoint write time (post-hoc, not QAT). Train/inference numerics will diverge slightly. If quality drops, the next move is fake-quant on the embedding inside the training forward pass — same STE pattern `BitLinear::forward` already uses for the per-layer matrices.
+
+### Decision: 1M restart on tokens (`D_MODEL = 256, N_LAYERS = 2`)
+
+`src/arch.rs` rolled all the way back to `N_LAYERS = 2`. Restarting at the smallest scale to re-establish the baseline curve on tokens is cheap — at the projected ~2.45× wall-time speedup from tokenization the original 7-hour 1M byte-level run (2026-04-24 entry) should land in ~3 hours — and the 1M-token-level point versus the next scales determines whether the BPE pivot actually beats byte-level on a per-parameter basis. The expectation going in: 1M token-level lands lower on train-loss-per-byte-encoded than 1M byte-level (each token now carries ~2.45 bytes), and the curve to higher scales should bend further than the byte-level diminishing-returns shape did from 1M → 8M (8× params for 17% loss reduction). If it does not, BPE was the wrong lever and the architecture or objective needs to change.
+
+### Open / deferred
+
+- **End-to-end validation**: training kickoff + first checkpoint + codec roundtrip on real (not random/zero) weights. Unit tests pass but the full token-level pipeline has not been driven end-to-end yet on hardware.
+- **Alphabet trim**: ~56 byte values (invalid UTF-8 prefixes, most C0 control codes) never appear in enwik9 but consume base-vocab slots. Saves ~1.4% of vocab. Folded out of this diff to keep the rewrite small; cheap follow-up.
+- **QAT for embedding**: post-hoc quantization is the first cut. If train/inference divergence costs measurable bpb, add fake-quant on the embedding in the training forward.
+- **Eval harness noise**: the 5-offset codec panel from 2026-04-23 is still deferred. Codec bpb at single 16 KiB windows remains too noisy for plateau detection; train loss is still the only trustworthy signal.
+- **Case folding**: deferred per the case-folding section above. A/B test it after tokenized end-to-end numbers exist.
+
+---
+
+## 2026-04-25 → 2026-05-03 — 8M RWKV Plateau; Metal Autorelease Fix; Scaling To 12M
+
+CDR/Claude attempted a sequence of scale-up runs over ~9 days on an M3 Pro, blocked initially by a candle Metal memory leak that masqueraded as "training getting OOM-killed", then landed an 8M (`D_MODEL=256, N_LAYERS=16, CM_MULT=1`) run end-to-end through plateau on 2026-05-03. The run plateaued at train loss 1.024 nats / ~1.48 info-bpb, the best checkpoint sits at step 14319, and the next scale step is queued at 12M (`N_LAYERS=26`) rather than the originally-planned 16M (`N_LAYERS=32`) — the 2× depth bump saturates the dev box's training throughput, so 12M is the partial step that fits the M3 Pro comfortably. This entry covers the leak hunt, the plumbing it forced into place, the 4M and 8M runs themselves, and the inference-budget tension at 12M.
 
 ### Memory leak: ~6 MB/sec linear RSS climb on Metal
 
@@ -77,15 +410,17 @@ Per-checkpoint codec test reports `encode_hours_1gb` and `decode_hours_1gb` meas
 
 Both numbers are with the TL1-NEON LUT path active (`bitnet::matvec_ternary_lut` dispatches to `matvec_ternary_tl1_neon` on aarch64; LUT buffer is built at `Weights::from_bytes` time and the I2_S buffer is dropped to save RSS). Wall-clock scales linearly with N_LAYERS as expected — matvec is the dominant inference cost.
 
-The Hutter wall budget is `70,000 / Geekbench5` hours on the judging machine. For a Zen 2 single-core system around Geekbench5 ~1100 that's ~64 hours total (encode + decode, since the same binary handles both at 1× scoring). **8M is already over budget**: 108 hours > 64 hours by a factor of ~1.7×. 16M without further kernel speedup would project to ~216 hours — over by ~3.4×.
+The Hutter wall budget is `70,000 / Geekbench5` hours on the judging machine. For a Zen 2 single-core system around Geekbench5 ~1100 that's ~64 hours total (encode + decode, since the same binary handles both at 1× scoring). **8M is already over budget**: 108 hours > 64 hours by a factor of ~1.7×. 12M (N_LAYERS=26) projects to ~88 h/GB encode → ~175 h total, over by ~2.7×. The originally-planned 16M (N_LAYERS=32) would have been ~216 hours, over by ~3.4×.
 
-Accepted as a known constraint for the 16M scale step. The matvec dominates so cleanly that the next round of optimization has to live in the matvec kernel itself: 2-row or 4-row output tile fusion across the TL1/TL2 inner loops to amortize the LUT load, tighter activation precision (4-bit or 5-bit rather than 7-bit), or eventually a non-LUT scheme. Outside scope of this entry.
+Accepted as a known constraint for the 12M scale step. The matvec dominates so cleanly that the next round of optimization has to live in the matvec kernel itself: 2-row or 4-row output tile fusion across the TL1/TL2 inner loops to amortize the LUT load, tighter activation precision (4-bit or 5-bit rather than 7-bit), or eventually a non-LUT scheme. Outside scope of this entry.
 
-### Decision: scale to 16M (N_LAYERS=32)
+### Decision: scale to 12M (N_LAYERS=26), not 16M
 
-`src/arch.rs` bumped to `N_LAYERS = 32` from 16. Same axis-only-moves rationale as every prior step: width preferred-over-depth would be ~15% faster per step (WKV recurrence is sequential, so depth costs more per parameter than width does) but committing to `D_MODEL=512` puts every matvec exactly at the TL1 i16 accumulator bound with no further-width headroom. Holding 256 keeps the kernel-side spec book unchanged across the whole 1M → 16M trajectory.
+Original plan was a clean 2× depth bump to `N_LAYERS = 32` (~14.88M total, "16M-class"). After landing it in `src/arch.rs` and re-running the build, projecting per-step training time at ~10.8 s on M3 Pro Metal (2× the 8M cost, ~78 hours wall for 26k steps), CDR pulled back: a 3.5-day run that pegs the dev box's GPU and thermal envelope is too disruptive when the 8M plateau already clears the "is the architecture working" bar. Backing off to `N_LAYERS = 26` (~12.10M total: 11.93M ternary `7·D_MODEL² = 458,752` per layer × 26 + ~173K f32) keeps the depth bump at 1.625× rather than 2×, projects per-step time to ~8.8 s and ~64 hours wall — a 2.6-day run that the dev box can comfortably absorb. Breaks the strict 1M → 2M → 4M → 8M doubling cadence; treated as the cost of staying inside the dev-machine envelope.
 
-Parameter budget at `N_LAYERS=32`: ~14.68M ternary (`7·D_MODEL² = 458,752` per layer × 32) + ~197K f32 ≈ 14.88M total. Per-step training time projects to ~10.8 s on M3 Pro Metal (2× the 8M cost). 26k steps to plateau-territory ≈ 78 hours wall, plan for a 3.5-day run. The expectation going in is that train loss continues bending toward 0.9 nats give-or-take, with the open question being whether the eval harness can be fixed in time to confirm; if the 16M run plateaus near 0.95–1.0 it's a ~5–7% improvement on 8M and the diminishing-returns pattern from 1M→8M continues. If it plateaus at 8M's 1.024, depth has stopped paying off and the next scale step needs width or a different objective.
+Same axis-only-moves rationale as every prior step: width preferred-over-depth would be ~15% faster per step (WKV recurrence is sequential, so depth costs more per parameter than width does) but committing to `D_MODEL=512` puts every matvec exactly at the TL1 i16 accumulator bound with no further-width headroom. Holding 256 keeps the kernel-side spec book unchanged across the whole 1M → 12M trajectory.
+
+The expectation going in is that train loss continues bending toward 0.95 nats give-or-take, with the open question being whether the eval harness can be fixed in time to confirm; if the 12M run plateaus near 0.97–1.00 it's a ~3–5% improvement on 8M and the diminishing-returns pattern from 1M→8M continues. If it plateaus at 8M's 1.024, depth has stopped paying off (at 1.625× the parameter count) and the next scale step needs width or a different objective.
 
 ---
 

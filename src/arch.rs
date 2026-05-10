@@ -10,31 +10,37 @@
 //! Constants are `const` so that the weight-file length check at the
 //! `include_bytes!` site is a compile-time assertion.
 
-/// Byte vocabulary: one symbol per possible byte value.
+/// Symbol vocabulary. Reverted to byte-level on 2026-05-09 with the
+/// pivot to a deterministic-first ensemble: type-routed mixing,
+/// order-N PPM, LZ pre-pass, etc. (see 2026-05-09 journal entry, when
+/// written). The neural component is shelved while the deterministic
+/// stack is iterated — when we re-introduce a neural arm it'll plug
+/// in as one component of a mixed ensemble, and the tokenizer
+/// question gets re-decided then.
 pub(crate) const VOCAB: usize = 256;
+
+/// Length of the cumulative distribution function passed to the
+/// arithmetic coder: one entry per symbol plus the trailing `TOTAL`
+/// sentinel.
+pub(crate) const CDF_LEN: usize = VOCAB + 1;
 
 /// Model width. Must be divisible by 256 for k-quant alignment (CLAUDE.md)
 /// and `≤ 512` so every ternary matrix's `in_dim` stays within the TL1 NEON
 /// kernel's i16-accumulator bound. Bumping beyond 512 requires widening
 /// the LUT-kernel accumulators to i32 or adding periodic flush.
 ///
-/// `D_MODEL = 256`, `N_LAYERS = 26`, `CM_MULT = 1` yields ~11.93M ternary
-/// weights (`7·D_MODEL² = 458752` per layer × 26 layers) plus ~173K f32
-/// parameters ≈ 12.10M total — partial depth bump from the 8M plateau
-/// (`N_LAYERS = 16`) on the 1M → 2M → 4M → 8M → 12M-class trajectory.
-/// Breaks the strict doubling cadence used through 8M because the full
-/// 16M step (`N_LAYERS = 32`) saturates the dev machine's training
-/// throughput. Width-preferred-over-depth would be ~15% faster per step
-/// but commits to `D_MODEL = 512` (exactly at the TL1 i16 accumulator
-/// bound, no further-width headroom), so depth still carries the
-/// scale-up. Inference budget remains the open concern — see
-/// `JOURNAL.md` 2026-04-25 → 2026-05-03 for the 8M plateau analysis and
-/// the wall-time projection that says ≥12M needs additional
-/// matvec-kernel optimization to fit the Hutter budget.
+/// `D_MODEL = 256`, `N_LAYERS = 2`, `CM_MULT = 1` — the **1M restart**
+/// shape held in reserve for when the neural arm comes back online.
+/// The 8M token-level run was killed on 2026-05-09 after 4.4k steps
+/// (info-bpb tracking byte-level 8M, no ceiling-raising headroom from
+/// BPE alone); the next neural arm will re-enter at 1M as one component
+/// of a mixed ensemble. The model code paths are dormant during phase-1
+/// deterministic-stack iteration but kept compiling so the resume is
+/// just "fill in the deterministic-residual training objective."
 pub(crate) const D_MODEL: usize = 256;
 
 /// Number of RWKV blocks. Each block is one time-mix + one channel-mix.
-pub(crate) const N_LAYERS: usize = 26;
+pub(crate) const N_LAYERS: usize = 2;
 
 /// Channel-mix hidden-size multiplier relative to `D_MODEL`. RWKV v4
 /// traditionally uses `4×`, but `D_FF = 4·D_MODEL = 2048` would exceed
@@ -65,6 +71,13 @@ pub(crate) const fn packed_bytes(out_dim: usize, in_dim: usize) -> usize {
     (out_dim * in_dim).div_ceil(4)
 }
 
+// Token-embedding ternary matrix size. `tok_emb` is `VOCAB × D_MODEL`,
+// stored as `I2_S` packed weights + per-row f32 absmax scale. Same
+// kernel used by the per-layer matrices, with the LM head reusing the
+// embedding via weight-tied output projection.
+pub(crate) const PACKED_TOK_EMB_BYTES: usize = packed_bytes(VOCAB, D_MODEL);
+pub(crate) const SCALE_TOK_EMB_F32S: usize = VOCAB;
+
 // Per-layer ternary matrix sizes.
 //
 // Time-mix has four projections: receptance `R`, key `K`, value `V`,
@@ -91,9 +104,10 @@ pub(crate) const SCALE_CM_R_F32S: usize = D_MODEL;
 ///   `cm_norm` (f32), `cm_mix_k` (f32), `cm_mix_r` (f32),
 ///   `cm_K` + scale, `cm_V` + scale, `cm_R` + scale.
 ///
-/// Plus global: `tok_emb` (f32), initial `ln0` (f32), final `ln_f` (f32).
+/// Global: `tok_emb` (ternary `I2_S` packed + per-row f32 scale),
+/// initial `ln0` (f32), final `ln_f` (f32).
 pub(crate) const PACKED_WEIGHTS_LEN: usize = {
-    let tok_emb = VOCAB * D_MODEL * 4;
+    let tok_emb = PACKED_TOK_EMB_BYTES + SCALE_TOK_EMB_F32S * 4;
     let ln0 = D_MODEL * 4;
     let ln_f = D_MODEL * 4;
 

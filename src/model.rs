@@ -12,8 +12,10 @@
 
 use crate::arch::{D_FF, D_MODEL, N_LAYERS, RMS_EPS, VOCAB};
 use crate::bitnet::{
-    build_lut, lut_scratch_bytes, matvec_ternary, matvec_ternary_lut, quantize_activations,
+    build_lut, dequantize_i2s_row, lut_scratch_bytes, matvec_ternary, matvec_ternary_lut,
+    quantize_activations,
 };
+use crate::tokenizer::Token;
 use crate::weights::{TernaryMatrix, Weights};
 
 /// Per-layer RWKV state. Five `D_MODEL`-sized f32 vectors.
@@ -204,20 +206,23 @@ impl ByteTransformer {
         }
     }
 
-    /// Consume one byte, advance state, return the logits predicting the
-    /// next byte.
+    /// Consume one token, advance state, return the logits predicting the
+    /// next token.
     // The step function reads top-to-bottom in the same order as RWKV v4's
     // reference implementation (embed → ln0 → per-layer time-mix +
     // channel-mix → ln_f → tied LM head); splitting it into helpers would
     // obscure the dataflow.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn step(&mut self, token: u8) -> &[f32; VOCAB] {
+    pub(crate) fn step(&mut self, token: Token) -> &[f32; VOCAB] {
         let scratch = &mut self.scratch;
 
-        // Embedding + ln0.
-        let tok_emb = self.weights.tok_emb();
-        let start = (token as usize) * D_MODEL;
-        scratch.x.copy_from_slice(&tok_emb[start..start + D_MODEL]);
+        // Embedding + ln0. Dequantize one row of the ternary `tok_emb`
+        // into `scratch.x` via per-row scale.
+        let emb = self.weights.tok_emb_mat();
+        let row_packed_off = (token as usize) * (D_MODEL / 4);
+        let row_packed = &emb.packed[row_packed_off..row_packed_off + (D_MODEL / 4)];
+        let row_scale = emb.scale[token as usize];
+        dequantize_i2s_row(row_packed, row_scale, D_MODEL, &mut scratch.x);
         let ln0_w = self.weights.ln0();
         let mut tmp = [0.0_f32; D_MODEL];
         rmsnorm(&scratch.x, ln0_w, &mut tmp);
@@ -396,70 +401,19 @@ impl ByteTransformer {
         rmsnorm(&scratch.x, ln_f_w, &mut tmp);
         scratch.x.copy_from_slice(&tmp);
 
-        // Tied-embedding output head: logit[i] = x · tok_emb[i]. `D_MODEL`
-        // is divisible by 16 so the SIMD dot kicks in.
-        for (i, logit) in scratch.logits.iter_mut().enumerate() {
-            let row = &tok_emb[i * D_MODEL..(i + 1) * D_MODEL];
-            *logit = dot_f32(&scratch.x, row);
+        // Tied-embedding output head: logit[i] = x · tok_emb[i]. The
+        // ternary matvec runs through the same kernel as the per-layer
+        // weights — `tok_emb_mat()` returns a TernaryMatrix and
+        // `matvec_prequant` dispatches to LUT or scalar.
+        {
+            let (x_q, x_scale) =
+                quantize_and_build_lut(&scratch.x, &mut scratch.xq, &mut scratch.lut);
+            let lut_len = lut_scratch_bytes(x_q.len());
+            let lut = &scratch.lut[..lut_len];
+            matvec_prequant(&emb, x_q, lut, x_scale, &mut scratch.logits);
         }
 
         &scratch.logits
-    }
-}
-
-/// Dot product of two f32 slices. Length must be divisible by 16; both
-/// `D_MODEL = 512` and `D_FF` satisfy this.
-#[inline]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    debug_assert_eq!(a.len() % 16, 0);
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is baseline on aarch64.
-        #[allow(unsafe_code)]
-        unsafe {
-            return neon_dot_f32(a, b);
-        }
-    }
-    #[allow(unreachable_code)]
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-/// NEON: f32 dot product for any length divisible by 16. 4-way unrolled
-/// FMA with 4 independent accumulators to hide the FMA pipeline latency.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-#[allow(unsafe_code)]
-unsafe fn neon_dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
-    debug_assert_eq!(a.len(), b.len());
-    debug_assert_eq!(a.len() % 16, 0);
-    // SAFETY: callers guarantee lengths; NEON is baseline on aarch64.
-    unsafe {
-        let mut acc0 = vdupq_n_f32(0.0);
-        let mut acc1 = vdupq_n_f32(0.0);
-        let mut acc2 = vdupq_n_f32(0.0);
-        let mut acc3 = vdupq_n_f32(0.0);
-        let mut off = 0;
-        while off + 16 <= a.len() {
-            let a0 = vld1q_f32(a.as_ptr().add(off));
-            let a1 = vld1q_f32(a.as_ptr().add(off + 4));
-            let a2 = vld1q_f32(a.as_ptr().add(off + 8));
-            let a3 = vld1q_f32(a.as_ptr().add(off + 12));
-            let b0 = vld1q_f32(b.as_ptr().add(off));
-            let b1 = vld1q_f32(b.as_ptr().add(off + 4));
-            let b2 = vld1q_f32(b.as_ptr().add(off + 8));
-            let b3 = vld1q_f32(b.as_ptr().add(off + 12));
-            acc0 = vfmaq_f32(acc0, a0, b0);
-            acc1 = vfmaq_f32(acc1, a1, b1);
-            acc2 = vfmaq_f32(acc2, a2, b2);
-            acc3 = vfmaq_f32(acc3, a3, b3);
-            off += 16;
-        }
-        let s01 = vaddq_f32(acc0, acc1);
-        let s23 = vaddq_f32(acc2, acc3);
-        vaddvq_f32(vaddq_f32(s01, s23))
     }
 }
 
@@ -476,15 +430,15 @@ mod tests {
     #[test]
     fn step_with_zero_weights_runs_without_panic() {
         let mut model = ByteTransformer::new(zero_weights());
-        let _ = model.step(b'a');
-        let _ = model.step(b'b');
-        let _ = model.step(b'c');
+        let _ = model.step(u16::from(b'a'));
+        let _ = model.step(u16::from(b'b'));
+        let _ = model.step(u16::from(b'c'));
     }
 
     #[test]
     fn reset_clears_state() {
         let mut model = ByteTransformer::new(zero_weights());
-        for i in 0..10u8 {
+        for i in 0..10u16 {
             let _ = model.step(i);
         }
         model.reset();

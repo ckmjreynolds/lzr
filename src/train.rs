@@ -26,8 +26,38 @@ use rand::{Rng, SeedableRng};
 
 use crate::arch::{D_FF, D_MODEL, N_LAYERS, RMS_EPS, VOCAB};
 use crate::bitnet::{pack_ternary, unpack_i2s_to_rowmajor};
+
+/// Quantize a row-major f32 matrix to ternary `I2_S` + per-row absmean
+/// scale, matching the [`BitLinear::quantize`] convention used for the
+/// per-layer ternary projections. Used for the token embedding when
+/// writing checkpoints.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn quantize_rows_to_ternary(
+    rows_flat: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> (Vec<u8>, Vec<f32>) {
+    debug_assert_eq!(rows_flat.len(), out_dim * in_dim);
+    let mut packed = vec![0u8; (out_dim * in_dim) / 4];
+    let mut scale = Vec::with_capacity(out_dim);
+    let mut row_buf = vec![0i8; in_dim];
+    for row_idx in 0..out_dim {
+        let row = &rows_flat[row_idx * in_dim..(row_idx + 1) * in_dim];
+        let absmean = row.iter().map(|v| v.abs()).sum::<f32>() / in_dim as f32;
+        let s = absmean.max(1e-5);
+        scale.push(s);
+        for (dst, src) in row_buf.iter_mut().zip(row.iter()) {
+            let q = (src / s).clamp(-1.0, 1.0).round();
+            *dst = q as i8;
+        }
+        let byte_off = row_idx * in_dim / 4;
+        pack_ternary(&row_buf, &mut packed[byte_off..byte_off + in_dim / 4]);
+    }
+    (packed, scale)
+}
 use crate::codec::{TransformerProbs, decode_bytes, encode_bytes};
 use crate::model::ByteTransformer;
+use crate::tokenizer::{Token, Tokenizer};
 use crate::weights::{
     LayerTensors, LayerView, TernaryMatrix, Weights, write_checkpoint, write_weights,
 };
@@ -116,6 +146,12 @@ pub(crate) struct TrainArgs {
     /// stream are not stored in checkpoints, so those reset on resume.
     #[arg(long)]
     pub resume: Option<PathBuf>,
+
+    /// Tokenizer file (BPE merges in compact binary format produced by
+    /// `lzr bpe`). The training pipeline tokenizes the input corpus once
+    /// at startup and trains the model on the resulting token stream.
+    #[arg(long, default_value = "assets/tokenizer.bin")]
+    pub tokenizer: PathBuf,
 }
 
 /// Entry point for `lzr train`.
@@ -130,13 +166,40 @@ pub(crate) fn run(args: TrainArgs) -> Result<()> {
     let device = pick_device();
     eprintln!("[lzr train] device = {device:?}");
 
-    let mut train_file = File::open(&args.input)
-        .with_context(|| format!("opening training input {}", args.input.display()))?;
-    let train_len = train_file.metadata()?.len() as usize;
+    let tokenizer = Tokenizer::load(&args.tokenizer)
+        .with_context(|| format!("loading tokenizer {}", args.tokenizer.display()))?;
+    eprintln!(
+        "[lzr train] tokenizer: vocab={}, merges={} ({})",
+        tokenizer.vocab_size(),
+        tokenizer.num_merges(),
+        args.tokenizer.display()
+    );
     anyhow::ensure!(
-        train_len > args.seq,
-        "training file {} is shorter than seq+1",
-        args.input.display()
+        tokenizer.vocab_size() == VOCAB,
+        "tokenizer vocab {} != arch::VOCAB {VOCAB} (rebuild tokenizer or update arch)",
+        tokenizer.vocab_size()
+    );
+
+    let tok_load_start = Instant::now();
+    let train_bytes = std::fs::read(&args.input)
+        .with_context(|| format!("reading training input {}", args.input.display()))?;
+    let train_byte_len = train_bytes.len();
+    let train_tokens: Vec<Token> = tokenizer.encode(&train_bytes);
+    drop(train_bytes);
+    #[allow(clippy::cast_precision_loss)]
+    let bpt = train_byte_len as f64 / train_tokens.len().max(1) as f64;
+    eprintln!(
+        "[lzr train] tokenized {} bytes → {} tokens in {:.1}s ({bpt:.3} bytes/token)",
+        train_byte_len,
+        train_tokens.len(),
+        tok_load_start.elapsed().as_secs_f64(),
+    );
+    anyhow::ensure!(
+        train_tokens.len() > args.seq,
+        "training file {} tokenized to {} tokens, less than seq+1 = {}",
+        args.input.display(),
+        train_tokens.len(),
+        args.seq + 1,
     );
 
     let codec_path = args
@@ -220,14 +283,8 @@ pub(crate) fn run(args: TrainArgs) -> Result<()> {
         // so their Arc<Buffer> strong counts are 1 by the time the buffer
         // pool's reuse logic runs.
         let loss_val = step_body(&device, || {
-            let (inputs, targets) = sample_batch(
-                &mut train_file,
-                train_len,
-                args.batch,
-                args.seq,
-                &mut rng,
-                &device,
-            )?;
+            let (inputs, targets) =
+                sample_batch(&train_tokens, args.batch, args.seq, &mut rng, &device)?;
             let logits = model.forward(&inputs)?;
             let loss = flattened_cross_entropy(&logits, &targets)?;
             optimizer.backward_step(&loss)?;
@@ -270,7 +327,8 @@ pub(crate) fn run(args: TrainArgs) -> Result<()> {
                 format!("renaming {} -> {}", tmp_path.display(), ckpt_path.display())
             })?;
 
-            let codec_result = run_codec_test(&tensors, &mut codec_file, codec_len, &mut rng)?;
+            let codec_result =
+                run_codec_test(&tensors, &tokenizer, &mut codec_file, codec_len, &mut rng)?;
             let delta = last_ckpt_loss.map(|prev| loss_val - prev);
 
             log_writer.log_checkpoint(step, &ckpt_path, loss_val, delta, &codec_result)?;
@@ -366,7 +424,17 @@ impl RwkvForTraining {
     /// Build a training-ready model from a loaded checkpoint. Each ternary
     /// matrix is rehydrated as `unpack(packed)[i, j] · scale[i]`.
     fn from_weights(w: &Weights, device: &Device, bptt_chunk: usize) -> Result<Self> {
-        let tok_emb = vec_to_var(w.tok_emb(), &[VOCAB, D_MODEL], device)?;
+        let emb = w.tok_emb_mat();
+        let mut emb_f32 = vec![0.0_f32; VOCAB * D_MODEL];
+        let mut row_i8 = vec![0i8; VOCAB * D_MODEL];
+        unpack_i2s_to_rowmajor(emb.packed, &mut row_i8, VOCAB, D_MODEL);
+        for r in 0..VOCAB {
+            let s = emb.scale[r];
+            for c in 0..D_MODEL {
+                emb_f32[r * D_MODEL + c] = f32::from(row_i8[r * D_MODEL + c]) * s;
+            }
+        }
+        let tok_emb = vec_to_var(&emb_f32, &[VOCAB, D_MODEL], device)?;
         let ln0 = RMSNormVar::from_slice(w.ln0(), device)?;
         let ln_f = RMSNormVar::from_slice(w.ln_f(), device)?;
         let layers = (0..N_LAYERS)
@@ -409,8 +477,10 @@ impl RwkvForTraining {
     }
 
     fn quantize_to_packed(&self) -> Result<OwnedTensors> {
-        let tok_emb = self.tok_emb.as_tensor().to_vec2::<f32>()?;
-        let tok_emb: Vec<f32> = tok_emb.into_iter().flatten().collect();
+        let tok_emb_rows = self.tok_emb.as_tensor().to_vec2::<f32>()?;
+        let tok_emb_flat: Vec<f32> = tok_emb_rows.into_iter().flatten().collect();
+        let (tok_emb_packed, tok_emb_scale) =
+            quantize_rows_to_ternary(&tok_emb_flat, VOCAB, D_MODEL);
         let ln0 = self.ln0.weight_as_vec()?;
         let ln_f = self.ln_f.weight_as_vec()?;
         let layers = self
@@ -419,7 +489,8 @@ impl RwkvForTraining {
             .map(RwkvBlock::quantize_to_packed)
             .collect::<Result<Vec<_>>>()?;
         Ok(OwnedTensors {
-            tok_emb,
+            tok_emb_packed,
+            tok_emb_scale,
             ln0,
             ln_f,
             layers,
@@ -850,24 +921,20 @@ fn flattened_cross_entropy(logits: &Tensor, targets: &Tensor) -> Result<Tensor> 
 }
 
 fn sample_batch(
-    file: &mut File,
-    file_len: usize,
+    tokens: &[Token],
     batch: usize,
     seq: usize,
     rng: &mut rand::rngs::StdRng,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    let max_off = file_len - (seq + 1);
-    let mut window = vec![0u8; seq + 1];
+    let max_off = tokens.len() - (seq + 1);
     let mut inputs = vec![0i64; batch * seq];
     let mut targets = vec![0i64; batch * seq];
     for bi in 0..batch {
-        let off = rng.random_range(0..=max_off) as u64;
-        file.seek(SeekFrom::Start(off))?;
-        file.read_exact(&mut window)?;
+        let off = rng.random_range(0..=max_off);
         for i in 0..seq {
-            inputs[bi * seq + i] = i64::from(window[i]);
-            targets[bi * seq + i] = i64::from(window[i + 1]);
+            inputs[bi * seq + i] = i64::from(tokens[off + i]);
+            targets[bi * seq + i] = i64::from(tokens[off + i + 1]);
         }
     }
     let inp = Tensor::from_vec(inputs, (batch, seq), device)?;
@@ -905,7 +972,8 @@ impl LrSchedule {
 }
 
 struct OwnedTensors {
-    tok_emb: Vec<f32>,
+    tok_emb_packed: Vec<u8>,
+    tok_emb_scale: Vec<f32>,
     ln0: Vec<f32>,
     ln_f: Vec<f32>,
     layers: Vec<OwnedLayer>,
@@ -965,7 +1033,16 @@ fn layers_as_refs(t: &OwnedTensors) -> [LayerTensors<'_>; N_LAYERS] {
 
 fn write_checkpoint_from_parts(out: &mut File, step: u64, t: &OwnedTensors) -> Result<()> {
     let layers = layers_as_refs(t);
-    write_checkpoint(out, step, &t.tok_emb, &t.ln0, &t.ln_f, &layers).map_err(Into::into)
+    write_checkpoint(
+        out,
+        step,
+        &t.tok_emb_packed,
+        &t.tok_emb_scale,
+        &t.ln0,
+        &t.ln_f,
+        &layers,
+    )
+    .map_err(Into::into)
 }
 
 fn checkpoint_filename(step: usize) -> String {
@@ -988,6 +1065,7 @@ struct CodecResult {
 #[allow(clippy::cast_precision_loss)]
 fn run_codec_test(
     tensors: &OwnedTensors,
+    tokenizer: &Tokenizer,
     codec_file: &mut File,
     codec_len: usize,
     rng: &mut rand::rngs::StdRng,
@@ -1001,7 +1079,8 @@ fn run_codec_test(
     let mut blob = Vec::with_capacity(crate::arch::PACKED_WEIGHTS_LEN);
     let layers = layers_as_refs(tensors);
     write_weights(
-        &tensors.tok_emb,
+        &tensors.tok_emb_packed,
+        &tensors.tok_emb_scale,
         &tensors.ln0,
         &tensors.ln_f,
         &layers,
@@ -1015,7 +1094,7 @@ fn run_codec_test(
     let mut archive = Vec::new();
     {
         let mut probs = TransformerProbs::new(&mut model);
-        encode_bytes(&slice, &mut probs, &mut archive)?;
+        encode_bytes(&slice, tokenizer, &mut probs, &mut archive)?;
     }
     let encode_ms = enc_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1023,7 +1102,7 @@ fn run_codec_test(
     let decoded = {
         let mut cur = &archive[..];
         let mut probs = TransformerProbs::new(&mut model);
-        decode_bytes(&mut cur, &mut probs)?
+        decode_bytes(&mut cur, tokenizer, &mut probs)?
     };
     let decode_ms = dec_start.elapsed().as_secs_f64() * 1000.0;
 

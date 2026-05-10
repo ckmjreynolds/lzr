@@ -609,6 +609,41 @@ pub(crate) fn unpack_i2s_to_rowmajor(
     }
 }
 
+/// Dequantize a single I2_S-packed row into f32 via per-row scale.
+///
+/// Caller passes the row's packed bytes (length `in_dim / 4`) and the
+/// row's f32 scale; the function decodes ternary values from the
+/// block-interleaved layout (matching [`unpack_i2s_to_rowmajor`]) and
+/// writes `scale * (-1 | 0 | +1)` into `out[..in_dim]`.
+///
+/// Used by the embedding lookup: `tok_emb` is stored as I2_S, but model
+/// inference needs an f32 row vector for `RMSNorm` and the residual
+/// path. Per-row dequant is `O(in_dim)` and runs once per token.
+#[allow(clippy::cast_possible_wrap)]
+pub(crate) fn dequantize_i2s_row(packed_row: &[u8], scale: f32, in_dim: usize, out: &mut [f32]) {
+    assert_eq!(packed_row.len(), in_dim / 4);
+    assert_eq!(out.len(), in_dim);
+    assert_eq!(in_dim % QK_I2_S, 0);
+
+    let n_blocks = in_dim / QK_I2_S;
+    let group_size = QK_I2_S / 4;
+    for block in 0..n_blocks {
+        let p_base = block * PACKED_BYTES_PER_BLOCK;
+        let w_base = block * QK_I2_S;
+        for b in 0..group_size {
+            let byte = packed_row[p_base + b];
+            let v0 = f32::from((((byte >> 6) & 0b11) as i8) - 1);
+            let v1 = f32::from((((byte >> 4) & 0b11) as i8) - 1);
+            let v2 = f32::from((((byte >> 2) & 0b11) as i8) - 1);
+            let v3 = f32::from(((byte & 0b11) as i8) - 1);
+            out[w_base + b] = scale * v0;
+            out[w_base + b + group_size] = scale * v1;
+            out[w_base + b + 2 * group_size] = scale * v2;
+            out[w_base + b + 3 * group_size] = scale * v3;
+        }
+    }
+}
+
 /// Build the TL1 activation LUT.
 ///
 /// `x_q` is the 8-bit absmax-quantized activation vector. We right-shift

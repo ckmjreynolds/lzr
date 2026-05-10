@@ -8,9 +8,10 @@
 //!
 //! Body layout (all LE for the f32 fields):
 //! ```text
-//! tok_emb: [f32; VOCAB * D_MODEL]
-//! ln0:     [f32; D_MODEL]
-//! ln_f:    [f32; D_MODEL]
+//! tok_emb_packed: [u8; PACKED_TOK_EMB_BYTES]   (I2_S, VOCAB × D_MODEL)
+//! tok_emb_scale:  [f32; VOCAB]                  (per-row absmax scale)
+//! ln0:            [f32; D_MODEL]
+//! ln_f:           [f32; D_MODEL]
 //! per layer (N_LAYERS times):
 //!   tm_norm:      [f32; D_MODEL]
 //!   time_mix_r:   [f32; D_MODEL]
@@ -36,17 +37,19 @@ use std::path::Path;
 
 use crate::arch::{
     D_FF, D_MODEL, N_LAYERS, PACKED_CM_K_BYTES, PACKED_CM_R_BYTES, PACKED_CM_V_BYTES,
-    PACKED_TM_BYTES, PACKED_WEIGHTS_LEN, SCALE_CM_K_F32S, SCALE_CM_R_F32S, SCALE_CM_V_F32S,
-    SCALE_TM_F32S, VOCAB,
+    PACKED_TM_BYTES, PACKED_TOK_EMB_BYTES, PACKED_WEIGHTS_LEN, SCALE_CM_K_F32S, SCALE_CM_R_F32S,
+    SCALE_CM_V_F32S, SCALE_TM_F32S, SCALE_TOK_EMB_F32S, VOCAB,
 };
 use crate::bitnet::{lut_packed_bytes, lut_supports, repack_i2s_to_lut};
 
 /// 8-byte ASCII magic for checkpoint files.
 pub(crate) const CKPT_MAGIC: &[u8; 8] = b"LZRCKPT1";
 
-const TOK_EMB_BYTES: usize = VOCAB * D_MODEL * 4;
+const TOK_EMB_SCALE_BYTES: usize = SCALE_TOK_EMB_F32S * 4;
+const TOK_EMB_TOTAL_BYTES: usize = PACKED_TOK_EMB_BYTES + TOK_EMB_SCALE_BYTES;
 const LN0_BYTES: usize = D_MODEL * 4;
 const LN_F_BYTES: usize = D_MODEL * 4;
+const LUT_TOK_EMB_BYTES: usize = lut_packed_bytes(VOCAB, D_MODEL);
 
 const TM_NORM_BYTES: usize = D_MODEL * 4;
 const TIME_MIX_BYTES: usize = D_MODEL * 4; // per time_mix_* vector
@@ -66,7 +69,7 @@ const LUT_CM_K_BYTES: usize = lut_packed_bytes(D_FF, D_MODEL);
 const LUT_CM_V_BYTES: usize = lut_packed_bytes(D_MODEL, D_FF);
 const LUT_CM_R_BYTES: usize = lut_packed_bytes(D_MODEL, D_MODEL);
 const LUT_LAYER_BYTES: usize = 4 * LUT_TM_BYTES + LUT_CM_K_BYTES + LUT_CM_V_BYTES + LUT_CM_R_BYTES;
-const LUT_TOTAL_BYTES: usize = N_LAYERS * LUT_LAYER_BYTES;
+const LUT_TOTAL_BYTES: usize = LUT_TOK_EMB_BYTES + N_LAYERS * LUT_LAYER_BYTES;
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const _: () = {
@@ -81,6 +84,11 @@ const _: () = {
     assert!(
         lut_supports(D_MODEL, D_FF),
         "LUT kernel does not support cm_v shape"
+    );
+    assert!(
+        lut_supports(VOCAB, D_MODEL),
+        "LUT kernel does not support tok_emb (VOCAB x D_MODEL) shape — \
+         tied LM head matvec runs through the same kernel"
     );
 };
 
@@ -172,7 +180,7 @@ const fn layer_layout_starting_at(start: usize) -> LayerLayout {
 const fn all_layer_layouts() -> [LayerLayout; N_LAYERS] {
     let zero = layer_layout_starting_at(0);
     let mut out = [zero; N_LAYERS];
-    let mut cursor = TOK_EMB_BYTES + LN0_BYTES + LN_F_BYTES;
+    let mut cursor = TOK_EMB_TOTAL_BYTES + LN0_BYTES + LN_F_BYTES;
     let mut i = 0;
     while i < N_LAYERS {
         out[i] = layer_layout_starting_at(cursor);
@@ -225,21 +233,30 @@ pub(crate) struct LayerView<'a> {
 }
 
 /// Owned, parsed weights.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Weights {
     f32s: Vec<f32>,
     packed: Vec<u8>,
     /// Arch-preferred LUT packing (`TL1` on aarch64, `TL2` on `x86_64`,
     /// empty elsewhere). Built once at load time from `packed`.
     lut: Vec<u8>,
+    /// `I2_S`-packed token embedding, retained separately from `packed` so
+    /// per-row dequant is available at every step (the LM head matvec
+    /// uses the LUT form, but the embedding lookup needs the `I2_S` form
+    /// for [`crate::bitnet::dequantize_i2s_row`]). Always populated.
+    tok_emb_packed: Vec<u8>,
+    /// Offset into `lut` where the token embedding's LUT bytes live
+    /// (always 0 by convention; 0 here also when `lut.is_empty()`).
+    tok_emb_lut_off: usize,
+    /// Offset into `f32s` where the token embedding's per-row scale lives.
+    tok_emb_scale_off: usize,
     f32_ix: F32Index,
     pk_ix: [TensorIndex; N_LAYERS],
     lut_ix: [TensorIndex; N_LAYERS],
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct F32Index {
-    tok_emb: usize,
     ln0: usize,
     ln_f: usize,
     layers: [LayerF32Index; N_LAYERS],
@@ -297,12 +314,29 @@ impl Weights {
         let mut packed = Vec::with_capacity(PACKED_WEIGHTS_LEN);
         let mut lut = Vec::with_capacity(LUT_TOTAL_BYTES);
 
-        let tok_emb_off = f32s.len();
-        read_f32s(buf, 0, VOCAB * D_MODEL, &mut f32s);
+        // tok_emb: I2_S packed bytes + per-row scale, stored in the
+        // separate `tok_emb_packed` buffer (kept at runtime for per-row
+        // dequant). The LM head's matvec uses the LUT form, populated
+        // first in `lut` so its offset is 0.
+        let mut tok_emb_packed: Vec<u8> = Vec::with_capacity(PACKED_TOK_EMB_BYTES);
+        tok_emb_packed.extend_from_slice(&buf[0..PACKED_TOK_EMB_BYTES]);
+        let tok_emb_lut_off = lut.len();
+        if LUT_TOK_EMB_BYTES > 0 && !force_i2s {
+            lut.resize(tok_emb_lut_off + LUT_TOK_EMB_BYTES, 0);
+            repack_i2s_to_lut(
+                &tok_emb_packed,
+                &mut lut[tok_emb_lut_off..tok_emb_lut_off + LUT_TOK_EMB_BYTES],
+                VOCAB,
+                D_MODEL,
+            );
+        }
+        let tok_emb_scale_off = f32s.len();
+        read_f32s(buf, PACKED_TOK_EMB_BYTES, VOCAB, &mut f32s);
+
         let ln0_off = f32s.len();
-        read_f32s(buf, TOK_EMB_BYTES, D_MODEL, &mut f32s);
+        read_f32s(buf, TOK_EMB_TOTAL_BYTES, D_MODEL, &mut f32s);
         let ln_f_off = f32s.len();
-        read_f32s(buf, TOK_EMB_BYTES + LN0_BYTES, D_MODEL, &mut f32s);
+        read_f32s(buf, TOK_EMB_TOTAL_BYTES + LN0_BYTES, D_MODEL, &mut f32s);
 
         let zero_f32_idx = LayerF32Index {
             tm_norm: 0,
@@ -482,8 +516,10 @@ impl Weights {
             f32s,
             packed,
             lut,
+            tok_emb_packed,
+            tok_emb_lut_off,
+            tok_emb_scale_off,
             f32_ix: F32Index {
-                tok_emb: tok_emb_off,
                 ln0: ln0_off,
                 ln_f: ln_f_off,
                 layers: layers_f32,
@@ -536,10 +572,22 @@ impl Weights {
         Ok((weights, step))
     }
 
-    /// Token embedding matrix, `VOCAB × D_MODEL` in row-major layout.
-    pub(crate) fn tok_emb(&self) -> &[f32] {
-        let o = self.f32_ix.tok_emb;
-        &self.f32s[o..o + VOCAB * D_MODEL]
+    /// Token embedding as a ternary matrix (`VOCAB × D_MODEL`).
+    /// `packed` is the row-contiguous `I2_S` form (always populated; used
+    /// for per-row dequant in the input embedding lookup). `lut_packed`
+    /// is the arch-preferred LUT form (used by the tied LM head matvec;
+    /// empty on architectures without a LUT kernel).
+    pub(crate) fn tok_emb_mat(&self) -> TernaryMatrix<'_> {
+        let lp: &[u8] = if self.lut.is_empty() {
+            &[]
+        } else {
+            &self.lut[self.tok_emb_lut_off..self.tok_emb_lut_off + LUT_TOK_EMB_BYTES]
+        };
+        TernaryMatrix {
+            packed: &self.tok_emb_packed,
+            lut_packed: lp,
+            scale: &self.f32s[self.tok_emb_scale_off..self.tok_emb_scale_off + VOCAB],
+        }
     }
 
     /// Initial `RMSNorm` weight applied to the token embedding before the
@@ -660,7 +708,8 @@ pub(crate) struct LayerTensors<'a> {
 /// Serialize the model tensors into the canonical weight-blob byte format.
 #[cfg(feature = "training")]
 pub(crate) fn write_weights(
-    tok_emb: &[f32],
+    tok_emb_packed: &[u8],
+    tok_emb_scale: &[f32],
     ln0: &[f32],
     ln_f: &[f32],
     layers: &[LayerTensors<'_>; N_LAYERS],
@@ -668,7 +717,10 @@ pub(crate) fn write_weights(
 ) {
     out.clear();
     out.reserve(PACKED_WEIGHTS_LEN);
-    write_f32s(tok_emb, out);
+    debug_assert_eq!(tok_emb_packed.len(), PACKED_TOK_EMB_BYTES);
+    debug_assert_eq!(tok_emb_scale.len(), SCALE_TOK_EMB_F32S);
+    out.extend_from_slice(tok_emb_packed);
+    write_f32s(tok_emb_scale, out);
     write_f32s(ln0, out);
     write_f32s(ln_f, out);
     for l in layers {
@@ -704,7 +756,8 @@ pub(crate) fn write_weights(
 pub(crate) fn write_checkpoint<W: Write>(
     out: &mut W,
     step: u64,
-    tok_emb: &[f32],
+    tok_emb_packed: &[u8],
+    tok_emb_scale: &[f32],
     ln0: &[f32],
     ln_f: &[f32],
     layers: &[LayerTensors<'_>; N_LAYERS],
@@ -712,7 +765,7 @@ pub(crate) fn write_checkpoint<W: Write>(
     out.write_all(CKPT_MAGIC)?;
     out.write_all(&step.to_le_bytes())?;
     let mut body = Vec::with_capacity(PACKED_WEIGHTS_LEN);
-    write_weights(tok_emb, ln0, ln_f, layers, &mut body);
+    write_weights(tok_emb_packed, tok_emb_scale, ln0, ln_f, layers, &mut body);
     out.write_all(&body)?;
     Ok(())
 }
@@ -775,7 +828,9 @@ mod tests {
     fn blob_parses_and_views_have_right_sizes() {
         let buf = vec![0u8; PACKED_WEIGHTS_LEN];
         let w = Weights::from_bytes(&buf).unwrap();
-        assert_eq!(w.tok_emb().len(), VOCAB * D_MODEL);
+        let emb = w.tok_emb_mat();
+        assert_eq!(emb.scale.len(), VOCAB);
+        assert!(!emb.packed.is_empty() || !emb.lut_packed.is_empty());
         assert_eq!(w.ln0().len(), D_MODEL);
         assert_eq!(w.ln_f().len(), D_MODEL);
         for i in 0..N_LAYERS {
