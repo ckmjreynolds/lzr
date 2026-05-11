@@ -25,6 +25,7 @@ use crate::classifier_stats::ClassifierStats;
 use crate::codec::{Codec, Decomposition};
 use crate::null::NullCodec;
 use crate::xml_codec::XmlCodec;
+use crate::xml_ppm::XmlPpmCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
 const SAMPLE_BYTES_QUICK: usize = 64 * 1024;
@@ -71,7 +72,8 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "null" => Ok(Box::new(NullCodec)),
         "classifier-stats" => Ok(Box::new(ClassifierStats)),
         "xml" => Ok(Box::new(XmlCodec)),
-        other => bail!("unknown codec '{other}' (known: null, classifier-stats, xml)"),
+        "xml-ppm" => Ok(Box::new(XmlPpmCodec)),
+        other => bail!("unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm)"),
     }
 }
 
