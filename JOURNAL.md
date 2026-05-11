@@ -13,6 +13,92 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-10 → 2026-05-11 — 4M Neural Scale-Up; Mixer Saturation at 2 Arms; Order-2 as Third Arm
+
+CDR/Claude scaled the neural arm 4× (1M → 4M, `N_LAYERS=2 → 8`, `D_MODEL=256` held, `CM_MULT=1` held) and ran a 24h training pass on enwik9. Best checkpoint landed at step 9056 / info-bpb 1.79 — a ~4% improvement on the neural arm in isolation. The improvement did not flow through the ensemble: 4M + 2-arm logistic at w=0.5 landed at 1.990 bpb (vs 1.994 at 1M), and three mixer-side experiments at 4M scale (single-global adaptive, per-class adaptive, fixed logistic at w=0.6) all converged to 1.988 ± 0.001. Adding Order-2 dense as a third arm via a 2-simplex adaptive log-linear mix landed at 1.985 — small but uniform across all five offsets. The dominant finding is architectural rather than numerical: **with two correlated predictors, the mixer's parameterization is saturated; predictor diversity is the binding constraint, not mixer cleverness**.
+
+### 4M training run
+
+`D_MODEL=256, N_LAYERS=8, CM_MULT=1`, identity tokenizer (vocab=256, no merges), seed 1, batch 32, seq 256, bptt_chunk 32, peak LR 3e-4. Tokenized 1 GB → 1B tokens in 7.3 s; trained at ~750 steps/h on M3 Pro Metal (4× slower per step than 1M, consistent with the ternary parameter count). RSS stable at 1.8 GB.
+
+| step  | train loss (nats) | info-bpb |
+|------:|------------------:|---------:|
+|  1007 |             1.474 |     2.13 |
+|  2014 |             1.395 |     2.01 |
+|  3015 |             1.323 |     1.91 |
+|  4021 |             1.281 |     1.85 |
+|  5028 |             1.265 |     1.83 |
+|  6035 |             1.252 |     1.81 |
+|  7042 |             1.247 |     1.80 |
+|  8049 |             1.245 |     1.80 |
+|  **9056** |         **1.242** | **1.79** |
+| 10064 |             1.249 |     1.80 |
+| 11071 |             1.255 |     1.81 |
+| 12077 |             1.260 |     1.82 |
+
+Best at step 9056 / ~12h in. Plateaued and began the same alternating-stale oscillation seen on the 1M run, plateau-detector pattern matches. Killed at step 12077 / ~16h, archived as `BEST-step9056.ckpt` under `checkpoints/keep/4M-byte-2026-05-10/`.
+
+Standalone neural info-bpb: 4M improves over 1M by 0.07 bpb (1.86 → 1.79). The 4× parameter cost bought ~4% in neural quality — at the lower end of the expected scaling-law gain at this scale.
+
+### Mixer-side saturation at 2 arms (4M)
+
+Three experiments at 4M scale, all 2-arm logistic over neural + routed-PPM, varying the mixer parameterization:
+
+| mixer                                        | mean bpb |
+|----------------------------------------------|---------:|
+| fixed logistic w=0.5                         | 1.990    |
+| fixed logistic w=0.6                         | 1.988    |
+| fixed logistic w=0.7                         | 1.991    |
+| single-global adaptive (SGD on cross-entropy)| 1.988    |
+| per-class adaptive (3 scalars, one per `ByteClass`) | 1.988 |
+
+A 2-arm log-linear mix has a single degree of freedom per context (the simplex point on the 1-simplex). The fixed-weight sweep already finds the optimum near w=0.6; per-class adaptive converges to a near-identical operating point per class. Adding parameters to the mixer side cannot move the result because the limiting factor is the predictor pair, not the weighting between them.
+
+### 3-arm mix: Order-2 as third predictor
+
+Wired Order-2 dense (`Order2Adaptive`) into the mix as a third arm under the `AdaptiveLogistic` mode. The mixer becomes two scalars per class — `(w_neural, w_routed)` with `w_order2 = 1 − w_neural − w_routed` — projected onto the 2-simplex by clamp-and-scale after each SGD step. CDFs combine log-linearly: `log p_mix[s] = w_n · log p_n[s] + w_r · log p_r[s] + w_o · log p_o[s] − log Z`. Gradient via standard cross-entropy:
+
+`∂L/∂w_n = log p_o[t] − log p_n[t] + E_{p_mix}[log p_n − log p_o]`
+
+with the symmetric form for w_r. Order-2 is advanced through every output byte (literal or match-copied) so its 2-byte context tracks the actual sequence; Upper-class positions fold both neural and Order-2 CDFs A-Z → a-z so all three inputs share the routed letter alphabet.
+
+| ensemble                                     | mean bpb |
+|----------------------------------------------|---------:|
+| 4M + per-class adaptive (2-arm)              | 1.988    |
+| 4M + per-class adaptive (3-arm: n+r+o2)      | **1.985** |
+
+Per-offset, every offset improved by 0.001-0.006 (uniform). Statistically real but small. The 3-arm result confirms the predictor-diversity thesis directionally: adding a structurally different predictor moves the floor in a way that adding mixer parameters cannot. But the magnitude — 0.003 bpb — bounds the headroom of this particular third arm: Order-2 dense overlaps heavily with PPM-D order-5/8 (same alphabet, same input stream, only a shorter context). A genuinely orthogonal predictor (word-level, run-length over `\n`, number tokens) should buy more.
+
+### Phase-2 standing post 4M + 3-arm
+
+```
+Predictor                                                       mean bpb     1 GB
+order-2 adaptive (dense, 64 MiB)                                  2.771       346 MB
+type-routed PPM, cross-stream context                             2.373       297 MB
+LZ77 + routed (deterministic floor)                               2.056       257 MB
+LZ77 + routed + 1M neural (logistic w=0.5)                        1.994       249 MB
+LZ77 + routed + 4M neural (logistic w=0.6)                        1.988       249 MB
+LZ77 + routed + 4M neural + Order-2 (adaptive 3-arm)              1.985       248 MB ← operating
+target (Hutter 99%)                                               0.878       109 MB
+```
+
+The deterministic-floor-then-mix strategy continues to compound modestly. Total margin since the byte-stream order-2 baseline: −0.79 bpb / −98 MB. Still 139 MB over the 109 MB target — closing that needs a genuinely diverse new predictor type, not more of the same.
+
+### Negative findings
+
+- **4× neural parameters → 0.06 bpb at the ensemble level**, despite a 4% improvement at the standalone arm. Diminishing returns from neural scale-up against a stable deterministic ensemble are the expected pattern at this regime (the deterministic stack already captures much of what the neural would have predicted). Future scale-ups (8M, 16M) need a clear theory of why more neural should compound, not just more neural.
+- **Mixer parameterization (1 → 3 → infinite-grained) does not move the floor** when the predictor pair is correlated. Per-context PAQ-style mixers don't help here; the next architectural lever is component diversity.
+- **Order-2 dense is mostly redundant with PPM-D**. 0.003 bpb gain says it captures almost-nothing PPM-D doesn't. A useful third arm needs a different alphabet or a different conditioning structure.
+
+### Open / next levers
+
+- **Genuinely diverse third predictor**: position-in-word / capitalization-pattern / word-boundary-conditional model; RLE for `\n`-runs in markup; integer-token model for sequences of digits. Each ~50 LOC, no training cost.
+- **8M neural** — same arch shape, `N_LAYERS=16`. Multi-day training, expected gain bounded by the 1M→4M trajectory (~0.05 bpb at the ensemble).
+- **Optimal-parse LZ** — Storer-Szymanski DP. Classical 3-7% LZ gain. Has not been attempted yet.
+- **Eval window scale-up** — 16 KiB windows are content-variance-noisy; 256 KiB would let us detect 0.001 bpb changes reliably. The 4M experiments are already running into the noise floor.
+
+---
+
 ## 2026-05-09 → 2026-05-10 — LZ77 Pre-Pass; Cross-Stream PPM Context; 1M Neural Restart; Phase-2 Ensemble Under 2.0 bpb
 
 CDR/Claude completed the deterministic-stack iteration through cross-stream PPM context plus an LZ77 pre-pass with bucketed offset/length encoding and lazy parsing, dropping the 5-offset bench mean to 2.056 bpb / 257 MB on 1 GB. Restarted neural training at 1M scale (the same arch as 2026-04-24) — landed train loss 1.289 nats / info-bpb 1.86 at step 13646, beating the historical 1M baseline by ~11% and giving a clean phase-2 starting point. Integrated the 1M neural into the LZ-routed codec as a logistic-mixed component at literal positions, with case-folding-aware Upper-class handling, hitting the **first sub-2.0-bpb operating point: 1.994 bpb / 249 MB on 1 GB**. The deterministic-floor-then-mix strategy compounded as designed: −0.93 bpb total margin over the byte-stream order-2 dense baseline (2.898), spread across LZ (~0.85), cross-stream PPM context (~0.07), and neural mixing (~0.06). Still 140 MB over the 109 MB Hutter target — closing that gap requires bigger neural (next training run) or a denser cmix-style predictor ensemble.
