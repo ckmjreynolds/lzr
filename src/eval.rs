@@ -21,6 +21,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::classifier_stats::ClassifierStats;
 use crate::codec::{Codec, Decomposition};
 use crate::null::NullCodec;
 
@@ -67,7 +68,8 @@ pub(crate) fn run_bench(
 fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
     match name {
         "null" => Ok(Box::new(NullCodec)),
-        other => bail!("unknown codec '{other}' (known: null)"),
+        "classifier-stats" => Ok(Box::new(ClassifierStats)),
+        other => bail!("unknown codec '{other}' (known: null, classifier-stats)"),
     }
 }
 
