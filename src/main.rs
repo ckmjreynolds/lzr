@@ -16,11 +16,13 @@
 #![allow(clippy::redundant_pub_crate)]
 #![allow(clippy::module_name_repetitions)]
 
+mod bits;
 mod classifier;
 mod classifier_stats;
 mod codec;
 mod eval;
 mod null;
+mod xml_codec;
 
 use std::path::PathBuf;
 

@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use crate::classifier_stats::ClassifierStats;
 use crate::codec::{Codec, Decomposition};
 use crate::null::NullCodec;
+use crate::xml_codec::XmlCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
 const SAMPLE_BYTES_QUICK: usize = 64 * 1024;
@@ -69,7 +70,8 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
     match name {
         "null" => Ok(Box::new(NullCodec)),
         "classifier-stats" => Ok(Box::new(ClassifierStats)),
-        other => bail!("unknown codec '{other}' (known: null, classifier-stats)"),
+        "xml" => Ok(Box::new(XmlCodec)),
+        other => bail!("unknown codec '{other}' (known: null, classifier-stats, xml)"),
     }
 }
 
