@@ -1,11 +1,11 @@
 [package]
 name            = "lzr"
-version         = "0.1.0"
+version         = "0.2.0"
 edition         = "2024"
 rust-version    = "1.85"
 
 authors         = ["Chris Reynolds <chris@reynolds.guru>"]
-description     = "Transformer-based compression CLI (Hutter prize attempt)."
+description     = "Mode-routed compression CLI (Hutter prize attempt, v2)."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
 repository      = "https://github.com/ckmjreynolds/lzr"
@@ -17,54 +17,19 @@ include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [features]
 default     = ["submission"]
+# Submission build: zero threading deps, no training dependencies. This is
+# what ships. Training-related code is gated behind `training` and will be
+# added later when (and if) the bit-budget audit calls for a neural arm.
 submission  = []
-training    = [
-    "dep:candle-core",
-    "dep:candle-nn",
-    "dep:chrono",
-    "dep:rand",
-    "dep:serde",
-    "dep:serde_json",
-]
-dev         = ["submission", "training"]
 
 [dependencies]
 anyhow      = "=1.0.102"
 clap        = { version = "=4.6.1", features = ["derive"] }
 
-# Training-only deps (all optional; activated via `training` feature).
-# candle-core / candle-nn move to target-specific blocks below so we can
-# opt into the `metal` feature on macOS (and CUDA on Linux later).
-chrono      = { version = "=0.4.41", optional = true, default-features = false, features = ["clock", "std"] }
-rand        = { version = "=0.9.4",  optional = true }
-serde       = { version = "=1.0.228", optional = true, features = ["derive"] }
-serde_json  = { version = "=1.0.149", optional = true }
-
-# Apple-silicon training runs on Metal. Without this feature candle falls
-# back to CPU, which is orders of magnitude slower for the training forward
-# pass. `objc2` is non-optional but macOS-only: `train.rs` wraps the
-# per-step loop body in `objc2::rc::autoreleasepool` so Metal-allocated
-# NSObjects drain between steps, without which the process leaks ~6 MB/sec
-# on Apple Silicon (candle issue #2271). The macOS submission build pays a
-# small compile-time cost for objc2 even though it doesn't link against it
-# — keeps the manifest tractable without extra feature plumbing.
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { version = "=0.10.2", optional = true, features = ["metal"] }
-candle-nn   = { version = "=0.10.2", optional = true, features = ["metal"] }
-objc2       = "=0.6.4"
-
-# Everywhere else (Linux / Windows): CPU-only build for now. When we have
-# CUDA hardware to test against, add a parallel block with `features = ["cuda"]`.
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-core = { version = "=0.10.2", optional = true }
-candle-nn   = { version = "=0.10.2", optional = true }
-
 [dev-dependencies]
 assert_cmd        = "=2.2.1"
-criterion         = "=0.8.2"
 pretty_assertions = "=1.4.1"
 proptest          = "=1.11.0"
-rand              = "=0.9.4"
 
 [lints.rust]
 keyword_idents = { level = "forbid", priority = -1 }
@@ -75,12 +40,10 @@ non_ascii_idents = "forbid"
 rust_2018_idioms = { level = "warn", priority = -1 }
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 unreachable_pub = "deny"
-# Crate-level default: deny unsafe. The matvec SIMD kernels need explicit
-# per-function `#[allow(unsafe_code)]` because `std::arch::*` intrinsics and
-# `#[target_feature(enable = ...)]` functions require unsafe.
+# Crate-level default: deny unsafe. If any kernel needs unsafe later (NEON
+# intrinsics etc.), it gets a localized `#[allow(unsafe_code)]` with
+# documented justification — never a blanket allow at the crate root.
 unsafe_code = "deny"
-# Too many false positives in a crate with both a library and executable.
-# unused_crate_dependencies = "warn"
 unused_lifetimes = "warn"
 unused_qualifications = "warn"
 
@@ -89,10 +52,9 @@ all      = { level = "warn", priority = -1 }
 cargo    = { level = "warn", priority = -1 }
 nursery  = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-# Specific per-lint exceptions live as `#![allow(...)]` at the crate root in
-# `src/main.rs`; the Cargo.toml `[lints]` table has trouble overriding lint
-# group levels in this toolchain, so we keep the enabling here and the
-# allow-list there.
+# Per-lint exceptions live as `#![allow(...)]` at the crate root in
+# `src/main.rs` (and re-exports thereof). The Cargo.toml `[lints]` table
+# has trouble overriding lint-group levels in this toolchain.
 
 [profile.release]
 strip = true
