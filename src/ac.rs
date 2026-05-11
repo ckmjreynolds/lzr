@@ -53,7 +53,7 @@ impl<'a> AcEncoder<'a> {
     /// (`low=0, high=u32::MAX`), `range = 2^32` and `range * TOTAL`
     /// = `2^48`. The intermediate `(range * hi) / TOTAL` can reach
     /// `2^32`, which doesn't fit u32 — so the cast to u32 happens
-    /// after subtracting 1, when the value is bounded by u32::MAX.
+    /// after subtracting 1, when the value is bounded by `u32::MAX`.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn encode(&mut self, cdf: &[u32], symbol: usize) {
         debug_assert!(symbol + 1 < cdf.len(), "symbol out of CDF range");

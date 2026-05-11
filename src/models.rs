@@ -130,6 +130,57 @@ impl Order1Bytes {
     }
 }
 
+/// Generic Order-1 model with caller-managed context. `NCTX` rows of
+/// `NSYM` counts each. Unlike [`Order1Bytes`], the caller passes the
+/// context explicitly to `cdf_to` and `observe` — useful when the
+/// "previous symbol" definition isn't a literal previous byte (e.g.,
+/// the letter codec conditions on the previous **letter**, skipping
+/// non-letter content bytes between them).
+#[derive(Debug)]
+pub(crate) struct Order1Ctx<const NCTX: usize, const NSYM: usize> {
+    counts: Vec<[u32; NSYM]>,
+    totals: Vec<u64>,
+}
+
+impl<const NCTX: usize, const NSYM: usize> Order1Ctx<NCTX, NSYM> {
+    pub(crate) fn new() -> Self {
+        Self {
+            counts: vec![[1u32; NSYM]; NCTX],
+            totals: vec![NSYM as u64; NCTX],
+        }
+    }
+
+    /// CDF (`NSYM + 1` entries) conditioned on `ctx`.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn cdf_to(&self, ctx: usize, out: &mut [u32]) {
+        debug_assert_eq!(out.len(), NSYM + 1);
+        debug_assert!(ctx < NCTX);
+        let total = self.totals[ctx];
+        let row = &self.counts[ctx];
+        let mut acc: u64 = 0;
+        for (slot, &c) in out.iter_mut().zip(row.iter()).take(NSYM) {
+            *slot = ((acc * u64::from(TOTAL)) / total) as u32;
+            acc += u64::from(c);
+        }
+        out[NSYM] = TOTAL;
+    }
+
+    pub(crate) fn observe(&mut self, ctx: usize, sym: usize) {
+        debug_assert!(ctx < NCTX);
+        debug_assert!(sym < NSYM);
+        self.counts[ctx][sym] += 1;
+        self.totals[ctx] += 1;
+        if self.totals[ctx] > RESCALE_THRESHOLD {
+            let mut new_total: u64 = 0;
+            for c in &mut self.counts[ctx] {
+                *c = (*c >> 1).max(1);
+                new_total += u64::from(*c);
+            }
+            self.totals[ctx] = new_total;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

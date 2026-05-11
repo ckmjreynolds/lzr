@@ -1,18 +1,24 @@
-//! Phase-4 codec: XML schema for tags + LZ77 pre-pass + Order-1 AC
-//! for Content literals.
+//! Phase-5 codec: XML schema for tags + LZ77 pre-pass + letter / non-
+//! letter split for Content literals.
 //!
-//! Builds on `xml-ppm`. At each Content-mode position the encoder
-//! decides literal vs match using the LZ77 matcher; the choice is
-//! emitted as a 1-bit flag through an adaptive 2-symbol model, then
-//! either the byte (Order-1 AC) or the match record
-//! (`bucketed-offset` + `length` Order-0 AC models). Tag and
-//! `AttrValue` handling is unchanged from `xml-ppm`.
+//! Builds on `xml-lz-ppm`. The only architectural difference is the
+//! Content-mode literal path:
 //!
-//! Insertion timing: the matcher inserts position `p` once bytes
-//! `p..=p+2` are available. The encoder uses the full input buffer
-//! (warm + measure) for matching but commits to the same lazy-insert
-//! cursor the decoder will use, so the two sides see identical
-//! matcher state.
+//! 1. Emit an adaptive `is_letter` flag conditioned on the previous
+//!    Content byte (256 contexts × 2 outcomes — `Order1Ctx<256, 2>`).
+//! 2. If letter (`a-z` or `A-Z`): encode the 52-symbol letter index
+//!    through a model conditioned on the previous **letter**, skipping
+//!    non-letter bytes in context. Letters cluster in space when
+//!    conditioned on the prior letter (`th → e`, `qu → e`/`a`/`i`)
+//!    much more tightly than when conditioned on the prior raw byte.
+//! 3. If non-letter: encode the byte through a 256-alphabet model
+//!    conditioned on the previous Content byte (regardless of letter
+//!    type).
+//!
+//! State `(last_content_byte, last_letter_idx)` updates on every
+//! Content byte — literal or LZ-match-copied — so contexts stay in
+//! lock-step on both sides. LZ match bytes do **not** update model
+//! counts (they were encoded by the match record, not by the model).
 
 use anyhow::{Context, Result, bail};
 
@@ -21,11 +27,8 @@ use crate::bits::{BitReader, BitWriter};
 use crate::classifier::{Classifier, Mode};
 use crate::codec::{Codec, Decomposition};
 use crate::lz::{MIN_MATCH, Matcher};
-use crate::models::{Order0, Order1Bytes};
+use crate::models::{Order0, Order1Ctx};
 
-/// Tag-structure dictionary, copied from Phase 3 to keep the codec
-/// self-contained. 32 entries → adaptive 33-symbol model (entries +
-/// 1 escape). High-frequency entries pay sub-5-bit costs.
 const DICTIONARY: &[&[u8]] = &[
     b"page>",
     b"/page>",
@@ -65,25 +68,28 @@ const TAG_ESCAPE: usize = DICTIONARY.len();
 const TAG_ALPHABET: usize = DICTIONARY.len() + 1;
 const _: () = assert!(TAG_ALPHABET == 33);
 
-/// Offset log-bucket alphabet. `offset` is in `[1, WINDOW_SIZE]` so
-/// `bucket = log2_floor(offset)` is in `[0, 22]`. Allow 32 to
-/// future-proof without changing the encoding.
 const OFFSET_BUCKET_ALPHABET: usize = 32;
 
+/// 26 lowercase + 26 uppercase = 52 letter symbols.
+const N_LETTERS: usize = 52;
+
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct XmlLzPpmCodec;
+pub(crate) struct XmlLzWordCodec;
 
 struct Models {
     tag_dict: Order0<TAG_ALPHABET>,
     tag_byte: Order0<256>,
     attr_byte: Order0<256>,
-    content: Order1Bytes,
-    /// Literal-vs-match flag at Content positions.
+    /// Literal-vs-match flag at Content positions (kept from Phase 4).
     lz_flag: Order0<2>,
-    /// Log-bucket of the offset (= floor(log2(offset))).
     lz_offset_bucket: Order0<OFFSET_BUCKET_ALPHABET>,
-    /// `length - MIN_MATCH` (always in `[0, 255]`).
     lz_length: Order0<256>,
+    /// `is_letter` flag conditioned on previous Content byte.
+    is_letter: Order1Ctx<256, 2>,
+    /// 52-alphabet letter, conditioned on previous letter (52 ctx).
+    letter: Order1Ctx<N_LETTERS, N_LETTERS>,
+    /// 256-alphabet byte, conditioned on previous Content byte.
+    nonletter: Order1Ctx<256, 256>,
 }
 
 impl Models {
@@ -92,24 +98,58 @@ impl Models {
             tag_dict: Order0::new(),
             tag_byte: Order0::new(),
             attr_byte: Order0::new(),
-            content: Order1Bytes::new(),
             lz_flag: Order0::new(),
             lz_offset_bucket: Order0::new(),
             lz_length: Order0::new(),
+            is_letter: Order1Ctx::new(),
+            letter: Order1Ctx::new(),
+            nonletter: Order1Ctx::new(),
         }
     }
 }
 
-impl Codec for XmlLzPpmCodec {
+/// Running state for the Content literal codec: the most-recent Content
+/// byte (any class) and the most-recent letter (index 0..52). Both
+/// update on every Content byte — literal or match-copied.
+#[derive(Clone, Copy, Debug, Default)]
+struct ContentState {
+    last_byte: u8,
+    last_letter: Option<u8>,
+}
+
+impl ContentState {
+    const fn advance(&mut self, byte: u8) {
+        self.last_byte = byte;
+        if let Some(idx) = letter_to_idx(byte) {
+            self.last_letter = Some(idx);
+        }
+    }
+}
+
+const fn letter_to_idx(b: u8) -> Option<u8> {
+    match b {
+        b'a'..=b'z' => Some(b - b'a'),
+        b'A'..=b'Z' => Some(26 + (b - b'A')),
+        _ => None,
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+const fn idx_to_letter(idx: usize) -> u8 {
+    if idx < 26 {
+        b'a' + idx as u8
+    } else {
+        b'A' + (idx - 26) as u8
+    }
+}
+
+impl Codec for XmlLzWordCodec {
     fn name(&self) -> &'static str {
-        "xml-lz-ppm"
+        "xml-lz-word"
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        // Build the full byte buffer the matcher sees: warm prefix
-        // followed by the measure window. Matcher offsets reference
-        // positions inside this combined view.
         let mut buf: Vec<u8> = Vec::with_capacity(warm.len() + measure.len());
         buf.extend_from_slice(warm);
         let warm_end = buf.len();
@@ -118,13 +158,15 @@ impl Codec for XmlLzPpmCodec {
         let mut classifier = Classifier::new();
         let mut models = Models::new();
         let mut matcher = Matcher::new();
+        let mut content_state = ContentState::default();
 
-        // Prime the matcher + models + classifier through the warm
-        // prefix. Order-1 model only observes Content-mode bytes; the
-        // matcher inserts every position once we have three bytes of
-        // context. `prewarm` returns the next-insert cursor so we
-        // don't re-insert warm positions when extending past `warm`.
-        let mut next_insert = prewarm(&buf[..warm_end], &mut classifier, &mut models, &mut matcher);
+        let mut next_insert = prewarm(
+            &buf[..warm_end],
+            &mut classifier,
+            &mut models,
+            &mut matcher,
+            &mut content_state,
+        );
         next_insert = catch_up_inserts(&buf, warm_end, next_insert, &mut matcher);
 
         let mut writer = BitWriter::new();
@@ -136,6 +178,8 @@ impl Codec for XmlLzPpmCodec {
         let mut bucket_cdf = [0u32; OFFSET_BUCKET_ALPHABET + 1];
         let mut flag_cdf = [0u32; 3];
         let mut length_cdf = [0u32; 257];
+        let mut is_letter_cdf = [0u32; 3];
+        let mut letter_cdf = [0u32; N_LETTERS + 1];
         {
             let mut enc = AcEncoder::new(&mut writer);
 
@@ -145,12 +189,9 @@ impl Codec for XmlLzPpmCodec {
                 let mode = classifier.current_mode();
                 match mode {
                     Mode::Content => {
-                        // Match decision with single-position lazy parse.
                         let m_here = matcher.find_match(&buf, i);
                         let take_match = match m_here {
                             Some((_, len_here)) if i + (len_here as usize) <= buf.len() => {
-                                // Lazy parse: defer if a *strictly* longer match
-                                // starts at the next position.
                                 let m_next = if i + 1 + MIN_MATCH <= buf.len() {
                                     matcher.find_match(&buf, i + 1)
                                 } else {
@@ -163,13 +204,11 @@ impl Codec for XmlLzPpmCodec {
 
                         if take_match {
                             let (offset, length) = m_here.unwrap();
-                            // Literal-vs-match flag.
                             models.lz_flag.cdf_to(&mut flag_cdf);
                             let before = enc.bits_written();
                             enc.encode(&flag_cdf, 1);
                             models.lz_flag.observe(1);
 
-                            // Offset: bucket + bucket-relative bits.
                             let bucket = log2_floor(offset);
                             models.lz_offset_bucket.cdf_to(&mut bucket_cdf);
                             enc.encode(&bucket_cdf, bucket as usize);
@@ -178,8 +217,6 @@ impl Codec for XmlLzPpmCodec {
                                 let rel = offset - (1u32 << bucket);
                                 encode_uniform_bits(&mut enc, &mut uniform_cdf_cache, rel, bucket);
                             }
-
-                            // Length - MIN_MATCH.
                             let len_token = (length as usize) - MIN_MATCH;
                             models.lz_length.cdf_to(&mut length_cdf);
                             enc.encode(&length_cdf, len_token);
@@ -187,24 +224,47 @@ impl Codec for XmlLzPpmCodec {
 
                             comp_bits.lz_match += enc.bits_written() - before;
 
-                            // Advance: classifier through all matched bytes,
-                            // Order-1 model is NOT updated on match bytes (they
-                            // were encoded by the match record, not the model).
                             let len_us = length as usize;
                             for &b in &buf[i..i + len_us] {
                                 classifier.advance(b);
+                                content_state.advance(b);
                             }
                             i += len_us;
                         } else {
+                            // Literal Content byte. Three-step encode:
+                            //   1) lz_flag = 0
+                            //   2) is_letter flag
+                            //   3) letter or non-letter byte
                             models.lz_flag.cdf_to(&mut flag_cdf);
                             let before = enc.bits_written();
                             enc.encode(&flag_cdf, 0);
                             models.lz_flag.observe(0);
-                            models.content.cdf_to(&mut byte_cdf);
-                            enc.encode(&byte_cdf, buf[i] as usize);
+
+                            let byte = buf[i];
+                            let ctx_byte = content_state.last_byte as usize;
+                            let is_letter_val = usize::from(letter_to_idx(byte).is_some());
+                            models.is_letter.cdf_to(ctx_byte, &mut is_letter_cdf);
+                            enc.encode(&is_letter_cdf, is_letter_val);
+                            models.is_letter.observe(ctx_byte, is_letter_val);
+
+                            if is_letter_val == 1 {
+                                let letter_idx = letter_to_idx(byte)
+                                    .expect("just classified as letter")
+                                    as usize;
+                                let ctx_letter =
+                                    content_state.last_letter.map_or(0, |l| l as usize);
+                                models.letter.cdf_to(ctx_letter, &mut letter_cdf);
+                                enc.encode(&letter_cdf, letter_idx);
+                                models.letter.observe(ctx_letter, letter_idx);
+                            } else {
+                                models.nonletter.cdf_to(ctx_byte, &mut byte_cdf);
+                                enc.encode(&byte_cdf, byte as usize);
+                                models.nonletter.observe(ctx_byte, byte as usize);
+                            }
+
                             comp_bits.content += enc.bits_written() - before;
-                            models.content.observe(buf[i]);
-                            classifier.advance(buf[i]);
+                            classifier.advance(byte);
+                            content_state.advance(byte);
                             i += 1;
                         }
                     }
@@ -281,8 +341,6 @@ impl Codec for XmlLzPpmCodec {
         let measure_len = usize::try_from(u32::from_le_bytes(len_bytes))
             .expect("u32 measure_len fits usize on supported targets");
 
-        // The decoder builds the same combined buffer the encoder did,
-        // growing the measure portion byte by byte as it decodes.
         let mut buf: Vec<u8> = Vec::with_capacity(warm.len() + measure_len);
         buf.extend_from_slice(warm);
         let warm_end = buf.len();
@@ -290,7 +348,14 @@ impl Codec for XmlLzPpmCodec {
         let mut classifier = Classifier::new();
         let mut models = Models::new();
         let mut matcher = Matcher::new();
-        let mut next_insert = prewarm(&buf, &mut classifier, &mut models, &mut matcher);
+        let mut content_state = ContentState::default();
+        let mut next_insert = prewarm(
+            &buf,
+            &mut classifier,
+            &mut models,
+            &mut matcher,
+            &mut content_state,
+        );
         next_insert = catch_up_inserts(&buf, warm_end, next_insert, &mut matcher);
 
         let mut reader = BitReader::new(&archive[4..]);
@@ -301,6 +366,8 @@ impl Codec for XmlLzPpmCodec {
         let mut bucket_cdf = [0u32; OFFSET_BUCKET_ALPHABET + 1];
         let mut flag_cdf = [0u32; 3];
         let mut length_cdf = [0u32; 257];
+        let mut is_letter_cdf = [0u32; 3];
+        let mut letter_cdf = [0u32; N_LETTERS + 1];
 
         while buf.len() - warm_end < measure_len {
             next_insert = catch_up_inserts(&buf, buf.len(), next_insert, &mut matcher);
@@ -334,14 +401,30 @@ impl Codec for XmlLzPpmCodec {
                             let b = buf[src_start + k];
                             buf.push(b);
                             classifier.advance(b);
+                            content_state.advance(b);
                         }
                     } else {
-                        models.content.cdf_to(&mut byte_cdf);
-                        let sym = dec.decode(&byte_cdf)?;
-                        let b = u8::try_from(sym).expect("byte symbol fits u8");
+                        let ctx_byte = content_state.last_byte as usize;
+                        models.is_letter.cdf_to(ctx_byte, &mut is_letter_cdf);
+                        let is_letter_val = dec.decode(&is_letter_cdf)?;
+                        models.is_letter.observe(ctx_byte, is_letter_val);
+
+                        let b = if is_letter_val == 1 {
+                            let ctx_letter = content_state.last_letter.map_or(0, |l| l as usize);
+                            models.letter.cdf_to(ctx_letter, &mut letter_cdf);
+                            let letter_idx = dec.decode(&letter_cdf)?;
+                            models.letter.observe(ctx_letter, letter_idx);
+                            idx_to_letter(letter_idx)
+                        } else {
+                            models.nonletter.cdf_to(ctx_byte, &mut byte_cdf);
+                            let sym = dec.decode(&byte_cdf)?;
+                            models.nonletter.observe(ctx_byte, sym);
+                            u8::try_from(sym).expect("byte symbol fits u8")
+                        };
+
                         buf.push(b);
-                        models.content.observe(b);
                         classifier.advance(b);
+                        content_state.advance(b);
                     }
                 }
                 Mode::AttrValue => {
@@ -401,13 +484,6 @@ struct ComponentBits {
     lz_match: u64,
 }
 
-/// Cache of uniform CDFs for power-of-2 alphabets, keyed by bit count
-/// `k` (alphabet size `2^k`). Only `k ∈ [1, 8]` is supported — for
-/// larger bit counts, callers must split the value into ≤8-bit chunks
-/// and call the AC once per chunk. (At `TOTAL = 1 << 16`, alphabets
-/// larger than 256 force per-symbol mass below `TOTAL/alphabet`,
-/// which approaches the integer-zero floor and breaks the AC's
-/// strictly-increasing-CDF contract.)
 struct UniformCdfCache {
     cdfs: [Option<Vec<u32>>; 9],
 }
@@ -440,10 +516,6 @@ impl UniformCdfCache {
     }
 }
 
-/// Encode `value` as `n_bits` raw bits through the AC by chunking
-/// into ≤8-bit symbols. Each chunk costs exactly `chunk_bits` bits,
-/// so the total cost is `n_bits` — equivalent to a raw bit emission,
-/// but routed through the same AC stream so framing is consistent.
 fn encode_uniform_bits(
     enc: &mut AcEncoder<'_>,
     cache: &mut UniformCdfCache,
@@ -486,27 +558,44 @@ const fn log2_floor(x: u32) -> u32 {
     x.ilog2()
 }
 
-/// Run the classifier, the per-mode models, and the matcher's hash
-/// chain through `warm` so the encoder and decoder converge to the
-/// same state before the measured region. Returns the
-/// `next_insert` cursor the caller should resume from when bytes
-/// extend past `warm`.
 fn prewarm(
     warm: &[u8],
     classifier: &mut Classifier,
     models: &mut Models,
     matcher: &mut Matcher,
+    content_state: &mut ContentState,
 ) -> usize {
     if warm.is_empty() {
         return 0;
     }
     let mut i = 0;
+    let mut is_letter_cdf = [0u32; 3];
+    let mut letter_cdf = [0u32; N_LETTERS + 1];
+    // CDFs are unused during prewarm (no AC), but cdf_to/observe pairs
+    // mirror the encode-time observation pattern so both sides reach
+    // the same model state at the boundary.
     while i < warm.len() {
         let mode = classifier.current_mode();
         match mode {
             Mode::Content => {
-                models.content.observe(warm[i]);
-                classifier.advance(warm[i]);
+                let byte = warm[i];
+                let ctx_byte = content_state.last_byte as usize;
+                let is_letter_val = usize::from(letter_to_idx(byte).is_some());
+                models.is_letter.cdf_to(ctx_byte, &mut is_letter_cdf);
+                models.is_letter.observe(ctx_byte, is_letter_val);
+                if is_letter_val == 1 {
+                    let letter_idx =
+                        letter_to_idx(byte).expect("just classified as letter") as usize;
+                    let ctx_letter = content_state.last_letter.map_or(0, |l| l as usize);
+                    models.letter.cdf_to(ctx_letter, &mut letter_cdf);
+                    models.letter.observe(ctx_letter, letter_idx);
+                } else {
+                    let mut byte_cdf = [0u32; 257];
+                    models.nonletter.cdf_to(ctx_byte, &mut byte_cdf);
+                    models.nonletter.observe(ctx_byte, byte as usize);
+                }
+                classifier.advance(byte);
+                content_state.advance(byte);
                 i += 1;
             }
             Mode::AttrValue => {
@@ -535,8 +624,6 @@ fn prewarm(
     catch_up_inserts(warm, warm.len(), 0, matcher)
 }
 
-/// Insert all positions `q` with `q + 3 <= up_to` and `q >= next`.
-/// Returns the new `next_insert` cursor.
 fn catch_up_inserts(buf: &[u8], up_to: usize, mut next: usize, matcher: &mut Matcher) -> usize {
     let bound = up_to.min(buf.len());
     while next + 3 <= bound {
@@ -564,59 +651,47 @@ mod tests {
     use super::*;
 
     fn roundtrip(warm: &[u8], measure: &[u8]) {
-        let codec = XmlLzPpmCodec;
+        let codec = XmlLzWordCodec;
         let (archive, _decomp) = codec.encode_window(warm, measure).unwrap();
         let decoded = codec.decode_window(warm, &archive).unwrap();
         assert_eq!(decoded, measure);
     }
 
     #[test]
-    fn roundtrip_short_no_matches() {
-        roundtrip(b"", b"<page>quick</page>");
+    fn roundtrip_short_mixed_letters() {
+        roundtrip(b"", b"<page>The quick brown fox jumps.</page>");
     }
 
     #[test]
-    fn roundtrip_long_repetition() {
-        let head = b"This prefix repeats and repeats and repeats again.\n";
-        let mut measure: Vec<u8> = Vec::new();
-        measure.extend_from_slice(b"<page><text xml:space=\"preserve\">");
-        for _ in 0..4 {
-            measure.extend_from_slice(head);
-        }
-        measure.extend_from_slice(b"</text></page>");
-        roundtrip(b"", &measure);
-    }
-
-    #[test]
-    fn roundtrip_with_warm_prefix_match() {
-        let warm = b"<page><text xml:space=\"preserve\">Lorem ipsum dolor sit amet.</text></page>";
-        let measure =
-            b"<page><text xml:space=\"preserve\">Lorem ipsum dolor sit amet.</text></page>";
-        roundtrip(warm, measure);
-    }
-
-    #[test]
-    fn roundtrip_unknown_tag() {
-        roundtrip(b"", b"<weird>body content</weird>");
+    fn roundtrip_with_attr_value() {
+        roundtrip(
+            b"",
+            b"<text xml:space=\"preserve\">Hello, World! 123 ABC.</text>",
+        );
     }
 
     #[test]
     fn roundtrip_real_enwik8_window() {
-        // 4 MiB warm + 4 KiB measure — matches the bench's pre-warm
-        // size, isolates the codec from bench plumbing.
         let Ok(bytes) = std::fs::read("assets/enwik8") else {
             return;
         };
         let warm_start = 4_194_304;
         let warm = &bytes[warm_start - 4 * 1024 * 1024..warm_start];
-        let measure = &bytes[warm_start..warm_start + 4096];
+        let measure = &bytes[warm_start..warm_start + 8192];
         roundtrip(warm, measure);
     }
 
     #[test]
-    fn roundtrip_attr_value_with_match_in_content() {
-        let warm = b"<page><text xml:space=\"preserve\">abcdefghijklmnop</text></page>";
-        let measure = b"<page><text xml:space=\"preserve\">abcdefghijklmnop</text></page>";
-        roundtrip(warm, measure);
+    fn letter_idx_roundtrips_all_letters() {
+        for b in b'a'..=b'z' {
+            let idx = letter_to_idx(b).unwrap() as usize;
+            assert_eq!(idx_to_letter(idx), b);
+        }
+        for b in b'A'..=b'Z' {
+            let idx = letter_to_idx(b).unwrap() as usize;
+            assert_eq!(idx_to_letter(idx), b);
+        }
+        assert!(letter_to_idx(b'0').is_none());
+        assert!(letter_to_idx(b' ').is_none());
     }
 }
