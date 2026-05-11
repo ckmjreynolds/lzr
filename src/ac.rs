@@ -49,20 +49,23 @@ impl<'a> AcEncoder<'a> {
     /// Encode `symbol` against `cdf`. Caller-supplied CDF must satisfy
     /// the contract documented at the module level.
     ///
-    /// The `(range * cdf_entry) / TOTAL` casts to `u32` are bounded by
-    /// `range <= 2^32` and `cdf_entry <= TOTAL = 2^16`, so the result
-    /// is `<= 2^32` — fits the u32 result after the divide.
+    /// Arithmetic is done in u64 because at the initial state
+    /// (`low=0, high=u32::MAX`), `range = 2^32` and `range * TOTAL`
+    /// = `2^48`. The intermediate `(range * hi) / TOTAL` can reach
+    /// `2^32`, which doesn't fit u32 — so the cast to u32 happens
+    /// after subtracting 1, when the value is bounded by u32::MAX.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn encode(&mut self, cdf: &[u32], symbol: usize) {
         debug_assert!(symbol + 1 < cdf.len(), "symbol out of CDF range");
         debug_assert_eq!(cdf[cdf.len() - 1], TOTAL, "CDF must total to TOTAL");
         let lo = u64::from(cdf[symbol]);
         let hi = u64::from(cdf[symbol + 1]);
+        let low_u64 = u64::from(self.low);
         let range = u64::from(self.high - self.low) + 1;
-        let new_high = self.low + ((range * hi) / u64::from(TOTAL)) as u32 - 1;
-        let new_low = self.low + ((range * lo) / u64::from(TOTAL)) as u32;
-        self.low = new_low;
-        self.high = new_high;
+        let scaled_lo = (range * lo) / u64::from(TOTAL);
+        let scaled_hi = (range * hi) / u64::from(TOTAL);
+        self.low = (low_u64 + scaled_lo) as u32;
+        self.high = (low_u64 + scaled_hi - 1) as u32;
         self.renormalize();
     }
 
@@ -178,10 +181,11 @@ impl<'a, 'b> AcDecoder<'a, 'b> {
         }
         let lo = u64::from(cdf[symbol]);
         let hi = u64::from(cdf[symbol + 1]);
-        let new_high = self.low + ((range * hi) / u64::from(TOTAL)) as u32 - 1;
-        let new_low = self.low + ((range * lo) / u64::from(TOTAL)) as u32;
-        self.low = new_low;
-        self.high = new_high;
+        let low_u64 = u64::from(self.low);
+        let scaled_lo = (range * lo) / u64::from(TOTAL);
+        let scaled_hi = (range * hi) / u64::from(TOTAL);
+        self.low = (low_u64 + scaled_lo) as u32;
+        self.high = (low_u64 + scaled_hi - 1) as u32;
         self.renormalize();
         Ok(symbol)
     }
@@ -314,6 +318,45 @@ mod tests {
             .map(|_| dec.decode(&cdf).unwrap())
             .collect();
         assert_eq!(out, pattern);
+    }
+
+    #[test]
+    fn ac_stress_many_symbols_adaptive() {
+        // Long sequence through an adaptive Order-0 byte model — meant
+        // to exercise extreme renormalization paths (skewed CDFs,
+        // long runs of high-probability symbols) that the short
+        // synthetic tests don't reach.
+        use crate::models::Order0;
+        let input: Vec<u8> = (0..50_000u32)
+            .map(|i| u8::try_from((i.wrapping_mul(31)) % 256).unwrap())
+            .collect();
+
+        let mut model = Order0::<256>::new();
+        let mut writer = BitWriter::new();
+        let mut cdf = vec![0u32; 257];
+        {
+            let mut enc = AcEncoder::new(&mut writer);
+            for &b in &input {
+                model.cdf_to(&mut cdf);
+                enc.encode(&cdf, b as usize);
+                model.observe(b as usize);
+            }
+            enc.finish();
+        }
+        let (buf, _pad) = writer.finish();
+
+        let mut model2 = Order0::<256>::new();
+        let mut reader = BitReader::new(&buf);
+        let mut dec = AcDecoder::new(&mut reader);
+        let out: Vec<u8> = (0..input.len())
+            .map(|_| {
+                model2.cdf_to(&mut cdf);
+                let s = dec.decode(&cdf).unwrap();
+                model2.observe(s);
+                u8::try_from(s).unwrap()
+            })
+            .collect();
+        assert_eq!(out, input);
     }
 
     #[test]

@@ -22,9 +22,11 @@ mod classifier;
 mod classifier_stats;
 mod codec;
 mod eval;
+mod lz;
 mod models;
 mod null;
 mod xml_codec;
+mod xml_lz_ppm;
 mod xml_ppm;
 
 use std::path::PathBuf;
