@@ -43,7 +43,7 @@ use crate::ac::{Decoder, Encoder, TOTAL};
 use crate::arch::{CDF_LEN, VOCAB};
 use crate::codec::{ProbSource, read_header, write_header};
 use crate::model::ByteTransformer;
-use crate::predict::{ByteClass, Order0Adaptive};
+use crate::predict::{ByteClass, Order0Adaptive, Order2Adaptive};
 use crate::probs::{logits_to_cdf, uniform_cdf};
 use crate::routed::RoutedProbs;
 use crate::tokenizer::Token;
@@ -257,59 +257,224 @@ impl UniformCdfTable {
     }
 }
 
-/// Optional neural arm: a byte-level model whose per-position CDF is
-/// linearly mixed with the routed-class predictor at literal positions.
-/// Match bytes don't go through the AC, so the neural is only queried
-/// at literals; its state is advanced through every output byte (literal
-/// or match-copied) so the model's context tracks the actual byte
+/// Auxiliary-predictor arm of the LZ-routed codec: a byte-level neural
+/// model, plus (in 3-arm `AdaptiveLogistic` mode) an Order-2 dense byte
+/// predictor. Both are queried at literal positions and mixed against
+/// the routed-class predictor; both are advanced through every output
+/// byte (literal or match-copied) so context tracks the actual byte
 /// sequence, not just the literals.
 struct NeuralState {
     model: ByteTransformer,
-    /// CDF for the next byte conditioned on the model's current state.
-    /// Refreshed after every `model.step` call.
     cdf: [u32; CDF_LEN],
-    /// Mixing weight for the neural CDF in `[0, 1]`. The routed CDF
-    /// gets `1 - mix_weight`.
+    /// `None` outside `AdaptiveLogistic` to skip the 64 MiB alloc.
+    order2: Option<Order2Adaptive>,
+    /// Meaningful only when `order2.is_some()`.
+    order2_cdf: [u32; CDF_LEN],
+    /// Live neural weight for `Linear`/`Logistic`; seed weight for the
+    /// per-class adaptive mixers (with routed and order-2 splitting the
+    /// remainder evenly at init time).
     mix_weight: f32,
-    /// Linear or logistic combination of routed and neural CDFs.
     mix_mode: MixMode,
+    /// Per-class learned simplex point `(w_neural, w_routed, w_order2)`
+    /// with `w_order2 = 1 − w_neural − w_routed`. Populated only for
+    /// `AdaptiveLogistic`; indexed by `ByteClass as usize`.
+    mixers: Option<[ThreeWayMixer; 3]>,
 }
+
+/// Default learning rate for the adaptive mixer. Tuned for stability:
+/// gradient magnitudes are typically O(0.1–1.0) per byte, so 0.01 keeps
+/// the weights from oscillating while still reaching a sensible value
+/// after a few hundred bytes of pre-warm.
+const ADAPTIVE_MIXER_LR: f64 = 0.01;
 
 impl NeuralState {
     fn new(weights: Weights, mix_weight: f32, mix_mode: MixMode) -> Self {
         let mut model = ByteTransformer::new(weights);
         model.reset();
+        let is_adaptive = matches!(mix_mode, MixMode::AdaptiveLogistic);
+        let order2 = is_adaptive.then(Order2Adaptive::new);
+        let mixers = is_adaptive.then(|| {
+            let init_n = f64::from(mix_weight);
+            // Seed routed and order-2 with equal halves of the remainder.
+            let init_r = ((1.0 - init_n) * 0.5).max(0.0);
+            [
+                ThreeWayMixer::new(init_n, init_r, ADAPTIVE_MIXER_LR),
+                ThreeWayMixer::new(init_n, init_r, ADAPTIVE_MIXER_LR),
+                ThreeWayMixer::new(init_n, init_r, ADAPTIVE_MIXER_LR),
+            ]
+        });
         Self {
             model,
             cdf: uniform_cdf(),
+            order2,
+            order2_cdf: uniform_cdf(),
             mix_weight,
             mix_mode,
+            mixers,
         }
     }
 
-    /// Consume `byte`, advance state, refresh `cdf` for the next position.
+    /// Consume `byte`, advance state, refresh CDFs for the next position.
     fn advance(&mut self, byte: u8) {
         let logits = self.model.step(Token::from(byte));
         self.cdf = logits_to_cdf(logits);
+        if let Some(o2) = self.order2.as_mut() {
+            self.order2_cdf = o2.advance(Token::from(byte));
+        }
     }
 
-    /// Reset model state and CDF to the cold-start configuration.
+    /// Reset model state and CDFs to the cold-start configuration.
+    /// Adaptive-mixer weights are preserved across resets (state across
+    /// the prewarm-to-measure boundary is the whole point of an online
+    /// mixer). Order-2 is fully re-created — its statistics shouldn't
+    /// carry over a reset.
     fn reset(&mut self) {
         self.model.reset();
         self.cdf = uniform_cdf();
+        if let Some(o2) = self.order2.as_mut() {
+            *o2 = Order2Adaptive::new();
+            self.order2_cdf = uniform_cdf();
+        }
     }
 }
 
-/// Mixing scheme for combining two CDFs.
+/// Mixing scheme for combining CDFs from multiple predictors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MixMode {
-    /// `p_mix[s] = w · p_a[s] + (1−w) · p_b[s]`. Simple, fast, but
-    /// dilutes both predictors where they disagree.
+    /// 2-arm linear (count-space) mix of neural and routed:
+    /// `p_mix[s] = w · p_neural[s] + (1−w) · p_routed[s]`. Simple, fast,
+    /// but dilutes both predictors where they disagree.
     Linear,
-    /// `p_mix[s] ∝ p_a[s]^w · p_b[s]^(1−w)`. PAQ-canonical: favors
-    /// symbols where both agree, sharpens the combined prediction
+    /// 2-arm logistic (geometric-mean) mix of neural and routed:
+    /// `p_mix[s] ∝ p_neural[s]^w · p_routed[s]^(1−w)`. PAQ-canonical:
+    /// favors symbols where both agree, sharpens the combined prediction
     /// where one is confident.
     Logistic,
+    /// 3-arm logistic mix of neural, routed, and Order-2 dense, with
+    /// per-class weights `(w_n, w_r, 1 − w_n − w_r)` updated online by
+    /// SGD on cross-entropy after every observed byte. The encoder and
+    /// decoder see the same byte sequence (decoder's `true_byte` comes
+    /// from the prior `decode_byte_value`), so weights evolve
+    /// identically on both sides without any explicit synchronization.
+    AdaptiveLogistic,
+}
+
+/// Online-trained 3-way logistic mixer for `AdaptiveLogistic`. The
+/// simplex point `(w_neural, w_routed, w_order2)` satisfies
+/// `w_n, w_r ≥ 0`, `w_n + w_r ≤ 1`, with `w_order2 = 1 − w_n − w_r`.
+/// Updates via SGD on the per-position cross-entropy
+/// `L = -log p_mix[true_byte]` with `p_mix[s] ∝ p_n[s]^w_n · p_r[s]^w_r · p_o[s]^w_o`.
+struct ThreeWayMixer {
+    w_neural: f64,
+    w_routed: f64,
+    learning_rate: f64,
+}
+
+impl ThreeWayMixer {
+    fn new(initial_w_neural: f64, initial_w_routed: f64, learning_rate: f64) -> Self {
+        let mut w_n = initial_w_neural.clamp(0.0, 1.0);
+        let mut w_r = initial_w_routed.clamp(0.0, 1.0);
+        let sum = w_n + w_r;
+        if sum > 1.0 {
+            w_n /= sum;
+            w_r /= sum;
+        }
+        Self {
+            w_neural: w_n,
+            w_routed: w_r,
+            learning_rate,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    const fn w_neural_f32(&self) -> f32 {
+        self.w_neural as f32
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    const fn w_routed_f32(&self) -> f32 {
+        self.w_routed as f32
+    }
+
+    /// One SGD step. The three CDFs are the same ones that were mixed
+    /// to produce the AC emission at the position just observed
+    /// (neural and order-2 already class-folded by the caller if
+    /// applicable); `true_byte` is the byte that was emitted to / read
+    /// from the AC under that mix.
+    ///
+    /// Gradient derivation: for `L = -log p_mix[t]` with
+    /// `log p_mix[s] = w_n·log p_n[s] + w_r·log p_r[s] + w_o·log p_o[s] − log Z`
+    /// and `w_o = 1 − w_n − w_r`,
+    ///   `∂L/∂w_n = log p_o[t] − log p_n[t] + E_{p_mix}[log p_n − log p_o]`,
+    ///   `∂L/∂w_r = log p_o[t] − log p_r[t] + E_{p_mix}[log p_r − log p_o]`.
+    /// After the gradient step both scalars are projected back onto the
+    /// 2-simplex: clamp each to `[0, 1]`, then scale both by `1/(w_n+w_r)`
+    /// if their sum overshoots.
+    #[allow(clippy::cast_precision_loss)]
+    fn update(
+        &mut self,
+        neural_cdf: &[u32; CDF_LEN],
+        routed_cdf: &[u32; CDF_LEN],
+        order2_cdf: &[u32; CDF_LEN],
+        true_byte: u8,
+    ) {
+        let inv_total = 1.0_f64 / f64::from(TOTAL);
+        let wn = self.w_neural;
+        let wr = self.w_routed;
+        let wo = (1.0 - wn - wr).max(0.0);
+
+        let mut log_neural = [0.0_f64; VOCAB];
+        let mut log_routed = [0.0_f64; VOCAB];
+        let mut log_order2 = [0.0_f64; VOCAB];
+        let mut log_pmix = [0.0_f64; VOCAB];
+        let mut max_lp = f64::NEG_INFINITY;
+        for s in 0..VOCAB {
+            let gap_n = (f64::from(neural_cdf[s + 1] - neural_cdf[s]) * inv_total).max(1e-15);
+            let gap_r = (f64::from(routed_cdf[s + 1] - routed_cdf[s]) * inv_total).max(1e-15);
+            let gap_o = (f64::from(order2_cdf[s + 1] - order2_cdf[s]) * inv_total).max(1e-15);
+            let ln_n = gap_n.ln();
+            let ln_r = gap_r.ln();
+            let ln_o = gap_o.ln();
+            log_neural[s] = ln_n;
+            log_routed[s] = ln_r;
+            log_order2[s] = ln_o;
+            log_pmix[s] = wn.mul_add(ln_n, wr.mul_add(ln_r, wo * ln_o));
+            if log_pmix[s] > max_lp {
+                max_lp = log_pmix[s];
+            }
+        }
+
+        let mut sum_exp = 0.0_f64;
+        for lp in &mut log_pmix {
+            *lp = (*lp - max_lp).exp();
+            sum_exp += *lp;
+        }
+        let inv_sum = 1.0_f64 / sum_exp;
+
+        let mut exp_log_neural_minus_o = 0.0_f64;
+        let mut exp_log_routed_minus_o = 0.0_f64;
+        for s in 0..VOCAB {
+            let p = log_pmix[s] * inv_sum;
+            exp_log_neural_minus_o =
+                p.mul_add(log_neural[s] - log_order2[s], exp_log_neural_minus_o);
+            exp_log_routed_minus_o =
+                p.mul_add(log_routed[s] - log_order2[s], exp_log_routed_minus_o);
+        }
+
+        let t = true_byte as usize;
+        let grad_n = log_order2[t] - log_neural[t] + exp_log_neural_minus_o;
+        let grad_r = log_order2[t] - log_routed[t] + exp_log_routed_minus_o;
+
+        self.w_neural = self.learning_rate.mul_add(-grad_n, self.w_neural);
+        self.w_routed = self.learning_rate.mul_add(-grad_r, self.w_routed);
+        self.w_neural = self.w_neural.clamp(0.0, 1.0);
+        self.w_routed = self.w_routed.clamp(0.0, 1.0);
+        let s = self.w_neural + self.w_routed;
+        if s > 1.0 {
+            self.w_neural /= s;
+            self.w_routed /= s;
+        }
+    }
 }
 
 /// Linear count-space mix of two CDFs:
@@ -362,32 +527,18 @@ fn mix_cdfs_linear(a: &[u32; CDF_LEN], b: &[u32; CDF_LEN], w_a: f32) -> [u32; CD
     cdf
 }
 
-/// Logistic mix:
-/// `p_mix[s] ∝ p_a[s]^w · p_b[s]^(1−w)`, which is
-/// `log p_mix[s] = w · log p_a[s] + (1−w) · log p_b[s] − log Z`.
-/// Computed in f64 for numerical headroom (log of 1/65536 = −11.1, so
-/// f32 would suffice but f64 is cheap).
+/// Quantize per-symbol log-probabilities (unnormalized, up to an
+/// additive constant) into an integer CDF with each gap ≥ 1 and total
+/// exactly `TOTAL`. Shared back-end for `mix_cdfs_logistic` and
+/// `mix_cdfs_3way_logistic`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn mix_cdfs_logistic(a: &[u32; CDF_LEN], b: &[u32; CDF_LEN], w_a: f32) -> [u32; CDF_LEN] {
-    let w_a = f64::from(w_a.clamp(0.0, 1.0));
-    let w_b = 1.0 - w_a;
-    // 1/TOTAL guards log of 0 (gaps are guaranteed >= 1, so this is
-    // just a precaution).
-    let inv_total = 1.0 / f64::from(TOTAL);
-    let mut log_p = [0.0_f64; VOCAB];
+fn log_probs_to_cdf(log_p: &[f64; VOCAB]) -> [u32; CDF_LEN] {
     let mut max_lp = f64::NEG_INFINITY;
-    for i in 0..VOCAB {
-        let gap_a = u16::try_from(a[i + 1] - a[i]).expect("CDF gap fits u16");
-        let gap_b = u16::try_from(b[i + 1] - b[i]).expect("CDF gap fits u16");
-        let pa = (f64::from(gap_a)).max(1.0) * inv_total;
-        let pb = (f64::from(gap_b)).max(1.0) * inv_total;
-        let lp = w_a.mul_add(pa.ln(), w_b * pb.ln());
-        log_p[i] = lp;
+    for &lp in log_p {
         if lp > max_lp {
             max_lp = lp;
         }
     }
-    // Exponentiate (subtract max for stability) and normalize.
     let mut probs = [0.0_f64; VOCAB];
     let mut sum = 0.0_f64;
     for i in 0..VOCAB {
@@ -397,7 +548,6 @@ fn mix_cdfs_logistic(a: &[u32; CDF_LEN], b: &[u32; CDF_LEN], w_a: f32) -> [u32; 
     }
     let inv_sum = 1.0 / sum;
 
-    // Quantize to integer CDF with each gap >= 1.
     let mut counts = [1u32; VOCAB];
     let mut allocated: u32 = VOCAB as u32;
     let mut frac_idx: Vec<(f64, usize)> = Vec::with_capacity(VOCAB);
@@ -433,10 +583,67 @@ fn mix_cdfs_logistic(a: &[u32; CDF_LEN], b: &[u32; CDF_LEN], w_a: f32) -> [u32; 
     cdf
 }
 
-fn mix_cdfs(a: &[u32; CDF_LEN], b: &[u32; CDF_LEN], w_a: f32, mode: MixMode) -> [u32; CDF_LEN] {
+/// Logistic mix:
+/// `p_mix[s] ∝ p_a[s]^w · p_b[s]^(1−w)`, which is
+/// `log p_mix[s] = w · log p_a[s] + (1−w) · log p_b[s] − log Z`.
+/// Computed in f64 for numerical headroom (log of 1/65536 = −11.1, so
+/// f32 would suffice but f64 is cheap).
+fn mix_cdfs_logistic(a: &[u32; CDF_LEN], b: &[u32; CDF_LEN], w_a: f32) -> [u32; CDF_LEN] {
+    let w_a = f64::from(w_a.clamp(0.0, 1.0));
+    let w_b = 1.0 - w_a;
+    // 1/TOTAL guards log of 0 (gaps are guaranteed >= 1, so this is
+    // just a precaution).
+    let inv_total = 1.0 / f64::from(TOTAL);
+    let mut log_p = [0.0_f64; VOCAB];
+    for i in 0..VOCAB {
+        let gap_a = u16::try_from(a[i + 1] - a[i]).expect("CDF gap fits u16");
+        let gap_b = u16::try_from(b[i + 1] - b[i]).expect("CDF gap fits u16");
+        let pa = (f64::from(gap_a)).max(1.0) * inv_total;
+        let pb = (f64::from(gap_b)).max(1.0) * inv_total;
+        log_p[i] = w_a.mul_add(pa.ln(), w_b * pb.ln());
+    }
+    log_probs_to_cdf(&log_p)
+}
+
+/// 3-arm logistic mix:
+/// `p_mix[s] ∝ p_a[s]^w_a · p_b[s]^w_b · p_c[s]^(1−w_a−w_b)`,
+/// the natural extension of `mix_cdfs_logistic` to the 2-simplex.
+fn mix_cdfs_3way_logistic(
+    a: &[u32; CDF_LEN],
+    b: &[u32; CDF_LEN],
+    c: &[u32; CDF_LEN],
+    w_a: f32,
+    w_b: f32,
+) -> [u32; CDF_LEN] {
+    let w_a = f64::from(w_a.clamp(0.0, 1.0));
+    let w_b = f64::from(w_b.clamp(0.0, 1.0));
+    let w_c = (1.0 - w_a - w_b).max(0.0);
+    let inv_total = 1.0 / f64::from(TOTAL);
+    let mut log_p = [0.0_f64; VOCAB];
+    for i in 0..VOCAB {
+        let gap_a = u16::try_from(a[i + 1] - a[i]).expect("CDF gap fits u16");
+        let gap_b = u16::try_from(b[i + 1] - b[i]).expect("CDF gap fits u16");
+        let gap_c = u16::try_from(c[i + 1] - c[i]).expect("CDF gap fits u16");
+        let pa = (f64::from(gap_a)).max(1.0) * inv_total;
+        let pb = (f64::from(gap_b)).max(1.0) * inv_total;
+        let pc = (f64::from(gap_c)).max(1.0) * inv_total;
+        log_p[i] = w_a.mul_add(pa.ln(), w_b.mul_add(pb.ln(), w_c * pc.ln()));
+    }
+    log_probs_to_cdf(&log_p)
+}
+
+/// 2-arm dispatcher for the fixed-weight modes. `AdaptiveLogistic`
+/// (3-arm) goes through `mix_cdfs_3way_logistic` directly.
+fn mix_cdfs_2arm(
+    a: &[u32; CDF_LEN],
+    b: &[u32; CDF_LEN],
+    w_a: f32,
+    mode: MixMode,
+) -> [u32; CDF_LEN] {
     match mode {
         MixMode::Linear => mix_cdfs_linear(a, b, w_a),
         MixMode::Logistic => mix_cdfs_logistic(a, b, w_a),
+        MixMode::AdaptiveLogistic => unreachable!("3-arm mode does not use mix_cdfs_2arm"),
     }
 }
 
@@ -540,28 +747,82 @@ impl LzRouted {
         }
     }
 
-    /// Compute the literal byte CDF for the given class. With neural
-    /// active and class is `Lower` or `NonLetter`, this is the linear
-    /// mix of routed + neural. `Upper` class skips neural mixing
-    /// because the case-folding scheme makes the two CDFs index
-    /// different things; at `Upper` positions the routed letter CDF
-    /// (over folded a-z) is used alone.
+    /// Compute the literal byte CDF for the given class. For 2-arm
+    /// modes (`Linear`, `Logistic`) this is a 2-way mix of neural and
+    /// routed; for `AdaptiveLogistic` it's a 3-way mix of neural,
+    /// routed, and Order-2 dense with per-class learned weights. The
+    /// routed letter CDF is over case-folded bytes (a-z); neural and
+    /// Order-2 are over raw bytes, so at `Upper` positions both are
+    /// folded into the a-z alphabet first.
     fn literal_byte_cdf(&self, class: ByteClass) -> [u32; CDF_LEN] {
         let routed_base = *self.routed.cdf_for_class(class);
-        match (&self.neural, class) {
-            (Some(n), ByteClass::Lower | ByteClass::NonLetter) => {
-                mix_cdfs(&n.cdf, &routed_base, n.mix_weight, n.mix_mode)
+        let Some(n) = self.neural.as_ref() else {
+            return routed_base;
+        };
+        let neural_for_class = match class {
+            ByteClass::Upper => fold_neural_cdf_for_upper(&n.cdf),
+            ByteClass::Lower | ByteClass::NonLetter => n.cdf,
+        };
+        match (n.mix_mode, n.mixers.as_ref()) {
+            (MixMode::Linear | MixMode::Logistic, _) => {
+                mix_cdfs_2arm(&neural_for_class, &routed_base, n.mix_weight, n.mix_mode)
             }
-            (Some(n), ByteClass::Upper) => {
-                // Routed encodes the folded byte (a-z), but the neural
-                // model was trained on raw bytes (which include A-Z).
-                // Fold neural's A-Z mass into the corresponding a-z slot
-                // so both inputs to `mix_cdfs` are on the same alphabet.
-                let folded = fold_neural_cdf_for_upper(&n.cdf);
-                mix_cdfs(&folded, &routed_base, n.mix_weight, n.mix_mode)
+            (MixMode::AdaptiveLogistic, Some(mixers)) => {
+                let mixer = &mixers[class as usize];
+                let order2_for_class = match class {
+                    ByteClass::Upper => fold_neural_cdf_for_upper(&n.order2_cdf),
+                    ByteClass::Lower | ByteClass::NonLetter => n.order2_cdf,
+                };
+                mix_cdfs_3way_logistic(
+                    &neural_for_class,
+                    &routed_base,
+                    &order2_for_class,
+                    mixer.w_neural_f32(),
+                    mixer.w_routed_f32(),
+                )
             }
-            _ => routed_base,
+            // `mixers` is `Some` iff `mix_mode == AdaptiveLogistic` by
+            // construction (see `NeuralState::new`); unreachable.
+            (MixMode::AdaptiveLogistic, None) => unreachable!(),
         }
+    }
+
+    /// For `AdaptiveLogistic` mode, run an SGD step on the per-class
+    /// mixer using the byte that was just emitted/read at the previous
+    /// literal position. Called *after* the routed/neural/order-2
+    /// state has advanced, but with the pre-advance CDFs captured
+    /// before the encoding/decoding decision.
+    fn maybe_update_mixer(
+        &mut self,
+        pre_neural_cdf: &[u32; CDF_LEN],
+        pre_routed_cdf: &[u32; CDF_LEN],
+        pre_order2_cdf: &[u32; CDF_LEN],
+        emitted_byte: u8,
+        class: ByteClass,
+    ) {
+        let Some(n) = self.neural.as_mut() else {
+            return;
+        };
+        if n.mix_mode != MixMode::AdaptiveLogistic {
+            return;
+        }
+        let Some(mixers) = n.mixers.as_mut() else {
+            return;
+        };
+        // For Upper-class positions, the mix consumed the *folded*
+        // neural and order-2 CDFs and emitted the folded byte. Mirror
+        // that here so the gradient targets the same alphabet.
+        let (neural_for_mix, order2_for_mix, true_byte) = match class {
+            ByteClass::Upper => (
+                fold_neural_cdf_for_upper(pre_neural_cdf),
+                fold_neural_cdf_for_upper(pre_order2_cdf),
+                emitted_byte | 0x20,
+            ),
+            ByteClass::Lower | ByteClass::NonLetter => {
+                (*pre_neural_cdf, *pre_order2_cdf, emitted_byte)
+            }
+        };
+        mixers[class as usize].update(&neural_for_mix, pre_routed_cdf, &order2_for_mix, true_byte);
     }
 
     fn advance_neural(&mut self, byte: u8) {
@@ -721,12 +982,21 @@ pub(crate) fn encode_range<W: Write>(
             enc.encode(&flag_cdf, 0)?;
             state.flag.observe(0);
             let byte = buf[pos];
+            // Snapshot pre-update routed + neural + order-2 CDFs for
+            // the mixer's gradient step (after `encode_byte_value` /
+            // `advance_neural` all three predictors have advanced to
+            // the next position).
+            let pre_routed_cdf = *state.routed.cdf_for_class(ByteClass::classify(byte));
+            let pre_aux = state.neural.as_ref().map(|n| (n.cdf, n.order2_cdf));
             let class = state.routed.encode_class(&mut enc, byte)?;
             let byte_cdf = state.literal_byte_cdf(class);
             state
                 .routed
                 .encode_byte_value(&mut enc, byte, class, &byte_cdf)?;
             state.advance_neural(byte);
+            if let Some((pn, po2)) = pre_aux {
+                state.maybe_update_mixer(&pn, &pre_routed_cdf, &po2, byte, class);
+            }
             pos += 1;
         }
     }
@@ -788,10 +1058,15 @@ pub(crate) fn decode_into<R: Read>(
             produced += length as u64;
         } else {
             let class = state.routed.decode_class(&mut dec)?;
+            let pre_routed_cdf = *state.routed.cdf_for_class(class);
+            let pre_aux = state.neural.as_ref().map(|n| (n.cdf, n.order2_cdf));
             let byte_cdf = state.literal_byte_cdf(class);
             let byte = state.routed.decode_byte_value(&mut dec, class, &byte_cdf)?;
             out.push(byte);
             state.advance_neural(byte);
+            if let Some((pn, po2)) = pre_aux {
+                state.maybe_update_mixer(&pn, &pre_routed_cdf, &po2, byte, class);
+            }
             produced += 1;
         }
     }

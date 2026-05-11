@@ -29,18 +29,18 @@ pub(crate) const CDF_LEN: usize = VOCAB + 1;
 /// kernel's i16-accumulator bound. Bumping beyond 512 requires widening
 /// the LUT-kernel accumulators to i32 or adding periodic flush.
 ///
-/// `D_MODEL = 256`, `N_LAYERS = 2`, `CM_MULT = 1` — the **1M restart**
-/// shape held in reserve for when the neural arm comes back online.
-/// The 8M token-level run was killed on 2026-05-09 after 4.4k steps
-/// (info-bpb tracking byte-level 8M, no ceiling-raising headroom from
-/// BPE alone); the next neural arm will re-enter at 1M as one component
-/// of a mixed ensemble. The model code paths are dormant during phase-1
-/// deterministic-stack iteration but kept compiling so the resume is
-/// just "fill in the deterministic-residual training objective."
+/// `D_MODEL = 256`, `N_LAYERS = 8`, `CM_MULT = 1` — the **4M scale-up**
+/// for the second neural arm in the phase-2 ensemble. The 1M run
+/// (2026-05-09) plateaued at info-bpb 1.86, mixed into the LZ-routed
+/// codec at 1.991 bpb / 249 MB on 1 GB. Standalone-neural's gap to the
+/// deterministic floor was the dominant remaining lever; bumping to
+/// 4M (4× ternary parameter count, ~2× per-step training time) targets
+/// the 0.10–0.20 bpb improvement the 1M-vs-2026-04-24-baseline gap
+/// suggests is on the table.
 pub(crate) const D_MODEL: usize = 256;
 
 /// Number of RWKV blocks. Each block is one time-mix + one channel-mix.
-pub(crate) const N_LAYERS: usize = 2;
+pub(crate) const N_LAYERS: usize = 8;
 
 /// Channel-mix hidden-size multiplier relative to `D_MODEL`. RWKV v4
 /// traditionally uses `4×`, but `D_FF = 4·D_MODEL = 2048` would exceed

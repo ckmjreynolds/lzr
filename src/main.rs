@@ -148,7 +148,10 @@ fn main() -> Result<()> {
             let mode = match mix_mode.as_str() {
                 "linear" => lz77::MixMode::Linear,
                 "logistic" => lz77::MixMode::Logistic,
-                other => anyhow::bail!("unknown mix-mode '{other}' (use linear or logistic)"),
+                "adaptive" | "adaptive-logistic" => lz77::MixMode::AdaptiveLogistic,
+                other => {
+                    anyhow::bail!("unknown mix-mode '{other}' (use linear, logistic, or adaptive)")
+                }
             };
             cmd_bench(&corpus, weights.as_deref(), mix_weight, mode)
         }
@@ -218,6 +221,7 @@ fn run_lz_routed(
         let mode_str = match mix_mode {
             lz77::MixMode::Linear => "linear",
             lz77::MixMode::Logistic => "logistic",
+            lz77::MixMode::AdaptiveLogistic => "adaptive-3 (n+r+o2)",
         };
         format!(
             "LZ77 (4 MiB window, MIN_MATCH=6, bucketed, lazy parse) + routed + neural ({mode_str} w={mix_weight:.2})"
