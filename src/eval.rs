@@ -33,6 +33,7 @@ use crate::xml_lz_ppm::XmlLzPpmCodec;
 use crate::xml_lz_ppmc::XmlLzPpmcCodec;
 use crate::xml_lz_word::XmlLzWordCodec;
 use crate::xml_ppm::XmlPpmCodec;
+use crate::xml_wiki_lz_cp::XmlWikiLzCpCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
 const SAMPLE_BYTES_QUICK: usize = 64 * 1024;
@@ -85,10 +86,11 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "xml-lz-ord3" => Ok(Box::new(XmlLzOrd3Codec)),
         "xml-lz-cp" => Ok(Box::new(XmlLzCpCodec)),
         "xml-lz-ppmc" => Ok(Box::new(XmlLzPpmcCodec)),
+        "xml-wiki-lz-cp" => Ok(Box::new(XmlWikiLzCpCodec)),
         "bwt" => Ok(Box::new(BwtCodec)),
         "paq" => Ok(Box::new(PaqCodec)),
         other => bail!(
-            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc, bwt, paq)"
+            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc, xml-wiki-lz-cp, bwt, paq)"
         ),
     }
 }

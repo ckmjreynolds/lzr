@@ -13,6 +13,62 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-12 — Phase 12: Wiki Sub-Mode Literal Models (Negative Result)
+
+CDR/Claude tested whether splitting the Content literal models (`letter`, `nonletter`) by an in-band wiki sub-mode (Plain / Link / Template) would close some of the v2 → v1 gap. Hypothesis came from a recon analyzer (`analyze-wiki`) that walked the first 16 MiB of enwik8 through the production XML classifier and found that **76% of all Content bytes live inside `[[..]]` internal-link spans** (template spans are another 4.5%, headings 0.3%, the leftover 19% is Plain prose). The intuition: the alphabet inside `[[..]]` is constrained — link targets are mostly letters with a small set of separators — so a Link-specific Order-3-letter model trained only on link-internal bytes should concentrate mass better than a single model trained on everything. Pre-measurement bpb prediction: 0.075–0.10 bpb on the panel.
+
+### Recon: wiki sub-mode byte coverage on enwik8
+
+`analyze-wiki --bytes 16777216` on `assets/enwik8`:
+
+| layer | bytes | % of total | % of Content |
+|---|---:|---:|---:|
+| Content | 16,380,045 | 97.63 | — |
+| TagStructure | 376,532 | 2.24 | — |
+| AttrValue | 20,639 | 0.12 | — |
+| Plain Content | 3,117,479 | 18.58 | 19.03 |
+| Inside `[[..]]` | 12,471,947 | 74.34 | 76.14 |
+| Inside `{{..}}` | 740,805 | 4.42 | 4.52 |
+| Inside `==..==` | 49,814 | 0.30 | 0.30 |
+
+The Link share is dominated by image links with thumb captions (`[[Image:Foo.jpg|thumb|right|300px|Caption...]]`), which average ~71 bytes per span across 175,651 spans. Bracket counts via `grep -oF '[[' | wc -l` confirm 175,652 `[[` openers and 175,659 `]]` closers — the FSM's depth tracking is correct.
+
+### Implementation
+
+New `WikiClassifier` (`src/wiki_classifier.rs`): a Moore-style sub-mode FSM run alongside `Classifier` inside Content. Three sub-modes (Plain / Link / Template); Heading dropped after the recon showed it at 0.3%, not worth line-start tracking. The FSM uses a one-byte memory (`prev`) rather than a one-byte lookahead so decode can advance the FSM without seeing the next byte — paired tokens (`[[`, `]]`, `{{`, `}}`) fire on the *second* byte of the pair. Depth-tracked nesting (templates nest heavily); Link takes priority over Template when both depths are active.
+
+New codec `xml-wiki-lz-cp` (`src/xml_wiki_lz_cp.rs`): clone of Phase-7 xml-lz-cp with the Content letter and non-letter Order-1Ctx models replicated three times (one per sub-mode). Memory cost: letter ~30 MB × 3 = 90 MB, non-letter ~64 MB × 3 = 192 MB, total ~282 MB per window run. Within Hutter's 10 GB cap.
+
+Two cuts:
+- **Phase 12a**: split `lz_flag`, `is_letter`, `letter`, `nonletter` all by sub-mode.
+- **Phase 12b**: only split `letter` and `nonletter`; keep `lz_flag` and `is_letter` shared, after 12a's decomp showed the LZ-flag split alone added ~566 bits/window with no offsetting gain.
+
+### Results (quick panel, 5 × 64 KiB)
+
+| codec | mean bpb | Δ vs xml-lz-cp |
+|---|---:|---:|
+| xml-lz-cp (Phase 7 baseline) | 2.506 | — |
+| xml-wiki-lz-cp (Phase 12a, full split) | 2.517 | +0.011 |
+| xml-wiki-lz-cp (Phase 12b, literal-only split) | 2.518 | +0.012 |
+
+All 5 windows regress consistently — not panel noise. Phase 12b's failure to recover any of Phase 12a's loss means the regression is dominated by the literal-path split, not the LZ-flag split. The literal-path split itself is a clean negative.
+
+### Diagnosis
+
+The Order-3 letter context (`LETTER_NCTX = 52³ = 140,608` rows) already implicitly carries the wiki sub-mode signal: trigrams like `[[U` or `e]]` only appear in link-adjacent positions, so the prior-letter conditioning is already specialized to wiki structure where structure matters. Adding an explicit sub-mode tag is redundant *and* fragments the model — per-sub-mode training counts drop to roughly the sub-mode's byte share (19% / 76% / 4.5%), and Laplace smoothing pays the dilution cost on under-sampled contexts. The 4.5% template share is especially harmful: 1/3 of the table allocated to a slice that sees ~0.2 MiB of training in a 4 MiB warm prefix.
+
+### Implications
+
+- **Sub-mode-as-context-replication is the wrong mechanism for high-order models.** When the base context is already order-3, adding an orthogonal categorical dimension (sub-mode) hurts more than it helps because the dense context dilutes faster than the sub-mode signal sharpens.
+- **A correctly-sized wiki specialization would attack different bytes**: the LOW-order positions where letter context is sparse — the first letter after `[[`, the first byte after `|`, the byte after a doubled `=`. These are the positions where the trigram context is "junk" (separators or unknown) but the sub-mode would be informative. The current Order-3 model wastes mass on these positions because its 3-letter history is dominated by non-letter framing.
+- **The LZ matcher is already absorbing the bulk of wiki redundancy.** 65–70% of all archive bits in xml-lz-cp are `lz_match` bits, and the link/template framing repeats are captured there at long-match cost. The remaining literal residue is what's left after LZ peels off the easy gains, and that residue's distribution is closer to "novel content one-off" than "wiki-specific token". Sub-mode-conditioning a model fit to novel-content residue doesn't help.
+
+### Status
+
+Phase 12 lands on `v2` as a negative-finding commit. xml-lz-cp remains v2's best at 2.608 bpb on the full panel. The wiki sub-classifier and the analyzer stay in the tree — both will be reusable if a later phase wants to attack the sparse-context positions (e.g., a separate small-table predictor that fires only when letter context is empty AND sub-mode is non-Plain, mixed against the base predictor instead of replacing it).
+
+---
+
 ## 2026-05-11 — v2 Clean-Slate Rewrite; Eval-First Discipline; Mode-Routed Codec Stack
 
 CDR/Claude spent the day on a from-scratch v2 rewrite of the codec on a new branch (`v2` off `hutter`), motivated by the architectural critique at the end of the 2026-05-10 4M-scale-up entry: v1's "locally-greedy" iteration had reached a saturation point where mixer parameterization and neural scale weren't moving the needle, and the structural choices (byte-class routing, monolithic codec, ad-hoc bit accounting) had become the binding constraints. v2 inverts the build order: eval infrastructure and per-component bit decomposition first, then a mode classifier, then increasingly capable codecs layered on top. Eight build phases shipped in one session; the best operating point is **2.608 bpb on the enwik8 20×256KiB panel (xml-lz-cp)**, 0.55 bpb behind v1's deterministic floor of 2.056 — a real gap, but with the architecture and the audit table to know exactly where it sits.

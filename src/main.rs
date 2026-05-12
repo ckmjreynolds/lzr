@@ -18,6 +18,7 @@
 
 mod ac;
 mod analyze;
+mod analyze_wiki;
 mod bit_pred;
 mod bits;
 mod bwt;
@@ -33,6 +34,7 @@ mod mtf;
 mod null;
 mod paq_codec;
 mod ppm;
+mod wiki_classifier;
 mod xml_codec;
 mod xml_lz_cp;
 mod xml_lz_ord3;
@@ -40,6 +42,7 @@ mod xml_lz_ppm;
 mod xml_lz_ppmc;
 mod xml_lz_word;
 mod xml_ppm;
+mod xml_wiki_lz_cp;
 
 use std::path::PathBuf;
 
@@ -60,6 +63,18 @@ enum Command {
     /// how various codecs compress that stream. Diagnostic only — no
     /// archive is produced. Used to decide whether a deferred-BWT
     /// integration would beat the current per-mode literal codec.
+    /// Scan a prefix of the corpus and report wiki sub-mode coverage
+    /// within Content (links, templates, headings) plus top distinct
+    /// link targets and template names. Recon for Phase 12.
+    AnalyzeWiki {
+        /// Corpus file path.
+        #[arg(long, default_value = "assets/enwik8")]
+        corpus: PathBuf,
+        /// How many bytes from the start to scan.
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        bytes: usize,
+    },
+
     AnalyzeLiterals {
         /// Corpus file path.
         #[arg(long, default_value = "assets/enwik8")]
@@ -112,5 +127,6 @@ fn main() -> Result<()> {
             measure_bytes,
             warm_bytes,
         } => analyze::run_analyze_literals(&corpus, offset, measure_bytes, warm_bytes),
+        Command::AnalyzeWiki { corpus, bytes } => analyze_wiki::run_analyze_wiki(&corpus, bytes),
     }
 }
