@@ -42,7 +42,7 @@ pub(crate) struct TokenMatcher {
     /// All token ids emitted to the Content stream so far, in
     /// emission order. Both warm and measure tokens land here; the
     /// matcher walks back up to `WINDOW_SIZE` positions.
-    stream: Vec<u16>,
+    stream: Vec<u32>,
 }
 
 impl TokenMatcher {
@@ -60,14 +60,14 @@ impl TokenMatcher {
     }
 
     /// Token id at stream position `pos`.
-    pub(crate) fn at(&self, pos: usize) -> u16 {
+    pub(crate) fn at(&self, pos: usize) -> u32 {
         self.stream[pos]
     }
 
     /// Append a token id to the stream. After the third token,
     /// every appended token closes a `MIN_MATCH`-sized window whose
     /// hash is inserted at the head of its bucket's chain.
-    pub(crate) fn push(&mut self, id: u16) {
+    pub(crate) fn push(&mut self, id: u32) {
         self.stream.push(id);
         let n = self.stream.len();
         if n >= MIN_MATCH {
@@ -88,7 +88,7 @@ impl TokenMatcher {
         h
     }
 
-    fn hash_slice(slice: &[u16]) -> u64 {
+    fn hash_slice(slice: &[u32]) -> u64 {
         debug_assert!(slice.len() >= MIN_MATCH);
         let mut h = FNV_OFFSET;
         for &t in &slice[..MIN_MATCH] {
@@ -101,7 +101,7 @@ impl TokenMatcher {
     /// the stream's history. Returns `(offset_in_tokens, length)`
     /// or `None` when no `MIN_MATCH`-clearing match exists within
     /// the `WINDOW_SIZE` lookback.
-    pub(crate) fn find_match(&self, upcoming: &[u16]) -> Option<(u32, u32)> {
+    pub(crate) fn find_match(&self, upcoming: &[u32]) -> Option<(u32, u32)> {
         if upcoming.len() < MIN_MATCH {
             return None;
         }
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn finds_simple_repeat() {
         let mut m = TokenMatcher::new();
-        for id in [1u16, 2, 3, 4, 5] {
+        for id in [1u32, 2, 3, 4, 5] {
             m.push(id);
         }
         // Looking for "1 2 3 4 ..." should find offset 5 (back to the start).
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn no_match_below_min() {
         let mut m = TokenMatcher::new();
-        for id in [1u16, 2, 3, 4, 5] {
+        for id in [1u32, 2, 3, 4, 5] {
             m.push(id);
         }
         // "1 2 9 ..." has only 2 matching tokens, below MIN_MATCH=3.
@@ -189,13 +189,13 @@ mod tests {
     fn longer_match_preferred() {
         let mut m = TokenMatcher::new();
         // Two earlier matches of "1 2 3": one extends 3 tokens, one extends 5.
-        for id in [1u16, 2, 3, 99, 99] {
+        for id in [1u32, 2, 3, 99, 99] {
             m.push(id);
         }
-        for id in [1u16, 2, 3, 4, 5] {
+        for id in [1u32, 2, 3, 4, 5] {
             m.push(id);
         }
-        for id in [77u16, 77, 77] {
+        for id in [77u32, 77, 77] {
             m.push(id);
         }
         // Now look for "1 2 3 4 5 ..." — the second occurrence is 5 long.

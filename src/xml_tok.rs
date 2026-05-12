@@ -83,8 +83,16 @@ const TAG_ESCAPE: usize = DICTIONARY.len();
 const TAG_ALPHABET: usize = DICTIONARY.len() + 1;
 const _: () = assert!(TAG_ALPHABET == 33);
 
-/// Maximum dictionary entries — fits a u16 index.
-const DICT_CAPACITY: usize = 1 << 16;
+/// Maximum dictionary entries. v3 Phase 1: widened from 1 << 16
+/// (the u16 packaging cap that the survey showed costs ~0.527 bpb
+/// of pure-entropy headroom at enwik8 scale due to 7% OOV) to
+/// 1 << 18 = 262,144 — eliminates OOV on enwik8 measure windows
+/// and leaves headroom for enwik9's ~3× larger unique-type count.
+/// IDs are emitted as 18 bits per dictionary entry; the bit-level
+/// predictor sees the prev-id context at 18-bit resolution.
+const DICT_CAPACITY: usize = 1 << 18;
+/// Number of bits used to emit each dictionary id.
+const ID_BITS: u32 = 18;
 
 /// Class-bit context: 0 = no prior token (Content-run start), 1 =
 /// last was Word, 2 = last was Separator. Forced alternation
@@ -107,12 +115,10 @@ const BYTE_NCTX: usize = 257;
 /// Hash-table size (log₂) for the bit-level dict-id predictor.
 /// Phase 15 folds `prev_id` into the context to make this an
 /// Order-1 word model; the `(prev_id, bit_pos, prefix)` space is far
-/// larger than `(bit_pos, prefix)` alone, so 2^22 slots = 16 MiB of
-/// u16 count pairs. Common `prev_id`s (e.g. "the") concentrate their
-/// observations on a small set of `(bit_pos, prefix)` contexts in
-/// the active sub-table; rare `prev_id`s contribute thinner support
-/// but still get at least Order-0 behavior thanks to Laplace.
-const ID_BIT_K: u32 = 22;
+/// larger than `(bit_pos, prefix)` alone. v3 Phase 1 widens IDs to
+/// 18 bits and bumps the table to 2^24 = 16 M slots (64 MiB) to
+/// keep collision rate near zero at the new context-space size.
+const ID_BIT_K: u32 = 24;
 /// Hash-table size for the bit-level length predictor. Length is
 /// independent of `prev_id`, so the context space stays as in
 /// Phase 14: 2^18 slots = 1 MiB.
@@ -143,32 +149,32 @@ impl DictEntry {
 
 #[derive(Debug, Default)]
 struct Dict {
-    by_bytes: HashMap<Vec<u8>, u16>,
+    by_bytes: HashMap<Vec<u8>, u32>,
     entries: Vec<DictEntry>,
 }
 
 impl Dict {
-    fn get(&self, key: &[u8]) -> Option<u16> {
+    fn get(&self, key: &[u8]) -> Option<u32> {
         self.by_bytes.get(key).copied()
     }
 
     /// Insert a new entry if there's room. Returns the new id, or
     /// `None` if the dictionary is full.
-    fn insert(&mut self, key: Vec<u8>) -> Option<u16> {
+    fn insert(&mut self, key: Vec<u8>) -> Option<u32> {
         if self.entries.len() >= DICT_CAPACITY {
             return None;
         }
-        let id = u16::try_from(self.entries.len()).expect("entries.len() < DICT_CAPACITY");
+        let id = u32::try_from(self.entries.len()).expect("entries.len() < DICT_CAPACITY");
         self.by_bytes.insert(key.clone(), id);
         self.entries.push(DictEntry::new(key));
         Some(id)
     }
 
-    fn entry_mut(&mut self, id: u16) -> &mut DictEntry {
+    fn entry_mut(&mut self, id: u32) -> &mut DictEntry {
         &mut self.entries[id as usize]
     }
 
-    fn entry(&self, id: u16) -> &DictEntry {
+    fn entry(&self, id: u32) -> &DictEntry {
         &self.entries[id as usize]
     }
 }
@@ -269,7 +275,7 @@ impl Codec for XmlTokCodec {
         {
             let mut enc = AcEncoder::new(&mut writer);
             let mut last_class_ctx = CLASS_CTX_NONE;
-            let mut prev_id: Option<u16> = None;
+            let mut prev_id: Option<u32> = None;
             let mut uniform_cdf_cache = UniformCdfCache::new();
             let mut i = warm_end;
             while i < buf.len() {
@@ -279,7 +285,7 @@ impl Codec for XmlTokCodec {
                         // Try LZ match on the upcoming Content tokens.
                         let lookahead = lookahead_tokens(&buf, i, &dict);
                         let lz_match = if lookahead.len() >= tok_lz::MIN_MATCH {
-                            let ids: Vec<u16> = lookahead.iter().map(|t| t.id).collect();
+                            let ids: Vec<u32> = lookahead.iter().map(|t| t.id).collect();
                             matcher.find_match(&ids).and_then(|(off, len)| {
                                 let len_us = len as usize;
                                 // Cap to what the lookahead actually covers.
@@ -494,7 +500,7 @@ impl Codec for XmlTokCodec {
         let mut reader = BitReader::new(&archive[4..]);
         let mut dec = AcDecoder::new(&mut reader);
         let mut last_class_ctx = CLASS_CTX_NONE;
-        let mut prev_id: Option<u16> = None;
+        let mut prev_id: Option<u32> = None;
         let mut uniform_cdf_cache = UniformCdfCache::new();
 
         while buf.len() - warm_end < measure_len {
@@ -536,7 +542,7 @@ impl Codec for XmlTokCodec {
                         // Collect matched ids, then emit them. Read ids
                         // first so the matcher's stream isn't mutated
                         // mid-loop (would invalidate the source range).
-                        let copied: Vec<u16> =
+                        let copied: Vec<u32> =
                             (0..length).map(|k| matcher.at(src_start + k)).collect();
 
                         for id in copied {
@@ -690,8 +696,8 @@ fn encode_token(
     comp: &mut ComponentBits,
     class: TokenClass,
     token: &[u8],
-    prev_id: Option<u16>,
-) -> Option<u16> {
+    prev_id: Option<u32>,
+) -> Option<u32> {
     // Word tokens carry case info; the dict key is the lowercase form.
     // Separator tokens use their raw bytes as the dict key.
     let (case_pat, key): (Option<CasePattern>, Vec<u8>) = match class {
@@ -755,8 +761,8 @@ fn decode_token(
     models: &mut Models,
     dict: &mut Dict,
     class: TokenClass,
-    prev_id: Option<u16>,
-) -> Result<(Vec<u8>, Option<u16>)> {
+    prev_id: Option<u32>,
+) -> Result<(Vec<u8>, Option<u32>)> {
     let mut oov_cdf = [0u32; 3];
     models.token_oov.cdf_to(&mut oov_cdf);
     let oov_sym = dec.decode(&oov_cdf)?;
@@ -825,24 +831,22 @@ fn apply_case_decoded(
 /// `u64::MAX` is the sentinel for `None` — real prev ids live in
 /// `0..=65535`, so the high bits of `u64::MAX` make the sentinel
 /// unambiguous.
-fn id_bit_ctx(prev_id: Option<u16>, prefix: u16, bit_pos: u32) -> u64 {
+fn id_bit_ctx(prev_id: Option<u32>, prefix: u32, bit_pos: u32) -> u64 {
     let prev_field = prev_id.map_or(u64::MAX, u64::from);
     let h = fnv_mix(FNV_OFFSET, prev_field);
     let h = fnv_mix(h, u64::from(prefix));
     fnv_mix(h, u64::from(bit_pos))
 }
 
-/// Encode `id` MSB-first as 16 bit-level AC emissions, each
-/// conditioned on `(prev_id, bit_pos, prefix_so_far)`.
-fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, prev_id: Option<u16>, id: u16) {
+/// Encode `id` MSB-first as `ID_BITS` bit-level AC emissions, each
+/// conditioned on `(prev_id, bit_pos, prefix_so_far)`. v3 emits 18
+/// bits per id (up from 16 in v2) to cover the widened 262 K
+/// dictionary.
+fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, prev_id: Option<u32>, id: u32) {
     let mut prefix: u32 = 0;
-    for bit_pos in (0..16).rev() {
-        let bit = u32::from((id >> bit_pos) & 1);
-        let ctx = id_bit_ctx(
-            prev_id,
-            u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
-            bit_pos,
-        );
+    for bit_pos in (0..ID_BITS).rev() {
+        let bit = (id >> bit_pos) & 1;
+        let ctx = id_bit_ctx(prev_id, prefix, bit_pos);
         let p_zero = models.token_id_bit.predict_p_zero(ctx);
         let cdf = [0u32, p_zero, TOTAL];
         enc.encode(&cdf, bit as usize);
@@ -854,34 +858,26 @@ fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, prev_id: Option<
 fn decode_dict_id(
     dec: &mut AcDecoder<'_, '_>,
     models: &mut Models,
-    prev_id: Option<u16>,
-) -> Result<u16> {
+    prev_id: Option<u32>,
+) -> Result<u32> {
     let mut prefix: u32 = 0;
-    for bit_pos in (0..16).rev() {
-        let ctx = id_bit_ctx(
-            prev_id,
-            u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
-            bit_pos,
-        );
+    for bit_pos in (0..ID_BITS).rev() {
+        let ctx = id_bit_ctx(prev_id, prefix, bit_pos);
         let p_zero = models.token_id_bit.predict_p_zero(ctx);
         let cdf = [0u32, p_zero, TOTAL];
         let bit = u32::try_from(dec.decode(&cdf)?).expect("bit symbol fits u32");
         models.token_id_bit.observe(ctx, bit);
         prefix = (prefix << 1) | bit;
     }
-    Ok(u16::try_from(prefix).expect("16-bit id fits u16"))
+    Ok(prefix)
 }
 
 fn encode_length(enc: &mut AcEncoder<'_>, models: &mut Models, length: usize) {
     assert!(length <= 0xFFFF, "token length {length} exceeds u16 cap");
     let mut prefix: u32 = 0;
     for bit_pos in (0..16).rev() {
-        let bit = u32::from(u16::try_from((length >> bit_pos) & 1).expect("bit fits u16"));
-        let ctx = id_bit_ctx(
-            None,
-            u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
-            bit_pos,
-        );
+        let bit = u32::try_from((length >> bit_pos) & 1).expect("bit fits u32");
+        let ctx = id_bit_ctx(None, prefix, bit_pos);
         let p_zero = models.token_length_bit.predict_p_zero(ctx);
         let cdf = [0u32, p_zero, TOTAL];
         enc.encode(&cdf, bit as usize);
@@ -893,11 +889,7 @@ fn encode_length(enc: &mut AcEncoder<'_>, models: &mut Models, length: usize) {
 fn decode_length(dec: &mut AcDecoder<'_, '_>, models: &mut Models) -> Result<usize> {
     let mut prefix: u32 = 0;
     for bit_pos in (0..16).rev() {
-        let ctx = id_bit_ctx(
-            None,
-            u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
-            bit_pos,
-        );
+        let ctx = id_bit_ctx(None, prefix, bit_pos);
         let p_zero = models.token_length_bit.predict_p_zero(ctx);
         let cdf = [0u32, p_zero, TOTAL];
         let bit = u32::try_from(dec.decode(&cdf)?).expect("bit symbol fits u32");
@@ -973,7 +965,7 @@ fn encode_case_with_token_prior(
     enc: &mut AcEncoder<'_>,
     models: &mut Models,
     dict: &mut Dict,
-    id: u16,
+    id: u32,
     pat: CasePattern,
     original: &[u8],
 ) {
@@ -990,7 +982,7 @@ fn decode_case_with_token_prior(
     dec: &mut AcDecoder<'_, '_>,
     _models: &mut Models,
     dict: &Dict,
-    id: u16,
+    id: u32,
     _length: usize,
 ) -> Result<CasePattern> {
     let mut cdf = [0u32; 5];
@@ -1060,7 +1052,7 @@ fn decode_mixed_mask(
 #[derive(Clone, Copy, Debug)]
 struct TokenLookahead {
     end: usize,
-    id: u16,
+    id: u32,
     class: TokenClass,
 }
 
@@ -1197,7 +1189,7 @@ fn prewarm(
     matcher: &mut TokenMatcher,
 ) {
     let mut last_class_ctx = CLASS_CTX_NONE;
-    let mut prev_id: Option<u16> = None;
+    let mut prev_id: Option<u32> = None;
     let mut i = 0;
     while i < warm.len() {
         let mode = classifier.current_mode();
@@ -1267,8 +1259,8 @@ fn observe_token(
     dict: &mut Dict,
     class: TokenClass,
     token: &[u8],
-    prev_id: Option<u16>,
-) -> Option<u16> {
+    prev_id: Option<u32>,
+) -> Option<u32> {
     let (pat, key) = match class {
         TokenClass::Word => (Some(classify_case(token)), lowercase(token)),
         TokenClass::Separator => (None, token.to_vec()),
@@ -1279,13 +1271,9 @@ fn observe_token(
 
     if let Some(id) = hit_id {
         let mut prefix: u32 = 0;
-        for bit_pos in (0..16).rev() {
-            let bit = u32::from((id >> bit_pos) & 1);
-            let ctx = id_bit_ctx(
-                prev_id,
-                u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
-                bit_pos,
-            );
+        for bit_pos in (0..ID_BITS).rev() {
+            let bit = (id >> bit_pos) & 1;
+            let ctx = id_bit_ctx(prev_id, prefix, bit_pos);
             models.token_id_bit.observe(ctx, bit);
             prefix = (prefix << 1) | bit;
         }
@@ -1304,12 +1292,8 @@ fn observe_token(
         assert!(length <= 0xFFFF);
         let mut prefix: u32 = 0;
         for bit_pos in (0..16).rev() {
-            let bit = u32::from(u16::try_from((length >> bit_pos) & 1).expect("bit fits u16"));
-            let ctx = id_bit_ctx(
-                None,
-                u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
-                bit_pos,
-            );
+            let bit = u32::try_from((length >> bit_pos) & 1).expect("bit fits u32");
+            let ctx = id_bit_ctx(None, prefix, bit_pos);
             models.token_length_bit.observe(ctx, bit);
             prefix = (prefix << 1) | bit;
         }

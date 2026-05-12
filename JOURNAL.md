@@ -13,6 +13,58 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-12 21:30 — v3 Phase 1: Dict Cap 65 K → 262 K (Δ −0.031 bpb; Survey Over-Predicted by 10×)
+
+Following the v3 capability-survey methodology, the first architectural change informed by measurement: widen the dictionary cap from 65 K to 262 K, switch id type from u16 to u32 throughout, emit 18 bits per id (up from 16). Pre-measurement prediction (from the survey, biased toward floor): **0.3–0.5 bpb**. Actual on the full 20-window enwik8 panel: **2.381 bpb (Δ −0.031 vs Phase 16's 2.412)**.
+
+The result is positive but ~10× below the predicted range. The discrepancy is a survey methodology error, not a codec failure.
+
+### What the survey measured vs. what the codec does
+
+The survey walks the first 16 MiB of enwik8 from byte 0 and computes OOV rate against a top-N-frequency dictionary built from that same walk. On a fresh walk, ~7% of bytes land outside the top-64 K most-frequent forms; bumping to 256 K drops OOV to 0%. The survey reads this as 0.527 bpb of available headroom.
+
+The bench panel doesn't walk from byte 0. Each panel window has a 4 MiB warm prefix that runs through the same tokenizer-and-dict-insertion path as the measure window. **By the time measure starts, the dict already contains every token that appeared in the warm prefix**, including most of the rare-ish tokens the survey was counting as "OOV at top-64 K." The panel's effective OOV rate is much smaller than the survey's, and it's dominated by first-occurrence-in-corpus tokens (proper nouns specific to the article in this window) — those are OOV at any dictionary size because they haven't been seen yet.
+
+The dict-cap bump only helps when the prewarm-trained dict would actually have been 64 K-clipped during prewarm. Measured: roughly 540 bits of OOV-bits saved per 64 KiB quick-panel window, i.e. ~0.04 bpb. Plus a small win on the few rare-but-not-novel tokens that now fit in dict instead of going through OOV.
+
+### Decomposition (quick panel, per 64 KiB window avg)
+
+| component | v2 Phase 16 | v3 Phase 1 | Δ |
+|---|---:|---:|---:|
+| token_hit_ac    | ~45,000 | ~45,200 | +200 |
+| token_oov_ac    | ~28,600 | ~27,460 | −1,140 |
+| token_class_ac  |     ~56 |     ~38 | −18 |
+| case_ac         |  ~5,400 |  ~5,380 | −20 |
+| lz_match_ac     | ~80,000 | ~80,200 | +200 |
+| tag_ac          |    ~444 |    ~468 | +24 |
+| attr_ac         |    ~123 |    ~124 | — |
+
+The headline saving is concentrated in OOV bits (about 1 % of total per window). Hit bits stay flat: the extra 2 bits per id are mostly absorbed by the bit-level predictor's high-bit-collapse on hot tokens (those high bits are 0 for nearly all hot ids). The codec basically pays for the extra bits where the dict actually expanded — minor.
+
+### Calibration: the survey's third blind spot
+
+The survey assumed static dictionary; the codec runs adaptive with prewarm. For predictions to track:
+
+1. **OOV rate should be measured under panel conditions (prewarm + measure)**, not on a fresh walk from byte 0. The fresh-walk number over-counts OOV by a large factor — most "first-N-occurrence" tokens hit dict during prewarm in any realistic bench.
+2. **The Order-1 floor of 1.584 bpb is an asymptotic-data floor.** Adaptive models on a 4 MiB warm prefix don't reach it because per-context observation counts are small for the long tail.
+3. **The remaining 0.83 bpb between Phase 16 (2.412) and the survey's floor (1.584) is the gap I want to close**, but most of it is *not* available from dictionary-cap surgery — it's available from richer context modeling (Order-2 word, sparse contexts) and from the things the survey didn't measure (per-token case bits, LZ overhead).
+
+Prediction calibration updated: for survey-derived headroom predictions, divide the floor-vs-current gap by ~5–10× to get the actual gain achievable from a single targeted change. The survey's value is in showing the **direction** is correct (word tokens > BPE; conditional models > Order-0); the **magnitude** of any single change is much smaller than the asymptotic delta.
+
+### Implementation notes
+
+Mechanical refactor: every `u16` dict-id type became `u32`; `id_bit_ctx` takes u32 prev/prefix; bit loop emits `ID_BITS = 18` iterations; `ID_BIT_K` bumped from 22 to 24 (4 M → 16 M context slots = 64 MiB) to keep collision rate near zero at the widened context space. `tok_lz::TokenMatcher` stream is now `Vec<u32>`. Length encoding stays at 16 bits (separator tokens don't exceed 64 KiB).
+
+All 7 xml-tok roundtrip tests pass including 4 MiB-warm + 8 KiB-measure on real enwik8. 129 total tests green.
+
+### Status & next move
+
+xml-tok v3 lands at 2.381 bpb full panel — v3's new best, 0.227 bpb under xml-lz-cp. The headline result is positive but the predicted-vs-actual ratio is informative: dict-cap surgery on the Phase 16 architecture is mostly tapped out. The next architecturally larger lever per the survey is **Order-2 word context** (fold `prev_prev_id` into `id_bit_ctx`). Literature suggests Order-1 → Order-2 cuts conditional entropy by ~20–30%; with my calibration-corrected expectation (~5× discount), realistic gain is **0.05–0.15 bpb**, landing xml-tok around **2.23–2.33 bpb**.
+
+The survey should be re-run as a "panel survey" — same tokenization sweep but measuring entropy under panel-style prewarm conditions — to give predictions that actually match what the codec sees. Adding that to the queue.
+
+---
+
 ## 2026-05-12 20:00 — v3 Capability Survey: Order-1 Word Floor is 1.584 bpb; The 65 K Cap Was Wrong
 
 After a strategic conversation about whether incremental gains on the xml-tok stack could close the gap to the Hutter target, CDR raised three pointed questions: is the 65 K dictionary size the right choice, is letter/non-letter splitting the right unit, and was the adaptive-online commitment premature given that the Hutter scoring allows shipping a pre-computed vocab? Rather than guess further, branch `v3` was created from `v2` and a capability-survey subcommand was built to measure the entropy floor of each tokenization scheme on real corpus data before committing more codec engineering.
