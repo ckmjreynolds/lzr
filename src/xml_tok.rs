@@ -288,7 +288,6 @@ impl Codec for XmlTokCodec {
                             let ids: Vec<u32> = lookahead.iter().map(|t| t.id).collect();
                             matcher.find_match(&ids).and_then(|(off, len)| {
                                 let len_us = len as usize;
-                                // Cap to what the lookahead actually covers.
                                 if len_us <= lookahead.len() && len_us >= tok_lz::MIN_MATCH {
                                     Some((off, len))
                                 } else {
@@ -502,7 +501,6 @@ impl Codec for XmlTokCodec {
         let mut last_class_ctx = CLASS_CTX_NONE;
         let mut prev_id: Option<u32> = None;
         let mut uniform_cdf_cache = UniformCdfCache::new();
-
         while buf.len() - warm_end < measure_len {
             let mode = classifier.current_mode();
             match mode {
@@ -556,7 +554,7 @@ impl Codec for XmlTokCodec {
                                     id,
                                     lower.len(),
                                 )?;
-                                dict.entry_mut(id).case_counts[pat.idx()] += 1;
+                                case_counts_inc(&mut dict.entry_mut(id).case_counts, pat.idx());
                                 apply_case_decoded(&lower, pat, &mut dec, &mut models)?
                             } else {
                                 lower
@@ -685,6 +683,36 @@ fn case_cdf_from_counts(counts: &[u32; 4], out: &mut [u32; 5]) {
     out[4] = TOTAL;
 }
 
+/// Rescale threshold for per-dict-entry case counts. Above this the
+/// counts get halved (with `.max(1)`) so the smoothed total stays
+/// below `TOTAL`, which is what `case_cdf_from_counts` needs to keep
+/// every symbol at ≥ 1 unit of mass.
+///
+/// Without this, hot entries (e.g. "the" with ~1 M `AllLower`
+/// observations and a handful of `TitleCase` ones) produce a CDF
+/// where the rare patterns collapse to zero mass. Encoding that
+/// rare pattern then yields `new_high < new_low` and the AC
+/// permanently desyncs from the decoder (manifests at ~75 MB on
+/// enwik8).
+const CASE_COUNT_RESCALE: u32 = 1 << 15;
+
+/// Increment one case-pattern bucket and rescale if the bucket totals
+/// would push the smoothed sum past `TOTAL/2`. Encoder, decoder and
+/// prewarm all funnel through this so the case CDF stays in lock-step
+/// across all three.
+fn case_counts_inc(counts: &mut [u32; 4], idx: usize) {
+    counts[idx] = counts[idx].saturating_add(1);
+    let total = counts[0]
+        .saturating_add(counts[1])
+        .saturating_add(counts[2])
+        .saturating_add(counts[3]);
+    if total > CASE_COUNT_RESCALE {
+        for c in counts.iter_mut() {
+            *c = (*c >> 1).max(1);
+        }
+    }
+}
+
 /// Encode one Content token and return the dictionary id assigned
 /// to it (for use as the next token's `prev_id`). Returns `None`
 /// when the token was OOV and the dictionary was already full —
@@ -747,7 +775,7 @@ fn encode_token(
         let inserted = dict.insert(key);
         if let (Some(new_id), Some(pat)) = (inserted, case_pat) {
             // Bootstrap the new entry's case stats with this occurrence.
-            dict.entry_mut(new_id).case_counts[pat.idx()] += 1;
+            case_counts_inc(&mut dict.entry_mut(new_id).case_counts, pat.idx());
         }
         inserted
     }
@@ -773,7 +801,7 @@ fn decode_token(
         let lower = dict.entry(id).lower.clone();
         let bytes = if class == TokenClass::Word {
             let pat = decode_case_with_token_prior(dec, models, dict, id, lower.len())?;
-            dict.entry_mut(id).case_counts[pat.idx()] += 1;
+            case_counts_inc(&mut dict.entry_mut(id).case_counts, pat.idx());
             apply_case_decoded(&lower, pat, dec, models)?
         } else {
             lower
@@ -795,7 +823,7 @@ fn decode_token(
             let word = apply_case(&bytes, pat, mask.as_deref());
             let inserted = dict.insert(bytes);
             if let Some(new_id) = inserted {
-                dict.entry_mut(new_id).case_counts[pat.idx()] += 1;
+                case_counts_inc(&mut dict.entry_mut(new_id).case_counts, pat.idx());
             }
             Ok((word, inserted))
         } else {
@@ -972,7 +1000,7 @@ fn encode_case_with_token_prior(
     let mut cdf = [0u32; 5];
     case_cdf_from_counts(&dict.entry(id).case_counts, &mut cdf);
     enc.encode(&cdf, pat.idx());
-    dict.entry_mut(id).case_counts[pat.idx()] += 1;
+    case_counts_inc(&mut dict.entry_mut(id).case_counts, pat.idx());
     if pat == CasePattern::Mixed {
         encode_mixed_mask(enc, models, original);
     }
@@ -1279,7 +1307,7 @@ fn observe_token(
         }
 
         if let Some(p) = pat {
-            dict.entry_mut(id).case_counts[p.idx()] += 1;
+            case_counts_inc(&mut dict.entry_mut(id).case_counts, p.idx());
             if p == CasePattern::Mixed {
                 for upper in mixed_mask(token) {
                     models.case_mixed_bit.observe(usize::from(upper));
@@ -1328,7 +1356,7 @@ fn observe_token(
 
         let inserted = dict.insert(key);
         if let (Some(new_id), Some(p)) = (inserted, pat) {
-            dict.entry_mut(new_id).case_counts[p.idx()] += 1;
+            case_counts_inc(&mut dict.entry_mut(new_id).case_counts, p.idx());
         }
         inserted
     }
@@ -1393,5 +1421,22 @@ mod tests {
         let warm = &bytes[warm_start - 4 * 1024 * 1024..warm_start];
         let measure = &bytes[warm_start..warm_start + 8192];
         roundtrip(warm, measure);
+    }
+
+    /// Regression test for the case-CDF zero-mass AC desync. At
+    /// ~75 MB into enwik8, hot dict entries (e.g. "the") accumulate
+    /// O(10^6) `AllLower` observations and a handful of `TitleCase`
+    /// ones; without rescaling, the smoothed case CDF gives the rare
+    /// patterns zero mass, breaking the AC's `new_high < new_low`
+    /// invariant. Encodes an 80 MB chunk in one shot and verifies
+    /// the roundtrip.
+    #[test]
+    #[ignore = "slow; encodes 80 MB end-to-end to exercise the case-CDF rescale path"]
+    fn roundtrip_enwik8_large_chunk() {
+        let Ok(bytes) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let chunk = &bytes[..80 * 1024 * 1024];
+        roundtrip(b"", chunk);
     }
 }

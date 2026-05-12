@@ -58,6 +58,13 @@ impl<'a> AcEncoder<'a> {
     pub(crate) fn encode(&mut self, cdf: &[u32], symbol: usize) {
         debug_assert!(symbol + 1 < cdf.len(), "symbol out of CDF range");
         debug_assert_eq!(cdf[cdf.len() - 1], TOTAL, "CDF must total to TOTAL");
+        debug_assert!(
+            cdf[symbol + 1] > cdf[symbol],
+            "zero-mass symbol {symbol} (cdf[{symbol}]={}, cdf[{}]={}) — caller's model violated the AC's strictly-increasing-CDF contract",
+            cdf[symbol],
+            symbol + 1,
+            cdf[symbol + 1],
+        );
         let lo = u64::from(cdf[symbol]);
         let hi = u64::from(cdf[symbol + 1]);
         let low_u64 = u64::from(self.low);

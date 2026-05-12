@@ -13,6 +13,82 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Case-CDF zero-mass AC desync (bug fix)
+
+End-to-end compression of enwik8 through xml-tok crashed reproducibly at byte 74_825_535 with `index out of bounds` in `tok_lz.rs:64` (`stream[pos]` with `pos == stream.len()`). The same call shape — `codec.encode_window(b"", &corpus_bytes)` — works on the panel (4 MiB warm + 256 KiB measure per window) and on the 8 KiB unit test; it only fails at sustained encode beyond ~75 MB. CDR asked for a single end-to-end enwik9 run after Phase 3 was reverted; the bug surfaced because the panel never exercises a continuous AC stream long enough for this CDF degenerate case to land.
+
+### Symptom
+
+The matcher's `at(pos)` is only reached after the decoder reads `lz_flag=1` (a match record); it then decodes `(offset, length)` from the AC. If `length > offset` the source slice `[stream_len - offset ..]` doesn't cover all `length` ids and `at()` reads past the end. Encoder side never produces `length > offset` (its `find_match` caps `cap = stream.len() - cand_pos = offset`), so the only way to get there is **the decoder read a phantom match where the encoder wrote no match**, then proceeded to decode garbage `length` and `offset` values from misaligned AC bits.
+
+### Diagnosis
+
+Reproduced via a new test (`roundtrip_enwik8_large_chunk`) encoding the first 80 MB of enwik8 in one shot, then a temporary diagnostic test that logged `(low, high, code/pending, bits)` for both encoder and decoder at every Content-mode `lz_flag` boundary. The first divergence in `(low, high)` localized to **content_iter 8_876_004** (encoder wrote `flag=0`, decoder read `flag=1`). The state immediately before that iter showed delta `dec_bits - enc_bits = 10`, which violates the AC-bit-accounting identity `delta = 32 + pending` (a decoder-startup-offset of 32 plus current encoder pending must be ≥ 32 always). Some earlier operation had emitted bits that don't correspond to any renormalization step.
+
+Adding per-call AC tracing under `cfg(test)` and gating on the iter just before the divergence dumped this encoder log:
+
+```
+[enc] sym=1 cdf=[65418,65418/65536] pre low=0x7ddbeef0 high=0xd449caa3 pending=1
+       post-subdivide low=0xd421f400 high=0xd421f3ff
+       post-renorm    low=0x00000000 high=0xffffffff pending=0 bits=+23
+```
+
+`cdf[symbol] == cdf[symbol+1]` — **the CDF asked the AC to encode a symbol with zero probability mass**. The subdivide produces `new_high < new_low` (the invariant the AC relies on); renormalization then thrashes through 23 iterations emitting nonsense bits, eventually landing at the AC initial state `(0, 0xffffffff)`. The decoder, faithfully renormalizing on its own intact state, reads 23 fewer bits during the same iter, and is permanently misaligned thereafter.
+
+### Root cause: `case_cdf_from_counts` doesn't rescale
+
+The bad CDF is from `case_cdf_from_counts(&dict.entry(id).case_counts, &mut cdf)` — the 5-entry, 4-symbol CDF for per-token case-pattern encoding. Construction:
+
+```rust
+let total = counts[0] + counts[1] + counts[2] + counts[3] + 4;     // Laplace +1 per symbol
+let mut acc = 0u64;
+for (slot, &c) in out.iter_mut().zip(counts.iter()).take(4) {
+    *slot = ((acc * u64::from(TOTAL)) / total) as u32;
+    acc += u64::from(c) + 1;
+}
+out[4] = TOTAL;
+```
+
+Mass for symbol `i` is `(counts[i] + 1) * TOTAL / total`, floored. **When `total > TOTAL = 65536` and `counts[i] + 1 < total / TOTAL`, mass floors to zero.** All the codec's other adaptive models (`Order0`, `Order1Ctx`, `BitPredictor`) defend this by rescaling counts (halve with `.max(1)`) when their running totals approach `TOTAL/2`. The per-dict-entry case counts had no such rescale.
+
+For a hot dict entry like "the" (id ≈ 50): by byte 75 MB, AllLower count is on the order of 10⁶, TitleCase count is much smaller (sentence-start "The" is rare relative to mid-sentence "the"), AllUpper and Mixed are nearly zero. With `total ≈ 10⁶` and `TOTAL = 65536`, any case-pattern count below ~15 hits zero mass. The first time the encoder happens to see the rare pattern (e.g. an `AllUpper` "THE" somewhere in the corpus), it asks the AC to encode a zero-mass symbol and the desync starts.
+
+### Fix
+
+`case_counts_inc(counts: &mut [u32; 4], idx: usize)` increments the bucket and, when the raw sum exceeds `CASE_COUNT_RESCALE = 1 << 15`, halves all four counts with `.max(1)`. Both encoder and decoder go through this helper at every case observation (encode, decode, prewarm, OOV bootstrap), so the rescale fires at exactly the same logical points on both sides. All seven previous `dict.entry_mut(id).case_counts[i] += 1` sites were replaced.
+
+A defensive `debug_assert!(cdf[symbol + 1] > cdf[symbol])` was added at the top of `AcEncoder::encode` so any future model bug that produces a zero-mass CDF for an encoded symbol fails loudly at the point of violation instead of silently corrupting the AC state. Debug-only because the AC's CDF contract already requires strictly-increasing CDFs and we don't want to pay the check in release.
+
+### Regression test
+
+`xml_tok::tests::roundtrip_enwik8_large_chunk` (under `#[ignore]` because it's a 50 s test) encodes 80 MB of enwik8 in one shot and verifies the roundtrip. Without the fix, the test panics; with the fix, it passes.
+
+### First full-corpus result: enwik9 at 2.067 bpb
+
+With the fix in place, `lzr compress --corpus assets/enwik9 --codec xml-tok` runs end-to-end. First full-enwik9 result for the v2/v3 stack:
+
+- **Archive:** 258,332,159 bytes (246.36 MiB) on 1,000,000,000 bytes input
+- **bpb:** **2.0667**
+- **Encode time:** 5m 50.2 s (2.72 MiB/s, single thread)
+- **Decode time:** 1m 46.5 s (8.96 MiB/s, single thread)
+- **Roundtrip:** OK
+- **RAM:** ~2.4 GiB peak (well within the 10 GiB judging-machine budget)
+
+The 3.3× decode-vs-encode speedup comes from the matcher side: encode runs `find_match` (hash-chain walk, MIN_MATCH verification, extension comparison) at every Content-token boundary; decode just looks up `matcher.at(src_start + k)` for the offset/length the encoder shipped. Wall-clock relevant to Hutter scoring is encode+decode combined since both run on the judging machine: 7m 36 s here on a 2026 dev box.
+
+The full-corpus result is **0.314 bpb lower** than the v3 quick-panel result of 2.381 bpb on enwik8. The panel structurally underestimates a streaming codec's bpb because each window only has 4 MiB of warm prefix and 256 KiB of measure — the dictionary, the bit-level predictor's hash table, the case prior, and the LZ matcher's stream all keep filling with new structure right through the measure window. End-to-end on a 1 GB corpus, those tables saturate and most subsequent tokens are dict hits at near-Shannon cost. The panel's value is local-effect detection for codec deltas; the full encode is the only honest absolute bpb.
+
+Distance to target: the Hutter target is 109,685,197 bytes = 0.878 bpb. Current is 258 MB / 2.067 bpb; closing the 149 MB gap means roughly halving archive size. Still far from neural-class results (cmix hits ~1.1 bpb on enwik9) but a meaningful baseline for the next phase's improvements to attribute against.
+
+### What this changes
+
+The bug is in the case-pattern model alone; quick-panel bpb numbers from Phases 13–16 and v3 Phases 1–3 are unaffected because the panel's 256 KiB measure windows never accumulate enough per-entry case counts to trip the threshold. End-to-end enwik8/enwik9 compression results were previously unobtainable and are now unblocked. Two general lessons:
+
+1. **Every adaptive count source needs a rescale or it eventually breaks.** The discipline is uniform across `Order0`/`Order1Ctx`/`BitPredictor`; case_counts was a one-off that escaped the convention. Audit any future per-entry stat the same way.
+2. **The panel discipline doesn't catch streaming-scale bugs.** Two latent AC bugs in v2 were found this way; this is a third. End-to-end full-corpus roundtrip is a category of test the panel can't substitute for. The new `roundtrip_enwik8_large_chunk` regression test fills that gap for xml-tok; the analogous test belongs in every codec that adds streaming state.
+
+---
+
 ## 2026-05-12 22:30 — v3 Phase 3: Order-2 Word Context (Negative Result, +0.079 bpb)
 
 Following the panel-survey finding that the Order-1 asymptotic floor is 1.518 bpb (and the codec at 2.381 bpb has 0.86 bpb of headroom), the next architectural step was to fold `prev_prev_id` into the bit-level predictor's context — Order-2 word. Literature suggests Order-1 → Order-2 cuts conditional entropy 20–30%; with the calibrated 5–10× discount on tokenization-stack predictions, expected codec gain was **0.05–0.15 bpb**, target **~2.23–2.33 bpb**. The change implemented cleanly: ~50 LOC threading `prev_prev_id` alongside `prev_id` through `id_bit_ctx`, `encode_token`, `decode_token`, `observe_token` and the encode/decode/prewarm main loops.

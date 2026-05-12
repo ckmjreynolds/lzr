@@ -49,9 +49,11 @@ mod xml_ppm;
 mod xml_tok;
 mod xml_wiki_lz_cp;
 
+use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -107,6 +109,27 @@ enum Command {
         corpus: PathBuf,
     },
 
+    /// Compress a whole corpus through a codec end-to-end (no panel
+    /// structure: one call to `encode_window(b"", &corpus_bytes)`).
+    /// By default also runs `decode_window` and verifies the
+    /// roundtrip — disable with `--skip-verify` if you want to
+    /// time only the encode side.
+    Compress {
+        /// Corpus file path to compress.
+        #[arg(long, default_value = "assets/enwik9")]
+        corpus: PathBuf,
+        /// Codec name (see `bench` for the list).
+        #[arg(long, default_value = "xml-tok")]
+        codec: String,
+        /// Output archive path.
+        #[arg(long, default_value = "/tmp/lzr.archive")]
+        out: PathBuf,
+        /// Skip the decode-and-verify round-trip step (just encode
+        /// + write archive). Useful for timing-only runs.
+        #[arg(long, default_value_t = false)]
+        skip_verify: bool,
+    },
+
     AnalyzeLiterals {
         /// Corpus file path.
         #[arg(long, default_value = "assets/enwik8")]
@@ -144,6 +167,90 @@ enum Command {
     },
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn run_compress(
+    corpus: &PathBuf,
+    codec_name: &str,
+    out: &PathBuf,
+    skip_verify: bool,
+) -> Result<()> {
+    let codec = eval::make_codec_public(codec_name)?;
+
+    eprintln!("Reading {} ...", corpus.display());
+    let bytes = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
+    let n = bytes.len();
+    eprintln!(
+        "Input:  {n} bytes ({:.2} MiB)",
+        n as f64 / (1024.0 * 1024.0),
+    );
+
+    let codec_ref: &dyn codec::Codec = codec.as_ref();
+    eprintln!("Encoding through codec `{}` ...", codec_ref.name());
+    let start = Instant::now();
+    let (archive, _decomp) = codec_ref
+        .encode_window(b"", &bytes)
+        .context("encode_window failed")?;
+    let encode_elapsed = start.elapsed();
+
+    eprintln!("Writing archive to {} ...", out.display());
+    fs::write(out, &archive).with_context(|| format!("writing archive to {}", out.display()))?;
+
+    let archive_bytes = archive.len();
+    let bpb = 8.0 * archive_bytes as f64 / n as f64;
+
+    println!();
+    println!("Codec:           {}", codec_ref.name());
+    println!("Corpus:          {}", corpus.display());
+    println!("Input bytes:     {n}");
+    println!(
+        "Archive bytes:   {archive_bytes}  ({:.2} MiB)",
+        archive_bytes as f64 / (1024.0 * 1024.0),
+    );
+    println!("Compressed bpb:  {bpb:.4}");
+    println!("Encode time:     {encode_elapsed:?}");
+    println!(
+        "Encode rate:     {:.2} MiB/s",
+        n as f64 / (1024.0 * 1024.0) / encode_elapsed.as_secs_f64(),
+    );
+
+    if skip_verify {
+        println!("Verify:          skipped");
+        return Ok(());
+    }
+
+    eprintln!("Decoding for roundtrip verification ...");
+    let decode_start = Instant::now();
+    let decoded = codec_ref
+        .decode_window(b"", &archive)
+        .context("decode_window failed")?;
+    let decode_elapsed = decode_start.elapsed();
+
+    if decoded.len() != n {
+        bail!("decode produced {} bytes; expected {n}", decoded.len());
+    }
+    if decoded != bytes {
+        // Find first mismatch position for diagnostics.
+        let mismatch = bytes
+            .iter()
+            .zip(decoded.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        bail!(
+            "decode byte mismatch at offset {mismatch}: orig {:#04x} vs decoded {:#04x}",
+            bytes[mismatch],
+            decoded[mismatch]
+        );
+    }
+
+    println!("Decode time:     {decode_elapsed:?}");
+    println!(
+        "Decode rate:     {:.2} MiB/s",
+        n as f64 / (1024.0 * 1024.0) / decode_elapsed.as_secs_f64(),
+    );
+    println!("Roundtrip:       OK");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -162,5 +269,11 @@ fn main() -> Result<()> {
         Command::AnalyzeWiki { corpus, bytes } => analyze_wiki::run_analyze_wiki(&corpus, bytes),
         Command::Survey { corpus, bytes } => survey::run_survey(&corpus, bytes),
         Command::PanelSurvey { corpus } => survey::run_panel_survey(&corpus),
+        Command::Compress {
+            corpus,
+            codec,
+            out,
+            skip_verify,
+        } => run_compress(&corpus, &codec, &out, skip_verify),
     }
 }

@@ -76,6 +76,13 @@ pub(crate) fn run_bench(
     Ok(())
 }
 
+/// Public alias for the codec registry — `main` uses this to wire
+/// the `compress` subcommand. Same name table as `bench` so users
+/// don't have to learn two codec-name lists.
+pub(crate) fn make_codec_public(name: &str) -> Result<Box<dyn Codec>> {
+    make_codec(name)
+}
+
 fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
     match name {
         "null" => Ok(Box::new(NullCodec)),
