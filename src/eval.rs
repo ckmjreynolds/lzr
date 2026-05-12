@@ -28,6 +28,7 @@ use crate::xml_codec::XmlCodec;
 use crate::xml_lz_cp::XmlLzCpCodec;
 use crate::xml_lz_ord3::XmlLzOrd3Codec;
 use crate::xml_lz_ppm::XmlLzPpmCodec;
+use crate::xml_lz_ppmc::XmlLzPpmcCodec;
 use crate::xml_lz_word::XmlLzWordCodec;
 use crate::xml_ppm::XmlPpmCodec;
 
@@ -81,8 +82,9 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "xml-lz-word" => Ok(Box::new(XmlLzWordCodec)),
         "xml-lz-ord3" => Ok(Box::new(XmlLzOrd3Codec)),
         "xml-lz-cp" => Ok(Box::new(XmlLzCpCodec)),
+        "xml-lz-ppmc" => Ok(Box::new(XmlLzPpmcCodec)),
         other => bail!(
-            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp)"
+            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc)"
         ),
     }
 }
