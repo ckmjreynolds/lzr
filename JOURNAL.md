@@ -13,6 +13,75 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-12 18:00 — Phase 15: Order-1 Word Model — v2's New Best (2.534 bpb full panel)
+
+CDR/Claude folded `prev_id` into the bit-level dict-id context to convert the Phase-14 Order-0 model into an Order-1 word model. Pre-measurement prediction (60% confidence): 2.0–2.2 bpb. Actual on the 20×256 KiB full panel: **2.534 bpb** — above the predicted range but the first v2 phase to beat xml-lz-cp's 2.608 baseline. **Δ = −0.074 bpb, the new v2 best.**
+
+### Mechanism
+
+One-line change to the bit-context hash:
+
+```rust
+fn id_bit_ctx(prev_id: Option<u16>, prefix: u16, bit_pos: u32) -> u64 {
+    let prev_field = prev_id.map_or(u64::MAX, u64::from);
+    let h = fnv_mix(FNV_OFFSET, prev_field);
+    let h = fnv_mix(h, u64::from(prefix));
+    fnv_mix(h, u64::from(bit_pos))
+}
+```
+
+Plus threading `last_token_id: Option<u16>` through the encode/decode/prewarm loops (reset to `None` on each Content-run entry and on every tag/attr-mode transition). `encode_token` / `decode_token` / `observe_token` now return the assigned id so the caller can pass it as the next iteration's `prev_id`. `K_BITS` bumped from 20 to 22 (4 M slots, 16 MiB) to handle the richer `(prev_id, bit_pos, prefix)` context space.
+
+The OOV-length predictor stays Order-0 (passes `None` to `id_bit_ctx`) — token length is independent of `prev_id`.
+
+### Result (full panel, 20 × 256 KiB)
+
+| codec | mean bpb | best window | Δ vs xml-lz-cp |
+|---|---:|---:|---:|
+| xml-lz-cp (Phase 7) | 2.608 | 2.012 (W3) | — |
+| xml-tok Phase 14 (Order-0)        | ~2.83 (quick) | — | +0.32 (quick) |
+| **xml-tok Phase 15 (Order-1 word)** | **2.534** | **2.199 (W4)** | **−0.074** |
+
+Quick-panel comparison shows where Phase 15 wins and loses:
+
+| window | Phase 14 | Phase 15 | Δ |
+|---|---:|---:|---:|
+| W1 | 2.825 | 2.629 | −0.196 |
+| W2 | 2.779 | 2.578 | −0.201 |
+| W3 | 2.964 | 2.451 | **−0.513** |
+| W4 | 2.797 | 2.589 | −0.208 |
+| W5 | 2.797 | 2.607 | −0.190 |
+
+Window 3 is the most repetitive panel window (xml-lz-cp achieves 2.012 bpb on it via long LZ matches). It's also where Phase 15 saw the biggest improvement (−0.513 bpb from Phase 14) — repetitive content has highly predictable next-token distributions conditional on previous tokens, which is exactly what Order-1 exploits. xml-lz-cp still wins this single window by 0.44 bpb, but Phase 15 wins 3 of the other 4 quick-panel windows and the full-20-window mean.
+
+### Decomposition shift
+
+Avg `token_hit_ac` dropped from ~150k bits/window (Phase 14) to ~134k (Phase 15). Per-hit cost: ~10 → ~8 bits. That matches the literature claim that word-level Order-1 conditional entropy is ~30% below Order-0 — concretely, 10 → 8 bits is a 20% reduction, slightly below the literature's 30–40% because:
+- Heavy tail of unique `prev_id`s starves rare contexts (mitigated only partially by the global Laplace fallback via the BitPredictor's hash slot).
+- The bit-level predictor's hash slot count (4 M) doesn't perfectly separate all `(prev_id, bit_pos, prefix)` contexts.
+- The Order-1 conditional model still pays the same OOV tax when novel tokens appear.
+
+### Why it landed above the predicted range
+
+My prediction was 2.0–2.2 bpb based on word-level Order-1 reaching ~6–7 bits/token. Actual is ~8 bits/token. Two contributors I underweighted:
+
+- **Separator-class tokens.** Separator tokens make up ~50% of token emissions and have less Order-1 structure than words ("United" → "States" is high-mass; "," → "the" is moderate but the alternation prior already captures it). Conditioning on `prev_id` helps less for the separator half.
+- **OOV path overhead stays.** Phase 15 didn't touch the OOV path. ~10–20% of tokens are still OOV at the average cost of ~20 bits each. Order-1 doesn't move this.
+
+### Predictions discipline
+
+Two phases ago I predicted 2.1–2.3 bpb for naive tokenization (got 2.83). One phase ago I predicted Fenwick/bit-level would move the needle (got null). This phase I predicted 2.0–2.2 bpb (got 2.53). Calibration: my predictions are systematically optimistic on tokenization-stack phases by ~0.3–0.6 bpb. The pattern: each phase exploits the structure it targets *less* than literature numbers because (a) OOV tax in finite-window panels stays high, (b) the conditional model has fewer effective observations per context than a corpus-scale Markov model would, and (c) I keep forgetting to weight by the separator-token half.
+
+For Phase 16, I'll bias my prediction toward the lower end of the headroom estimate by 0.3 bpb to absorb this pattern.
+
+### Status
+
+xml-tok at 2.534 bpb is v2's new best. xml-lz-cp at 2.608 drops to second. Still 0.48 bpb behind v1's deterministic floor of 2.056 — but with a different, complementary mechanism (word-level Order-1) than v1's byte-level LZ77 + PPM-D stack. Phase 16 candidate: LZ on the token stream — catch phrase-level repeats (window 3-style) on top of the Order-1 word model. Realistic gain estimate (with the bias correction): **0.05–0.15 bpb additional**, putting xml-tok at ~2.40–2.48 bpb.
+
+121 tests pass; 7 of them xml-tok roundtrips including 4 MiB-warm + 8 KiB-measure on real enwik8.
+
+---
+
 ## 2026-05-12 17:00 — Phase 14: Bit-Level Dict-Id Encoding (Null Result; Phase 13 Was Already At Shannon)
 
 CDR/Claude replaced Phase 13's 2-byte-chunked dict-id encoding (`Order0<256>` high + `Order1Ctx<256, 256>` low) with a bit-level `BitPredictor` (`K_BITS=20`, 4 MiB of count pairs), emitting each 16-bit dict id MSB-first as 16 individual bit-level AC emissions conditioned on `(bit_pos, prefix_so_far)`. Same treatment for the OOV length encoding. The Phase 13 diagnosis was that the chunked encoding was paying ~8.7 bits/hit against a presumed Shannon floor of 4–5 bits, with the tail's under-trained `(high, low)` rows dragging the average. That diagnosis was wrong.

@@ -103,15 +103,18 @@ const LETTER_NCTX: usize = 27;
 const BYTE_START: usize = 256;
 const BYTE_NCTX: usize = 257;
 
-/// Hash-table size (log₂) for the bit-level dict-id predictor. 2^20
-/// slots = 4 MiB of u16 count pairs. K=22 gave byte-identical
-/// output in the 5-window panel, so collisions aren't blurring the
-/// Zipfian peaks — the Order-0 model is already at Shannon and the
-/// table size doesn't move the floor.
-const ID_BIT_K: u32 = 20;
-/// Hash-table size for the bit-level length predictor. Length
-/// distribution is narrower (most tokens < 32 bytes), so 2^18 slots
-/// = 1 MiB are plenty.
+/// Hash-table size (log₂) for the bit-level dict-id predictor.
+/// Phase 15 folds `prev_id` into the context to make this an
+/// Order-1 word model; the `(prev_id, bit_pos, prefix)` space is far
+/// larger than `(bit_pos, prefix)` alone, so 2^22 slots = 16 MiB of
+/// u16 count pairs. Common `prev_id`s (e.g. "the") concentrate their
+/// observations on a small set of `(bit_pos, prefix)` contexts in
+/// the active sub-table; rare `prev_id`s contribute thinner support
+/// but still get at least Order-0 behavior thanks to Laplace.
+const ID_BIT_K: u32 = 22;
+/// Hash-table size for the bit-level length predictor. Length is
+/// independent of `prev_id`, so the context space stays as in
+/// Phase 14: 2^18 slots = 1 MiB.
 const LEN_BIT_K: u32 = 18;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -240,6 +243,7 @@ impl Codec for XmlTokCodec {
         {
             let mut enc = AcEncoder::new(&mut writer);
             let mut last_class_ctx = CLASS_CTX_NONE;
+            let mut prev_id: Option<u16> = None;
             let mut i = warm_end;
             while i < buf.len() {
                 let mode = classifier.current_mode();
@@ -256,7 +260,15 @@ impl Codec for XmlTokCodec {
 
                         let end = run_end(&buf, i);
                         let token = &buf[i..end];
-                        encode_token(&mut enc, &mut models, &mut dict, &mut comp, class, token);
+                        prev_id = encode_token(
+                            &mut enc,
+                            &mut models,
+                            &mut dict,
+                            &mut comp,
+                            class,
+                            token,
+                            prev_id,
+                        );
 
                         for &b in token {
                             classifier.advance(b);
@@ -277,6 +289,7 @@ impl Codec for XmlTokCodec {
                         classifier.advance(buf[i]);
                         i += 1;
                         last_class_ctx = CLASS_CTX_NONE;
+                        prev_id = None;
                     }
                     Mode::TagStructure => {
                         let tag_end = find_tag_run_end(&buf, i, classifier);
@@ -303,6 +316,7 @@ impl Codec for XmlTokCodec {
                         }
                         i = tag_end;
                         last_class_ctx = CLASS_CTX_NONE;
+                        prev_id = None;
                     }
                 }
             }
@@ -359,6 +373,7 @@ impl Codec for XmlTokCodec {
         let mut reader = BitReader::new(&archive[4..]);
         let mut dec = AcDecoder::new(&mut reader);
         let mut last_class_ctx = CLASS_CTX_NONE;
+        let mut prev_id: Option<u16> = None;
 
         while buf.len() - warm_end < measure_len {
             let mode = classifier.current_mode();
@@ -371,7 +386,8 @@ impl Codec for XmlTokCodec {
                     let class = sym_to_class(class_sym)
                         .with_context(|| format!("invalid class symbol {class_sym}"))?;
 
-                    let token_bytes = decode_token(&mut dec, &mut models, &mut dict, class)?;
+                    let (token_bytes, new_prev) =
+                        decode_token(&mut dec, &mut models, &mut dict, class, prev_id)?;
                     for &b in &token_bytes {
                         buf.push(b);
                         classifier.advance(b);
@@ -380,6 +396,7 @@ impl Codec for XmlTokCodec {
                         TokenClass::Word => CLASS_CTX_WORD,
                         TokenClass::Separator => CLASS_CTX_SEP,
                     };
+                    prev_id = new_prev;
                 }
                 Mode::AttrValue => {
                     let mut byte_cdf = [0u32; 257];
@@ -390,6 +407,7 @@ impl Codec for XmlTokCodec {
                     models.attr_byte.observe(sym);
                     classifier.advance(b);
                     last_class_ctx = CLASS_CTX_NONE;
+                    prev_id = None;
                 }
                 Mode::TagStructure => {
                     let mut tag_cdf = [0u32; TAG_ALPHABET + 1];
@@ -419,6 +437,7 @@ impl Codec for XmlTokCodec {
                         }
                     }
                     last_class_ctx = CLASS_CTX_NONE;
+                    prev_id = None;
                 }
             }
         }
@@ -467,6 +486,10 @@ fn case_cdf_from_counts(counts: &[u32; 4], out: &mut [u32; 5]) {
     out[4] = TOTAL;
 }
 
+/// Encode one Content token and return the dictionary id assigned
+/// to it (for use as the next token's `prev_id`). Returns `None`
+/// when the token was OOV and the dictionary was already full —
+/// in that case the next token has no usable conditional context.
 fn encode_token(
     enc: &mut AcEncoder<'_>,
     models: &mut Models,
@@ -474,7 +497,8 @@ fn encode_token(
     comp: &mut ComponentBits,
     class: TokenClass,
     token: &[u8],
-) {
+    prev_id: Option<u16>,
+) -> Option<u16> {
     // Word tokens carry case info; the dict key is the lowercase form.
     // Separator tokens use their raw bytes as the dict key.
     let (case_pat, key): (Option<CasePattern>, Vec<u8>) = match class {
@@ -496,7 +520,7 @@ fn encode_token(
 
     if let Some(id) = hit_id {
         let before = enc.bits_written();
-        encode_dict_id(enc, models, id);
+        encode_dict_id(enc, models, prev_id, id);
         comp.token_hit += enc.bits_written() - before;
 
         if let (TokenClass::Word, Some(pat)) = (class, case_pat) {
@@ -504,6 +528,7 @@ fn encode_token(
             encode_case_with_token_prior(enc, models, dict, id, pat, token);
             comp.case += enc.bits_written() - cb;
         }
+        Some(id)
     } else {
         // OOV path: emit length + bytes, then insert into dict.
         let oov_before = enc.bits_written();
@@ -520,44 +545,48 @@ fn encode_token(
             comp.case += enc.bits_written() - cb;
         }
 
-        if let Some(new_id) = dict.insert(key)
-            && let Some(pat) = case_pat
-        {
+        let inserted = dict.insert(key);
+        if let (Some(new_id), Some(pat)) = (inserted, case_pat) {
             // Bootstrap the new entry's case stats with this occurrence.
             dict.entry_mut(new_id).case_counts[pat.idx()] += 1;
         }
+        inserted
     }
 }
 
+/// Decode one Content token. Returns the reconstructed bytes and
+/// the dictionary id assigned (for the next token's `prev_id`).
 #[allow(clippy::too_many_lines)]
 fn decode_token(
     dec: &mut AcDecoder<'_, '_>,
     models: &mut Models,
     dict: &mut Dict,
     class: TokenClass,
-) -> Result<Vec<u8>> {
+    prev_id: Option<u16>,
+) -> Result<(Vec<u8>, Option<u16>)> {
     let mut oov_cdf = [0u32; 3];
     models.token_oov.cdf_to(&mut oov_cdf);
     let oov_sym = dec.decode(&oov_cdf)?;
     models.token_oov.observe(oov_sym);
 
     if oov_sym == 0 {
-        let id = decode_dict_id(dec, models)?;
+        let id = decode_dict_id(dec, models, prev_id)?;
         let lower = dict.entry(id).lower.clone();
-        if class == TokenClass::Word {
+        let bytes = if class == TokenClass::Word {
             let pat = decode_case_with_token_prior(dec, models, dict, id, lower.len())?;
             dict.entry_mut(id).case_counts[pat.idx()] += 1;
-            apply_case_decoded(&lower, pat, dec, models)
+            apply_case_decoded(&lower, pat, dec, models)?
         } else {
-            Ok(lower)
-        }
+            lower
+        };
+        Ok((bytes, Some(id)))
     } else {
         let length = decode_length(dec, models)?;
         let bytes = match class {
             TokenClass::Word => decode_oov_word_bytes(dec, models, length)?,
             TokenClass::Separator => decode_oov_sep_bytes(dec, models, length)?,
         };
-        let reconstructed = if class == TokenClass::Word {
+        if class == TokenClass::Word {
             let pat = decode_case_global(dec, models, length)?;
             let mask = if pat == CasePattern::Mixed {
                 Some(decode_mixed_mask(dec, models, length)?)
@@ -565,15 +594,15 @@ fn decode_token(
                 None
             };
             let word = apply_case(&bytes, pat, mask.as_deref());
-            if let Some(new_id) = dict.insert(bytes) {
+            let inserted = dict.insert(bytes);
+            if let Some(new_id) = inserted {
                 dict.entry_mut(new_id).case_counts[pat.idx()] += 1;
             }
-            word
+            Ok((word, inserted))
         } else {
-            let _ = dict.insert(bytes.clone());
-            bytes
-        };
-        Ok(reconstructed)
+            let inserted = dict.insert(bytes.clone());
+            Ok((bytes, inserted))
+        }
     }
 }
 
@@ -591,23 +620,33 @@ fn apply_case_decoded(
     Ok(apply_case(lower, pat, mask.as_deref()))
 }
 
-/// Hash `(prefix, bit_pos)` into the bit predictor's context space.
-/// Both arguments are u16 so the FNV mix stays cheap; the high bits
-/// of `prefix` collapse to 0 quickly during MSB-first emission, and
-/// `bit_pos` disambiguates contexts at different stages of the same
-/// id.
-fn id_bit_ctx(prefix: u16, bit_pos: u32) -> u64 {
-    let h = fnv_mix(FNV_OFFSET, u64::from(prefix));
+/// Hash `(prev_id, prefix, bit_pos)` into the bit predictor's context
+/// space. `prev_id` is the dictionary id of the previous token in
+/// the Content stream (or `None` at the start of a Content run / when
+/// the previous token was an OOV that couldn't be inserted). Phase 15
+/// folds this into the FNV mix to make the bit predictor an Order-1
+/// word model. For contexts independent of `prev_id` (e.g. OOV
+/// length emission) the caller passes `None` to use a single
+/// "no-prev" sub-table.
+///
+/// `u64::MAX` is the sentinel for `None` — real prev ids live in
+/// `0..=65535`, so the high bits of `u64::MAX` make the sentinel
+/// unambiguous.
+fn id_bit_ctx(prev_id: Option<u16>, prefix: u16, bit_pos: u32) -> u64 {
+    let prev_field = prev_id.map_or(u64::MAX, u64::from);
+    let h = fnv_mix(FNV_OFFSET, prev_field);
+    let h = fnv_mix(h, u64::from(prefix));
     fnv_mix(h, u64::from(bit_pos))
 }
 
 /// Encode `id` MSB-first as 16 bit-level AC emissions, each
-/// conditioned on `(bit_pos, prefix_so_far)` via `BitPredictor`.
-fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, id: u16) {
+/// conditioned on `(prev_id, bit_pos, prefix_so_far)`.
+fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, prev_id: Option<u16>, id: u16) {
     let mut prefix: u32 = 0;
     for bit_pos in (0..16).rev() {
         let bit = u32::from((id >> bit_pos) & 1);
         let ctx = id_bit_ctx(
+            prev_id,
             u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
             bit_pos,
         );
@@ -619,10 +658,15 @@ fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, id: u16) {
     }
 }
 
-fn decode_dict_id(dec: &mut AcDecoder<'_, '_>, models: &mut Models) -> Result<u16> {
+fn decode_dict_id(
+    dec: &mut AcDecoder<'_, '_>,
+    models: &mut Models,
+    prev_id: Option<u16>,
+) -> Result<u16> {
     let mut prefix: u32 = 0;
     for bit_pos in (0..16).rev() {
         let ctx = id_bit_ctx(
+            prev_id,
             u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
             bit_pos,
         );
@@ -641,6 +685,7 @@ fn encode_length(enc: &mut AcEncoder<'_>, models: &mut Models, length: usize) {
     for bit_pos in (0..16).rev() {
         let bit = u32::from(u16::try_from((length >> bit_pos) & 1).expect("bit fits u16"));
         let ctx = id_bit_ctx(
+            None,
             u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
             bit_pos,
         );
@@ -656,6 +701,7 @@ fn decode_length(dec: &mut AcDecoder<'_, '_>, models: &mut Models) -> Result<usi
     let mut prefix: u32 = 0;
     for bit_pos in (0..16).rev() {
         let ctx = id_bit_ctx(
+            None,
             u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
             bit_pos,
         );
@@ -829,6 +875,7 @@ fn dict_lookup(run: &[u8]) -> Option<usize> {
 
 fn prewarm(warm: &[u8], classifier: &mut Classifier, models: &mut Models, dict: &mut Dict) {
     let mut last_class_ctx = CLASS_CTX_NONE;
+    let mut prev_id: Option<u16> = None;
     let mut i = 0;
     while i < warm.len() {
         let mode = classifier.current_mode();
@@ -840,7 +887,7 @@ fn prewarm(warm: &[u8], classifier: &mut Classifier, models: &mut Models, dict: 
 
                 let end = run_end(warm, i);
                 let token = &warm[i..end];
-                observe_token(models, dict, class, token);
+                prev_id = observe_token(models, dict, class, token, prev_id);
 
                 for &b in token {
                     classifier.advance(b);
@@ -856,6 +903,7 @@ fn prewarm(warm: &[u8], classifier: &mut Classifier, models: &mut Models, dict: 
                 classifier.advance(warm[i]);
                 i += 1;
                 last_class_ctx = CLASS_CTX_NONE;
+                prev_id = None;
             }
             Mode::TagStructure => {
                 let run_end_ = find_tag_run_end(warm, i, *classifier);
@@ -873,12 +921,24 @@ fn prewarm(warm: &[u8], classifier: &mut Classifier, models: &mut Models, dict: 
                 }
                 i = run_end_;
                 last_class_ctx = CLASS_CTX_NONE;
+                prev_id = None;
             }
         }
     }
 }
 
-fn observe_token(models: &mut Models, dict: &mut Dict, class: TokenClass, token: &[u8]) {
+/// Prewarm observe path — must mirror the encode/decode bit-level
+/// operations exactly (including conditioning on `prev_id`) so the
+/// model state at the start of measure is identical on both sides.
+/// Returns the assigned id for the next token's `prev_id`, matching
+/// the encode-time return convention.
+fn observe_token(
+    models: &mut Models,
+    dict: &mut Dict,
+    class: TokenClass,
+    token: &[u8],
+    prev_id: Option<u16>,
+) -> Option<u16> {
     let (pat, key) = match class {
         TokenClass::Word => (Some(classify_case(token)), lowercase(token)),
         TokenClass::Separator => (None, token.to_vec()),
@@ -892,6 +952,7 @@ fn observe_token(models: &mut Models, dict: &mut Dict, class: TokenClass, token:
         for bit_pos in (0..16).rev() {
             let bit = u32::from((id >> bit_pos) & 1);
             let ctx = id_bit_ctx(
+                prev_id,
                 u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
                 bit_pos,
             );
@@ -907,6 +968,7 @@ fn observe_token(models: &mut Models, dict: &mut Dict, class: TokenClass, token:
                 }
             }
         }
+        Some(id)
     } else {
         let length = key.len();
         assert!(length <= 0xFFFF);
@@ -914,6 +976,7 @@ fn observe_token(models: &mut Models, dict: &mut Dict, class: TokenClass, token:
         for bit_pos in (0..16).rev() {
             let bit = u32::from(u16::try_from((length >> bit_pos) & 1).expect("bit fits u16"));
             let ctx = id_bit_ctx(
+                None,
                 u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
                 bit_pos,
             );
@@ -949,11 +1012,11 @@ fn observe_token(models: &mut Models, dict: &mut Dict, class: TokenClass, token:
             }
         }
 
-        if let Some(new_id) = dict.insert(key) {
-            if let Some(p) = pat {
-                dict.entry_mut(new_id).case_counts[p.idx()] += 1;
-            }
+        let inserted = dict.insert(key);
+        if let (Some(new_id), Some(p)) = (inserted, pat) {
+            dict.entry_mut(new_id).case_counts[p.idx()] += 1;
         }
+        inserted
     }
 }
 
