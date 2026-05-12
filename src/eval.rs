@@ -25,6 +25,7 @@ use crate::bwt_codec::BwtCodec;
 use crate::classifier_stats::ClassifierStats;
 use crate::codec::{Codec, Decomposition};
 use crate::null::NullCodec;
+use crate::paq_codec::PaqCodec;
 use crate::xml_codec::XmlCodec;
 use crate::xml_lz_cp::XmlLzCpCodec;
 use crate::xml_lz_ord3::XmlLzOrd3Codec;
@@ -85,8 +86,9 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "xml-lz-cp" => Ok(Box::new(XmlLzCpCodec)),
         "xml-lz-ppmc" => Ok(Box::new(XmlLzPpmcCodec)),
         "bwt" => Ok(Box::new(BwtCodec)),
+        "paq" => Ok(Box::new(PaqCodec)),
         other => bail!(
-            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc, bwt)"
+            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc, bwt, paq)"
         ),
     }
 }

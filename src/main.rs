@@ -18,6 +18,7 @@
 
 mod ac;
 mod analyze;
+mod bit_pred;
 mod bits;
 mod bwt;
 mod bwt_codec;
@@ -29,6 +30,7 @@ mod lz;
 mod models;
 mod mtf;
 mod null;
+mod paq_codec;
 mod ppm;
 mod xml_codec;
 mod xml_lz_cp;
