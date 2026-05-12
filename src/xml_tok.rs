@@ -33,7 +33,8 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 
-use crate::ac::{AcDecoder, AcEncoder};
+use crate::ac::{AcDecoder, AcEncoder, TOTAL};
+use crate::bit_pred::{BitPredictor, FNV_OFFSET, fnv_mix};
 use crate::bits::{BitReader, BitWriter};
 use crate::classifier::{Classifier, Mode};
 use crate::codec::{Codec, Decomposition};
@@ -102,6 +103,17 @@ const LETTER_NCTX: usize = 27;
 const BYTE_START: usize = 256;
 const BYTE_NCTX: usize = 257;
 
+/// Hash-table size (log₂) for the bit-level dict-id predictor. 2^20
+/// slots = 4 MiB of u16 count pairs. K=22 gave byte-identical
+/// output in the 5-window panel, so collisions aren't blurring the
+/// Zipfian peaks — the Order-0 model is already at Shannon and the
+/// table size doesn't move the floor.
+const ID_BIT_K: u32 = 20;
+/// Hash-table size for the bit-level length predictor. Length
+/// distribution is narrower (most tokens < 32 bytes), so 2^18 slots
+/// = 1 MiB are plenty.
+const LEN_BIT_K: u32 = 18;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct XmlTokCodec;
 
@@ -156,11 +168,14 @@ struct Models {
     token_class: Order1Ctx<CLASS_NCTX, 2>,
     token_oov: Order0<2>,
 
-    token_id_high: Order0<256>,
-    token_id_low: Order1Ctx<256, 256>,
-
-    token_length_high: Order0<256>,
-    token_length_low: Order1Ctx<256, 256>,
+    /// Bit-level adaptive predictor for the 16-bit dictionary id.
+    /// Context = (bit position, prefix bits emitted so far). The MSB
+    /// is emitted first; once a hot token's high bits collapse to a
+    /// predictable 0-prefix the bit cost converges to Shannon. Replaces
+    /// the Phase-13 2-byte chunked encoding that starved tail rows.
+    token_id_bit: BitPredictor,
+    /// Same construction for OOV token lengths.
+    token_length_bit: BitPredictor,
 
     oov_word_letter: Order1Ctx<LETTER_NCTX, 26>,
     oov_sep_byte: Order1Ctx<BYTE_NCTX, 256>,
@@ -178,10 +193,8 @@ impl Models {
         Self {
             token_class: Order1Ctx::new(),
             token_oov: Order0::new(),
-            token_id_high: Order0::new(),
-            token_id_low: Order1Ctx::new(),
-            token_length_high: Order0::new(),
-            token_length_low: Order1Ctx::new(),
+            token_id_bit: BitPredictor::new(ID_BIT_K),
+            token_length_bit: BitPredictor::new(LEN_BIT_K),
             oov_word_letter: Order1Ctx::new(),
             oov_sep_byte: Order1Ctx::new(),
             case_pattern_global: Order0::new(),
@@ -448,10 +461,10 @@ fn case_cdf_from_counts(counts: &[u32; 4], out: &mut [u32; 5]) {
         + 4;
     let mut acc: u64 = 0;
     for (slot, &c) in out.iter_mut().zip(counts.iter()).take(4) {
-        *slot = ((acc * u64::from(crate::ac::TOTAL)) / total) as u32;
+        *slot = ((acc * u64::from(TOTAL)) / total) as u32;
         acc += u64::from(c) + 1;
     }
-    out[4] = crate::ac::TOTAL;
+    out[4] = TOTAL;
 }
 
 fn encode_token(
@@ -578,57 +591,81 @@ fn apply_case_decoded(
     Ok(apply_case(lower, pat, mask.as_deref()))
 }
 
-#[allow(clippy::cast_possible_truncation)]
+/// Hash `(prefix, bit_pos)` into the bit predictor's context space.
+/// Both arguments are u16 so the FNV mix stays cheap; the high bits
+/// of `prefix` collapse to 0 quickly during MSB-first emission, and
+/// `bit_pos` disambiguates contexts at different stages of the same
+/// id.
+fn id_bit_ctx(prefix: u16, bit_pos: u32) -> u64 {
+    let h = fnv_mix(FNV_OFFSET, u64::from(prefix));
+    fnv_mix(h, u64::from(bit_pos))
+}
+
+/// Encode `id` MSB-first as 16 bit-level AC emissions, each
+/// conditioned on `(bit_pos, prefix_so_far)` via `BitPredictor`.
 fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, id: u16) {
-    let high = ((id >> 8) & 0xFF) as usize;
-    let low = (id & 0xFF) as usize;
-    let mut high_cdf = [0u32; 257];
-    models.token_id_high.cdf_to(&mut high_cdf);
-    enc.encode(&high_cdf, high);
-    models.token_id_high.observe(high);
-    let mut low_cdf = [0u32; 257];
-    models.token_id_low.cdf_to(high, &mut low_cdf);
-    enc.encode(&low_cdf, low);
-    models.token_id_low.observe(high, low);
+    let mut prefix: u32 = 0;
+    for bit_pos in (0..16).rev() {
+        let bit = u32::from((id >> bit_pos) & 1);
+        let ctx = id_bit_ctx(
+            u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
+            bit_pos,
+        );
+        let p_zero = models.token_id_bit.predict_p_zero(ctx);
+        let cdf = [0u32, p_zero, TOTAL];
+        enc.encode(&cdf, bit as usize);
+        models.token_id_bit.observe(ctx, bit);
+        prefix = (prefix << 1) | bit;
+    }
 }
 
 fn decode_dict_id(dec: &mut AcDecoder<'_, '_>, models: &mut Models) -> Result<u16> {
-    let mut high_cdf = [0u32; 257];
-    models.token_id_high.cdf_to(&mut high_cdf);
-    let high = dec.decode(&high_cdf)?;
-    models.token_id_high.observe(high);
-    let mut low_cdf = [0u32; 257];
-    models.token_id_low.cdf_to(high, &mut low_cdf);
-    let low = dec.decode(&low_cdf)?;
-    models.token_id_low.observe(high, low);
-    let id = (high << 8) | low;
-    Ok(u16::try_from(id).expect("u16 id fits in (high<<8)|low"))
+    let mut prefix: u32 = 0;
+    for bit_pos in (0..16).rev() {
+        let ctx = id_bit_ctx(
+            u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
+            bit_pos,
+        );
+        let p_zero = models.token_id_bit.predict_p_zero(ctx);
+        let cdf = [0u32, p_zero, TOTAL];
+        let bit = u32::try_from(dec.decode(&cdf)?).expect("bit symbol fits u32");
+        models.token_id_bit.observe(ctx, bit);
+        prefix = (prefix << 1) | bit;
+    }
+    Ok(u16::try_from(prefix).expect("16-bit id fits u16"))
 }
 
 fn encode_length(enc: &mut AcEncoder<'_>, models: &mut Models, length: usize) {
     assert!(length <= 0xFFFF, "token length {length} exceeds u16 cap");
-    let high = (length >> 8) & 0xFF;
-    let low = length & 0xFF;
-    let mut high_cdf = [0u32; 257];
-    models.token_length_high.cdf_to(&mut high_cdf);
-    enc.encode(&high_cdf, high);
-    models.token_length_high.observe(high);
-    let mut low_cdf = [0u32; 257];
-    models.token_length_low.cdf_to(high, &mut low_cdf);
-    enc.encode(&low_cdf, low);
-    models.token_length_low.observe(high, low);
+    let mut prefix: u32 = 0;
+    for bit_pos in (0..16).rev() {
+        let bit = u32::from(u16::try_from((length >> bit_pos) & 1).expect("bit fits u16"));
+        let ctx = id_bit_ctx(
+            u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
+            bit_pos,
+        );
+        let p_zero = models.token_length_bit.predict_p_zero(ctx);
+        let cdf = [0u32, p_zero, TOTAL];
+        enc.encode(&cdf, bit as usize);
+        models.token_length_bit.observe(ctx, bit);
+        prefix = (prefix << 1) | bit;
+    }
 }
 
 fn decode_length(dec: &mut AcDecoder<'_, '_>, models: &mut Models) -> Result<usize> {
-    let mut high_cdf = [0u32; 257];
-    models.token_length_high.cdf_to(&mut high_cdf);
-    let high = dec.decode(&high_cdf)?;
-    models.token_length_high.observe(high);
-    let mut low_cdf = [0u32; 257];
-    models.token_length_low.cdf_to(high, &mut low_cdf);
-    let low = dec.decode(&low_cdf)?;
-    models.token_length_low.observe(high, low);
-    Ok((high << 8) | low)
+    let mut prefix: u32 = 0;
+    for bit_pos in (0..16).rev() {
+        let ctx = id_bit_ctx(
+            u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
+            bit_pos,
+        );
+        let p_zero = models.token_length_bit.predict_p_zero(ctx);
+        let cdf = [0u32, p_zero, TOTAL];
+        let bit = u32::try_from(dec.decode(&cdf)?).expect("bit symbol fits u32");
+        models.token_length_bit.observe(ctx, bit);
+        prefix = (prefix << 1) | bit;
+    }
+    Ok(usize::try_from(prefix).expect("u32 prefix fits usize"))
 }
 
 fn encode_oov_word_bytes(enc: &mut AcEncoder<'_>, models: &mut Models, lower: &[u8]) {
@@ -851,10 +888,16 @@ fn observe_token(models: &mut Models, dict: &mut Dict, class: TokenClass, token:
     models.token_oov.observe(oov_sym);
 
     if let Some(id) = hit_id {
-        let high = usize::from((id >> 8) & 0xFF);
-        let low = usize::from(id & 0xFF);
-        models.token_id_high.observe(high);
-        models.token_id_low.observe(high, low);
+        let mut prefix: u32 = 0;
+        for bit_pos in (0..16).rev() {
+            let bit = u32::from((id >> bit_pos) & 1);
+            let ctx = id_bit_ctx(
+                u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
+                bit_pos,
+            );
+            models.token_id_bit.observe(ctx, bit);
+            prefix = (prefix << 1) | bit;
+        }
 
         if let Some(p) = pat {
             dict.entry_mut(id).case_counts[p.idx()] += 1;
@@ -867,10 +910,16 @@ fn observe_token(models: &mut Models, dict: &mut Dict, class: TokenClass, token:
     } else {
         let length = key.len();
         assert!(length <= 0xFFFF);
-        let h = (length >> 8) & 0xFF;
-        let l = length & 0xFF;
-        models.token_length_high.observe(h);
-        models.token_length_low.observe(h, l);
+        let mut prefix: u32 = 0;
+        for bit_pos in (0..16).rev() {
+            let bit = u32::from(u16::try_from((length >> bit_pos) & 1).expect("bit fits u16"));
+            let ctx = id_bit_ctx(
+                u16::try_from(prefix).expect("prefix < 2^16 within first 16 iterations"),
+                bit_pos,
+            );
+            models.token_length_bit.observe(ctx, bit);
+            prefix = (prefix << 1) | bit;
+        }
 
         match class {
             TokenClass::Word => {

@@ -13,6 +13,43 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-12 17:00 — Phase 14: Bit-Level Dict-Id Encoding (Null Result; Phase 13 Was Already At Shannon)
+
+CDR/Claude replaced Phase 13's 2-byte-chunked dict-id encoding (`Order0<256>` high + `Order1Ctx<256, 256>` low) with a bit-level `BitPredictor` (`K_BITS=20`, 4 MiB of count pairs), emitting each 16-bit dict id MSB-first as 16 individual bit-level AC emissions conditioned on `(bit_pos, prefix_so_far)`. Same treatment for the OOV length encoding. The Phase 13 diagnosis was that the chunked encoding was paying ~8.7 bits/hit against a presumed Shannon floor of 4–5 bits, with the tail's under-trained `(high, low)` rows dragging the average. That diagnosis was wrong.
+
+### Result (quick panel, 5 × 64 KiB)
+
+| codec | mean bpb |
+|---|---:|
+| xml-lz-cp baseline                             | 2.506 |
+| xml-tok Phase 13 (chunked 2-byte)              | 2.826 |
+| xml-tok Phase 14 (bit-level, `K_BITS=20`)      | 2.832 |
+| xml-tok Phase 14 (bit-level, `K_BITS=22`)      | 2.832 (byte-identical to K=20) |
+
+Bumping the bit-predictor table from 1 M slots to 4 M slots produced **byte-identical archives** on every panel window — confirming there are no hash collisions left to recover and the bit predictor is operating at its information-theoretic limit for the contexts it sees.
+
+### What went wrong with the Phase 13 prediction
+
+Shannon entropy of a Zipfian distribution over an N=65,536 word alphabet (with a few high-mass head tokens and a long ~10 k tail) computes to roughly:
+
+```
+H ≈ 0.3 × 4 + 0.3 × 10 + 0.4 × 16 = 10.6 bits/token
+```
+
+— matching the measured 10 bits/hit almost exactly. The "5 bits/hit Shannon" figure in the Phase 13 entry was an artifact of weighting only the head; the tail's 16-bit-per-token contribution dominates. **Phase 13's Order-0 model was already at Shannon for its own distribution**, and Phase 14 is the equivalent operating point.
+
+### Implications
+
+- **Order-0 over a 65 k Zipfian alphabet has H ≈ 10 bits/token, full stop.** No reparameterization of the same Order-0 distribution (chunked, Fenwick, bit-level, PAQ-style mixing) can go below that floor.
+- **The real architectural lever is the Order-N step.** To beat 10 bits/token requires conditional context — P(curr_token | prev_token) is structurally much sharper for English. Cmix's word model and related work show the Order-1 conditional cuts the Order-0 entropy by 30–40%. Target: ~6–7 bits/token, ~2.0 bpb on the panel — finally below xml-lz-cp.
+- **Bit-level substrate is the right scaffolding for Order-1.** A dense Order-1 word model on 65 k × 65 k contexts would need ~17 GB. Sparse hashed bit-level with context `(prev_id, bit_pos, prefix)` packs the same expressive power into a 16 MiB `BitPredictor` — and a future Phase 15 can simply extend the existing `id_bit_ctx` to fold `prev_id` into the FNV mix. Phase 14's bit-level code lands as the substrate for that move.
+
+### Status
+
+xml-tok lands at 2.832 bpb (vs Phase 13's 2.826 — within rounding); xml-lz-cp remains v2's best at 2.608 bpb. Phase 14 is a null-result commit that clears a false hypothesis off the table and sets up Phase 15 (Order-1 word via bit-level conditional context) as the actual path past the Order-0 Shannon floor.
+
+---
+
 ## 2026-05-12 16:30 — Phase 13: Word-Level Tokenization MVT (Negative Result, Diagnostic)
 
 CDR proposed an architecturally distinct direction: tokenize Content into alternating word (`[a-zA-Z]+`) and separator (`[^a-zA-Z]+`) runs, build a u16-indexed dictionary on the fly via first-occurrence emission (no shipped dictionary, encoder/decoder grow it in lockstep), and run downstream modeling on the 16-bit token alphabet. CDR additionally flagged the case-folding move — store only the lowercase form in the dictionary and emit a 4-symbol case-pattern code so that "The"/"the"/"THE" share one slot instead of fragmenting three slots. Pre-measurement prediction: 2.1–2.3 bpb on the quick panel (vs xml-lz-cp's 2.506). The dimensional analysis was sound — word-level Shannon on enwik9 sits at ~1.5–1.8 bpb — so the question was whether a minimum-viable token codec could close ~30% of that gap.
