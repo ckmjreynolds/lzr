@@ -17,6 +17,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod ac;
+mod analyze;
 mod bits;
 mod bwt;
 mod bwt_codec;
@@ -51,6 +52,26 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Extract Content-literal bytes from one panel window (using
+    /// the production classifier + lazy-parse LZ matcher) and report
+    /// how various codecs compress that stream. Diagnostic only — no
+    /// archive is produced. Used to decide whether a deferred-BWT
+    /// integration would beat the current per-mode literal codec.
+    AnalyzeLiterals {
+        /// Corpus file path.
+        #[arg(long, default_value = "assets/enwik8")]
+        corpus: PathBuf,
+        /// Start offset of the measure window.
+        #[arg(long, default_value_t = 4_194_304)]
+        offset: u64,
+        /// Size of the measure window in bytes.
+        #[arg(long, default_value_t = 256 * 1024)]
+        measure_bytes: usize,
+        /// Size of the warm prefix before the measure window.
+        #[arg(long, default_value_t = 4 * 1024 * 1024)]
+        warm_bytes: usize,
+    },
+
     /// Run the multi-offset codec eval panel against a chosen codec.
     /// Reports per-window bpb and the mean; optionally dumps a
     /// per-component bit decomposition to CSV.
@@ -82,5 +103,11 @@ fn main() -> Result<()> {
             quick,
             decompose,
         } => eval::run_bench(&corpus, &codec, quick, decompose.as_deref()),
+        Command::AnalyzeLiterals {
+            corpus,
+            offset,
+            measure_bytes,
+            warm_bytes,
+        } => analyze::run_analyze_literals(&corpus, offset, measure_bytes, warm_bytes),
     }
 }
