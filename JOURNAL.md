@@ -13,6 +13,84 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-12 16:30 — Phase 13: Word-Level Tokenization MVT (Negative Result, Diagnostic)
+
+CDR proposed an architecturally distinct direction: tokenize Content into alternating word (`[a-zA-Z]+`) and separator (`[^a-zA-Z]+`) runs, build a u16-indexed dictionary on the fly via first-occurrence emission (no shipped dictionary, encoder/decoder grow it in lockstep), and run downstream modeling on the 16-bit token alphabet. CDR additionally flagged the case-folding move — store only the lowercase form in the dictionary and emit a 4-symbol case-pattern code so that "The"/"the"/"THE" share one slot instead of fragmenting three slots. Pre-measurement prediction: 2.1–2.3 bpb on the quick panel (vs xml-lz-cp's 2.506). The dimensional analysis was sound — word-level Shannon on enwik9 sits at ~1.5–1.8 bpb — so the question was whether a minimum-viable token codec could close ~30% of that gap.
+
+It can't, at least not with Order-0 over the dictionary alphabet.
+
+### Implementation
+
+`src/tokenizer.rs` (run-length helpers + case classifier/applier; ~220 LOC) and `src/xml_tok.rs` (codec; ~1100 LOC) land Phase 13. The codec:
+
+- Tokenizes Content into alternating word/separator runs.
+- Dictionary capacity 65,536 entries; key is the lowercase byte sequence for words, raw bytes for separators.
+- Token emission per token: 1-bit class (Order-1Ctx on prev class — forced alternation, near-zero cost after warm-up); 1-bit hit/OOV flag; on hit, dict_id via 2-byte chunked encoding (Order-0 for high byte, Order-1Ctx on high byte for low byte); on miss, 16-bit length + per-byte emission (Order-1Ctx over lowercase letters for words, over byte values for separators).
+- Case pattern per word: 4-symbol (`AllLower`/`TitleCase`/`AllUpper`/`Mixed`). On hit, modeled by per-token case stats (Laplace +1 on the dictionary entry's case counts). On miss, modeled by a global Order-0. `Mixed` escapes to a per-letter uppercase bitmask.
+- Per-token case stats from day one: each `DictEntry` carries `case_counts: [u32; 4]`; both encoder and decoder update them after every occurrence so the state stays in lockstep.
+- Tag/Attr modes unchanged from xml-lz-cp (Phase 7).
+- LZ disabled — the MVT isolates the tokenization gain.
+
+7 roundtrip tests pass including a 4 MiB-warm + 8 KiB-measure window on real enwik8.
+
+### Result (quick panel, 5 × 64 KiB)
+
+| codec | mean bpb | Δ vs xml-lz-cp |
+|---|---:|---:|
+| xml-lz-cp (Phase 7 baseline) | 2.506 | — |
+| xml-tok (Phase 13)           | **2.826** | **+0.320** |
+
+Decomposition averaged across windows:
+
+| component | bits/window | bpb contribution |
+|---|---:|---:|
+| token_hit_ac      | 150,485 | 2.30 |
+| token_oov_ac      |  28,603 | 0.44 |
+| case_ac           |   5,434 | 0.08 |
+| token_class_ac    |      56 | 0.001 |
+| tag_ac            |     461 | 0.007 |
+| attr_ac           |     123 | 0.002 |
+| ac_finish + framing + padding | ~40 | ~0.001 |
+| **total**         | ~185,000 | **2.83** |
+
+Two of CDR's design moves were validated cleanly even though the headline bpb regressed:
+
+- **Forced alternation collapses class-bit cost.** `token_class_ac` is **56 bits per 64 KiB window** — essentially zero. The Order-1Ctx-on-previous-class model learns that Word follows Separator and vice versa to within Laplace's residual, exactly as predicted.
+- **Case folding is cheap.** `case_ac` is **0.08 bpb** — well below the 0.6 bpb global-Order-0 case-entropy upper bound. Per-token case stats are responsible: "United" learns ~100% TitleCase quickly, "the" learns its real ~10% TitleCase / 90% AllLower split, and the per-entry Laplace prior collapses pattern entropy to near zero for words with consistent case.
+
+### Why it loses
+
+The dominant term is `token_hit_ac` at ~2.30 bpb. Average cost-per-hit is **8.7 bits**, against a Shannon target of ~4–5 bits for a Zipfian-distributed Order-0 over the dictionary alphabet. The bimodal nature of the bit distribution explains the gap:
+
+- **Head (IDs ≈ 0–256)**: hot tokens like "the", "of", "and" get ~4 bits each — close to Shannon. The Order-0 on the high byte concentrates almost all mass on `high=0`; the conditional Order-1Ctx low-byte model picks up the within-page Zipfian.
+- **Tail (IDs ≈ 256–65535)**: each (high≠0) bucket sees few observations because the dictionary is sparse beyond the head. The high-byte Order-0 has thin mass on `high=k` for k>0, and the conditional low-byte Order-1Ctx row for `high=k` is essentially uniform. Tail hits cost **12–16 bits each**.
+
+Token counts per 64 KiB window are ~20,000, of which ~25–30% are tail hits. The tail's ~15-bit cost dominates the average: a head-heavy estimate of 5 bits/token would predict ~100,000 bits/window for the hit path; the tail drag bumps that to 150,000.
+
+The structural problem is that **Order-0 over a 65,536-symbol alphabet, naively chunked as two Order-0 byte models, can't represent a heavy-tailed distribution efficiently**. The chunked decomposition forces each (high, low) row to be modeled independently, and tail rows starve.
+
+### What would close the gap
+
+Three architectural fixes, in increasing order of complexity:
+
+1. **Frequency-binned ID assignment**. Reassign IDs by observed frequency periodically (in lockstep on encode and decode). Hot tokens settle into low IDs over time — concentrates mass on (high=0) more tightly than first-occurrence. Probably gives ~0.1 bpb.
+2. **True Order-0 over the full alphabet via a Fenwick tree**. O(log N) per encode and observe; CDF queries don't materialize the full 65k table. This gets each hit token to its true `-log₂ P(id)` cost. Probably brings the codec to ~2.5 bpb — roughly at xml-lz-cp parity but without LZ.
+3. **Order-1 word model (sparse, conditional on previous token ID)**. Captures "United" → "States", "of" → "the". This is where word-level codecs actually beat byte-level LZ77 — the per-token entropy drops from ~5 bits (Order-0 Shannon) to ~3–4 bits (Order-1 conditional). Target: 1.8–2.1 bpb.
+
+### Lessons for the next attempt
+
+- **Don't bench MVT-quality model architectures against polished baselines and conclude "tokenization doesn't work."** The architecture that gives word-level codecs their win is the *conditional* model. Order-0 is to word-level codecs what Order-0 byte was to byte-level codecs (3.4 bpb on enwik8) before LZ77 and Order-N arrived.
+- **The 8.7-bits/hit figure is the load-bearing measurement.** If a Phase-14 Order-1-word codec gets the hit cost down to ~4 bits and OOV stays at ~1.4 bpb, the codec lands near 1.9 bpb — closer to Shannon than anything v2 has built.
+- **Case folding lands as predicted on its own merits**: 0.08 bpb cost, ~40-50% effective dictionary expansion (the recon estimate). The DictEntry case-counts mechanism is reusable for any future tokenized codec.
+
+Phase 13 lands as the negative-finding commit; tokenizer and codec stay in the tree as the substrate for Phase 14's Order-1 word model.
+
+### Status
+
+xml-lz-cp remains v2's best at 2.608 bpb on the full panel. Two negative findings in two days (wiki sub-mode, naive tokenization) but each one tightened the architectural map — Phase 12 told us where the sub-mode signal isn't worth carrying (dense Order-3 contexts); Phase 13 tells us where word-level codecs need conditional structure (Order-0 isn't enough). Both lessons feed Phase 14 directly.
+
+---
+
 ## 2026-05-12 — Phase 12: Wiki Sub-Mode Literal Models (Negative Result)
 
 CDR/Claude tested whether splitting the Content literal models (`letter`, `nonletter`) by an in-band wiki sub-mode (Plain / Link / Template) would close some of the v2 → v1 gap. Hypothesis came from a recon analyzer (`analyze-wiki`) that walked the first 16 MiB of enwik8 through the production XML classifier and found that **76% of all Content bytes live inside `[[..]]` internal-link spans** (template spans are another 4.5%, headings 0.3%, the leftover 19% is Plain prose). The intuition: the alphabet inside `[[..]]` is constrained — link targets are mostly letters with a small set of separators — so a Link-specific Order-3-letter model trained only on link-internal bytes should concentrate mass better than a single model trained on everything. Pre-measurement bpb prediction: 0.075–0.10 bpb on the panel.

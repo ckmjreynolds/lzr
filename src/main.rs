@@ -34,6 +34,7 @@ mod mtf;
 mod null;
 mod paq_codec;
 mod ppm;
+mod tokenizer;
 mod wiki_classifier;
 mod xml_codec;
 mod xml_lz_cp;
@@ -42,6 +43,7 @@ mod xml_lz_ppm;
 mod xml_lz_ppmc;
 mod xml_lz_word;
 mod xml_ppm;
+mod xml_tok;
 mod xml_wiki_lz_cp;
 
 use std::path::PathBuf;
