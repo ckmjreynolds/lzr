@@ -24,7 +24,7 @@ use crate::ac::{AcDecoder, AcEncoder};
 use crate::bits::{BitReader, BitWriter};
 use crate::bwt;
 use crate::codec::{Codec, Decomposition};
-use crate::models::Order0;
+use crate::models::Order1Bytes;
 use crate::mtf;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -45,14 +45,19 @@ impl Codec for BwtCodec {
 
         let mut writer = BitWriter::new();
         let bits_before = writer.bits_written();
-        let mut model: Order0<256> = Order0::new();
+        // Order-1 byte model conditioned on the previous MTF symbol.
+        // MTF output after BWT has strong "after 0, likely another 0"
+        // structure that Order-0 can't capture — Order-1 directly
+        // models the run-vs-not-run transition probability per
+        // previous-symbol context.
+        let mut model = Order1Bytes::new();
         let mut cdf = vec![0u32; 257];
         {
             let mut enc = AcEncoder::new(&mut writer);
             for &sym in &mtf_out {
                 model.cdf_to(&mut cdf);
                 enc.encode(&cdf, sym as usize);
-                model.observe(sym as usize);
+                model.observe(sym);
             }
             enc.finish();
         }
@@ -84,14 +89,15 @@ impl Codec for BwtCodec {
 
         let mut reader = BitReader::new(&archive[8..]);
         let mut dec = AcDecoder::new(&mut reader);
-        let mut model: Order0<256> = Order0::new();
+        let mut model = Order1Bytes::new();
         let mut cdf = vec![0u32; 257];
         let mut mtf_buf = Vec::with_capacity(measure_len);
         for _ in 0..measure_len {
             model.cdf_to(&mut cdf);
             let sym = dec.decode(&cdf)?;
-            mtf_buf.push(u8::try_from(sym).expect("byte symbol fits u8"));
-            model.observe(sym);
+            let b = u8::try_from(sym).expect("byte symbol fits u8");
+            mtf_buf.push(b);
+            model.observe(b);
         }
 
         let last_col = mtf::inverse(&mtf_buf);
