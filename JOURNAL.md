@@ -13,6 +13,53 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-12 22:30 — v3 Phase 3: Order-2 Word Context (Negative Result, +0.079 bpb)
+
+Following the panel-survey finding that the Order-1 asymptotic floor is 1.518 bpb (and the codec at 2.381 bpb has 0.86 bpb of headroom), the next architectural step was to fold `prev_prev_id` into the bit-level predictor's context — Order-2 word. Literature suggests Order-1 → Order-2 cuts conditional entropy 20–30%; with the calibrated 5–10× discount on tokenization-stack predictions, expected codec gain was **0.05–0.15 bpb**, target **~2.23–2.33 bpb**. The change implemented cleanly: ~50 LOC threading `prev_prev_id` alongside `prev_id` through `id_bit_ctx`, `encode_token`, `decode_token`, `observe_token` and the encode/decode/prewarm main loops.
+
+Result: **2.460 bpb full panel, Δ +0.079 vs Phase 1's 2.381.** Regression of 0.079 bpb. Reverted.
+
+### Why it failed: context starvation at panel scale
+
+`id_bit_ctx`'s new context is `(prev_prev_id, prev_id, prefix, bit_pos)`. With a 262 K dictionary, the `(prev_prev_id, prev_id)` space is ~70 billion potential pairs. The actually-observed pairs over a panel run (warm + measure ≈ 1.2 M tokens) are bounded by ~1 M unique bigrams. With 18 bits emitted per id, each unique (pp, p, prefix, bit_pos) context sees on average **well under 1 observation** across the entire window.
+
+The `BitPredictor` returns `P(bit=0) ≈ 0.5` (cost = 1 bit) for any context with no observations. Tokens whose (prev_prev, prev) pair was rare in warm therefore pay **~18 bits per id** — vs Order-1's ~5 bits per id for the same token. The decomposition tells the story:
+
+| component | Phase 1 (Order-1) | Phase 3 (Order-2) | Δ |
+|---|---:|---:|---:|
+| token_hit_ac    | ~45,200 | ~49,664 | **+4,464** |
+| token_oov_ac    | ~27,460 | ~27,452 | 0 |
+| lz_match_ac     | ~80,200 | ~80,119 | 0 |
+| case_ac         |  ~5,380 |  ~5,413 | 0 |
+
+The regression is concentrated in `token_hit_ac` (+4,464 bits/window avg). Order-2 didn't help hot tokens (those use the same context-prefix-collapse trick that already worked at Order-1) and severely penalized rare-pair tokens.
+
+### Methodology note: the survey's fourth blind spot
+
+The panel survey measures **asymptotic** entropy floors. Order-2 word has a lower asymptotic floor than Order-1 (probably 1.0–1.2 bpb). But the codec doesn't operate at the asymptote — it has Laplace smoothing on a finite-capacity hash table with bounded training data per context.
+
+For Order-1 word on the panel: ~30 K unique prev_ids × ~18 bit positions × ~32 typical prefix values ≈ **17 M contexts**, of which maybe 1–2 M are populated by the 250 K tokens per window. Each populated context sees ~5–10 observations on average — enough for the Laplace prior to wash out and approach the true conditional probability.
+
+For Order-2 word on the panel: ~1 M unique (prev_prev, prev) pairs × 18 bit positions × ~32 prefixes ≈ **600 M contexts**, of which maybe ~5 M are populated. Each populated context sees ~0.05 observations — Laplace dominates, predictions are near 0.5, and the model is structurally worse than Order-1 for this corpus size.
+
+**Rule of thumb (added to calibration discipline)**: Order-N word context requires ~10× more training tokens per increment of N to reach the same effective per-context observation count. At panel scale (~1.2 M tokens/window), the ladder caps out somewhere between Order-1 and Order-2. To unlock Order-2 cleanly would require either:
+
+- **More training data per context**: corpus-scale training (run the whole prewarm over a 100 MB pre-pass before measure), or pre-shipped Order-2 statistics.
+- **PPM-style escape mechanism**: try Order-2 first; if context has <K observations, escape to Order-1. Pays one bit of escape signaling on cold contexts. Standard in PAQ/cmix.
+- **Smaller alphabet for prev_prev**: collapse `prev_prev_id` to a coarse class (e.g., top-1024 ids + "other") to reduce the context space by ~256×.
+
+### What this means for next moves
+
+Order-2 word is genuinely blocked at panel scale. The path to closing the 0.86 bpb headroom to the Order-1 floor goes through:
+
+1. **LZ improvements** (50% of bits per window). Cost-aware decision per xml-lz-cp Phase 7, lazy parse, larger MAX_MATCH. Estimated 0.05–0.15 bpb.
+2. **OOV reduction** (17% of bits per window). Per-byte models conditional on token-prefix-so-far instead of a single Order-1-over-bytes model. Or sub-word fallback for OOVs (a token's OOV bytes fed through BPE on the byte stream).
+3. **PPM-D-style multi-order word model**. Order-2 with escape to Order-1 with escape to Order-0. ~300 LOC; gain depends on escape calibration. Estimated 0.10–0.25 bpb.
+
+xml-tok stays at Phase 1's 2.381 bpb. Phase 3 lands as an unreverted code path **deliberately not committed** — the journal entry is the record. The next phase will target the LZ slice (Phase 4 candidate: cost-aware LZ on tokens).
+
+---
+
 ## 2026-05-12 21:30 — v3 Phase 1: Dict Cap 65 K → 262 K (Δ −0.031 bpb; Survey Over-Predicted by 10×)
 
 Following the v3 capability-survey methodology, the first architectural change informed by measurement: widen the dictionary cap from 65 K to 262 K, switch id type from u16 to u32 throughout, emit 18 bits per id (up from 16). Pre-measurement prediction (from the survey, biased toward floor): **0.3–0.5 bpb**. Actual on the full 20-window enwik8 panel: **2.381 bpb (Δ −0.031 vs Phase 16's 2.412)**.
