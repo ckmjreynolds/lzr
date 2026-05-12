@@ -13,6 +13,99 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-11 — v2 Clean-Slate Rewrite; Eval-First Discipline; Mode-Routed Codec Stack
+
+CDR/Claude spent the day on a from-scratch v2 rewrite of the codec on a new branch (`v2` off `hutter`), motivated by the architectural critique at the end of the 2026-05-10 4M-scale-up entry: v1's "locally-greedy" iteration had reached a saturation point where mixer parameterization and neural scale weren't moving the needle, and the structural choices (byte-class routing, monolithic codec, ad-hoc bit accounting) had become the binding constraints. v2 inverts the build order: eval infrastructure and per-component bit decomposition first, then a mode classifier, then increasingly capable codecs layered on top. Eight build phases shipped in one session; the best operating point is **2.608 bpb on the enwik8 20×256KiB panel (xml-lz-cp)**, 0.55 bpb behind v1's deterministic floor of 2.056 — a real gap, but with the architecture and the audit table to know exactly where it sits.
+
+### Method
+
+v2 is committed on `v2` branch off `hutter`, single wipe commit followed by incremental phase commits. All v1 work (`src/`, weights, checkpoints) is intact on `hutter` for reference and rollback. v2 preserves `assets/` (the corpora), `JOURNAL.md`, `CLAUDE.md`/`AGENTS.md`, licenses, and `build.sh` (modified to drop the v1 `training`/`dev` feature plumbing). `Cargo.toml` rewritten with just `anyhow` and `clap` as runtime deps — no neural, no training, no candle. enwik8 (first 100 MB of enwik9) generated from the corpus for fast dev cycles; canonical Hutter measurement still happens on enwik9.
+
+The meta-discipline is the bit-budget: every architectural decision is preceded by a written prediction of which decomposition cells move and by how much, then measured against that prediction. The bench panel emits a per-component decomposition CSV (`offset,measured_bytes,archive_bytes,bpb,bits_*`) for every codec. The eval harness asserts that the sum of named components equals exactly `8 * archive_bytes` — bits that don't sum to that are caught at panel time, not silently leaked.
+
+### Phase-by-phase progression
+
+| phase | commit | codec | mean bpb on enwik8 |
+|------:|--------|-------|-------------------:|
+| 0 | `67ed146` | null (sanity)              | 8.000 |
+| 1 | `be97567` | classifier-stats (measure) | 8.000 |
+| 2 | `ff8ec6d` | xml (templated dict)       | 7.830 |
+| 3 | `2ce9229` | xml-ppm (AC + Order-1)     | 3.794 |
+| 4 | `ec4710b` | xml-lz-ppm (LZ77)          | 2.707 |
+| 5 | `e04a67c` | xml-lz-word (letter/non-letter split) | 2.642 |
+| 6 | `267920e` | xml-lz-ord3 (Order-3/Order-2 dense) | 2.620 |
+| 7 | `13e1096` | xml-lz-cp (cost-aware LZ) | **2.608** |
+| 8 | `8104ecf` | xml-lz-ppmc (PPM-C order 3/2) | 2.617 |
+
+The big steps are Phases 3 and 4 (the AC + Order-1 model and the LZ77 pre-pass). Subsequent phases tighten the literal residue and the match decision, with diminishing returns concentrated in the 0.05-0.10 bpb range per phase.
+
+### Mode classifier and the empirical mode-distribution finding
+
+A three-mode Moore FSM (`Content`, `TagStructure`, `AttrValue`) drives per-byte routing. Encoder and decoder run the same classifier deterministically — no signaling, zero bits of overhead. The `classifier-stats` codec attributes 8 bpb to per-mode buckets, giving an empirical mode-distribution on the panel before any compressor lands:
+
+| mode          | % of corpus | extrapolated to 100 MB |
+|---------------|------------:|-----------------------:|
+| Content       | 97.51       | 97.5 MB |
+| TagStructure  |  2.37       |  2.4 MB |
+| AttrValue     |  0.13       |  0.1 MB |
+
+This was a Phase-1 finding that immediately bounded Phase 2's ceiling: even a perfect XML codec saves at most ~2.5% of the corpus. The bit-budget discipline replaced an intuition-driven guess (where I'd have over-invested in XML schema fidelity) with a measured ceiling. Phase 2 shipped a 32-entry hardcoded dictionary that hit 100% on the panel (zero `tag_raw` entries) and saved 0.170 bpb global — almost exactly the predicted ceiling. No further XML codec work warranted.
+
+### Two latent AC bugs surfaced under Phase 4
+
+The LZ77 pre-pass exercised AC paths the short-codec tests didn't, and two long-standing latent bugs came out:
+
+1. **`u32` cast truncation at initial state.** The encode/decode `(range * hi) / TOTAL` computation truncated `2^32` to `0` when `range = u32::MAX + 1` (the initial state) and `hi = TOTAL`. Result: `low + 0 - 1` underflow. Fixed by doing all arithmetic in `u64` and casting the result *after* the `-1`, when it's bounded by `u32::MAX`.
+2. **Degenerate uniform CDFs for >8-bit alphabets.** With `TOTAL = 2^16`, a `2^22`-symbol uniform CDF can't give every symbol mass ≥ 1 — most consecutive entries are equal, violating the AC's strictly-increasing-CDF contract. Replaced offset bucket-relative-bits encoding with chunked emission: each 1-8 bit chunk is one AC symbol against a `2^chunk` uniform CDF. Cost stays at exactly `n_bits` for an `n`-bit value (equivalent to raw bit emission) but routed through the same AC stream so framing stays consistent.
+
+Both were silent on small inputs and triggered immediately under the 4 MiB warm + 256 KiB measure regime. v1's matcher window and panel sizes happened to avoid them by accident.
+
+### Architectural findings: where things ceiling out
+
+The interesting phases are 6, 7, 8 — each gave a small win and a clear ceiling.
+
+**Phase 6** (Order-3 letter + Order-2 non-letter dense): +0.022 bpb only, because LZ absorbs ~80% of bytes via matches and the literal residue skews toward non-letter bytes (punctuation, whitespace, digits — the bytes that don't repeat in long enough runs). Higher-order *letter* context helps less when most literals aren't letters. Dense Order-2 non-letter on a 256×256 table is the same model v1 also had — no new ground.
+
+**Phase 7** (cost-aware LZ): +0.012 bpb. The mechanism works correctly — the bit-decomposition shows 0.126 bpb migrating from `lz_match` into `content_ac` and the net is positive. Net is small because the Order-3 letter model is the cap.
+
+**Phase 8** (PPM-C without exclusions): swept the order configuration 2/1, 3/2, 4/3, 5/4. Best at 3/2 = 2.617 bpb. **Essentially tied with Phase 6 dense (2.620)**. Higher orders monotonically hurt — each escape pays `log2((T+K)/K)` bits, and without the exclusion mechanism (PPM-D's signature feature) lower-order CDFs still cover symbols handled by higher orders, wasting mass on impossible alternatives. The negative result is the architectural finding: **PPM-D's exclusion mechanism, not just multi-order escape, is what gives v1's PPM-D its wins**.
+
+### Standing relative to v1
+
+```
+codec                                    mean bpb (enwik8 panel)
+----------------------------------------+-----------------------
+v1 LZ77 + cross-stream PPM-D + 4M neural             1.985
+v1 deterministic floor (LZ77 + PPM-D)                2.056
+v2 best (xml-lz-cp)                                  2.608   <- v2 operating
+v2 Phase 6 dense Order-3/Order-2                     2.620
+v2 Phase 8 PPM-C order 3/2                           2.617
+v2 deterministic byte-stream baseline (null+xml)     7.830
+```
+
+v2 is **0.55 bpb behind v1's deterministic floor**. The gap is concentrated in two cells of the audit table:
+- `content_ac` (0.875 bpb in xml-lz-cp): the literal residue after LZ. v1's PPM-D goes deeper here.
+- `lz_match` (1.731 bpb): v1's combination of better Content prediction and probably slightly better LZ parsing keeps matches shorter.
+
+The path to close most of this is well-defined: implement PPM-D's exclusion bookkeeping (~100 LOC on top of `src/ppm.rs`), raise non-letter order to 8 (v1's choice), add cost-DP optimal-parse LZ. Estimated cumulative gain: 0.2-0.35 bpb, putting v2 around 2.25-2.40 bpb — still some gap to v1's full deterministic floor, but with cleaner attribution and a proven path.
+
+### What v2 demonstrates regardless of the absolute number
+
+- **Bit-budget discipline works.** Phase 1's mode distribution correctly predicted Phase 2's ceiling. Phase 6's diminishing-return prediction matched the result. Phase 8's saturation was caught without surprise. Compare to v1's 4M neural scale-up, where 4× neural parameters bought ~0.06 bpb at the ensemble — a result that should have been predictable from the standalone-neural-vs-deterministic gap on the 1M baseline.
+- **Per-component attribution gives a real audit table.** Every commit ships a decomposition that says where bits went and by how much each component moved. The "lost 0.012 bpb to a refactor" failure mode that haunts v1 doesn't happen here.
+- **Latent correctness bugs surface under varied conditions.** Two AC bugs that v1's parameters avoided showed up in v2's bench. Both are now fixed.
+
+### Next levers (if and when v2 resumes)
+
+- **PPM-D with exclusions.** ~100 LOC on top of `src/ppm.rs`. Track an "excluded symbols" set across the fallback chain; rebuild CDFs minus excluded entries at each lower order. Estimated 0.10-0.20 bpb gain on top of current PPM-C.
+- **Optimal-parse LZ with cost-DP.** Replace the greedy/lazy heuristic in `xml-lz-cp` with a proper DP over a small lookahead window. Estimated 0.05-0.10 bpb.
+- **Order-8 non-letter PPM** (once exclusions work). Matches v1's parameters.
+- **Different sub-mode classification within Content** — prose / wiki-markup / numeric / URL splits, with per-sub-mode codecs. Theoretical upside but each sub-mode is a small slice; the wins compound rather than multiply.
+
+A neural arm is *not* on this list. The 2026-05-10 finding was that even a 4M neural barely moved the v1 ensemble (4× params → 0.06 bpb global). The bit budget for v2 should be spent on deterministic improvements until the deterministic floor is genuinely hit; only then does a neural residual model become worthwhile, and at that point it should target the specific residual rather than predicting raw bytes.
+
+---
+
 ## 2026-05-10 → 2026-05-11 — 4M Neural Scale-Up; Mixer Saturation at 2 Arms; Order-2 as Third Arm
 
 CDR/Claude scaled the neural arm 4× (1M → 4M, `N_LAYERS=2 → 8`, `D_MODEL=256` held, `CM_MULT=1` held) and ran a 24h training pass on enwik9. Best checkpoint landed at step 9056 / info-bpb 1.79 — a ~4% improvement on the neural arm in isolation. The improvement did not flow through the ensemble: 4M + 2-arm logistic at w=0.5 landed at 1.990 bpb (vs 1.994 at 1M), and three mixer-side experiments at 4M scale (single-global adaptive, per-class adaptive, fixed logistic at w=0.6) all converged to 1.988 ± 0.001. Adding Order-2 dense as a third arm via a 2-simplex adaptive log-linear mix landed at 1.985 — small but uniform across all five offsets. The dominant finding is architectural rather than numerical: **with two correlated predictors, the mixer's parameterization is saturated; predictor diversity is the binding constraint, not mixer cleverness**.
