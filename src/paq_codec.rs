@@ -35,11 +35,16 @@ use crate::ac::{AcDecoder, AcEncoder, TOTAL};
 use crate::bit_pred::{BitPredictor, FNV_OFFSET, fnv_mix};
 use crate::bits::{BitReader, BitWriter};
 use crate::codec::{Codec, Decomposition};
+use crate::match_model::MatchModel;
 
 /// Predictor table sizes per order. Higher orders need more slots to
 /// hold their richer context space; orders 0/1 fit comfortably in a
 /// few hundred K slots.
 const K_BITS: [u32; 4] = [11, 17, 20, 20];
+
+/// Total number of mixer inputs: four context-predictor logits +
+/// one match-model logit.
+const N_MIXERS: usize = 5;
 
 /// Mixer learning rate. Tuned conservatively — gradient magnitudes on
 /// English text are small (per-bit logits ~0-5), so 0.01 keeps
@@ -106,20 +111,22 @@ fn squash_to_p_zero(logit_p1: f32) -> u32 {
 /// online via cross-entropy gradient after every observed bit.
 #[derive(Debug)]
 struct Mixer {
-    weights: [f32; 4],
+    weights: [f32; N_MIXERS],
     lr: f32,
 }
 
 impl Mixer {
     const fn new(lr: f32) -> Self {
+        // Equal weights at init so each predictor contributes 1/N
+        // before the gradient updates differentiate them.
         Self {
-            weights: [0.25; 4],
+            weights: [0.2_f32; N_MIXERS],
             lr,
         }
     }
 
     /// Mixed logit = weighted sum of stretched per-predictor logits.
-    fn mix(&self, logits: &[f32; 4]) -> f32 {
+    fn mix(&self, logits: &[f32; N_MIXERS]) -> f32 {
         let mut sum = 0.0_f32;
         for (w, l) in self.weights.iter().zip(logits.iter()) {
             sum = w.mul_add(*l, sum);
@@ -131,7 +138,7 @@ impl Mixer {
     /// `bit` is 0 or 1; `combined_logit` is the output of `mix`; the
     /// gradient term uses the squashed `p1`.
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-    fn update(&mut self, logits: &[f32; 4], combined_logit: f32, bit: u32) {
+    fn update(&mut self, logits: &[f32; N_MIXERS], combined_logit: f32, bit: u32) {
         let p1 = 1.0_f64 / (1.0 + (-f64::from(combined_logit)).exp());
         let err = (bit as f32) - p1 as f32;
         for (w, l) in self.weights.iter_mut().zip(logits.iter()) {
@@ -155,16 +162,18 @@ impl Codec for PaqCodec {
             BitPredictor::new(K_BITS[3]),
         ];
         let mut mixer = Mixer::new(MIXER_LR);
+        let mut match_model = MatchModel::new();
         let mut hist = [0u8; 3];
         if warm.len() >= 3 {
             hist.copy_from_slice(&warm[warm.len() - 3..]);
         }
-        prewarm_predictors(&mut predictors, &mut mixer, warm);
+        prewarm_predictors(&mut predictors, &mut mixer, &mut match_model, warm);
 
         let bits_before = writer.bits_written();
         {
             let mut enc = AcEncoder::new(&mut writer);
             for &byte in measure {
+                match_model.enter_byte();
                 let mut partial: u8 = 0;
                 for bit_pos in (0..8u8).rev() {
                     let bit = u32::from((byte >> bit_pos) & 1);
@@ -174,6 +183,7 @@ impl Codec for PaqCodec {
                         stretch_p1(predictors[1].predict_p_zero(ctxs[1])),
                         stretch_p1(predictors[2].predict_p_zero(ctxs[2])),
                         stretch_p1(predictors[3].predict_p_zero(ctxs[3])),
+                        stretch_p1(match_model.predict_p_zero(bit_pos, partial)),
                     ];
                     let combined_logit = mixer.mix(&logits);
                     let p_zero = squash_to_p_zero(combined_logit);
@@ -185,6 +195,7 @@ impl Codec for PaqCodec {
                     mixer.update(&logits, combined_logit, bit);
                     partial = (partial << 1) | (bit as u8);
                 }
+                match_model.commit_byte(byte);
                 hist[0] = hist[1];
                 hist[1] = hist[2];
                 hist[2] = byte;
@@ -226,16 +237,18 @@ impl Codec for PaqCodec {
             BitPredictor::new(K_BITS[3]),
         ];
         let mut mixer = Mixer::new(MIXER_LR);
+        let mut match_model = MatchModel::new();
         let mut hist = [0u8; 3];
         if warm.len() >= 3 {
             hist.copy_from_slice(&warm[warm.len() - 3..]);
         }
-        prewarm_predictors(&mut predictors, &mut mixer, warm);
+        prewarm_predictors(&mut predictors, &mut mixer, &mut match_model, warm);
 
         let mut reader = BitReader::new(&archive[4..]);
         let mut dec = AcDecoder::new(&mut reader);
         let mut out = Vec::with_capacity(measure_len);
         for _ in 0..measure_len {
+            match_model.enter_byte();
             let mut byte: u8 = 0;
             let mut partial: u8 = 0;
             for bit_pos in (0..8u8).rev() {
@@ -245,6 +258,7 @@ impl Codec for PaqCodec {
                     stretch_p1(predictors[1].predict_p_zero(ctxs[1])),
                     stretch_p1(predictors[2].predict_p_zero(ctxs[2])),
                     stretch_p1(predictors[3].predict_p_zero(ctxs[3])),
+                    stretch_p1(match_model.predict_p_zero(bit_pos, partial)),
                 ];
                 let combined_logit = mixer.mix(&logits);
                 let p_zero = squash_to_p_zero(combined_logit);
@@ -259,6 +273,7 @@ impl Codec for PaqCodec {
                 byte = (byte << 1) | bit_u8;
                 partial = (partial << 1) | bit_u8;
             }
+            match_model.commit_byte(byte);
             out.push(byte);
             hist[0] = hist[1];
             hist[1] = hist[2];
@@ -268,13 +283,20 @@ impl Codec for PaqCodec {
     }
 }
 
-/// Walk the warm prefix bit-by-bit, updating predictor counts AND
-/// mixer weights but not emitting through the AC. Identical paths on
-/// both sides so the measure-region state matches.
+/// Walk the warm prefix bit-by-bit, updating predictor counts, mixer
+/// weights, AND match-model buffer+hash without emitting through the
+/// AC. Identical paths on both sides so the measure-region state
+/// matches exactly.
 #[allow(clippy::cast_possible_truncation)]
-fn prewarm_predictors(predictors: &mut [BitPredictor; 4], mixer: &mut Mixer, warm: &[u8]) {
+fn prewarm_predictors(
+    predictors: &mut [BitPredictor; 4],
+    mixer: &mut Mixer,
+    match_model: &mut MatchModel,
+    warm: &[u8],
+) {
     let mut hist = [0u8; 3];
     for (i, &byte) in warm.iter().enumerate() {
+        match_model.enter_byte();
         let mut partial: u8 = 0;
         for bit_pos in (0..8u8).rev() {
             let bit = u32::from((byte >> bit_pos) & 1);
@@ -284,6 +306,7 @@ fn prewarm_predictors(predictors: &mut [BitPredictor; 4], mixer: &mut Mixer, war
                 stretch_p1(predictors[1].predict_p_zero(ctxs[1])),
                 stretch_p1(predictors[2].predict_p_zero(ctxs[2])),
                 stretch_p1(predictors[3].predict_p_zero(ctxs[3])),
+                stretch_p1(match_model.predict_p_zero(bit_pos, partial)),
             ];
             let combined_logit = mixer.mix(&logits);
             for (pred, &ctx) in predictors.iter_mut().zip(ctxs.iter()) {
@@ -292,6 +315,7 @@ fn prewarm_predictors(predictors: &mut [BitPredictor; 4], mixer: &mut Mixer, war
             mixer.update(&logits, combined_logit, bit);
             partial = (partial << 1) | (bit as u8);
         }
+        match_model.commit_byte(byte);
         if i >= 2 {
             hist[0] = hist[1];
             hist[1] = hist[2];

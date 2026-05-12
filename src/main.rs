@@ -27,6 +27,7 @@ mod classifier_stats;
 mod codec;
 mod eval;
 mod lz;
+mod match_model;
 mod models;
 mod mtf;
 mod null;
