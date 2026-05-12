@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -382,7 +382,274 @@ fn token_entropy_order1_u32(tokens: &[u32]) -> f64 {
                 -p_given * p_given.log2()
             })
             .sum();
-        h += p_prev * row_h;
+        h = p_prev.mul_add(row_h, h);
     }
     h
+}
+
+// =========================================================================
+// Panel survey — matches the bench panel structure (warm + measure)
+// =========================================================================
+
+const PANEL_WARM_BYTES: usize = 4 * 1024 * 1024;
+const PANEL_MEASURE_BYTES: usize = 256 * 1024;
+const PANEL_N_OFFSETS: usize = 20;
+
+/// CLI entry: run the panel survey on the canonical 20×256 KiB
+/// panel and report panel-OOV rate plus Order-1 entropy attributed
+/// to measure bytes only. This is the calibration-corrected version
+/// of the prefix survey — it measures what the codec actually sees
+/// under prewarm-then-measure, not what a fresh-walk-from-byte-0
+/// would observe.
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+pub(crate) fn run_panel_survey(corpus: &Path) -> Result<()> {
+    let mut f =
+        File::open(corpus).with_context(|| format!("opening corpus {}", corpus.display()))?;
+    let corpus_len = f.metadata()?.len();
+    let offsets = pick_panel_offsets(corpus_len);
+    if offsets.is_empty() {
+        anyhow::bail!(
+            "corpus too small for the canonical panel (need ≥ {} bytes)",
+            PANEL_WARM_BYTES + PANEL_MEASURE_BYTES,
+        );
+    }
+
+    eprintln!(
+        "Panel survey: {} windows × ({} KiB warm + {} KiB measure)",
+        offsets.len(),
+        PANEL_WARM_BYTES / 1024,
+        PANEL_MEASURE_BYTES / 1024,
+    );
+    eprintln!();
+
+    let mut total_measure_bytes: u64 = 0;
+    let mut total_measure_tokens: u64 = 0;
+    let mut total_oov_tokens: u64 = 0;
+    let mut total_oov_bytes: u64 = 0;
+    let mut total_order0_bits: f64 = 0.0;
+    let mut total_order1_bits: f64 = 0.0;
+    let mut total_order1_laplace_bits: f64 = 0.0;
+
+    println!(
+        "{:>11} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "offset", "OOV%", "Ord-0", "Ord-1", "Ord-1+L", "tok/byte",
+    );
+    println!(
+        "{:->11} {:->10} {:->10} {:->10} {:->10} {:->10}",
+        "", "", "", "", "", "",
+    );
+
+    for off in offsets {
+        let warm_start = off.saturating_sub(PANEL_WARM_BYTES as u64);
+        let warm_len =
+            usize::try_from(off - warm_start).expect("warm length bounded by PANEL_WARM_BYTES");
+        let mut warm = vec![0u8; warm_len];
+        f.seek(SeekFrom::Start(warm_start))?;
+        f.read_exact(&mut warm)?;
+        let mut measure = vec![0u8; PANEL_MEASURE_BYTES];
+        f.seek(SeekFrom::Start(off))?;
+        f.read_exact(&mut measure)?;
+
+        let warm_tokens = tokenize_words(&warm);
+        let measure_tokens = tokenize_words(&measure);
+
+        // Build the "warm dictionary": every distinct token that
+        // appeared in warm. This is the set against which we measure
+        // panel-OOV — a token is OOV only if it's truly first-of-its-
+        // kind in this window (not just below a frequency cap).
+        let mut warm_dict: HashMap<Vec<u8>, u32> = HashMap::new();
+        for tok in &warm_tokens {
+            let next_id = u32::try_from(warm_dict.len()).expect("id fits u32");
+            warm_dict.entry(tok.clone()).or_insert(next_id);
+        }
+
+        // Panel OOV: measure tokens whose key isn't in warm_dict.
+        // (Dict still grows during measure in the real codec; for
+        // entropy purposes we hold it static at warm_end so OOV
+        // means "the model hasn't seen this token yet when it
+        // starts encoding measure.")
+        let mut window_oov_tokens: u64 = 0;
+        let mut window_oov_bytes: u64 = 0;
+        for tok in &measure_tokens {
+            if !warm_dict.contains_key(tok) {
+                window_oov_tokens += 1;
+                window_oov_bytes += tok.len() as u64;
+            }
+        }
+
+        // Build bigram counts over the combined warm+measure token
+        // stream. This is the "static" Order-1 model — the codec's
+        // adaptive model would be slightly worse than this floor
+        // due to Laplace smoothing on undersampled contexts.
+        // Use a single combined id space.
+        let mut combined_dict: HashMap<Vec<u8>, u32> = HashMap::new();
+        let mut combined_ids: Vec<u32> =
+            Vec::with_capacity(warm_tokens.len() + measure_tokens.len());
+        for tok in warm_tokens.iter().chain(measure_tokens.iter()) {
+            let next_id = u32::try_from(combined_dict.len()).expect("id fits u32");
+            let id = *combined_dict.entry(tok.clone()).or_insert(next_id);
+            combined_ids.push(id);
+        }
+        let warm_len_tokens = warm_tokens.len();
+
+        // Static bigram + marginal counts (full window).
+        let mut marginal: HashMap<u32, u64> = HashMap::new();
+        let mut joint: HashMap<u32, HashMap<u32, u64>> = HashMap::new();
+        for w in combined_ids.windows(2) {
+            *marginal.entry(w[0]).or_insert(0) += 1;
+            *joint.entry(w[0]).or_default().entry(w[1]).or_insert(0) += 1;
+        }
+        let total_tokens_in_window = combined_ids.len() as u64;
+
+        // Order-0 + Order-1 entropy attributed to measure tokens
+        // only. For each measure token at position i, look up its
+        // bigram probability conditioned on token at i-1.
+        let mut window_order0_bits: f64 = 0.0;
+        let mut window_order1_bits: f64 = 0.0;
+        let mut window_order1_laplace_bits: f64 = 0.0;
+        let vocab_size = combined_dict.len() as u64;
+
+        let mut measure_token_marginal: HashMap<u32, u64> = HashMap::new();
+        for &t in &combined_ids[warm_len_tokens..] {
+            *measure_token_marginal.entry(t).or_insert(0) += 1;
+        }
+        let measure_token_count = combined_ids.len() - warm_len_tokens;
+
+        // Order-0: -log P(t) using full-window frequencies.
+        for &t in &combined_ids[warm_len_tokens..] {
+            let count = marginal.get(&t).copied().unwrap_or(1).max(1);
+            let p = count as f64 / total_tokens_in_window as f64;
+            window_order0_bits += -p.log2();
+        }
+
+        // Order-1: -log P(curr | prev) using full-window bigram
+        // and marginal counts.
+        for i in 0..measure_token_count {
+            let pos = warm_len_tokens + i;
+            if pos == 0 {
+                continue; // no prev
+            }
+            let prev = combined_ids[pos - 1];
+            let curr = combined_ids[pos];
+            let prev_total = marginal.get(&prev).copied().unwrap_or(0);
+            let joint_count = joint
+                .get(&prev)
+                .and_then(|r| r.get(&curr))
+                .copied()
+                .unwrap_or(0);
+            // No-Laplace (asymptotic floor): if count is 0, skip
+            // by attributing 1 bit (unrealistic but bounded).
+            let p_no_laplace = if joint_count == 0 || prev_total == 0 {
+                1.0 / vocab_size as f64
+            } else {
+                joint_count as f64 / prev_total as f64
+            };
+            window_order1_bits += -p_no_laplace.log2();
+            // Laplace +1: matches what the codec's adaptive Order-1
+            // model would charge for this token.
+            let p_laplace = (joint_count + 1) as f64 / (prev_total + vocab_size) as f64;
+            window_order1_laplace_bits += -p_laplace.log2();
+        }
+
+        let measure_bytes = measure.len() as u64;
+        let bpb_oov = 8.0 * (window_oov_bytes as f64) / (measure_bytes as f64);
+        let bpb_order0 = window_order0_bits / measure_bytes as f64;
+        let bpb_order1 = window_order1_bits / measure_bytes as f64;
+        let bpb_order1_laplace = window_order1_laplace_bits / measure_bytes as f64;
+        let tok_per_byte = measure_token_count as f64 / measure_bytes as f64;
+        let oov_pct = 100.0 * window_oov_tokens as f64 / measure_token_count as f64;
+        // OOV cost is approximately a per-byte byte-spelling
+        // overhead; surface alongside the Order-N entropy.
+        let _ = bpb_oov;
+
+        println!(
+            "{off:>11} {oov_pct:>9.2}% {bpb_order0:>10.3} {bpb_order1:>10.3} {bpb_order1_laplace:>10.3} {tok_per_byte:>10.3}",
+        );
+
+        total_measure_bytes += measure_bytes;
+        total_measure_tokens += measure_token_count as u64;
+        total_oov_tokens += window_oov_tokens;
+        total_oov_bytes += window_oov_bytes;
+        total_order0_bits += window_order0_bits;
+        total_order1_bits += window_order1_bits;
+        total_order1_laplace_bits += window_order1_laplace_bits;
+    }
+
+    println!(
+        "{:->11} {:->10} {:->10} {:->10} {:->10} {:->10}",
+        "", "", "", "", "", "",
+    );
+    let mean_oov_pct = 100.0 * total_oov_tokens as f64 / total_measure_tokens as f64;
+    let mean_order0 = total_order0_bits / total_measure_bytes as f64;
+    let mean_order1 = total_order1_bits / total_measure_bytes as f64;
+    let mean_order1_laplace = total_order1_laplace_bits / total_measure_bytes as f64;
+    println!(
+        "{:>11} {:>9.2}% {:>10.3} {:>10.3} {:>10.3} {:>10.3}",
+        "mean",
+        mean_oov_pct,
+        mean_order0,
+        mean_order1,
+        mean_order1_laplace,
+        total_measure_tokens as f64 / total_measure_bytes as f64,
+    );
+
+    println!();
+    println!("Panel-OOV rate:        {mean_oov_pct:.2}% of measure tokens");
+    println!(
+        "Panel-OOV byte share:  {:.2}% of measure bytes",
+        100.0 * total_oov_bytes as f64 / total_measure_bytes as f64,
+    );
+    println!("Order-0 (asymptotic):  {mean_order0:.3} bpb on measure");
+    println!("Order-1 (asymptotic):  {mean_order1:.3} bpb on measure  ← entropy floor");
+    println!("Order-1 (Laplace +1):  {mean_order1_laplace:.3} bpb on measure  ← codec target");
+
+    Ok(())
+}
+
+/// Tokenize `buf` into letter / non-letter runs, lowercasing words
+/// to match xml-tok's case-fold convention. Allocates a `Vec<u8>`
+/// per token; survey-scale only.
+fn tokenize_words(buf: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut p = 0;
+    while p < buf.len() {
+        let class_is_letter = buf[p].is_ascii_alphabetic();
+        let mut q = p + 1;
+        while q < buf.len() && buf[q].is_ascii_alphabetic() == class_is_letter {
+            q += 1;
+        }
+        let token: Vec<u8> = if class_is_letter {
+            buf[p..q].iter().map(u8::to_ascii_lowercase).collect()
+        } else {
+            buf[p..q].to_vec()
+        };
+        out.push(token);
+        p = q;
+    }
+    out
+}
+
+/// Pick the same 20 panel offsets the bench panel uses.
+fn pick_panel_offsets(corpus_len: u64) -> Vec<u64> {
+    let prewarm = PANEL_WARM_BYTES as u64;
+    let sample = PANEL_MEASURE_BYTES as u64;
+    if corpus_len < prewarm + sample {
+        return Vec::new();
+    }
+    let min_off = prewarm;
+    let max_off = corpus_len - sample;
+    if max_off < min_off {
+        return Vec::new();
+    }
+    let span = max_off - min_off;
+    let n_u64 = PANEL_N_OFFSETS as u64;
+    (0..PANEL_N_OFFSETS)
+        .map(|i| {
+            if PANEL_N_OFFSETS == 1 {
+                min_off + span / 2
+            } else {
+                min_off + (span * i as u64) / (n_u64 - 1)
+            }
+        })
+        .collect()
 }

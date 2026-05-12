@@ -95,6 +95,18 @@ enum Command {
         bytes: usize,
     },
 
+    /// Panel survey: measure Order-N word entropy under the same
+    /// 20×(4 MiB warm + 256 KiB measure) structure the bench panel
+    /// uses. Calibration-corrected version of the prefix survey —
+    /// the codec's prewarm absorbs first-occurrence tokens, so the
+    /// "static-dict OOV" the prefix survey reported is much higher
+    /// than the panel actually sees.
+    PanelSurvey {
+        /// Corpus file path.
+        #[arg(long, default_value = "assets/enwik8")]
+        corpus: PathBuf,
+    },
+
     AnalyzeLiterals {
         /// Corpus file path.
         #[arg(long, default_value = "assets/enwik8")]
@@ -149,5 +161,6 @@ fn main() -> Result<()> {
         } => analyze::run_analyze_literals(&corpus, offset, measure_bytes, warm_bytes),
         Command::AnalyzeWiki { corpus, bytes } => analyze_wiki::run_analyze_wiki(&corpus, bytes),
         Command::Survey { corpus, bytes } => survey::run_survey(&corpus, bytes),
+        Command::PanelSurvey { corpus } => survey::run_panel_survey(&corpus),
     }
 }
