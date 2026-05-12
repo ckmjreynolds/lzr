@@ -21,6 +21,7 @@ mod analyze;
 mod analyze_wiki;
 mod bit_pred;
 mod bits;
+mod bpe;
 mod bwt;
 mod bwt_codec;
 mod classifier;
@@ -34,6 +35,7 @@ mod mtf;
 mod null;
 mod paq_codec;
 mod ppm;
+mod survey;
 mod tok_lz;
 mod tokenizer;
 mod wiki_classifier;
@@ -74,6 +76,21 @@ enum Command {
         #[arg(long, default_value = "assets/enwik8")]
         corpus: PathBuf,
         /// How many bytes from the start to scan.
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        bytes: usize,
+    },
+
+    /// v3 capability survey: sweep tokenization schemes (bytes,
+    /// word tokens at various dict sizes, BPE at various vocab
+    /// sizes) and report Order-0 / Order-1 entropy on the corpus
+    /// prefix. Goal: pick the right architecture from measurement,
+    /// not vibes.
+    Survey {
+        /// Corpus file path.
+        #[arg(long, default_value = "assets/enwik8")]
+        corpus: PathBuf,
+        /// How many bytes from the start of the corpus to use for
+        /// both training and entropy measurement.
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         bytes: usize,
     },
@@ -131,5 +148,6 @@ fn main() -> Result<()> {
             warm_bytes,
         } => analyze::run_analyze_literals(&corpus, offset, measure_bytes, warm_bytes),
         Command::AnalyzeWiki { corpus, bytes } => analyze_wiki::run_analyze_wiki(&corpus, bytes),
+        Command::Survey { corpus, bytes } => survey::run_survey(&corpus, bytes),
     }
 }

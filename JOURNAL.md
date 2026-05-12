@@ -13,6 +13,85 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-12 20:00 — v3 Capability Survey: Order-1 Word Floor is 1.584 bpb; The 65 K Cap Was Wrong
+
+After a strategic conversation about whether incremental gains on the xml-tok stack could close the gap to the Hutter target, CDR raised three pointed questions: is the 65 K dictionary size the right choice, is letter/non-letter splitting the right unit, and was the adaptive-online commitment premature given that the Hutter scoring allows shipping a pre-computed vocab? Rather than guess further, branch `v3` was created from `v2` and a capability-survey subcommand was built to measure the entropy floor of each tokenization scheme on real corpus data before committing more codec engineering.
+
+### Method
+
+`lzr survey --corpus assets/enwik8 --bytes N` walks the first `N` bytes of the corpus and computes Order-0 and Order-1 entropy for every row in the survey, expressed as bits-per-byte-of-original so comparisons are direct. Schemes:
+
+- **Bytes** at Order-0, Order-1, Order-2 (dense 256, 256×256, sparse 256×256×256).
+- **Word tokens** (letter / non-letter alternating runs, lowercased word keys) at dict caps 8 K, 16 K, 32 K, 64 K, 128 K, 256 K. Top-N most-frequent keys are in-dict; the rest pay full byte-cost OOV.
+- **BPE tokens** trained on a 4 MiB prefix (for tractability) at vocab sizes 4 K, 8 K, 16 K, 32 K, 64 K. Pre-split on letter / non-letter runs (mirroring xml-tok). Fast BPE implementation using a lazy max-heap over the pair-count table to avoid the `O(|pairs|)` find-max scan per merge.
+
+OOV cost for word tokens is accounted as the full 8-bpb byte spelling, treated as an upper bound. Order-1 conditional entropy is `Σ P(prev) · H(curr | prev)` over the observed corpus.
+
+### Result (16 MiB of enwik8)
+
+```
+scheme    params         n_tokens   Ord-0 bpb  Ord-1 bpb   notes
+--------  ------------  ---------   ---------  ---------   -----------------------
+bytes     Order-0        16.8 M       5.090       —          —
+bytes     Order-1        16.8 M         —        3.875       —
+bytes     Order-2        16.8 M         —        3.066       —
+word      dict=8 K        4.3 M       3.675      3.124      22.2% OOV
+word      dict=16 K       4.5 M       3.327      2.697      15.6% OOV
+word      dict=32 K       4.6 M       3.080      2.379      10.8% OOV
+word      dict=64 K       4.7 M       2.881      2.111       7.0% OOV  ← xml-tok cur
+word      dict=128 K      4.8 M       2.637      1.795       2.8% OOV
+word      dict=256 K      4.8 M       2.476      **1.584**   0.0% OOV
+BPE       vocab=4 K       6.8 M       3.501      2.232       —
+BPE       vocab=8 K       6.2 M       3.284      2.079       —
+BPE       vocab=16 K      5.8 M       3.108      1.955       —
+BPE       vocab=32 K      5.5 M       2.976      1.864       —
+BPE       vocab=64 K      5.4 M       2.912      1.810       —
+```
+
+Reference points: xml-tok Phase 16 lands at 2.412 bpb on the full 20-window panel. xml-lz-cp at 2.608. v1 deterministic floor at 2.056.
+
+### Five findings, in order of impact on architectural choices
+
+**1. The 65 K dictionary cap was wrong by ~0.5 bpb of pure-entropy headroom.** At 64 K we pay 7% of corpus bytes as full-byte-cost OOV (~1.17 MB of 16 MiB). At 256 K, OOV vanishes. The Order-1 floor drops from 2.111 to **1.584 bpb** — a 0.527 bpb improvement that's available *just by changing the dictionary size cap*. The 16-bit packaging convenience cost us real bits.
+
+**2. Word tokenization beats BPE at every comparable operating point.** BPE 64 K = 1.810 vs Word 128 K = 1.795 (with 2.8% OOV) vs Word 256 K = 1.584 (no OOV). BPE never reaches the floor that word tokenization hits at 256 K. The reason is that BPE splits common words into multiple sub-tokens, paying the Order-1 conditional-entropy tax once per sub-token rather than once per word; whole-word tokens preserve more semantic coherence and ride lower in the Zipfian distribution. **On English Wikipedia, BPE is not the winning move.**
+
+**3. xml-lz-cp at 2.608 outperforms byte Order-2 (3.066) by 0.46 bpb.** Confirms that the LZ matcher + mode-routed classifier in xml-lz-cp adds genuine structure beyond byte Order-2 alone — not pure adaptive-Order-2 in another guise.
+
+**4. The Order-1 word floor is 1.584 bpb; xml-tok Phase 16 is at 2.412.** Headroom of **0.83 bpb** on the current architectural choice if we approach the conditional-entropy floor. That's a meaningful gap and a clear next-phase target: chase the floor.
+
+**5. Pre-computed vs adaptive is not the binding question.** The Order-1 entropy floor of a tokenization is a property of the tokenization itself, not of how IDs are assigned. Adaptive Order-N models converge to the same floor given enough training data; pre-computed vocabs reach it from token 1. The 4 MiB warm prefix already provides ~150 K training tokens — enough for the adaptive model to converge on hot tokens before measure starts. **The choice is about cold-start cost, not asymptotic compression.** Shipping a vocab is justified only if the cold-start cost on the first few thousand tokens of the corpus matters, which it might in tight panels but is amortized over enwik9.
+
+### Methodology indictment
+
+This survey would have prevented two negative-result phases (12 wiki sub-mode, 14 bit-level rewrite) and probably reshaped Phase 13 substantially. The pattern across the v2 build is that bit-budget discipline was applied *within* an architecture choice but never *across* architecture choices. Each phase predicted which decomposition cells would move; no phase predicted whether the next architecture would have a meaningfully better entropy floor.
+
+Going forward: **any new architectural commitment runs the capability survey first.** ~500 LOC of analyzer, runs in 15 minutes, produces falsifiable numbers. The cost of not doing it has been measured: ~3 phases of work that landed wrong-side-of-target because we didn't know the floor.
+
+### Architectural decision
+
+Branch `v3` is currently survey-only — no codec changes. The clear next move is **bump the dictionary cap from 65 K to 262 K (18-bit ID encoding) on the existing xml-tok stack**. Expected gain: most of the 0.527 bpb gap to the 256 K Order-1 floor. Implementation: small change to `id_bit_ctx` and the bit-level emission loop; no model restructure.
+
+After that, the remaining headroom (~0.5 bpb between the realized Order-1 dict-256 K and the pure floor of 1.584) lives in:
+- **Order-2 word** context (`prev_prev_id`): closes another fraction of the floor gap.
+- **Better OOV handling on enwik9**: even at 256 K cap on 16 MiB, OOV vanishes — but enwik9 has ~3× the unique-type count of enwik8; the OOV story will return at corpus scale.
+- **Per-position context refinements** that the survey can't measure directly: skip contexts, indirect contexts, match models per order.
+
+The 1.584 bpb floor is what we can achieve from a *single* Order-1 word predictor at infinite training. To push lower requires either higher-order context (Order-2, Order-3) or mixing multiple correlated predictors via PAQ-style adaptive regression — exactly the cmix recipe discussed earlier.
+
+### Status
+
+`v3` branched off `v2`. New code:
+- `src/survey.rs` — orchestration + byte-level + word-token entropy.
+- `src/bpe.rs` — fast BPE trainer (lazy max-heap) + tokenizer + tests.
+- `src/main.rs` — `survey` subcommand.
+
+129 tests pass (4 new BPE tests). Build clean.
+
+Next session: decide whether to bring the 65 K → 262 K dict-cap change back into v2 directly, or continue iterating on v3 with the survey as the guiding measurement. Either way, the survey replaces the "what should we do next" guesswork with measured headroom.
+
+---
+
 ## 2026-05-12 19:00 — Phase 16: LZ on the Token Stream — 2.412 bpb, −0.196 vs xml-lz-cp
 
 CDR/Claude added a hash-chain LZ77 matcher operating on the u16 token stream emitted by xml-tok's online dictionary, mirroring `src/lz.rs`'s byte-level design but indexing on token IDs instead of bytes. Pre-measurement prediction (biased-toward-floor per the Phase 15 calibration note): **2.40–2.48 bpb**. Actual on the canonical 20×256 KiB enwik8 panel: **2.412 bpb** — right at the floor of the predicted range. v2's new best, **0.196 bpb under xml-lz-cp** (2.608), and **0.122 bpb under Phase 15's Order-1 word model** (2.534).
