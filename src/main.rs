@@ -34,6 +34,7 @@ mod mtf;
 mod null;
 mod paq_codec;
 mod ppm;
+mod tok_lz;
 mod tokenizer;
 mod wiki_classifier;
 mod xml_codec;

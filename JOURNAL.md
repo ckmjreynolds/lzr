@@ -13,6 +13,88 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-12 19:00 — Phase 16: LZ on the Token Stream — 2.412 bpb, −0.196 vs xml-lz-cp
+
+CDR/Claude added a hash-chain LZ77 matcher operating on the u16 token stream emitted by xml-tok's online dictionary, mirroring `src/lz.rs`'s byte-level design but indexing on token IDs instead of bytes. Pre-measurement prediction (biased-toward-floor per the Phase 15 calibration note): **2.40–2.48 bpb**. Actual on the canonical 20×256 KiB enwik8 panel: **2.412 bpb** — right at the floor of the predicted range. v2's new best, **0.196 bpb under xml-lz-cp** (2.608), and **0.122 bpb under Phase 15's Order-1 word model** (2.534).
+
+### Mechanism
+
+New `src/tok_lz.rs` (~200 LOC): `TokenMatcher` with a hash-chain over a 1 M-token (`WINDOW_SIZE = 2^20`) sliding window, hashed on 3-token triplets into a 256 K-bucket hash table. `MIN_MATCH = 3` tokens, `MAX_MATCH = 258`, `CHAIN_DEPTH = 32` (same shape as `src/lz.rs`).
+
+The matcher's stream contains every token id emitted to Content (warm + measure), in emission order. After each id is pushed, the 3-token window ending at the new position is hashed and inserted at the head of its bucket's chain. Tokens that didn't get a dictionary id (capacity-full corner case) break any match passing through that position.
+
+`xml_tok.rs` changes:
+- Three new models: `lz_flag: Order0<2>`, `lz_offset_bucket: Order0<21>`, `lz_length: Order0<256>`. Bucket-relative low bits emit through a shared `UniformCdfCache` (same construction as `xml_lz_cp`).
+- Encode loop's Content branch first calls `lookahead_tokens(buf, pos, dict)` — walks forward up to `MAX_MATCH` tokens, stopping at an OOV (no dict id) or a separator containing `<` (the next byte transitions out of Content). If `>= MIN_MATCH` lookahead tokens exist, hash the first three and run `matcher.find_match()`.
+- One `lz_flag` bit is emitted per Content-token boundary regardless. The bit's adaptive Order-0 cost converges to `H(match_rate)` ≈ 0.15 bpb when matches are rare and ≈ 1 bit when they're 50/50; in practice it lands at ~0.05 bpb.
+- Match record: `flag=1 | bucket | raw bucket bits | length token`. Per matched token, emit only the case pattern (via per-token `case_counts`); the token ID itself is *not* emitted — the decoder reads it from `matcher.stream[stream_len - offset + k]`.
+- Decode mirrors: read flag; if 1, decode offset+length, copy ids from history, emit each id's bytes (with case if it's a word per `dict.entry(id).lower[0]`), push each id to the matcher.
+- Prewarm threads `matcher` through and pushes every observed warm token's id so the matcher's history is identical at the start of measure on both sides.
+
+### Result (full panel, 20 × 256 KiB enwik8)
+
+| codec | mean bpb | best window | Δ vs xml-lz-cp |
+|---|---:|---:|---:|
+| xml-lz-cp (Phase 7)                | 2.608 | 2.012 (W3 quick / W4 full at offset 19280128) | — |
+| xml-tok Phase 15 (Order-1 word)    | 2.534 | 2.199 | −0.074 |
+| **xml-tok Phase 16 (LZ on tokens)** | **2.412** | **2.016** | **−0.196** |
+
+Best window: **2.016 bpb** at offset 19280128 — within 0.04 bpb of v1's deterministic floor (2.056) on a single window. All 20 panel windows improve over Phase 15.
+
+Quick-panel Phase 15 → Phase 16 deltas:
+
+| window | Phase 15 | Phase 16 | Δ |
+|---|---:|---:|---:|
+| W1 | 2.629 | 2.545 | −0.084 |
+| W2 | 2.578 | 2.468 | −0.110 |
+| W3 | 2.451 | 2.167 | **−0.284** |
+| W4 | 2.589 | 2.564 | −0.025 |
+| W5 | 2.607 | 2.442 | −0.165 |
+
+Window 3 (the LZ-friendly repetition-heavy window) sees the biggest gain — the Order-1 word model alone couldn't capture phrase-level repetition the way LZ-on-tokens does.
+
+### Decomposition
+
+Quick-panel components (avg per 64 KiB window):
+
+| component | Phase 15 | Phase 16 |
+|---|---:|---:|
+| `token_hit_ac`    | ~134 k | ~45 k |
+| `token_oov_ac`    |  ~29 k |  ~29 k |
+| `token_class_ac`  |     ~56 |     ~40 |
+| `case_ac`         |   ~5.4 k |   ~5.3 k |
+| **`lz_match_ac`** |       — |  **~80 k** |
+| `tag_ac`          |    ~444 |    ~444 |
+| `attr_ac`         |    ~123 |    ~123 |
+
+The shift is dramatic and clean: `token_hit_ac` collapses from 134 k to 45 k bits (matched tokens no longer go through individual hit emission) while `lz_match_ac` picks up 80 k bits. The 80 k > (134 k − 45 k) = 89 k difference is the LZ overhead price — about 9 k bits/window of fixed-cost overhead (flag bits, bucket headers, length tokens) on top of the per-matched-token case bits.
+
+Per-matched-token cost: roughly **~9 bits/match-record-amortized** (close to Phase 15's per-hit cost), but the savings come from the *fixed-overhead amortization* over long matches. A 10-token match costs ~30 fixed bits + 10 × ~1.5 case bits = ~45 bits = **4.5 bits/token**, vs Phase 15's ~8 bits/hit. The longer the match, the bigger the per-token saving.
+
+### Prediction calibration
+
+| phase | predicted | actual | error |
+|---|---|---:|---:|
+| Phase 13 (naive tokenization)  | 2.1–2.3 | 2.826 | +0.55 |
+| Phase 14 (bit-level rewrite)   | gain    | null  | +0.30 |
+| Phase 15 (Order-1 word)        | 2.0–2.2 | 2.534 | +0.33 |
+| Phase 16 (LZ on tokens)        | **2.40–2.48** | **2.412** | **+0.00** |
+
+First on-target prediction since the v2 rewrite. The "bias toward floor by 0.3 bpb" rule absorbed the systematic optimism from prior phases. Going forward I'll keep the floor-bias for tokenization-stack predictions and remove it once a phase outside this stack lands close to its un-biased estimate.
+
+### Status
+
+xml-tok at 2.412 bpb is v2's new best, **0.196 bpb under xml-lz-cp** and within 0.36 bpb of v1's deterministic floor. The token-level codec stack is now competitive in absolute terms — Phase 16 is the first v2 phase that meaningfully closes the v2→v1 gap. Phase 17 candidates, roughly in order of expected gain:
+
+- **Order-2 word** (fold `prev_prev_id` into bit context): ~0.05–0.10 bpb additional. Cheap. Same hashing pattern as Phase 15.
+- **Cost-aware LZ decision** (compute match-cost vs literal-cost per position, pick cheaper): ~0.02–0.06 bpb additional. Phase 16 takes any match ≥ MIN_MATCH; a cost-aware pass would reject marginal short matches whose amortized cost exceeds the Order-1 hit cost.
+- **Lazy parse for LZ** (look 1 token ahead; if the match starting at `pos+1` is longer than the one at `pos`, prefer that): ~0.01–0.03 bpb. Standard LZ improvement that xml-lz-cp's Phase 7 already uses; cheap to port.
+- **Hybrid byte-LZ on the OOV path**: when an OOV token's lowercase form has a substring match in the byte history, emit a byte-LZ reference instead of per-letter emission. Larger code change; gain uncertain.
+
+125 tests pass; xml-tok roundtrips green including 4 MiB-warm + 8 KiB-measure on real enwik8.
+
+---
+
 ## 2026-05-12 18:00 — Phase 15: Order-1 Word Model — v2's New Best (2.534 bpb full panel)
 
 CDR/Claude folded `prev_id` into the bit-level dict-id context to convert the Phase-14 Order-0 model into an Order-1 word model. Pre-measurement prediction (60% confidence): 2.0–2.2 bpb. Actual on the 20×256 KiB full panel: **2.534 bpb** — above the predicted range but the first v2 phase to beat xml-lz-cp's 2.608 baseline. **Δ = −0.074 bpb, the new v2 best.**

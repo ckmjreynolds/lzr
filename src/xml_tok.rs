@@ -39,6 +39,7 @@ use crate::bits::{BitReader, BitWriter};
 use crate::classifier::{Classifier, Mode};
 use crate::codec::{Codec, Decomposition};
 use crate::models::{Order0, Order1Ctx};
+use crate::tok_lz::{self, TokenMatcher};
 use crate::tokenizer::{
     CasePattern, TokenClass, apply_case, classify_case, lowercase, mixed_mask, run_end,
 };
@@ -117,6 +118,11 @@ const ID_BIT_K: u32 = 22;
 /// Phase 14: 2^18 slots = 1 MiB.
 const LEN_BIT_K: u32 = 18;
 
+/// LZ-on-tokens offset bucketing: bucket = `log₂(offset)`. Offsets
+/// up to `WINDOW_SIZE` (1 M tokens) need 20 buckets. Use 21 to give
+/// the model room when the offset hits the upper end.
+const OFFSET_BUCKET_ALPHABET: usize = 21;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct XmlTokCodec;
 
@@ -180,6 +186,15 @@ struct Models {
     /// Same construction for OOV token lengths.
     token_length_bit: BitPredictor,
 
+    /// Phase 16: LZ-on-tokens match-vs-literal flag (1 bit emitted
+    /// per Content-token boundary).
+    lz_flag: Order0<2>,
+    /// `log₂(offset)` bucket. Bucket-relative low bits emitted via
+    /// the uniform CDF cache.
+    lz_offset_bucket: Order0<OFFSET_BUCKET_ALPHABET>,
+    /// `length - MIN_MATCH` token, Order-0 over 0..=255.
+    lz_length: Order0<256>,
+
     oov_word_letter: Order1Ctx<LETTER_NCTX, 26>,
     oov_sep_byte: Order1Ctx<BYTE_NCTX, 256>,
 
@@ -198,6 +213,9 @@ impl Models {
             token_oov: Order0::new(),
             token_id_bit: BitPredictor::new(ID_BIT_K),
             token_length_bit: BitPredictor::new(LEN_BIT_K),
+            lz_flag: Order0::new(),
+            lz_offset_bucket: Order0::new(),
+            lz_length: Order0::new(),
             oov_word_letter: Order1Ctx::new(),
             oov_sep_byte: Order1Ctx::new(),
             case_pattern_global: Order0::new(),
@@ -215,6 +233,7 @@ struct ComponentBits {
     token_oov: u64,
     token_class: u64,
     case: u64,
+    lz_match: u64,
     tag: u64,
     attr: u64,
 }
@@ -234,8 +253,15 @@ impl Codec for XmlTokCodec {
         let mut classifier = Classifier::new();
         let mut models = Models::new();
         let mut dict = Dict::default();
+        let mut matcher = TokenMatcher::new();
 
-        prewarm(&buf[..warm_end], &mut classifier, &mut models, &mut dict);
+        prewarm(
+            &buf[..warm_end],
+            &mut classifier,
+            &mut models,
+            &mut dict,
+            &mut matcher,
+        );
 
         let mut writer = BitWriter::new();
         let mut comp = ComponentBits::default();
@@ -244,11 +270,95 @@ impl Codec for XmlTokCodec {
             let mut enc = AcEncoder::new(&mut writer);
             let mut last_class_ctx = CLASS_CTX_NONE;
             let mut prev_id: Option<u16> = None;
+            let mut uniform_cdf_cache = UniformCdfCache::new();
             let mut i = warm_end;
             while i < buf.len() {
                 let mode = classifier.current_mode();
                 match mode {
                     Mode::Content => {
+                        // Try LZ match on the upcoming Content tokens.
+                        let lookahead = lookahead_tokens(&buf, i, &dict);
+                        let lz_match = if lookahead.len() >= tok_lz::MIN_MATCH {
+                            let ids: Vec<u16> = lookahead.iter().map(|t| t.id).collect();
+                            matcher.find_match(&ids).and_then(|(off, len)| {
+                                let len_us = len as usize;
+                                // Cap to what the lookahead actually covers.
+                                if len_us <= lookahead.len() && len_us >= tok_lz::MIN_MATCH {
+                                    Some((off, len))
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        };
+
+                        let mut flag_cdf = [0u32; 3];
+                        models.lz_flag.cdf_to(&mut flag_cdf);
+                        let flag_sym = usize::from(lz_match.is_some());
+                        let flag_before = enc.bits_written();
+                        enc.encode(&flag_cdf, flag_sym);
+                        models.lz_flag.observe(flag_sym);
+                        comp.lz_match += enc.bits_written() - flag_before;
+
+                        if let Some((offset, length)) = lz_match {
+                            let length_us = length as usize;
+                            let lz_before = enc.bits_written();
+
+                            let bucket = log2_floor(offset);
+                            let mut bucket_cdf = [0u32; OFFSET_BUCKET_ALPHABET + 1];
+                            models.lz_offset_bucket.cdf_to(&mut bucket_cdf);
+                            enc.encode(&bucket_cdf, bucket as usize);
+                            models.lz_offset_bucket.observe(bucket as usize);
+                            if bucket > 0 {
+                                let rel = offset - (1u32 << bucket);
+                                encode_uniform_bits(&mut enc, &mut uniform_cdf_cache, rel, bucket);
+                            }
+
+                            let length_token = length_us - tok_lz::MIN_MATCH;
+                            let mut length_cdf = [0u32; 257];
+                            models.lz_length.cdf_to(&mut length_cdf);
+                            enc.encode(&length_cdf, length_token);
+                            models.lz_length.observe(length_token);
+
+                            comp.lz_match += enc.bits_written() - lz_before;
+
+                            // Per-token case for each matched word token.
+                            for k in 0..length_us {
+                                let lhk = lookahead[k];
+                                if lhk.class == TokenClass::Word {
+                                    let token_start = if k == 0 { i } else { lookahead[k - 1].end };
+                                    let token_bytes = &buf[token_start..lhk.end];
+                                    let case_pat = classify_case(token_bytes);
+                                    let cb = enc.bits_written();
+                                    encode_case_with_token_prior(
+                                        &mut enc,
+                                        &mut models,
+                                        &mut dict,
+                                        lhk.id,
+                                        case_pat,
+                                        token_bytes,
+                                    );
+                                    comp.case += enc.bits_written() - cb;
+                                }
+                                matcher.push(lhk.id);
+                            }
+
+                            let new_i = lookahead[length_us - 1].end;
+                            for &b in &buf[i..new_i] {
+                                classifier.advance(b);
+                            }
+                            i = new_i;
+                            let last = lookahead[length_us - 1];
+                            last_class_ctx = match last.class {
+                                TokenClass::Word => CLASS_CTX_WORD,
+                                TokenClass::Separator => CLASS_CTX_SEP,
+                            };
+                            prev_id = Some(last.id);
+                            continue;
+                        }
+
+                        // No LZ match — emit a regular token.
                         let class = TokenClass::from_byte(buf[i]);
                         let class_sym = class_to_sym(class);
                         let mut class_cdf = [0u32; 3];
@@ -260,7 +370,7 @@ impl Codec for XmlTokCodec {
 
                         let end = run_end(&buf, i);
                         let token = &buf[i..end];
-                        prev_id = encode_token(
+                        let new_id = encode_token(
                             &mut enc,
                             &mut models,
                             &mut dict,
@@ -269,6 +379,10 @@ impl Codec for XmlTokCodec {
                             token,
                             prev_id,
                         );
+                        if let Some(id) = new_id {
+                            matcher.push(id);
+                        }
+                        prev_id = new_id;
 
                         for &b in token {
                             classifier.advance(b);
@@ -337,10 +451,16 @@ impl Codec for XmlTokCodec {
         decomp.add("token_oov_ac", comp.token_oov);
         decomp.add("token_class_ac", comp.token_class);
         decomp.add("case_ac", comp.case);
+        decomp.add("lz_match_ac", comp.lz_match);
         decomp.add("tag_ac", comp.tag);
         decomp.add("attr_ac", comp.attr);
-        let attributed =
-            comp.token_hit + comp.token_oov + comp.token_class + comp.case + comp.tag + comp.attr;
+        let attributed = comp.token_hit
+            + comp.token_oov
+            + comp.token_class
+            + comp.case
+            + comp.lz_match
+            + comp.tag
+            + comp.attr;
         decomp.add("ac_finish", payload_bits.saturating_sub(attributed));
         decomp.add("framing", 32);
         decomp.add("padding", u64::from(pad_bits));
@@ -368,17 +488,87 @@ impl Codec for XmlTokCodec {
         let mut classifier = Classifier::new();
         let mut models = Models::new();
         let mut dict = Dict::default();
-        prewarm(&buf, &mut classifier, &mut models, &mut dict);
+        let mut matcher = TokenMatcher::new();
+        prewarm(&buf, &mut classifier, &mut models, &mut dict, &mut matcher);
 
         let mut reader = BitReader::new(&archive[4..]);
         let mut dec = AcDecoder::new(&mut reader);
         let mut last_class_ctx = CLASS_CTX_NONE;
         let mut prev_id: Option<u16> = None;
+        let mut uniform_cdf_cache = UniformCdfCache::new();
 
         while buf.len() - warm_end < measure_len {
             let mode = classifier.current_mode();
             match mode {
                 Mode::Content => {
+                    let mut flag_cdf = [0u32; 3];
+                    models.lz_flag.cdf_to(&mut flag_cdf);
+                    let flag = dec.decode(&flag_cdf)?;
+                    models.lz_flag.observe(flag);
+
+                    if flag == 1 {
+                        // LZ match record.
+                        let mut bucket_cdf = [0u32; OFFSET_BUCKET_ALPHABET + 1];
+                        models.lz_offset_bucket.cdf_to(&mut bucket_cdf);
+                        let bucket = dec.decode(&bucket_cdf)?;
+                        models.lz_offset_bucket.observe(bucket);
+                        let bucket_u32 = u32::try_from(bucket).expect("bucket fits u32");
+                        let offset = if bucket_u32 == 0 {
+                            1
+                        } else {
+                            let rel =
+                                decode_uniform_bits(&mut dec, &mut uniform_cdf_cache, bucket_u32)?;
+                            (1u32 << bucket_u32) + rel
+                        };
+
+                        let mut length_cdf = [0u32; 257];
+                        models.lz_length.cdf_to(&mut length_cdf);
+                        let length_token = dec.decode(&length_cdf)?;
+                        models.lz_length.observe(length_token);
+                        let length = tok_lz::MIN_MATCH + length_token;
+
+                        let stream_len = matcher.stream_len();
+                        let src_start =
+                            stream_len.checked_sub(offset as usize).with_context(|| {
+                                format!("match offset {offset} exceeds stream length {stream_len}")
+                            })?;
+
+                        // Collect matched ids, then emit them. Read ids
+                        // first so the matcher's stream isn't mutated
+                        // mid-loop (would invalidate the source range).
+                        let copied: Vec<u16> =
+                            (0..length).map(|k| matcher.at(src_start + k)).collect();
+
+                        for id in copied {
+                            let lower = dict.entry(id).lower.clone();
+                            let class = TokenClass::from_byte(lower[0]);
+                            let bytes = if class == TokenClass::Word {
+                                let pat = decode_case_with_token_prior(
+                                    &mut dec,
+                                    &mut models,
+                                    &dict,
+                                    id,
+                                    lower.len(),
+                                )?;
+                                dict.entry_mut(id).case_counts[pat.idx()] += 1;
+                                apply_case_decoded(&lower, pat, &mut dec, &mut models)?
+                            } else {
+                                lower
+                            };
+                            for &b in &bytes {
+                                buf.push(b);
+                                classifier.advance(b);
+                            }
+                            matcher.push(id);
+                            last_class_ctx = match class {
+                                TokenClass::Word => CLASS_CTX_WORD,
+                                TokenClass::Separator => CLASS_CTX_SEP,
+                            };
+                            prev_id = Some(id);
+                        }
+                        continue;
+                    }
+
                     let mut class_cdf = [0u32; 3];
                     models.token_class.cdf_to(last_class_ctx, &mut class_cdf);
                     let class_sym = dec.decode(&class_cdf)?;
@@ -391,6 +581,9 @@ impl Codec for XmlTokCodec {
                     for &b in &token_bytes {
                         buf.push(b);
                         classifier.advance(b);
+                    }
+                    if let Some(id) = new_prev {
+                        matcher.push(id);
                     }
                     last_class_ctx = match class {
                         TokenClass::Word => CLASS_CTX_WORD,
@@ -860,6 +1053,129 @@ fn decode_mixed_mask(
     Ok(out)
 }
 
+/// One lookahead token used by the LZ matcher's encode-time search.
+/// `end` is the byte position one past the token; `id` is the
+/// already-known dictionary id; `class` lets the encoder pick the
+/// case-emission path per token without re-classifying.
+#[derive(Clone, Copy, Debug)]
+struct TokenLookahead {
+    end: usize,
+    id: u16,
+    class: TokenClass,
+}
+
+/// Walk forward from `start`, tokenizing Content bytes into a
+/// sequence of `(end_pos, dict_id, class)` triples for the LZ
+/// matcher. Stops at:
+///   - `tok_lz::MAX_MATCH` collected tokens (the matcher won't
+///     extend past this anyway).
+///   - An OOV token (no dict id) — a match record can't bridge
+///     a slot that hasn't been assigned an id yet.
+///   - A separator that contains `<` — the next byte transitions
+///     into `TagStructure` mode and the Content run ends.
+fn lookahead_tokens(buf: &[u8], start: usize, dict: &Dict) -> Vec<TokenLookahead> {
+    let mut out = Vec::new();
+    let mut p = start;
+    while p < buf.len() && out.len() < tok_lz::MAX_MATCH {
+        let end = run_end(buf, p);
+        let token_bytes = &buf[p..end];
+        let class = TokenClass::from_byte(buf[p]);
+        let key = match class {
+            TokenClass::Word => lowercase(token_bytes),
+            TokenClass::Separator => token_bytes.to_vec(),
+        };
+        match dict.get(&key) {
+            Some(id) => out.push(TokenLookahead { end, id, class }),
+            None => break,
+        }
+        if class == TokenClass::Separator && token_bytes.contains(&b'<') {
+            // Include this token but stop further lookahead — the
+            // next byte is in TagStructure mode.
+            break;
+        }
+        p = end;
+    }
+    out
+}
+
+/// Cache of uniform CDFs for chunked raw-bit emission via the AC.
+/// Mirrors the helper in `xml_lz_cp` so LZ offset bucket-relative
+/// bits can be coded against the shared AC stream without
+/// materializing a 2^k CDF every emission.
+struct UniformCdfCache {
+    cdfs: [Option<Vec<u32>>; 9],
+}
+
+impl UniformCdfCache {
+    const fn new() -> Self {
+        Self {
+            cdfs: [const { None }; 9],
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn get(&mut self, bits: u32) -> &[u32] {
+        let idx = bits as usize;
+        assert!(
+            (1..=8).contains(&bits),
+            "uniform CDF requested for {bits}-bit alphabet; use chunked encoding for >8 bits",
+        );
+        if self.cdfs[idx].is_none() {
+            let n: usize = 1 << bits;
+            let mut cdf = vec![0u32; n + 1];
+            let n_u64 = n as u64;
+            for (i, slot) in cdf.iter_mut().enumerate().take(n) {
+                *slot = ((i as u64 * u64::from(TOTAL)) / n_u64) as u32;
+            }
+            cdf[n] = TOTAL;
+            self.cdfs[idx] = Some(cdf);
+        }
+        self.cdfs[idx].as_ref().expect("just populated").as_slice()
+    }
+}
+
+fn encode_uniform_bits(
+    enc: &mut AcEncoder<'_>,
+    cache: &mut UniformCdfCache,
+    value: u32,
+    n_bits: u32,
+) {
+    let mut remaining = n_bits;
+    let mut v = value;
+    while remaining > 0 {
+        let chunk = remaining.min(8);
+        let mask = (1u32 << chunk) - 1;
+        let cdf = cache.get(chunk);
+        let symbol = (v & mask) as usize;
+        enc.encode(cdf, symbol);
+        v >>= chunk;
+        remaining -= chunk;
+    }
+}
+
+fn decode_uniform_bits(
+    dec: &mut AcDecoder<'_, '_>,
+    cache: &mut UniformCdfCache,
+    n_bits: u32,
+) -> Result<u32> {
+    let mut value: u32 = 0;
+    let mut shift: u32 = 0;
+    let mut remaining = n_bits;
+    while remaining > 0 {
+        let chunk = remaining.min(8);
+        let cdf = cache.get(chunk);
+        let sym = dec.decode(cdf)?;
+        value |= u32::try_from(sym).expect("chunk ≤ 8 bits fits u32") << shift;
+        shift += chunk;
+        remaining -= chunk;
+    }
+    Ok(value)
+}
+
+const fn log2_floor(x: u32) -> u32 {
+    x.ilog2()
+}
+
 fn find_tag_run_end(measure: &[u8], start: usize, mut probe: Classifier) -> usize {
     let mut i = start;
     while i < measure.len() && probe.current_mode() == Mode::TagStructure {
@@ -873,7 +1189,13 @@ fn dict_lookup(run: &[u8]) -> Option<usize> {
     DICTIONARY.iter().position(|entry| *entry == run)
 }
 
-fn prewarm(warm: &[u8], classifier: &mut Classifier, models: &mut Models, dict: &mut Dict) {
+fn prewarm(
+    warm: &[u8],
+    classifier: &mut Classifier,
+    models: &mut Models,
+    dict: &mut Dict,
+    matcher: &mut TokenMatcher,
+) {
     let mut last_class_ctx = CLASS_CTX_NONE;
     let mut prev_id: Option<u16> = None;
     let mut i = 0;
@@ -887,7 +1209,15 @@ fn prewarm(warm: &[u8], classifier: &mut Classifier, models: &mut Models, dict: 
 
                 let end = run_end(warm, i);
                 let token = &warm[i..end];
-                prev_id = observe_token(models, dict, class, token, prev_id);
+                let new_id = observe_token(models, dict, class, token, prev_id);
+                if let Some(id) = new_id {
+                    matcher.push(id);
+                }
+                prev_id = new_id;
+                // Also observe the lz_flag=0 (no-match) for prewarm
+                // so the model arrives at measure with a calibrated
+                // P(no-match) prior.
+                models.lz_flag.observe(0);
 
                 for &b in token {
                     classifier.advance(b);
