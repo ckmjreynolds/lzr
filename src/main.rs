@@ -18,12 +18,15 @@
 
 mod ac;
 mod bits;
+mod bwt;
+mod bwt_codec;
 mod classifier;
 mod classifier_stats;
 mod codec;
 mod eval;
 mod lz;
 mod models;
+mod mtf;
 mod null;
 mod ppm;
 mod xml_codec;

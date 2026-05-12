@@ -21,6 +21,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::bwt_codec::BwtCodec;
 use crate::classifier_stats::ClassifierStats;
 use crate::codec::{Codec, Decomposition};
 use crate::null::NullCodec;
@@ -83,8 +84,9 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "xml-lz-ord3" => Ok(Box::new(XmlLzOrd3Codec)),
         "xml-lz-cp" => Ok(Box::new(XmlLzCpCodec)),
         "xml-lz-ppmc" => Ok(Box::new(XmlLzPpmcCodec)),
+        "bwt" => Ok(Box::new(BwtCodec)),
         other => bail!(
-            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc)"
+            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc, bwt)"
         ),
     }
 }
