@@ -25,6 +25,7 @@ use crate::classifier_stats::ClassifierStats;
 use crate::codec::{Codec, Decomposition};
 use crate::null::NullCodec;
 use crate::xml_codec::XmlCodec;
+use crate::xml_lz_ord3::XmlLzOrd3Codec;
 use crate::xml_lz_ppm::XmlLzPpmCodec;
 use crate::xml_lz_word::XmlLzWordCodec;
 use crate::xml_ppm::XmlPpmCodec;
@@ -77,8 +78,9 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "xml-ppm" => Ok(Box::new(XmlPpmCodec)),
         "xml-lz-ppm" => Ok(Box::new(XmlLzPpmCodec)),
         "xml-lz-word" => Ok(Box::new(XmlLzWordCodec)),
+        "xml-lz-ord3" => Ok(Box::new(XmlLzOrd3Codec)),
         other => bail!(
-            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word)"
+            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3)"
         ),
     }
 }

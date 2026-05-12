@@ -26,6 +26,7 @@ mod lz;
 mod models;
 mod null;
 mod xml_codec;
+mod xml_lz_ord3;
 mod xml_lz_ppm;
 mod xml_lz_word;
 mod xml_ppm;
