@@ -35,6 +35,7 @@ mod mtf;
 mod null;
 mod paq_codec;
 mod ppm;
+mod recon;
 mod survey;
 mod tok_lz;
 mod tokenizer;
@@ -107,6 +108,23 @@ enum Command {
         /// Corpus file path.
         #[arg(long, default_value = "assets/enwik8")]
         corpus: PathBuf,
+    },
+
+    /// Phase-0 recon for v3 next-phase decisions. Streams the full
+    /// corpus through XML + fine-grained wiki sub-classifier and a
+    /// page-id counter, building a global word-token table indexed by
+    /// `(token -> total, distinct_pages, max_in_page)`. Reports byte
+    /// share per sub-mode and the in-page repetition factor for the
+    /// top-N tokens — the two measurements that decide between
+    /// Proposal B (wiki-sub-mode word models) and Proposal C
+    /// (page-local cache).
+    Recon {
+        /// Corpus file path.
+        #[arg(long, default_value = "assets/enwik9")]
+        corpus: PathBuf,
+        /// Number of top tokens to list in the per-token table.
+        #[arg(long, default_value_t = 100)]
+        top: usize,
     },
 
     /// Compress a whole corpus through a codec end-to-end (no panel
@@ -275,5 +293,6 @@ fn main() -> Result<()> {
             out,
             skip_verify,
         } => run_compress(&corpus, &codec, &out, skip_verify),
+        Command::Recon { corpus, top } => recon::run_recon(&corpus, top),
     }
 }
