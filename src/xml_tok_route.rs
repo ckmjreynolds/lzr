@@ -140,11 +140,22 @@ const CLASS_NCTX: usize = 3;
 /// token"; 0-25 = previous lowercase letter.
 const LETTER_START: usize = 26;
 const LETTER_NCTX: usize = 27;
+/// Phase-20: joint context for the Order-4 OOV word letter model.
+/// `ctx = p4 * 27^3 + p3 * 27^2 + p2 * 27 + p1`. 531441 rows × 26
+/// syms × 4 bytes = ~55 MiB. The Order-2 → Order-3 → Order-4 sweep
+/// gained -0.0207, -0.0063, -0.0013 bpb on enwik8 e2e respectively;
+/// Order-5 (14M rows, ~1.5 GiB) regressed +0.003 because cells went
+/// too cold for the OOV byte volume.
+const LETTER_NCTX_O4: usize = LETTER_NCTX * LETTER_NCTX * LETTER_NCTX * LETTER_NCTX;
 
 /// Byte context for OOV-separator emission: index 256 = "start of
 /// token"; 0-255 = previous byte.
 const BYTE_START: usize = 256;
 const BYTE_NCTX: usize = 257;
+/// Phase-20g: joint context for the Order-2 OOV separator byte
+/// model. `ctx = prev_prev * 257 + prev` over `(BYTE_NCTX, BYTE_NCTX)`.
+/// 66049 rows × 256 syms × 4 bytes = ~64 MiB.
+const BYTE_NCTX_O2: usize = BYTE_NCTX * BYTE_NCTX;
 
 /// Hash-table size (log₂) for the bit-level dict-id predictor.
 /// Phase 15 folds `prev_id` into the context to make this an
@@ -154,7 +165,7 @@ const BYTE_NCTX: usize = 257;
 /// keep collision rate near zero at the new context-space size.
 /// Phase-19k: bumped from 2 ^ 24 to 2 ^ 25 (128 MiB → 256 MiB) so
 /// the long tail of Order-1 contexts has less collision pressure.
-const ID_BIT_K: u32 = 25;
+const ID_BIT_K: u32 = 27;
 /// Hash-table size for the bit-level length predictor. Length is
 /// independent of `prev_id`, so the context space stays as in
 /// Phase 14: 2^18 slots = 1 MiB.
@@ -170,7 +181,7 @@ const OFFSET_BUCKET_ALPHABET: usize = 21;
 /// larger than Order-1's. Phase-19i bumped from 2 ^ 26 to 2 ^ 27 to
 /// reduce collisions on the long tail of warm bigrams; the table is
 /// 1 GiB now (within the 10 GiB judging-machine budget).
-const ID_BIT_O2_K: u32 = 28;
+const ID_BIT_O2_K: u32 = 29;
 
 /// Hash-table size for the Order-3 `dict_id` bit predictor. Trigram
 /// context space is so large that hashing to 2 ^ 26 puts roughly one
@@ -204,17 +215,22 @@ const N_ID_CLASSES: u8 = 8;
 /// `(prev_id, current_predictor)` — predictor returns `P(stay)`.
 const ROUTER_BIT_K: u32 = 18;
 
-/// Hash-table size for the Order-1 `lz_flag` predictor. Context is
-/// `(prev_id)`. Replaces Order-0 `lz_flag` so the no-match flag
-/// (~90% of Content-token boundaries) is predicted with prev-token
-/// conditioning — after-separator-with-`{` tokens see more matches
-/// than after-prose-words, for instance.
-const LZ_FLAG_BIT_K: u32 = 20;
+/// Phase-20l: hash-table size for the Order-2 `lz_flag` predictor.
+/// Context = `(prev_prev_id, prev_id)`. The `lz_flag` bit is
+/// binary, so even cold bigrams converge fast (only 2 outcomes
+/// per context). 2^23 = 8 MiB. The Phase-19f Order-1 version
+/// (K=20) is now superseded; the `token_oov_bit` continues to use
+/// the prev-id-only hash from `lz_flag_ctx`.
+const LZ_FLAG_BIT_O2_K: u32 = 23;
 
 /// Hash-table size for the Order-1 `token_oov` predictor. Context
 /// is `(prev_id)`. Replaces Order-0 `token_oov` so P(hit vs OOV)
 /// is conditioned on the preceding token — after `[[` the next
-/// token has different OOV likelihood than after `the`.
+/// token has different OOV likelihood than after `the`. Phase-20m
+/// tested Order-2 (K=23) and it regressed +0.003 bpb on enwik8:
+/// the OOV/hit ratio is dominated by unigram `prev_id` stats, so
+/// Order-1 saturates fast and splitting into bigrams just starves
+/// cells.
 const TOKEN_OOV_BIT_K: u32 = 20;
 
 /// Context-row count for the Order-1 LZ match predictors
@@ -223,7 +239,9 @@ const TOKEN_OOV_BIT_K: u32 = 20;
 /// to fit (86 KiB for the 21-symbol bucket, 1 MiB for the 256-
 /// symbol length) while still giving the model meaningful prev-id
 /// stratification — after-`{` tokens have different match offset
-/// and length distributions than after-prose-words.
+/// and length distributions than after-prose-words. Phase-20n
+/// confirmed 1024 is the saturation point on enwik8 e2e too — 4096
+/// regressed +0.016 bpb because the length CDF cells went cold.
 const LZ_MATCH_NCTX: usize = 1024;
 
 /// Number of predictors in the routing stack. Generalized indexing
@@ -335,8 +353,15 @@ struct Models {
     /// Phase-19h: Order-1 `lz_length`.
     lz_length_o1: Order1Ctx<LZ_MATCH_NCTX, 256>,
 
-    oov_word_letter: Order1Ctx<LETTER_NCTX, 26>,
-    oov_sep_byte: Order1Ctx<BYTE_NCTX, 256>,
+    /// Phase-20j: Order-4 OOV word letter model. Context =
+    /// `p4 * 27^3 + p3 * 27^2 + p2 * 27 + p1`. 531441 rows × 26 syms
+    /// = ~55 MiB. Order-5 (Phase-20k, 14M rows) regressed enwik8
+    /// (+0.003 bpb) — cells too sparse for the OOV-byte volume.
+    oov_word_letter: Order1Ctx<LETTER_NCTX_O4, 26>,
+    /// Phase-20g: Order-2 OOV separator byte model. Context =
+    /// `prev_prev * 257 + prev`. 66049 rows × 256 syms × 4 bytes =
+    /// ~64 MiB.
+    oov_sep_byte: Order1Ctx<BYTE_NCTX_O2, 256>,
 
     case_pattern_global: Order0<4>,
     case_mixed_bit: Order0<2>,
@@ -370,10 +395,11 @@ struct Models {
     /// predictor per Content hit-token. Context = `(prev_id,
     /// current_predictor)`. Learns `P(stay)`.
     router_bit: BitPredictor,
-    /// Phase-19f: Order-1 `lz_flag` predictor — replaces the
-    /// previous Order-0 `lz_flag`. Context = `(prev_id)`. Predicts
-    /// `P(no-match)` per prev-token so we don't pay a flat ~0.46
-    /// bits per Content boundary regardless of context.
+    /// Phase-20l: Order-2 `lz_flag` predictor — replaces the
+    /// Order-1 `lz_flag`. Context = `(prev_prev_id, prev_id)`. The
+    /// bigram context catches structure the unigram misses (e.g.,
+    /// after `[[ X` vs `; X` the match likelihood for the same
+    /// `X` differs sharply). Binary outcome saturates fast.
     lz_flag_bit: BitPredictor,
     /// Phase-19g: Order-1 `token_oov` predictor — replaces the
     /// previous Order-0 `token_oov`. Context = `(prev_id)`.
@@ -402,7 +428,7 @@ impl Models {
             token_id_bit_wiki: BitPredictor::new(ID_BIT_WIKI_K),
             token_id_bit_class: BitPredictor::new(ID_BIT_CLASS_K),
             router_bit: BitPredictor::new(ROUTER_BIT_K),
-            lz_flag_bit: BitPredictor::new(LZ_FLAG_BIT_K),
+            lz_flag_bit: BitPredictor::new(LZ_FLAG_BIT_O2_K),
             token_oov_bit: BitPredictor::new(TOKEN_OOV_BIT_K),
         }
     }
@@ -483,7 +509,7 @@ impl Codec for XmlTokRouteCodec {
                             None
                         };
 
-                        let flag_ctx = lz_flag_ctx(ctx.p1);
+                        let flag_ctx = lz_flag_ctx_o2(ctx.p2, ctx.p1);
                         let flag_p_zero = models.lz_flag_bit.predict_p_zero(flag_ctx);
                         let flag_cdf = [0u32, flag_p_zero, TOTAL];
                         let flag_sym = u32::from(lz_match.is_some());
@@ -741,7 +767,7 @@ impl Codec for XmlTokRouteCodec {
             let mode = classifier.current_mode();
             match mode {
                 Mode::Content => {
-                    let flag_ctx = lz_flag_ctx(ctx.p1);
+                    let flag_ctx = lz_flag_ctx_o2(ctx.p2, ctx.p1);
                     let flag_p_zero = models.lz_flag_bit.predict_p_zero(flag_ctx);
                     let flag_cdf = [0u32, flag_p_zero, TOTAL];
                     let flag = dec.decode(&flag_cdf)?;
@@ -1253,10 +1279,20 @@ fn class_of_pp(prev_prev_id: Option<u32>) -> u8 {
     prev_prev_id.map_or(u8::MAX, class_of_slot)
 }
 
-/// Hash `(prev_id)` into the Order-1 `lz_flag` predictor's context.
+/// Hash `(prev_id)` into the Order-1 `lz_flag` and `token_oov`
+/// predictor's context. (The `token_oov_bit` shares this hash —
+/// it is binary and saturates fast on prev-id alone.)
 fn lz_flag_ctx(prev_id: Option<u32>) -> u64 {
     let p = prev_id.map_or(u64::MAX, u64::from);
     fnv_mix(FNV_OFFSET, p)
+}
+
+/// Phase-20l: Order-2 `lz_flag` context — `(prev_prev_id, prev_id)`.
+fn lz_flag_ctx_o2(prev_prev_id: Option<u32>, prev_id: Option<u32>) -> u64 {
+    let pp = prev_prev_id.map_or(u64::MAX, u64::from);
+    let p = prev_id.map_or(u64::MAX, u64::from);
+    let h = fnv_mix(FNV_OFFSET, pp);
+    fnv_mix(h, p)
 }
 
 /// Hash `(prev_id)` into a small context-row index for the Order-1
@@ -1530,14 +1566,21 @@ fn decode_length(dec: &mut AcDecoder<'_, '_>, models: &mut Models) -> Result<usi
 }
 
 fn encode_oov_word_bytes(enc: &mut AcEncoder<'_>, models: &mut Models, lower: &[u8]) {
-    let mut prev_ctx = LETTER_START;
+    let mut p4 = LETTER_START;
+    let mut p3 = LETTER_START;
+    let mut p2 = LETTER_START;
+    let mut p1 = LETTER_START;
     let mut cdf = [0u32; 27];
     for &b in lower {
         let idx = (b - b'a') as usize;
-        models.oov_word_letter.cdf_to(prev_ctx, &mut cdf);
+        let ctx = ((p4 * LETTER_NCTX + p3) * LETTER_NCTX + p2) * LETTER_NCTX + p1;
+        models.oov_word_letter.cdf_to(ctx, &mut cdf);
         enc.encode(&cdf, idx);
-        models.oov_word_letter.observe(prev_ctx, idx);
-        prev_ctx = idx;
+        models.oov_word_letter.observe(ctx, idx);
+        p4 = p3;
+        p3 = p2;
+        p2 = p1;
+        p1 = idx;
     }
 }
 
@@ -1546,29 +1589,39 @@ fn decode_oov_word_bytes(
     models: &mut Models,
     length: usize,
 ) -> Result<Vec<u8>> {
-    let mut prev_ctx = LETTER_START;
+    let mut p4 = LETTER_START;
+    let mut p3 = LETTER_START;
+    let mut p2 = LETTER_START;
+    let mut p1 = LETTER_START;
     let mut cdf = [0u32; 27];
     let mut out = Vec::with_capacity(length);
     for _ in 0..length {
-        models.oov_word_letter.cdf_to(prev_ctx, &mut cdf);
+        let ctx = ((p4 * LETTER_NCTX + p3) * LETTER_NCTX + p2) * LETTER_NCTX + p1;
+        models.oov_word_letter.cdf_to(ctx, &mut cdf);
         let idx = dec.decode(&cdf)?;
-        models.oov_word_letter.observe(prev_ctx, idx);
+        models.oov_word_letter.observe(ctx, idx);
         let b = b'a' + u8::try_from(idx).expect("letter idx fits u8");
         out.push(b);
-        prev_ctx = idx;
+        p4 = p3;
+        p3 = p2;
+        p2 = p1;
+        p1 = idx;
     }
     Ok(out)
 }
 
 fn encode_oov_sep_bytes(enc: &mut AcEncoder<'_>, models: &mut Models, bytes: &[u8]) {
-    let mut prev_ctx = BYTE_START;
+    let mut prev_prev = BYTE_START;
+    let mut prev = BYTE_START;
     let mut cdf = [0u32; 257];
     for &b in bytes {
         let idx = b as usize;
-        models.oov_sep_byte.cdf_to(prev_ctx, &mut cdf);
+        let ctx = prev_prev * BYTE_NCTX + prev;
+        models.oov_sep_byte.cdf_to(ctx, &mut cdf);
         enc.encode(&cdf, idx);
-        models.oov_sep_byte.observe(prev_ctx, idx);
-        prev_ctx = idx;
+        models.oov_sep_byte.observe(ctx, idx);
+        prev_prev = prev;
+        prev = idx;
     }
 }
 
@@ -1577,16 +1630,19 @@ fn decode_oov_sep_bytes(
     models: &mut Models,
     length: usize,
 ) -> Result<Vec<u8>> {
-    let mut prev_ctx = BYTE_START;
+    let mut prev_prev = BYTE_START;
+    let mut prev = BYTE_START;
     let mut cdf = [0u32; 257];
     let mut out = Vec::with_capacity(length);
     for _ in 0..length {
-        models.oov_sep_byte.cdf_to(prev_ctx, &mut cdf);
+        let ctx = prev_prev * BYTE_NCTX + prev;
+        models.oov_sep_byte.cdf_to(ctx, &mut cdf);
         let idx = dec.decode(&cdf)?;
-        models.oov_sep_byte.observe(prev_ctx, idx);
+        models.oov_sep_byte.observe(ctx, idx);
         let b = u8::try_from(idx).expect("byte symbol fits u8");
         out.push(b);
-        prev_ctx = idx;
+        prev_prev = prev;
+        prev = idx;
     }
     Ok(out)
 }
@@ -1854,7 +1910,7 @@ fn prewarm(
                 // so the model arrives at measure with a calibrated
                 // P(no-match) prior. Use the prev_id-conditioned
                 // bit predictor (Phase-19f).
-                let flag_ctx = lz_flag_ctx(ctx.p1);
+                let flag_ctx = lz_flag_ctx_o2(ctx.p2, ctx.p1);
                 models.lz_flag_bit.observe(flag_ctx, 0);
 
                 for &b in token {
@@ -1952,18 +2008,28 @@ fn observe_token(
 
         match class {
             TokenClass::Word => {
-                let mut prev = LETTER_START;
+                let mut p4 = LETTER_START;
+                let mut p3 = LETTER_START;
+                let mut p2 = LETTER_START;
+                let mut p1 = LETTER_START;
                 for &b in &key {
                     let idx = (b - b'a') as usize;
-                    models.oov_word_letter.observe(prev, idx);
-                    prev = idx;
+                    let ctx = ((p4 * LETTER_NCTX + p3) * LETTER_NCTX + p2) * LETTER_NCTX + p1;
+                    models.oov_word_letter.observe(ctx, idx);
+                    p4 = p3;
+                    p3 = p2;
+                    p2 = p1;
+                    p1 = idx;
                 }
             }
             TokenClass::Separator => {
+                let mut prev_prev = BYTE_START;
                 let mut prev = BYTE_START;
                 for &b in &key {
                     let idx = b as usize;
-                    models.oov_sep_byte.observe(prev, idx);
+                    let ctx = prev_prev * BYTE_NCTX + prev;
+                    models.oov_sep_byte.observe(ctx, idx);
+                    prev_prev = prev;
                     prev = idx;
                 }
             }

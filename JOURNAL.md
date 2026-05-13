@@ -13,6 +13,137 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 20: Order-N Byte Modeling on OOV Streams + Order-2 lz_flag — 1.929 bpb on Enwik9
+
+CDR returned and said "continue." The Phase 19k summary had handed off three candidates (PPM-D escape, OOV stream Order-2, mixing layer). With no further direction the cheapest first step was a fresh bit decomposition of the panel: where do the bits actually live in `xml-tok-route` Phase 19k? The answer reframed the next moves.
+
+### The decomposition (Phase 20a/b)
+
+Panel bench at 20 × 256 KiB measure windows, Phase 19k codec state:
+
+| Component | Bits | % of archive |
+|---|---:|---:|
+| `lz_match_ac` (combined) | 7,129,694 | 52.36% |
+| `token_hit_ac` | 3,711,050 | 27.22% |
+| `token_oov_ac` | 2,029,907 | 14.89% |
+| `case_ac` | 426,139 | 3.13% |
+| `router_ac` | 245,226 | 1.80% |
+| `tag_ac` | 65,301 | 0.48% |
+| smaller streams | <30 K | <0.3% |
+
+I split `lz_match_ac` into four sub-components (flag, bucket CDF, within-bucket uniform raw bits, length CDF) to see where the LZ bits really go:
+
+| Sub-component | Bits | % of archive |
+|---|---:|---:|
+| `lz_uniform_ac` (raw within-bucket offset bits) | 3,483,993 | 25.56% |
+| `lz_length_ac` | 1,423,485 | 10.44% |
+| `lz_bucket_ac` | 1,127,462 | 8.27% |
+| `lz_flag_ac` | 1,094,754 | 8.03% |
+
+**The largest single uncompressed bit pool in the archive is `lz_uniform_ac` at 25.56%** — the within-bucket position of the LZ offset, encoded as raw bits through a uniform CDF for AC framing consistency.
+
+### Phase 20c — `LZ_MATCH_NCTX` sweep, panel-window starvation
+
+Doubling `LZ_MATCH_NCTX` from 1024 to 16384 on the panel **regressed** +0.024 bpb. The split decomposition showed `lz_bucket_ac` stayed flat (21-symbol CDF already saturated at 1024 rows × 21 syms = 21 K cells with ~350 K matches/panel) while `lz_length_ac` went up by 128 K bits — the 256-symbol length CDF has 16 K rows × 256 syms = 4 M cells, with only ~10 K matches per 256 KiB measure window. Cells went cold. Phase 20n later re-confirmed this on enwik8 end-to-end (NCTX=4096 regressed +0.016 bpb), so `LZ_MATCH_NCTX = 1024` is the saturation point even at enwik9 scale.
+
+### Phase 20d — BitPredictor for the offset residual, abandoned
+
+The 1/x distribution of LZ offsets says the MSB of the within-bucket residual should be biased toward 0 (lower half of each octave is ~58% likely). Replaced `encode_uniform_bits(rel, bucket)` with a `BitPredictor` keyed on `(bucket, bit_pos, prefix, prev_id)`, K=22 = 4 M slots.
+
+- Panel: +0.007 bpb (small regression)
+- enwik8 e2e: +0.026 bpb / +323 K bytes (worse, the cold-context warmup outweighs the bias signal)
+
+Stripped `prev_id` and shrank to K=20 (`(bucket, bit_pos, prefix)` only):
+
+- enwik8 e2e: +0.0004 bpb / +4,799 bytes (essentially a wash)
+
+The theoretical maximum from the 1/x bias is ~0.022 bits/bit × ~3.5 M residual bits ≈ 77 K bits / panel = 0.7% of archive = 0.016 bpb. The signal is too weak to overcome per-context warmup overhead. Abandoned — `lz_uniform_ac` is treated as entropy-floor going forward.
+
+### Phase 20e/f — Order-1 and Order-2 dict_id table size
+
+The `ID_BIT_O2_K` curve from Phase 19j said K=27→28 gave -0.0040 on enwik9. The next steps:
+
+| K | Order-1 table | Order-2 table | enwik8 e2e bpb | Δ vs prior |
+|---:|---:|---:|---:|---:|
+| baseline (Phase 19k) | K=25 (256 MiB) | K=28 (1 GiB) | 2.2299 | — |
+| 20e: K=29 | K=25 | K=29 (2 GiB) | 2.2293 | -0.0006 |
+| 20e: K=30 | K=25 | K=30 (4 GiB) | 2.2289 | -0.0010 (vs K=28) |
+| 20f: K=26 | K=26 (512 MiB) | K=29 | 2.2283 | -0.0016 |
+| 20f: K=27 | K=27 (1 GiB) | K=29 | 2.2280 | -0.0019 |
+
+Settled on Order-1 K=27 + Order-2 K=29 (3 GiB total table). Diminishing returns past that; K=30 Order-2 added only -0.0004 over K=29 at the cost of doubling RAM. The per-doubling gain dropped from -0.0040 (K=27→28 on enwik9) to -0.0006 (K=28→29 on enwik8) — saturation as expected.
+
+### Phase 20g/i/j/k — Order-N byte modeling on OOV streams (the real win)
+
+`token_oov_ac` is the byte stream when a token isn't in the dict — `encode_length` + the per-character emission. Word characters used `Order1Ctx<27, 26>` (previous letter only, 729 cells); separator bytes used `Order1Ctx<257, 256>` (previous byte, ~66 K cells). Both Order-1 over the immediate preceding character.
+
+English bigram statistics are extremely peaked (`th`, `he`, `in`, `er`, `an`...). Order-2 modeling — context = `prev_prev_char * NCTX + prev_char` over `(LETTER_NCTX, LETTER_NCTX)` for words and `(BYTE_NCTX, BYTE_NCTX)` for separators — is trivial memory-wise (76 KiB and 64 MiB respectively) and the per-cell observation count should saturate quickly on any realistic corpus.
+
+| Phase | OOV word ctx | OOV sep ctx | enwik8 e2e bpb | Δ vs prior |
+|---|---|---|---:|---:|
+| baseline (Phase 20f, Order-1 both) | O1 | O1 | 2.2280 | — |
+| **20g word**: Order-2 word letter | **O2** (729 cells) | O1 | 2.2207 | -0.0073 |
+| **20g full**: + Order-2 sep byte | O2 | **O2** (66 K cells, ~64 MiB) | 2.2073 | -0.0207 |
+| **20i**: Order-3 word | **O3** (19 K cells) | O2 | 2.2010 | -0.0270 |
+| **20j**: Order-4 word | **O4** (531 K cells, ~55 MiB) | O2 | 2.1997 | -0.0283 |
+| 20k: Order-5 word | O5 (14 M cells, ~1.5 GiB) | O2 | 2.2027 | +0.003 from O4 — regression |
+
+Order-2 OOV separator (Phase 20g sep step) gave the single largest gain — **-0.0134 bpb** on its own — because the panel-level OOV breakdown turns out to be heavily separator-weighted (rare-byte sequences, URL fragments inside templates, accented letters). Word letter Order-2→3→4 then compounded: each new order dropped another 0.005–0.013 bpb on enwik8 e2e. Order-5 (14 M cells, 1.5 GiB) regressed because OOV-letter volume on enwik8 is ~1.5 M letters → 0.1 obs/cell on average, way too sparse. Order-4's 531 K cells at ~3 obs/cell is the sweet spot; enwik9 (~15 M OOV letters) would warm Order-5 better but probably not break even on warmup overhead vs Order-4.
+
+### Phase 20l — Order-2 `lz_flag`
+
+The `lz_flag` is binary (LZ match / no-match) emitted at every Content-token boundary. Order-1 (Phase 19f) saw `(prev_id)`; Order-2 sees `(prev_prev_id, prev_id)`. Binary streams converge fast even on cold bigrams (only two outcomes per cell), and the bigram catches multi-token structure the unigram misses — e.g., after `[[ X` for the same `X`, match likelihood differs sharply from after `; X` or `the X`.
+
+| Config | enwik8 e2e bpb |
+|---|---:|
+| 20j (Order-1 lz_flag, K=20) | 2.1997 |
+| 20l (Order-2 lz_flag, K=23 = 8 MiB) | 2.1983 |
+
+-0.0014 bpb / -17 K bytes on enwik8. Small but real and clean.
+
+### Phase 20m — Order-2 `token_oov_bit`, negative finding
+
+Applied the same Order-2 upgrade to the `token_oov_bit` (the per-token hit-vs-OOV decision). Result on enwik8 e2e: **+0.0029 bpb / +37 K bytes — regression**. The reason: hit-vs-OOV is dominated by unigram `prev_id` statistics, not by bigram structure. After common prev tokens (`the`, `of`, `in`...) P(OOV) is ~0.04 and saturates almost immediately at Order-1. Splitting into bigrams just halves the observations per cell with no extra signal to extract. Reverted.
+
+### End-to-end on enwik9 (the canonical measurement)
+
+| Config | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 19k baseline | 249,191,955 | 1.9935 | — |
+| Phase 20j (without Order-2 lz_flag) | 241,839,904 | 1.9347 | -0.0588 |
+| **Phase 20l (with Order-2 lz_flag) — final** | **241,105,534** | **1.9288** | **-0.0647** |
+
+The full archive drops **8.09 MiB on enwik9**. The codec is now at **2.20× the Hutter target** (down from 2.27× after Phase 19k). Cumulative from the original xml-tok Phase 16 baseline (2.0667): **-0.1379 bpb**.
+
+Time cost: encode 489 s, decode 201 s on enwik9 (Apple Silicon, single-threaded, default features). Memory peak ≈ 4 GiB.
+
+### Bit-budget tracking — what just moved
+
+The Order-N OOV byte models are doing exactly what the dict-id Order-2 routing did one level up: spending memory (55 MiB + 64 MiB on enwik8 e2e) to model a stream of high-entropy bytes against the bigram/trigram structure of natural English. The lesson generalizes: **wherever an emission stream still uses Order-0 or Order-1 byte-level conditioning, English's higher-order entropy floor (Order-3 ≈ 2.7 bits/letter, Order-4 ≈ 2.5) is leaving bits on the table.** Specifically out-of-scope for the lz_match path (offsets/lengths) where the symbols aren't English text and the bigram structure is the dict-id bigram, not letter bigrams.
+
+### What's left in this layer
+
+- **OOV separator Order-3**: 257^3 = 17 M direct rows = 17 GiB, over the 10 GiB budget. Would need hash-based addressing (BitPredictor-style with `(p3, p2, p1, bit_pos, prefix)` context). Probable -0.005 to -0.010 bpb on enwik9 based on Phase 20g/20i word scaling.
+- **`lz_offset_residual` modeled per-prev_id**: failed at K=22 because the within-octave 1/x bias is too small relative to per-context warmup cost. Could revisit with a much coarser context (just `(bucket, bit_pos)` over ~400 cells, fully saturated) but the theoretical ceiling is 0.016 bpb total — bounded.
+- **Cost-aware LZ matching**: currently emit a match whenever one exists at `MIN_MATCH = 3`. In warm bigram zones a 3-token match can cost more bits than 3 token emissions; skipping such matches deterministically (both sides compute the predicted cost) could save bits. Complex but a fresh direction.
+- **Page-conditional models**: track current page section (body / talk / redirect) and condition predictors. Recon (`run_recon`) already classifies pages; the wiring would be modest.
+
+The OOV/lz_flag wins are the cleanest extraction of the per-stream-Order-N pattern. Past this, gains come from architectural changes (e.g., mixing instead of routing) or external knowledge (grammar, semantics). The 1.93 bpb floor on enwik9 with a fully deterministic byte-level codec, no neural arm, no preprocessing, is now within reach of the v1 4M-parameter RWKV result (1.985 on enwik8 → ~1.98 on enwik9 extrapolated). The next branch question is whether v2 should pursue a neural arm, a richer non-neural model, or a different mode-routed split.
+
+### Tables not pursued
+
+| Idea | Phase | Result | Reason |
+|---|---|---|---|
+| `LZ_MATCH_NCTX = 4096`/16384 | 20c/20n | -0.024 panel / +0.016 e2e | lz_length cells go cold |
+| `BitPredictor` LZ offset residual K=22 (w/ prev_id) | 20d | +0.026 e2e | 1/x signal too weak vs warmup |
+| `BitPredictor` LZ offset residual K=20 (no prev_id) | 20d2 | +0.0004 e2e | wash |
+| `ID_BIT_O2_K = 30` | 20e | -0.0004 vs K=29 | memory not worth marginal gain |
+| `ID_BIT_K = 28` | (not measured) | n/a | already at saturation curve at K=27 |
+| Order-5 OOV word | 20k | +0.003 from O4 | 14 M cells too sparse for OOV volume |
+| Order-2 `token_oov_bit` K=23 | 20m | +0.003 e2e | OOV/hit dominated by unigram |
+
+---
+
 ## 2026-05-16 — Phase 19: Routing Saturates at N=2; Order-1 Upgrades Compound to 2.006 bpb on Enwik9
 
 CDR asked for a systematic sweep of three extensions to Phase 18's cost-aware routing — stickiness sweep, additional predictors (Order-3 hashed, wiki-sub-mode-conditional, class-based), and (later) Order-1 conditioning on the other Order-0 emission streams the codec was using. The framing was explicit: "test them all and report back," with grammar-aware and wide-context-window approaches called out as candidates of interest.
