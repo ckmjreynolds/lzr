@@ -276,12 +276,29 @@ const ID_SPARSE_LR_LR: f32 = 0.02;
 /// Phase-23A: number of features the `dict_id` sparse-LR carries.
 /// `[Order-3-hashed, Wiki × Order-2, (bit_pos, prefix) bias]`.
 const N_LR_ID_FEATS: usize = 3;
-/// Phase-21: number of predictors in the `lz_flag` mixer.
-/// `[Order-1, Order-2]`.
-const N_MIX_LZ_FLAG: usize = 2;
-/// Phase-21: number of predictors in the `token_oov_bit` mixer.
-/// `[Order-1, Order-2]`.
-const N_MIX_TOKEN_OOV: usize = 2;
+/// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
+/// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
+/// Order-3 + wiki cross-features at SGD-amortized cost.
+const N_MIX_LZ_FLAG: usize = 3;
+/// Phase-21 / Phase-23B: number of predictors in the
+/// `token_oov_bit` mixer. `[Order-1, Order-2, SparseLR]`. Mirrors
+/// the `lz_flag` mix — same context, different target bit.
+const N_MIX_TOKEN_OOV: usize = 3;
+
+/// Phase-23B: weight-table size per feature in the binary-decision
+/// sparse-LRs (`lz_flag`, `token_oov_bit`). K=20 → 1 Mi slots ×
+/// 4 bytes × 3 features × 2 streams = 24 MiB total. Smaller than
+/// the `dict_id` LR because each stream emits one bit per token, so
+/// the per-feature observation rate is ~16× lower than the `dict_id`
+/// stream; K=20 keeps the average obs/slot near 1.
+const FLAG_SPARSE_LR_K: u32 = 20;
+/// Phase-23B: SGD learning rate for the binary-decision sparse-LRs.
+const FLAG_SPARSE_LR_LR: f32 = 0.02;
+/// Phase-23B: number of features each binary-decision sparse-LR
+/// carries. `[Order-3-hashed, Wiki × Order-2, Wiki × Order-1]`.
+/// `lz_flag` and `token_oov_bit` share the feature shape; the
+/// per-stream weight tables differ because the target bits differ.
+const N_LR_FLAG_FEATS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct XmlTokRouteCodec;
@@ -413,6 +430,15 @@ struct Models {
     /// chosen to be signals the count-table base predictors miss:
     /// hashed Order-3, wiki × Order-2, and a position-prefix bias.
     token_id_sparse_lr: SparseLR<N_LR_ID_FEATS>,
+    /// Phase-23B: sparse-LR for the `lz_flag` binary decision —
+    /// 3rd arm of `lz_flag_mixer`. Features: hashed Order-3, wiki ×
+    /// Order-2, wiki × Order-1. Same shape used by
+    /// `token_oov_sparse_lr`.
+    lz_flag_sparse_lr: SparseLR<N_LR_FLAG_FEATS>,
+    /// Phase-23B: sparse-LR for the `token_oov_bit` binary decision —
+    /// 3rd arm of `token_oov_mixer`. Same feature shape as the
+    /// `lz_flag` LR with independent weights (the target bit differs).
+    token_oov_sparse_lr: SparseLR<N_LR_FLAG_FEATS>,
 }
 
 impl Models {
@@ -442,6 +468,8 @@ impl Models {
             lz_flag_mixer: LogitMixer::new(LZ_FLAG_MIXER_K, MIXER_LR),
             token_oov_mixer: LogitMixer::new(TOKEN_OOV_MIXER_K, MIXER_LR),
             token_id_sparse_lr: SparseLR::new(ID_SPARSE_LR_K, ID_SPARSE_LR_LR),
+            lz_flag_sparse_lr: SparseLR::new(FLAG_SPARSE_LR_K, FLAG_SPARSE_LR_LR),
+            token_oov_sparse_lr: SparseLR::new(FLAG_SPARSE_LR_K, FLAG_SPARSE_LR_LR),
         }
     }
 }
@@ -1372,39 +1400,85 @@ fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, ctx: PredCtx, id
     }
 }
 
-/// Phase-21: read both `lz_flag` base predictors' `P(no-match)`
-/// and return the mixed value. State is not mutated; call
-/// `observe_lz_flag_bit` after the bit is known.
+/// Phase-23B: feature hashes shared by the `lz_flag` and
+/// `token_oov_bit` sparse-LRs. Both are binary decisions made once
+/// per token, with identical available context (`p3..p1`, `wiki`),
+/// so they share the feature shape; the per-stream weight tables
+/// differ because the targets differ.
+fn flag_lr_features(ctx: PredCtx) -> [u64; N_LR_FLAG_FEATS] {
+    let p1 = ctx.p1.map_or(u64::MAX, u64::from);
+    let p2 = ctx.p2.map_or(u64::MAX, u64::from);
+    let p3 = ctx.p3.map_or(u64::MAX, u64::from);
+    let wiki = u64::from(ctx.wiki);
+
+    // Order-3 hashed: (p3, p2, p1). The natural ~2^48 logical-cell
+    // count is unreachable for a count table; SGD averages noisy
+    // updates across hash collisions instead.
+    let f_o3 = {
+        let h = fnv_mix(FNV_OFFSET, p3);
+        let h = fnv_mix(h, p2);
+        fnv_mix(h, p1)
+    };
+
+    // Wiki × Order-2: lets the wiki sub-mode bend the bigram
+    // match/OOV rates without paying for a dedicated count table.
+    let f_wiki_o2 = {
+        let h = fnv_mix(FNV_OFFSET, wiki);
+        let h = fnv_mix(h, p2);
+        fnv_mix(h, p1)
+    };
+
+    // Wiki × Order-1: coarser, denser cross — captures the wiki
+    // sub-mode unigram interaction even when p2 lands in a cold
+    // slot of the higher-order feature.
+    let f_wiki_o1 = {
+        let h = fnv_mix(FNV_OFFSET, wiki);
+        fnv_mix(h, p1)
+    };
+
+    [f_o3, f_wiki_o2, f_wiki_o1]
+}
+
+/// Phase-21 / Phase-23B: read all `lz_flag` base predictors'
+/// `P(no-match)` and the mixer-blended value. State is not
+/// mutated; call `observe_lz_flag_bit` after the bit is known.
 fn lz_flag_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX_LZ_FLAG], u32) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
+    let feats = flag_lr_features(ctx);
     let p_zeros = [
         models.lz_flag_bit_o1.predict_p_zero(ctx_o1),
         models.lz_flag_bit.predict_p_zero(ctx_o2),
+        models.lz_flag_sparse_lr.predict(&feats),
     ];
     let p_mixed = models.lz_flag_mixer.predict(ctx_o1, &p_zeros);
     (p_zeros, p_mixed)
 }
 
-/// Phase-21: observe one `lz_flag` bit in both base predictors
-/// and the mixer. `p_zeros` should be the same array returned by
-/// `lz_flag_p_mixed` for the same context.
+/// Phase-21 / Phase-23B: observe one `lz_flag` bit in every base
+/// predictor and the mixer. `p_zeros` should be the same array
+/// returned by `lz_flag_p_mixed` for the same context.
 fn observe_lz_flag_bit(models: &mut Models, ctx: PredCtx, p_zeros: [u32; N_MIX_LZ_FLAG], bit: u32) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
+    let feats = flag_lr_features(ctx);
     models.lz_flag_bit_o1.observe(ctx_o1, bit);
     models.lz_flag_bit.observe(ctx_o2, bit);
+    models.lz_flag_sparse_lr.observe(&feats, bit);
     models.lz_flag_mixer.observe(ctx_o1, &p_zeros, bit);
 }
 
-/// Phase-21: read both `token_oov` base predictors' `P(hit)` and
-/// the mixer-blended value. Same shape as `lz_flag_p_mixed`.
+/// Phase-21 / Phase-23B: read all `token_oov` base predictors'
+/// `P(hit)` and the mixer-blended value. Same shape as
+/// `lz_flag_p_mixed`.
 fn token_oov_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX_TOKEN_OOV], u32) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
+    let feats = flag_lr_features(ctx);
     let p_zeros = [
         models.token_oov_bit.predict_p_zero(ctx_o1),
         models.token_oov_bit_o2.predict_p_zero(ctx_o2),
+        models.token_oov_sparse_lr.predict(&feats),
     ];
     let p_mixed = models.token_oov_mixer.predict(ctx_o1, &p_zeros);
     (p_zeros, p_mixed)
@@ -1418,8 +1492,10 @@ fn observe_token_oov_bit(
 ) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
+    let feats = flag_lr_features(ctx);
     models.token_oov_bit.observe(ctx_o1, bit);
     models.token_oov_bit_o2.observe(ctx_o2, bit);
+    models.token_oov_sparse_lr.observe(&feats, bit);
     models.token_oov_mixer.observe(ctx_o1, &p_zeros, bit);
 }
 

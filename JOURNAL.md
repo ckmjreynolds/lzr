@@ -13,6 +13,66 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23B: Sparse-LR on `lz_flag` and `token_oov_bit` Mixers — 1.881 bpb on Enwik9
+
+Follow-up to Phase 23A. The same `SparseLR` primitive applied to the two remaining mixed streams — `lz_flag` (was this token an LZ match?) and `token_oov_bit` (was the non-match token an OOV?). Both are 1-bit-per-token decisions already mixing Order-1 + Order-2 count predictors; the sparse-LR adds the same shape of hashed cross-features that worked at the `dict_id` layer.
+
+### What landed
+
+1. **`flag_lr_features(ctx)`** in `src/xml_tok_route.rs` — a shared 3-feature shape for the two binary streams:
+   - **Hashed Order-3**: `(p3, p2, p1)`. Natural cell count ~2^48; SGD with K=20 collisions.
+   - **Wiki × Order-2**: `(wiki, p2, p1)`.
+   - **Wiki × Order-1**: `(wiki, p1)`. Denser, captures the wiki-unigram interaction when p2 lands cold.
+2. **Two independent `SparseLR<3>` predictors**, one per stream, K=20 (1 Mi slots × `f32` per feature). 24 MiB total: 4 MiB × 3 features × 2 streams. Same `lr = 0.02` as Phase 23A.
+3. **Mixer arities bumped**: `N_MIX_LZ_FLAG` 2 → 3, `N_MIX_TOKEN_OOV` 2 → 3.
+
+The two LRs share their feature shape because their available context is identical, but the per-stream weights differ — the LZ-match decision and the OOV decision are correlated but not equivalent.
+
+### Results
+
+| Config | enwik8 e2e bpb | Δ vs Phase 23A |
+|---|---:|---:|
+| Phase 23A | 2.1274 | — |
+| **Phase 23B** | **2.1243** | **-0.0031** |
+
+| Config | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23A |
+|---|---:|---:|---:|
+| Phase 23A | 1.8841 | 235,510,295 | — |
+| **Phase 23B** | **1.8810** | **235,124,739** | **-0.0031 / -376 KiB** |
+
+The enwik8 and enwik9 deltas are identical to four decimals (-0.0031). That's consistent with the binary streams being relatively scale-invariant — the OOV/hit and match/non-match ratios stabilize quickly and don't sharpen the same way the dict_id stream does as the corpus grows. Encode time on enwik9: 559 s (≈ Phase 23A's 555 s); the two extra LR observers add negligible per-token cost.
+
+### Phase 23B cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 19k | 249,191,955 | 1.9935 | — |
+| Phase 20l | 241,105,534 | 1.9288 | -0.0647 |
+| Phase 21 | 237,259,434 | 1.8981 | -0.0954 |
+| Phase 22 | 237,120,859 | 1.8970 | -0.0965 |
+| Phase 23A | 235,510,295 | 1.8841 | -0.1094 |
+| **Phase 23B** | **235,124,739** | **1.8810** | **-0.1125** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1857 bpb / -18.6 MiB on enwik9**. Hutter ratio: **2.14× target**.
+
+### Why the gain is smaller than 23A
+
+Phase 23A landed -0.0129 bpb on enwik9; Phase 23B added another -0.0031. Two reasons the second deployment is smaller:
+
+1. **Stream size.** The `dict_id` stream is ~17 bits/hit-token; `lz_flag` and `token_oov_bit` are 1 bit/token each. Even a large relative improvement on a small stream is a small absolute one.
+2. **Diminishing context-feature returns.** The Phase 21 mixer note "the per-bigram cells starved because the OOV/hit ratio is dominated by unigram `prev_id` stats" still applies — the higher-order signal is genuinely thinner here than at the dict_id layer. The LR weights end up assigning most of their mass to the wiki × Order-1 feature (the densest, most general one), with smaller marginal contributions from the Order-3 and wiki × Order-2 features.
+
+Both observations argue for landing the gain and moving on rather than pushing K higher on these particular streams.
+
+### Next probes still in the LR family
+
+- **Bump dict_id LR K from 22 → 24** (192 MiB total): the dict_id stream is large enough that the Order-3 feature might still be saturation-limited at K=22.
+- **Add a sparse-LR arm to `case_pattern_global`** or the OOV byte streams (`oov_word_letter`, `oov_sep_byte`) — neither currently uses a mixer; landing them would require adding a mixer layer first.
+
+After those, step B (small online MLP) remains the next architectural step.
+
+---
+
 ## 2026-05-13 — Phase 23A: Sparse-LR as Fourth `dict_id` Mixer Arm — 1.884 bpb on Enwik9
 
 CDR set the next major lever as a neural arm with an explicit A → B → C path (sparse-LR → small online MLP → pretrained-and-embedded transformer), under two hard constraints: no GPU at test time, and the Hutter time budget (70,000 / Geekbench5 hours). Step A is the cheapest move that still exercises the integration path — a sparse logistic regression as a 4th arm of the Phase-22 `dict_id` mixer. It lives entirely in CPU scalar `f32` + one `exp` per bit, so determinism and runtime are trivially satisfied; the only open question was whether it would buy real bits.
