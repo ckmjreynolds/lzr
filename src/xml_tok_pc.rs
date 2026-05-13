@@ -1171,12 +1171,7 @@ fn cache_pos_ctx(prefix: u32, bit_pos: u32) -> u64 {
 /// occurrence — so the bit predictor on `(prefix, bit_pos)` quickly
 /// learns the leading bits are zero and the tail bits are nearly
 /// uniform.
-fn encode_cache_pos(
-    enc: &mut AcEncoder<'_>,
-    models: &mut Models,
-    slot: u32,
-    cache_next: usize,
-) {
+fn encode_cache_pos(enc: &mut AcEncoder<'_>, models: &mut Models, slot: u32, cache_next: usize) {
     let rel = slot_to_rel(slot, cache_next);
     let mut prefix: u32 = 0;
     for bit_pos in (0..PAGE_CACHE_POS_BITS).rev() {
@@ -1538,8 +1533,7 @@ fn prewarm(
 
                 let end = run_end(warm, i);
                 let token = &warm[i..end];
-                let new_id =
-                    observe_token(models, dict, page_cache, class, token, prev_id);
+                let new_id = observe_token(models, dict, page_cache, class, token, prev_id);
                 if let Some(id) = new_id {
                     matcher.push(id);
                     page_cache.push(id);

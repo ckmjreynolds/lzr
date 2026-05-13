@@ -1,3 +1,8 @@
 .claude/
 rustc-ice-*.txt
 target/
+.DS_Store
+assets/
+checkpoints/
+lcov.info
+src/.DS_Store

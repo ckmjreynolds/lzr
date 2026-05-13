@@ -309,9 +309,7 @@ pub(crate) fn run_recon(corpus: &Path, top_k: usize) -> Result<()> {
     }
 
     if in_word {
-        let entry = token_stats
-            .entry(word_buf)
-            .or_insert_with(TokenStats::new);
+        let entry = token_stats.entry(word_buf).or_insert_with(TokenStats::new);
         entry.observe(page_id);
         word_per_submode[word_submode.idx()] += 1;
     }
@@ -443,10 +441,22 @@ pub(crate) fn run_recon(corpus: &Path, top_k: usize) -> Result<()> {
     let template_w = word_per_submode[WikiFine::TemplateName.idx()]
         + word_per_submode[WikiFine::TemplateArg.idx()];
     println!("Proposal-B signal: word-token slice by sub-mode");
-    println!("  Plain words:        {plain_w} ({:>5.2}%)", 100.0 * plain_w as f64 / word_f);
-    println!("  LinkTarget words:   {link_target_w} ({:>5.2}%)", 100.0 * link_target_w as f64 / word_f);
-    println!("  LinkDisplay words:  {link_display_w} ({:>5.2}%)", 100.0 * link_display_w as f64 / word_f);
-    println!("  Template* words:    {template_w} ({:>5.2}%)", 100.0 * template_w as f64 / word_f);
+    println!(
+        "  Plain words:        {plain_w} ({:>5.2}%)",
+        100.0 * plain_w as f64 / word_f
+    );
+    println!(
+        "  LinkTarget words:   {link_target_w} ({:>5.2}%)",
+        100.0 * link_target_w as f64 / word_f
+    );
+    println!(
+        "  LinkDisplay words:  {link_display_w} ({:>5.2}%)",
+        100.0 * link_display_w as f64 / word_f
+    );
+    println!(
+        "  Template* words:    {template_w} ({:>5.2}%)",
+        100.0 * template_w as f64 / word_f
+    );
 
     Ok(())
 }
