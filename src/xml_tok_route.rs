@@ -283,7 +283,11 @@ const N_LR_ID_FEATS: usize = 3;
 const ID_MLP_K: u32 = 20;
 /// Phase-23D: SGD learning rate for the `dict_id` MLP.
 const ID_MLP_LR: f32 = 0.02;
-/// Phase-23D: hidden dimension of the `dict_id` MLP.
+/// Phase-23D: hidden dimension of the `dict_id` MLP. Phase 23I
+/// tested `H=16` to diagnose feature- vs capacity-limitation; it
+/// landed +0.0002 bpb on enwik8 at +13 % encode and +192 MiB,
+/// confirming the diminishing-returns curve is feature-limited.
+/// Reverted to `H=8`.
 const ID_MLP_H: usize = 8;
 /// Phase-23D → Phase-23H: feature count of the `dict_id` MLP.
 /// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),

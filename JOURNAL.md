@@ -13,6 +13,40 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23I (Diagnostic, Negative): MLP `H=8 → H=16` Doesn't Help — Reverted
+
+Phase 23H's journal posed an explicit question: the 23F/G/H diminishing-returns curve could be **feature exhaustion** (we've mined the length-pair signal) or **capacity exhaustion** (the `H=8` hidden layer can't decompose more feature directions). Phase 23I tested it with a one-line change.
+
+### What was tried
+
+`ID_MLP_H` 8 → 16. No feature changes. Doubles the MLP's embedding tables (192 MiB → 384 MiB) and approximately doubles the per-bit MLP forward/backward work.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik8 bytes | Δ vs Phase 23H |
+|---|---:|---:|---:|
+| Phase 23H (`H=8`) | 2.1106 | 26,382,241 | — |
+| Phase 23I (`H=16`) | 2.1108 | 26,384,504 | **+0.0002 / +2,263 bytes** |
+
+Encode time grew +13 % (84 s → 95 s); decode +23 % (44 s → 54 s). Memory +192 MiB. Did not run enwik9 — enwik8 was already trending the wrong way and the marginal-cost-vs-marginal-gain math is clear-cut against keeping it.
+
+### Verdict
+
+**The MLP is feature-limited, not capacity-limited.** `H=8` already has enough hidden directions for the six features it carries. The diminishing returns in Phases 23F/G/H come from the length-pair feature space genuinely running dry, not from a representational bottleneck.
+
+This rules out scale-up of the existing architecture as a productive lever and refocuses next moves on bringing in genuinely-new information sources:
+
+- **`recency_bucket`** — bytes since last LZ-match, capped at 64. Independent of `p3..p1` and the length pair; captures "are we in a hot copy-region or in unique content?".
+- **`page_offset_bucket`** — coarse byte position within the current page (early infobox vs. mid prose vs. references tail). Independent of dict-id history.
+
+Both require new tracking in the encode/decode loops (a counter that resets at LZ-match / page boundary). Heavier plumbing than 23F/G/H's `PredCtx` extensions, but the **expected information content is higher** because these features aren't a transformation of existing PredCtx fields.
+
+### Reverted
+
+`ID_MLP_H` restored to 8 in `src/xml_tok_route.rs`. Journal stays as a guardrail: scaling MLP hidden dim doesn't substitute for missing information.
+
+---
+
 ## 2026-05-13 — Phase 23H: `(p1_len, p2_len)` Joint Coarse Feature — 1.875 bpb on Enwik9
 
 Cheapest extension after 23F/23G — combine the two existing length fields into an explicit `(p1_len_bucket, p2_len_bucket, prefix, bit_pos)` joint feature, no new `PredCtx` plumbing.
