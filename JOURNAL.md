@@ -13,6 +13,68 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 17: Page-Local Cache (Negative at Enwik9, +0.008 bpb)
+
+Following the Phase-0 recon, the candidate Proposal C — a per-page ring-buffer cache of dictionary ids reset at every `<page>` boundary — looked like the most promising novel angle. The recon showed mean `avg_in_page = 2.89` across enwik9's top-1000 word types (with mid-rank outliers like "td" at avg 76 per page), suggesting substantial in-page repetition to amortize over. The implementation lands as `xml-tok-pc`: an additive layer over `xml-tok` that emits a `cache_flag` bit (BitPredictor on `prev_id`) before each Content hit-token, and on `cache_flag=1` emits a recency-relative position via a second BitPredictor whose context drops `prev_id` to converge on the MRU-dominant rel distribution.
+
+### Cache-size sweep on enwik8 full panel
+
+The position-cost / hit-rate trade-off has a clear sweet spot well below the natural "fits a typical page" choice:
+
+| `PAGE_CACHE_SIZE` | bpb (full panel, enwik8) | Δ vs xml-tok |
+|---:|---:|---:|
+| 4096 (12-bit pos) | 2.391 | +0.010 (regression) |
+| 1024 (10-bit pos) | 2.372 | -0.009 |
+|  512 (9-bit pos)  | 2.356 | -0.025 |
+|  256 (8-bit pos)  | 2.345 | -0.036 |
+|  128 (7-bit pos)  | **2.339** | **-0.042** |
+|   64 (6-bit pos)  | 2.339 | -0.042 |
+|   32 (5-bit pos)  | 2.345 | -0.036 |
+
+Smaller caches win because position cost drops faster than hit rate falls. The recon's mean `avg_in_page = 2.89` means re-occurrences cluster in a short recency window; a 128-slot cache catches almost all of them at 7 bits raw position cost, vs. a 4096-slot cache paying 12 bits raw to retain barely more hits.
+
+### Panel vs. end-to-end vs. enwik9: the gain disappears at scale
+
+The chosen 128-slot configuration was then measured at three scales:
+
+| Scale | xml-tok bpb | xml-tok-pc bpb | Δ |
+|---|---:|---:|---:|
+| enwik8 full panel (20 × 256 KiB measure, fresh predictor per window) | 2.381 | 2.339 | **-0.042** |
+| enwik8 end-to-end (`encode_window(b"", &enwik8)`) | 2.2576 | 2.2433 | -0.014 |
+| **enwik9 end-to-end** (`encode_window(b"", &enwik9)`) | **2.0667** | **2.0745** | **+0.008** |
+
+The cache *regresses* on the actual Hutter target.
+
+### Mechanism: bit-predictor saturation eats the cache's headroom
+
+The page cache was designed to amortize the **first-occurrence cost** of page-concentrated rare tokens — the bit predictor's `(prev_id, prefix, bit_pos)` table is data-starved on those tokens early in the corpus, so the first few mentions of "Einstein" inside the Einstein page each cost 12–18 bits and the cache could replace those with 5–7-bit cache positions.
+
+As the corpus grows, the bit predictor accumulates per-context observations. At enwik9 scale (200 M Content hit-tokens × 18 bits per id emission = 3.6 G bit-level observations spread across 16 M predictor slots, ~225 observations per slot average), the predictor's marginal cost on rare-but-page-repeated tokens drops from ~15 bits to ~6 bits. The cache, fixed at 1 (flag) + ~5 (position) ≈ 6 bits per hit, no longer beats it — and the `cache_flag` overhead paid on **every** hit-token (the predictor learns to predict `0` for hot tokens, but never with full confidence) becomes the dominant cost.
+
+Quick BoE on enwik9: 250 M hit-tokens × ~0.07 bit/flag = 17.5 MB of cache_flag overhead. Cache savings at 30% hit rate × ~1.5 bits avg/hit = 14 MB. Net **-3.5 MB**, matching the observed +1 MB archive size regression.
+
+### Methodology note: the panel's third blind spot
+
+The panel-survey discipline calibrated against Order-2 word context (Phase 3) revealed that the panel can **overstate** gains for predictors that need lots of training data, because each panel window starts with fresh model state. Phase 17 reveals the opposite failure mode: the panel can also **overstate** gains for codec changes that compete with a predictor whose marginal cost falls with training volume. Either direction, the rule is the same — extrapolation from panel to end-to-end is **not** justified for changes whose ROI depends on model state. The panel is a comparator for **local** effects (same model state, two codec paths); architectural decisions like "add a cache" need end-to-end validation on the actual target corpus.
+
+Added to the rule of thumb: **a panel gain greater than ±0.02 bpb that depends on shared adaptive state should always be re-measured end-to-end on enwik8 before committing the design; gains that survive enwik8 should be re-measured on enwik9 before claiming.**
+
+### What to do with the code
+
+`xml-tok-pc` is left in the tree as an experimental side-path codec, addressable via `--codec xml-tok-pc`. It's bit-identical to xml-tok minus the cache layer (removing the cache-flag emission and falling back to Path A recovers xml-tok). The recon module (`src/recon.rs`) is the more durable artifact — it lands the byte-share-per-wiki-sub-mode and per-token page-locality measurements we'll want for any subsequent architectural decision.
+
+### Implication for next phase
+
+The take-away is that **the bit predictor itself is the bottleneck**, not its inputs. At enwik9 scale, a 16 M-slot bit predictor with `(prev_id, prefix, bit_pos)` context is roughly saturated on the head distribution but still under-trained on the tail. The path forward is to make the predictor **stronger** rather than route around it:
+
+1. **PPM-D-style word context with escape** (Phase 18 candidate, Proposal A from the recon). Order-2 word with explicit escape to Order-1, calibrated against the saturated bit-predictor's per-token cost. Standard cmix machinery, predicted **0.05–0.15 bpb**, lower variance than Phase 17.
+2. **Mixer over multiple predictors**. Run Order-1 and Order-2 in parallel, combine via logistic regression on context features. Even more cmix-like, predicted **0.10–0.20 bpb** but adds significant complexity.
+3. **Different bit-predictor shape**. Replace the FNV-hashed (prev_id, prefix, bit_pos) with something closer to a probabilistic suffix tree, so the predictor degrades to lower orders smoothly when high-order contexts are starved. Less standard, predicted **0.05–0.15 bpb** with significant implementation cost.
+
+Phase 18 will run with option 1.
+
+---
+
 ## 2026-05-13 — Case-CDF zero-mass AC desync (bug fix)
 
 End-to-end compression of enwik8 through xml-tok crashed reproducibly at byte 74_825_535 with `index out of bounds` in `tok_lz.rs:64` (`stream[pos]` with `pos == stream.len()`). The same call shape — `codec.encode_window(b"", &corpus_bytes)` — works on the panel (4 MiB warm + 256 KiB measure per window) and on the 8 KiB unit test; it only fails at sustained encode beyond ~75 MB. CDR asked for a single end-to-end enwik9 run after Phase 3 was reverted; the bug surfaced because the panel never exercises a continuous AC stream long enough for this CDF degenerate case to land.

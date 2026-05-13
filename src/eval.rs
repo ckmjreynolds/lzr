@@ -34,6 +34,7 @@ use crate::xml_lz_ppmc::XmlLzPpmcCodec;
 use crate::xml_lz_word::XmlLzWordCodec;
 use crate::xml_ppm::XmlPpmCodec;
 use crate::xml_tok::XmlTokCodec;
+use crate::xml_tok_pc::XmlTokPcCodec;
 use crate::xml_wiki_lz_cp::XmlWikiLzCpCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
@@ -96,10 +97,11 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "xml-lz-ppmc" => Ok(Box::new(XmlLzPpmcCodec)),
         "xml-wiki-lz-cp" => Ok(Box::new(XmlWikiLzCpCodec)),
         "xml-tok" => Ok(Box::new(XmlTokCodec)),
+        "xml-tok-pc" => Ok(Box::new(XmlTokPcCodec)),
         "bwt" => Ok(Box::new(BwtCodec)),
         "paq" => Ok(Box::new(PaqCodec)),
         other => bail!(
-            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc, xml-wiki-lz-cp, xml-tok, bwt, paq)"
+            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc, xml-wiki-lz-cp, xml-tok, xml-tok-pc, bwt, paq)"
         ),
     }
 }
