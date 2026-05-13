@@ -13,6 +13,45 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23E (Negative): New MLP Features (Order-4, Wiki × Order-3) Don't Pay — Reverted
+
+Phase 23D ended with the observation that the MLP shared all three features with the sparse-LR, so the MLP could only add a nonlinearity, not new information. The Phase 23E experiment tested the obvious counter-move: give the MLP **its own additional features** the LR doesn't have.
+
+### What was tried
+
+1. **Extended `PredCtx` with `p4: Option<u32>`** — the 4th-most-recent dict id. Shifted through all six `PredCtx` construction sites in encode/decode/prewarm; PredCtx::NONE got a `p4: None` field. The Order-4 generalization of the existing length-1/2/3 LZ-match shift logic landed clean.
+2. **Added an `id_mlp_features` helper** returning 5 hashes. First three identical to `id_lr_features` (Order-3 hashed, Wiki × Order-2, bias); two new:
+   - **Order-4 hashed**: `(p4, p3, p2, p1, prefix, bit_pos)`. Phrase-level signal.
+   - **Wiki × Order-3**: `(wiki, p3, p2, p1, prefix, bit_pos)`. Wiki sub-mode + trigram.
+3. **Bumped `N_MLP_ID_FEATS` 3 → 5** keeping K=20, H=8. MLP memory: 96 MiB → 160 MiB.
+
+The LR stayed on its 3-feature shape (its linear nature means more features mostly just pay for redundant linear combinations of existing ones).
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23D |
+|---|---:|---:|---:|---:|
+| Phase 23D | 2.1199 | 1.8792 | 234,905,363 | — |
+| Phase 23E | 2.1203 | 1.8792 | 234,901,166 | **+0.0004 / 0.0000** |
+
+Enwik9 difference is 4,197 bytes out of 234.9 MB — measurement noise. Roundtrip OK in both runs. Encode time grew +8 % (654 s → 708 s) and decode +10 %; memory +64 MiB. Net result: the new features cost runtime + memory without any compression gain.
+
+### Why this is the right negative
+
+Hashed Order-4 has a natural cell count near 2^73 (16 × 65 K × 65 K × 65 K × 16 × prefix). Hashed into K=20 (1 Mi slots), the collision rate is ~10^16 distinct contexts per slot — even when one underlying 4-token sequence is genuinely warm, the slot's gradient is dominated by ~10^16 unrelated sequences also colliding. The SGD update is noise on top of noise.
+
+The Phase-23A features worked because:
+- **Order-3 hashed**: natural cell count ~2^57, collisions ~10^11, but Zipfian token distribution concentrates mass on a tiny working set — many slots see one dominant 3-gram and ~0 contributions from the long tail.
+- **Wiki × Order-2**: wiki-cardinality is 5, so the bigram-conditioned space is only 5× the bigram one — much denser per slot than Order-4.
+
+Order-4 doesn't have the Zipf concentration that makes Order-3 hashing work; the conditional distribution `p(bit | p4, p3, p2, p1)` is too sparse even at the enwik9 scale of ~200 M tokens.
+
+### Reverted
+
+`src/xml_tok_route.rs` restored to the Phase 23D state at commit `ade0239`. Journal entry stays as a guardrail: the MLP can only learn from features that have **observation density per slot**, not just from features with high naturally-conditional information. Future feature additions should target either coarser conditioning (denser cells) or genuinely new context dimensions (e.g., recency-since-last-LZ-match, page-position, token length) rather than deeper word-history orders.
+
+---
+
 ## 2026-05-13 — Phase 23D: Small Online MLP Joins the `dict_id` Mixer — 1.879 bpb on Enwik9
 
 Step B of the A → B → C neural-arm path CDR sketched: a two-layer online MLP, the smallest architecture that adds a `tanh` nonlinearity and a learned hidden dimension on top of the Phase-23A sparse-LR.
