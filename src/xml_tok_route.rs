@@ -289,14 +289,16 @@ const ID_MLP_LR: f32 = 0.02;
 /// confirming the diminishing-returns curve is feature-limited.
 /// Reverted to `H=8`.
 const ID_MLP_H: usize = 8;
-/// Phase-23D → Phase-23H: feature count of the `dict_id` MLP.
+/// Phase-23D → Phase-23J: feature count of the `dict_id` MLP.
 /// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),
 /// bias (LR-shared), p1_len_bucket (23F), p2_len_bucket (23G),
-/// (p1_len, p2_len) joint (23H)]`. Phase 23E tried two deep-
-/// context features (Order-4, Wiki × Order-3) which regressed —
-/// see that journal entry for the saturation argument that picked
-/// the coarse path.
-const N_MLP_ID_FEATS: usize = 6;
+/// (p1_len, p2_len) joint (23H), tokens_since_match_bucket (23J)]`.
+/// Phase 23E tried two deep-context features (Order-4,
+/// Wiki × Order-3) which regressed — see that journal entry for
+/// the saturation argument that picked the coarse path. Phase 23I
+/// confirmed the MLP is feature-limited (H=16 didn't help) which
+/// motivated 23J's genuinely-new information feature.
+const N_MLP_ID_FEATS: usize = 7;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -658,6 +660,7 @@ impl Codec for XmlTokRouteCodec {
                                 p1: Some(last_id),
                                 p1_len: p1_len_new,
                                 p2_len: p2_len_new,
+                                tokens_since_match: 0,
                                 wiki: ctx.wiki,
                             };
                             continue;
@@ -703,6 +706,7 @@ impl Codec for XmlTokRouteCodec {
                             p1: new_id,
                             p1_len: p1_len_new,
                             p2_len: ctx.p1_len,
+                            tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                             wiki: token_ctx.wiki,
                         };
 
@@ -935,6 +939,7 @@ impl Codec for XmlTokRouteCodec {
                             p1: Some(last_id),
                             p1_len: p1_len_new,
                             p2_len: p2_len_new,
+                            tokens_since_match: 0,
                             wiki: ctx.wiki,
                         };
                         continue;
@@ -974,6 +979,7 @@ impl Codec for XmlTokRouteCodec {
                         p1: new_prev,
                         p1_len: p1_len_new,
                         p2_len: ctx.p1_len,
+                        tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                         wiki: token_ctx.wiki,
                     };
                 }
@@ -1298,11 +1304,14 @@ fn lz_match_row(prev_id: Option<u32>) -> usize {
 /// `p1`/`p2`/`p3` are the trailing dict-id history; `wiki` is the
 /// `wiki_classifier` sub-mode (0=Plain, 1=Link, 2=Template);
 /// `p1_len`/`p2_len` are the byte lengths of `p1`/`p2`'s tokens
-/// (capped at 255; 0 when the corresponding id is `None`). Phase
-/// 23F added `p1_len` as a **coarse warm feature**; Phase 23G
-/// extended with `p2_len` so the MLP can see a length pair, not
-/// just the most recent length. None of the count predictors read
-/// either field.
+/// (capped at 255; 0 when the corresponding id is `None`);
+/// `tokens_since_match` is the count of tokens emitted since the
+/// most recent LZ-match (0 immediately after a match, increasing
+/// each non-match token). Phase 23F/G added the length fields;
+/// Phase 23J added `tokens_since_match` as a **genuinely-new
+/// information** feature (not derivable from the dict-id history),
+/// after Phase 23I confirmed the MLP was feature-limited rather
+/// than capacity-limited.
 #[derive(Clone, Copy, Debug)]
 struct PredCtx {
     p3: Option<u32>,
@@ -1310,6 +1319,7 @@ struct PredCtx {
     p1: Option<u32>,
     p1_len: u8,
     p2_len: u8,
+    tokens_since_match: u8,
     wiki: u8,
 }
 
@@ -1320,6 +1330,7 @@ impl PredCtx {
         p1: None,
         p1_len: 0,
         p2_len: 0,
+        tokens_since_match: 0,
         wiki: 0,
     };
 }
@@ -1383,14 +1394,14 @@ fn id_lr_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_LR_ID_FEAT
     [f_o3, f_wiki_o2, f_bias]
 }
 
-/// Phase-23F → Phase-23H: feature hashes for the `dict_id` MLP.
-/// Superset of [`id_lr_features`] plus three coarse warm features:
-/// `p1_len_bucket` (23F), `p2_len_bucket` (23G), and an explicit
-/// `(p1_len, p2_len)` joint (23H). The joint has cell count
-/// 16 × 16 × 65 K × 16 ≈ 2^28 — still warm at K=20 (~256
-/// contexts/slot). With `H=8` the MLP's hidden layer can only
-/// represent a small number of feature interactions; an explicit
-/// joint adds a dedicated weight row for the length-pair signal.
+/// Phase-23F → Phase-23J: feature hashes for the `dict_id` MLP.
+/// Superset of [`id_lr_features`] plus four coarse warm features:
+/// `p1_len_bucket` (23F), `p2_len_bucket` (23G), `(p1_len, p2_len)`
+/// joint (23H), and `tokens_since_match_bucket` (23J). The last is
+/// the first feature carrying information **not derivable from the
+/// dict-id history** — it tells the MLP how recently the codec
+/// emitted an LZ-match, which correlates strongly with whether
+/// we're in a heavily-templated region or unique prose.
 fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FEATS] {
     let [f_o3, f_wiki_o2, f_bias] = id_lr_features(ctx, prefix, bit_pos);
     let prefix64 = u64::from(prefix);
@@ -1398,6 +1409,7 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
 
     let p1_len_bucket = u64::from(ctx.p1_len.min(15));
     let p2_len_bucket = u64::from(ctx.p2_len.min(15));
+    let recency_bucket = u64::from(ctx.tokens_since_match.min(15));
     let f_p1_len = {
         let h = fnv_mix(FNV_OFFSET, p1_len_bucket);
         let h = fnv_mix(h, prefix64);
@@ -1414,8 +1426,15 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
+    let f_recency = {
+        let h = fnv_mix(FNV_OFFSET, recency_bucket);
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
 
-    [f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len, f_len_pair]
+    [
+        f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len, f_len_pair, f_recency,
+    ]
 }
 
 /// Read all base predictors' `P(bit = 0)` without touching any
@@ -1988,6 +2007,7 @@ fn prewarm(
                     p1: new_id,
                     p1_len: p1_len_new,
                     p2_len: ctx.p1_len,
+                    tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                     wiki: token_ctx.wiki,
                 };
                 // Also observe the lz_flag=0 (no-match) for prewarm

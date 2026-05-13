@@ -13,6 +13,74 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23J: `tokens_since_match` Coarse Feature — 1.873 bpb on Enwik9
+
+Followed the Phase 23I diagnostic ("MLP is feature-limited, not capacity-limited") to its natural next experiment: a feature carrying **genuinely-new information not derivable from the existing `PredCtx` fields**. The cheapest such feature is a counter for tokens since the last LZ-match — independent of `p3..p1`, the length pair, and the wiki sub-mode.
+
+### What landed
+
+1. **`PredCtx.tokens_since_match: u8`** — set to 0 on every LZ-match (encode + decode), incremented (`saturating_add(1)`) on every non-match token (encode + decode + prewarm). All five `PredCtx` construction sites updated.
+2. **New 7th MLP feature** `(recency_bucket, prefix, bit_pos)` with `recency_bucket = tokens_since_match.min(15)`. Cell count: 16 × 65 K × 16 ≈ 2^24 — same coarse-warm shape as the length features. K=20, +32 MiB to the MLP tables.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23H |
+|---|---:|---:|---:|---:|
+| Phase 23H | 2.1106 | 1.8747 | 234,336,587 | — |
+| **Phase 23J** | **2.1085** | **1.8728** | **234,096,064** | **-0.0021 / -0.0019 / -235 KiB** |
+
+Roundtrip OK. Encode 705 s on enwik9 vs Phase 23H's 692 s (+2 %); decode 404 s vs 393 s (+3 %). Memory +32 MiB.
+
+### The information-content premium
+
+Side-by-side with the recent length-feature additions:
+
+| Step | Feature kind | Information source | enwik8 Δ | enwik9 Δ |
+|---|---|---|---:|---:|
+| 23F | `p1_len_bucket` | Derived from `p1` | -0.0058 | -0.0022 |
+| 23G | `p2_len_bucket` | Derived from `p2` | -0.0027 | -0.0016 |
+| 23H | `(p1_len, p2_len)` joint | Combination of existing | -0.0008 | -0.0007 |
+| 23I | `H=8 → H=16` (reverted) | Capacity, not info | +0.0002 | — |
+| **23J** | **`tokens_since_match`** | **NEW** — not in any `PredCtx` field | **-0.0021** | **-0.0019** |
+
+23J delivered ~3× the enwik9 gain of 23H at the same +32 MiB cost. The contrast resolves cleanly:
+
+- 23H combined existing fields (`p1_len`, `p2_len`) → small, fully predictable from what the MLP already saw.
+- 23J brought in a counter that the MLP couldn't reconstruct from any other input → big, new signal.
+
+This is the same lesson from 23I from the other direction. Capacity scale-up didn't help because there was nothing left to fit; bringing in new information *was* the lever.
+
+### What the feature is measuring
+
+`tokens_since_match` correlates directly with **how heavily-templated the current region is**. Inside a `{{cite news |...}}` block the codec runs through many LZ-match emissions in quick succession; `tokens_since_match` stays near 0 across the entire block. In unique prose the counter climbs through dozens of tokens. The dict-id distribution conditional on "we are in a templated region" is sharper (the templates themselves have a small working set of recurring ids) than the unconditional distribution; the MLP can use the recency signal to switch between the two regimes.
+
+This is the same kind of latent state that a real wikitext parser would expose explicitly. The recency counter is a cheap approximation that captures the most-useful slice without parsing.
+
+### Phase 23J cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 22 | 237,120,859 | 1.8970 | -0.0965 |
+| Phase 23A | 235,510,295 | 1.8841 | -0.1094 |
+| Phase 23D | 234,905,363 | 1.8792 | -0.1143 |
+| Phase 23F | 234,619,206 | 1.8770 | -0.1165 |
+| Phase 23G | 234,426,423 | 1.8754 | -0.1181 |
+| Phase 23H | 234,336,587 | 1.8747 | -0.1188 |
+| **Phase 23J** | **234,096,064** | **1.8728** | **-0.1207** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1939 bpb / -19.4 MiB on enwik9**. Hutter ratio: **2.134× target**.
+
+### What's next in the same vein
+
+The 23F open-portfolio note flagged `page_offset_bucket` alongside `recency_bucket`. With recency landing this well, page-offset is the natural next probe — it's the other "genuinely new information" the dict-id history doesn't carry. Would require a counter that resets on each `<page>` boundary; the page-class transition is already detectable from `XmlTokRouteCodec`'s mode classifier but not currently exposed to `PredCtx`.
+
+Other candidates from the same family:
+- `lz_match_length_last`: length of the most recent LZ-match (1..=N). Resets each match.
+- `wiki_depth_link` / `wiki_depth_template`: nesting depth inside `[[` / `{{`, exposed from `WikiFineClassifier`'s internal state (currently hidden).
+- `bytes_since_match`: byte-granularity version of `tokens_since_match`. Finer, possibly redundant.
+
+---
+
 ## 2026-05-13 — Phase 23I (Diagnostic, Negative): MLP `H=8 → H=16` Doesn't Help — Reverted
 
 Phase 23H's journal posed an explicit question: the 23F/G/H diminishing-returns curve could be **feature exhaustion** (we've mined the length-pair signal) or **capacity exhaustion** (the `H=8` hidden layer can't decompose more feature directions). Phase 23I tested it with a one-line change.
