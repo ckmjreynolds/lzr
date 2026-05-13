@@ -13,6 +13,103 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-16 — Phase 19: Routing Saturates at N=2; Order-1 Upgrades Compound to 2.006 bpb on Enwik9
+
+CDR asked for a systematic sweep of three extensions to Phase 18's cost-aware routing — stickiness sweep, additional predictors (Order-3 hashed, wiki-sub-mode-conditional, class-based), and (later) Order-1 conditioning on the other Order-0 emission streams the codec was using. The framing was explicit: "test them all and report back," with grammar-aware and wide-context-window approaches called out as candidates of interest.
+
+Two major findings, in the order they emerged:
+
+### Finding 1: The routing layer saturates at N=2 with (Order-1, Order-2)
+
+Phase 18 settled `xml-tok-route` at N=2 with the Order-1 and Order-2 `dict_id` predictors. Phase 19's first hypothesis was that adding more predictors to the routing stack would let the encoder route per-token to whichever predictor wins, compounding the gain. Tested predictors:
+
+- **Order-3** — `(prev_prev_prev_id, prev_prev_id, prev_id, prefix, bit_pos)` context, 2^26 = 64 M-slot table.
+- **WikiMode** — `(wiki_sub_mode, prev_id, prefix, bit_pos)` context using the 3-mode `wiki_classifier` from Phase 12, 2^25 slots.
+- **Class** — `(class_of_prev_prev_id, prev_id, prefix, bit_pos)` where class is the 3-bit log-scale bucket of `prev_prev_id`'s dict slot. "Order-2 with coarsened `prev_prev_id`" — meant to be more saturated than full Order-2 on cold bigrams.
+
+Configurations measured end-to-end on enwik9 (the only honest scale for this codec, per the Phase 17 lesson):
+
+| Config | enwik9 bpb | Δ vs N=2 baseline (2.0392) |
+|---|---:|---:|
+| N=2 (O1, O2) baseline | 2.0392 | — |
+| N=2 (O1, O3) | (e2e enwik8 +0.008 → e2e enwik9 ~+0.005) | regression |
+| N=2 (O1, Wiki) | (e2e enwik8 +0.018) | regression |
+| N=3 (O1, O2, O3) | 2.0519 | +0.013 |
+| N=3 (O1, O2, Wiki) | (e2e enwik8 +0.016) | regression |
+| N=3 (O1, O2, Class) | (e2e enwik8 +0.017) | regression |
+| N=4 (O1, O2, O3, Wiki) | 2.0584 | +0.019 |
+
+Every addition regressed. The mechanism: the router stream costs ~1 raw bit per token going from N=2 (1-bit router) to N=3/N=4 (2-bit router), and at ~0.06 effective bits / token under the adaptive router predictor, the overhead is ~12 MB on enwik9 — comparable to or larger than the savings any of the new predictors deliver. The new predictors overlap heavily with Order-2 because all four condition on `prev_id`; the tokens where Order-3/Wiki/Class win are also the tokens where Order-2 wins, so the marginal value at the routing layer is small.
+
+**Stickiness sweep** (Phase 19a) on enwik8 e2e at fine granularity around the Phase-18 default (`ROUTE_STICKINESS_BITS = 1.0`):
+
+| Stickiness | enwik8 e2e bpb |
+|---:|---:|
+| 0.0 | 2.2554 |
+| 0.25 | 2.2540 |
+| 0.5 | 2.2535 |
+| 0.75 | 2.2533 |
+| 1.0 | 2.2532 |
+| 1.5 | 2.2543 |
+| 2.0 | 2.2550 |
+
+Optimum at 0.75–1.0, U-shaped. Kept at 1.0 (within noise of 0.75 and matches the enwik9 result we already had).
+
+The conclusion from Phase 19a–e: **the routing architecture saturates at N=2 for `dict_id` emission**. Adding more predictors at this layer is exhausted at enwik9 scale.
+
+### Finding 2: Order-1 conditioning on other Order-0 emission streams compounds
+
+The bit decomposition on enwik9 has the dict_id at ~46% of bits, but `lz_match_ac` is another ~20% — dominated by the `lz_flag` emission (the no-match flag fires at every Content-token boundary, ~250 M times on enwik9). The Phase 16 `lz_flag` was an `Order0<2>` — a single global P(no-match) prior of ~10%. That gives ~0.46 bits per Content boundary, with **zero context conditioning**.
+
+Replacing it with a `BitPredictor` keyed on `prev_id` turns it into Order-1: `P(no-match | prev_id)` instead of a global average. Same idea applied to the remaining Order-0 emissions on the codec's hot paths:
+
+| Phase | Change | enwik8 e2e bpb | enwik9 e2e bpb | Δ on enwik9 |
+|---|---|---:|---:|---:|
+| baseline xml-tok-route N=2 | (O1, O2) Order-0 lz_flag, Order-0 token_oov, Order-0 lz_offset_bucket, Order-0 lz_length | 2.2532 | 2.0392 | — |
+| **19f**: Order-1 `lz_flag` | `BitPredictor` on `prev_id`, replaces `Order0<2>` | 2.2426 | 2.0287 | **-0.0105** |
+| **19g**: + Order-1 `token_oov` | Same shape, replaces the second `Order0<2>` | 2.2394 | 2.0216 | **-0.0176** |
+| **19h**: + Order-1 `lz_offset_bucket` + `lz_length` | `Order1Ctx<1024, ...>` hashed on `prev_id` | 2.2340 | 2.0062 | -0.0330 |
+| **19i**: + `ID_BIT_O2_K` = 26 → 27 (Order-2 table 256 → 512 MiB) | doubles slots, halves collisions on the long bigram tail | 2.2324 | **1.9997** | **-0.0395** |
+
+The full enwik9 archive drops from **254,898,774 → 249,967,249 bytes (4.7 MiB smaller)**. Cumulative vs the original xml-tok (Phase 16 stack from 2026-05-13): **2.0667 → 1.9997 = -0.0670 bpb**. The codec is now under **2.0 bpb** on enwik9 for the first time, at **2.28× the Hutter target** (down from 2.32× after Phase 18, 2.35× after Phase 17, 2.41× after Phase 16).
+
+The pattern from Phase 17/18 holds: panel results understate the gain when the change depends on adaptive-state saturation. Each Order-1 upgrade was modestly positive on enwik8 e2e and ~2× larger on enwik9.
+
+**Phase 19i** bumped `ID_BIT_O2_K` from 26 to 27 (Order-2 table from 256 MiB to 512 MiB). On enwik8 e2e the delta was -0.0016 (within noise); on enwik9 it was **-0.0065** (more than the enwik8 e2e suggested, again matching the "saturation grows with corpus" pattern). The same change to K=28 (1 GiB table) is the natural next test if memory permits.
+
+### Class-based, Wiki-fine, and a methodology note
+
+The class-based predictor (Phase 19e) was the most architecturally distinct of the alternates. It was meant to exploit "Order-2 with coarsened prev_prev_id" — the bet that the 8-bucket class is more saturated than full prev_prev_id and would win on cold bigrams that Order-2 misses. It regressed by **+0.017 bpb on enwik8 e2e**. The likely failure mode: a 3-bit class strips too much information from `prev_prev_id` for the savings on cold bigrams to outweigh the loss on warm ones, AND the routing overhead at N=3 swamps whatever marginal gain remains. A finer class (say 5 bits) might have done better, but the routing overhead pattern says the answer is no.
+
+The 3-mode `WikiClassifier` was likely too coarse to win as the third predictor. The 5-mode `WikiFineClassifier` from `recon.rs` (split LinkTarget vs LinkDisplay, TemplateName vs TemplateArg) might have done better, but the routing-layer saturation finding suggests adding it as predictor #3 wouldn't help on enwik9 anyway. The honest move was to recognize the saturation and pivot to the Order-1 upgrade pattern that turned out to be the real win.
+
+**Methodology note**: the divergence between panel and end-to-end was again the key signal. Order-1 lz_flag's full panel result on enwik8 was 2.440 bpb — **+0.059 worse than the N=2 baseline of 2.381**. End-to-end on enwik8 it was 2.2426 — **-0.0106 better than the N=2 e2e baseline of 2.2532**. The panel was wildly wrong. Per the rule of thumb from Phase 17/18 (panel-vs-e2e divergence > 0.02 bpb means the change interacts with predictor training volume), this is the steepest divergence we've seen. The lz_flag Order-0 predictor was so good after a few thousand observations that the panel's small measure windows just sample it at the saturated regime; the Order-1 BitPredictor on prev_id with `2^20` slots needs hundreds of thousands of observations to populate, so the panel sees the cold-context cost. The enwik9 result confirms what e2e enwik8 hinted at.
+
+### What's left in this layer
+
+I think the dict_id and LZ paths are now mostly squeezed. The remaining Order-0 emissions are small bit budgets:
+
+- `tag_dict` (`Order0<33>`): ~3.3 K bits per panel window. Total budget on enwik9 is < 1 MB. Even halving doesn't move the needle.
+- `tag_byte` (`Order0<256>`): same magnitude.
+- `attr_byte` (`Order0<256>`): even smaller.
+- `case_pattern_global` (`Order0<4>`): fires only on OOV words; small share.
+
+OOV byte streams (`oov_word_letter`, `oov_sep_byte`) are already Order-1 on the previous *letter/byte*. Upgrading to Order-2 would buy a few thousand bits per panel window; ~5 MB on enwik9. Worth trying as a follow-up but not transformative.
+
+The architectural next move is back to the bit-predictor table contents, not the predictor topology:
+
+1. **Wider Order-2 table** (Phase 19i partial result): scaling `ID_BIT_O2_K` from 27 to 28 (1 GiB) is worth measuring; the marginal improvement at 26 → 27 was small (-0.0016 bpb) but at enwik9 scale the long tail of bigrams might benefit more.
+2. **PPM-D-style explicit escape on dict_id**: the routing layer is one way to gate predictors; PPM-D's deterministic context-count escape is another. The two are equivalent in the strong-saturation limit, but PPM-D doesn't pay a router bit when the high-order context has no observations — which is roughly half of all tokens for Order-3.
+3. **Different bit budget**: the bit_predictor `RESCALE_THRESHOLD = 4094` halves counts when total exceeds that. For super-hot contexts the halving fires frequently and the predictor underweights confidence. Tuning this could be free.
+
+### Code state
+
+`xml-tok-route` now has eight predictors plumbed (Order-1, Order-2, Order-3, Wiki, Class, plus the router_bit, lz_flag_bit, token_oov_bit) but the routing stack is reconfigured to N=2 (Order-1, Order-2). The unused predictors stay in the source as dead-code-marked fields so the dispatch table can be flipped to alternate configurations without re-plumbing. The five `PredKind` variants are all wired into `p_zero_for` — adding/dropping a predictor from the active stack is a one-line `PREDICTOR_KINDS` change.
+
+The `lz_flag_bit`, `token_oov_bit`, `lz_offset_bucket_o1`, and `lz_length_o1` upgrades **replaced** their Order-0 predecessors rather than being dispatched optionally — they're strict wins everywhere we measured. The original `Order0<2>` lz_flag and `Order0<2>` token_oov stay in `Models` as dead-code-marked placeholders for traceability.
+
+---
+
 ## 2026-05-15 — Phase 18: Cost-Aware Predictor Switching (New Best, −0.028 bpb on Enwik9)
 
 CDR's idea: instead of mixing predictions cmix-style, maintain N predictors in lock-step and have the encoder emit a per-token "router" bit selecting whichever predictor minimizes that specific token's emission cost. Switching is **strictly more flexible** than PPM-D escape (which is a special case where the router decision is deterministic from context-count) and can exploit the encoder's per-token hindsight in a way the mixer can't — the mixer's weights are computed from past data, not from the actual token about to be emitted.

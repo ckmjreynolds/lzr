@@ -76,6 +76,7 @@ use crate::tok_lz::{self, TokenMatcher};
 use crate::tokenizer::{
     CasePattern, TokenClass, apply_case, classify_case, lowercase, mixed_mask, run_end,
 };
+use crate::wiki_classifier::{N_WIKI_SUB, WikiClassifier};
 
 const DICTIONARY: &[&[u8]] = &[
     b"page>",
@@ -164,25 +165,88 @@ const OFFSET_BUCKET_ALPHABET: usize = 21;
 
 /// Hash-table size for the Order-2 `dict_id` bit predictor. The joint
 /// `(prev_prev_id, prev_id, prefix, bit_pos)` context space is much
-/// larger than Order-1's — ~70 G logical contexts for an 18-bit
-/// dictionary — but the actually-populated set after 200 M training
-/// tokens is bounded by ~50 M (one slot per observed bigram suffix
-/// × bit prefix). 2 ^ 26 = 64 M-slot table keeps collisions well
-/// below 1× expected per slot. Memory: 256 MiB (within the 10 GiB
-/// judging-machine budget).
-const ID_BIT_O2_K: u32 = 26;
+/// larger than Order-1's. Phase-19i bumped from 2 ^ 26 to 2 ^ 27 to
+/// reduce collisions on the long tail of warm bigrams; the table is
+/// 512 MiB now (within the 10 GiB judging-machine budget).
+const ID_BIT_O2_K: u32 = 27;
+
+/// Hash-table size for the Order-3 `dict_id` bit predictor. Trigram
+/// context space is so large that hashing to 2 ^ 26 puts roughly one
+/// distinct trigram-suffix per slot at enwik9 scale; most slots see
+/// few observations and the predictor degrades to near-uniform
+/// (cost = Order-1's cost or worse) which the router catches by
+/// staying on a lower-order predictor.
+const ID_BIT_O3_K: u32 = 26;
+
+/// Hash-table size for the wiki-mode-conditional `dict_id` bit
+/// predictor. Context = `(wiki_sub_mode, prev_id, prefix, bit_pos)`.
+/// Wiki sub-mode is the 3-way classification from `wiki_classifier`
+/// (Plain / Link / Template); the wiki-mode multiplier on top of
+/// Order-1's context space means we want ~3× the Order-1 table size,
+/// which still fits comfortably under 64 MiB.
+const ID_BIT_WIKI_K: u32 = 25;
+
+/// Hash-table size for the class-conditioned `dict_id` bit predictor.
+/// Context = `(class_of_prev_prev_id, prev_id, prefix, bit_pos)`.
+/// Class is the 3-bit log-scale bucket of the prev-prev token's dict
+/// slot (8 buckets). This is "Order-2 with coarsened `prev_prev_id`" —
+/// it loses some discrimination compared to full Order-2 but the
+/// context is ~32 K× more saturated, so it wins on cold bigrams that
+/// Order-2 can't predict.
+const ID_BIT_CLASS_K: u32 = 24;
+/// Number of log-scale classes a dict slot is bucketed into.
+#[allow(dead_code)]
+const N_ID_CLASSES: u8 = 8;
 
 /// Hash-table size for the router bit predictor. Context is
 /// `(prev_id, current_predictor)` — predictor returns `P(stay)`.
 const ROUTER_BIT_K: u32 = 18;
 
+/// Hash-table size for the Order-1 `lz_flag` predictor. Context is
+/// `(prev_id)`. Replaces Order-0 `lz_flag` so the no-match flag
+/// (~90% of Content-token boundaries) is predicted with prev-token
+/// conditioning — after-separator-with-`{` tokens see more matches
+/// than after-prose-words, for instance.
+const LZ_FLAG_BIT_K: u32 = 20;
+
+/// Hash-table size for the Order-1 `token_oov` predictor. Context
+/// is `(prev_id)`. Replaces Order-0 `token_oov` so P(hit vs OOV)
+/// is conditioned on the preceding token — after `[[` the next
+/// token has different OOV likelihood than after `the`.
+const TOKEN_OOV_BIT_K: u32 = 20;
+
+/// Context-row count for the Order-1 LZ match predictors
+/// (`lz_offset_bucket` and `lz_length`). `prev_id` is hashed into
+/// `LZ_MATCH_NCTX` rows so the `Order1Ctx` tables stay small enough
+/// to fit (86 KiB for the 21-symbol bucket, 1 MiB for the 256-
+/// symbol length) while still giving the model meaningful prev-id
+/// stratification — after-`{` tokens have different match offset
+/// and length distributions than after-prose-words.
+const LZ_MATCH_NCTX: usize = 1024;
+
 /// Number of predictors in the routing stack. Generalized indexing
 /// makes adding a third or fourth predictor a small code change.
-/// Must be a power of two so that `log2(N_PREDICTORS)` raw bits
-/// suffice to encode any predictor index.
+/// `ROUTER_BITS` is `ceil(log2(N_PREDICTORS))` — N values out of
+/// the 2 ^ ROUTER_BITS-symbol alphabet are used; the unused ones
+/// cost a negligible amount under the adaptive router predictor.
+/// Phase-19 predictor stack configuration. Each slot in
+/// `PREDICTOR_KINDS` is dispatched through `p_zero_for` to the
+/// matching predictor; swap entries here to test alternative
+/// combinations without touching the encode/decode loops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PredKind {
+    Order1,
+    Order2,
+    Order3,
+    Wiki,
+    Class,
+}
+
+const PREDICTOR_KINDS: [PredKind; N_PREDICTORS] = [PredKind::Order1, PredKind::Order2];
 const N_PREDICTORS: usize = 2;
-const _: () = assert!(N_PREDICTORS.is_power_of_two() && N_PREDICTORS >= 2);
-const ROUTER_BITS: u32 = N_PREDICTORS.trailing_zeros();
+const _: () = assert!(N_PREDICTORS >= 2 && N_PREDICTORS <= N_WIKI_SUB + 100);
+const ROUTER_BITS: u32 = (N_PREDICTORS - 1).ilog2() + 1;
 
 /// Per-token "stickiness" bias in bit units. Added to the cost of
 /// every non-current predictor when the encoder picks the next
@@ -245,6 +309,8 @@ impl Dict {
 
 struct Models {
     token_class: Order1Ctx<CLASS_NCTX, 2>,
+    /// Kept as a placeholder; Phase-19g replaces with `token_oov_bit`.
+    #[allow(dead_code)]
     token_oov: Order0<2>,
 
     /// Bit-level adaptive predictor for the 16-bit dictionary id.
@@ -256,14 +322,16 @@ struct Models {
     /// Same construction for OOV token lengths.
     token_length_bit: BitPredictor,
 
-    /// Phase 16: LZ-on-tokens match-vs-literal flag (1 bit emitted
-    /// per Content-token boundary).
+    /// Phase 16 (Order-0, kept for backward compat with the
+    /// non-Order-1 baseline of xml-tok-route). Phase-19f migrates
+    /// the `lz_flag` emission to `lz_flag_bit` (`BitPredictor`).
+    #[allow(dead_code)]
     lz_flag: Order0<2>,
-    /// `log₂(offset)` bucket. Bucket-relative low bits emitted via
-    /// the uniform CDF cache.
-    lz_offset_bucket: Order0<OFFSET_BUCKET_ALPHABET>,
-    /// `length - MIN_MATCH` token, Order-0 over 0..=255.
-    lz_length: Order0<256>,
+    /// Phase-19h: Order-1 `lz_offset_bucket`. Context = hashed
+    /// `prev_id` mod `LZ_MATCH_NCTX`.
+    lz_offset_bucket_o1: Order1Ctx<LZ_MATCH_NCTX, OFFSET_BUCKET_ALPHABET>,
+    /// Phase-19h: Order-1 `lz_length`.
+    lz_length_o1: Order1Ctx<LZ_MATCH_NCTX, 256>,
 
     oov_word_letter: Order1Ctx<LETTER_NCTX, 26>,
     oov_sep_byte: Order1Ctx<BYTE_NCTX, 256>,
@@ -281,10 +349,33 @@ struct Models {
     /// near-uniform (cost ≥ Order-1) when cold. The router decides
     /// which to use per token.
     token_id_bit_o2: BitPredictor,
+    /// Phase-19b: Order-3 `dict_id` bit predictor — `(prev_prev_prev_id,
+    /// prev_prev_id, prev_id, prefix, bit_pos)`. Wins on warm
+    /// trigrams; loses on cold trigrams which the router avoids.
+    token_id_bit_o3: BitPredictor,
+    /// Phase-19c: wiki-mode-conditional `dict_id` bit predictor —
+    /// `(wiki_sub_mode, prev_id, prefix, bit_pos)`. Wins on tokens
+    /// inside `[[..]]` or `{{..}}` where the conditional token
+    /// distribution differs sharply from Plain prose (proper nouns
+    /// dominate `LinkTarget`, structured args dominate Template).
+    token_id_bit_wiki: BitPredictor,
+    /// Phase-19e: class-conditioned `dict_id` predictor — context
+    /// `(class_of_prev_prev_id, prev_id, prefix, bit_pos)`. Order-2's
+    /// signal with a coarsened `prev_prev_id`, more saturated than
+    /// full Order-2 on cold bigrams.
+    token_id_bit_class: BitPredictor,
     /// Router bit predictor — emits the index of the chosen `dict_id`
     /// predictor per Content hit-token. Context = `(prev_id,
     /// current_predictor)`. Learns `P(stay)`.
     router_bit: BitPredictor,
+    /// Phase-19f: Order-1 `lz_flag` predictor — replaces the
+    /// previous Order-0 `lz_flag`. Context = `(prev_id)`. Predicts
+    /// `P(no-match)` per prev-token so we don't pay a flat ~0.46
+    /// bits per Content boundary regardless of context.
+    lz_flag_bit: BitPredictor,
+    /// Phase-19g: Order-1 `token_oov` predictor — replaces the
+    /// previous Order-0 `token_oov`. Context = `(prev_id)`.
+    token_oov_bit: BitPredictor,
 }
 
 impl Models {
@@ -295,8 +386,8 @@ impl Models {
             token_id_bit: BitPredictor::new(ID_BIT_K),
             token_length_bit: BitPredictor::new(LEN_BIT_K),
             lz_flag: Order0::new(),
-            lz_offset_bucket: Order0::new(),
-            lz_length: Order0::new(),
+            lz_offset_bucket_o1: Order1Ctx::new(),
+            lz_length_o1: Order1Ctx::new(),
             oov_word_letter: Order1Ctx::new(),
             oov_sep_byte: Order1Ctx::new(),
             case_pattern_global: Order0::new(),
@@ -305,7 +396,12 @@ impl Models {
             tag_byte: Order0::new(),
             attr_byte: Order0::new(),
             token_id_bit_o2: BitPredictor::new(ID_BIT_O2_K),
+            token_id_bit_o3: BitPredictor::new(ID_BIT_O3_K),
+            token_id_bit_wiki: BitPredictor::new(ID_BIT_WIKI_K),
+            token_id_bit_class: BitPredictor::new(ID_BIT_CLASS_K),
             router_bit: BitPredictor::new(ROUTER_BIT_K),
+            lz_flag_bit: BitPredictor::new(LZ_FLAG_BIT_K),
+            token_oov_bit: BitPredictor::new(TOKEN_OOV_BIT_K),
         }
     }
 }
@@ -319,10 +415,12 @@ struct ComponentBits {
     lz_match: u64,
     tag: u64,
     attr: u64,
-    /// Phase-18: router bits + per-predictor `token_hit` breakdown.
+    /// Phase-18+: router bits + per-slot `token_hit` breakdown.
     router: u64,
     token_hit_o1: u64,
     token_hit_o2: u64,
+    token_hit_slot2: u64,
+    token_hit_slot3: u64,
 }
 
 impl Codec for XmlTokRouteCodec {
@@ -343,6 +441,7 @@ impl Codec for XmlTokRouteCodec {
         let mut matcher = TokenMatcher::new();
 
         let mut current_predictor: usize = 0;
+        let mut wiki_class = WikiClassifier::new();
         prewarm(
             &buf[..warm_end],
             &mut classifier,
@@ -350,6 +449,7 @@ impl Codec for XmlTokRouteCodec {
             &mut dict,
             &mut matcher,
             &mut current_predictor,
+            &mut wiki_class,
         );
 
         let mut writer = BitWriter::new();
@@ -358,8 +458,7 @@ impl Codec for XmlTokRouteCodec {
         {
             let mut enc = AcEncoder::new(&mut writer);
             let mut last_class_ctx = CLASS_CTX_NONE;
-            let mut prev_id: Option<u32> = None;
-            let mut prev_prev_id: Option<u32> = None;
+            let mut ctx = PredCtx::NONE;
             let mut uniform_cdf_cache = UniformCdfCache::new();
             let mut i = warm_end;
             while i < buf.len() {
@@ -382,23 +481,25 @@ impl Codec for XmlTokRouteCodec {
                             None
                         };
 
-                        let mut flag_cdf = [0u32; 3];
-                        models.lz_flag.cdf_to(&mut flag_cdf);
-                        let flag_sym = usize::from(lz_match.is_some());
+                        let flag_ctx = lz_flag_ctx(ctx.p1);
+                        let flag_p_zero = models.lz_flag_bit.predict_p_zero(flag_ctx);
+                        let flag_cdf = [0u32, flag_p_zero, TOTAL];
+                        let flag_sym = u32::from(lz_match.is_some());
                         let flag_before = enc.bits_written();
-                        enc.encode(&flag_cdf, flag_sym);
-                        models.lz_flag.observe(flag_sym);
+                        enc.encode(&flag_cdf, flag_sym as usize);
+                        models.lz_flag_bit.observe(flag_ctx, flag_sym);
                         comp.lz_match += enc.bits_written() - flag_before;
 
                         if let Some((offset, length)) = lz_match {
                             let length_us = length as usize;
                             let lz_before = enc.bits_written();
+                            let row = lz_match_row(ctx.p1);
 
                             let bucket = log2_floor(offset);
                             let mut bucket_cdf = [0u32; OFFSET_BUCKET_ALPHABET + 1];
-                            models.lz_offset_bucket.cdf_to(&mut bucket_cdf);
+                            models.lz_offset_bucket_o1.cdf_to(row, &mut bucket_cdf);
                             enc.encode(&bucket_cdf, bucket as usize);
-                            models.lz_offset_bucket.observe(bucket as usize);
+                            models.lz_offset_bucket_o1.observe(row, bucket as usize);
                             if bucket > 0 {
                                 let rel = offset - (1u32 << bucket);
                                 encode_uniform_bits(&mut enc, &mut uniform_cdf_cache, rel, bucket);
@@ -406,9 +507,9 @@ impl Codec for XmlTokRouteCodec {
 
                             let length_token = length_us - tok_lz::MIN_MATCH;
                             let mut length_cdf = [0u32; 257];
-                            models.lz_length.cdf_to(&mut length_cdf);
+                            models.lz_length_o1.cdf_to(row, &mut length_cdf);
                             enc.encode(&length_cdf, length_token);
-                            models.lz_length.observe(length_token);
+                            models.lz_length_o1.observe(row, length_token);
 
                             comp.lz_match += enc.bits_written() - lz_before;
 
@@ -436,6 +537,7 @@ impl Codec for XmlTokRouteCodec {
                             let new_i = lookahead[length_us - 1].end;
                             for &b in &buf[i..new_i] {
                                 classifier.advance(b);
+                                wiki_class.advance(b);
                             }
                             i = new_i;
                             let last = lookahead[length_us - 1];
@@ -443,18 +545,25 @@ impl Codec for XmlTokRouteCodec {
                                 TokenClass::Word => CLASS_CTX_WORD,
                                 TokenClass::Separator => CLASS_CTX_SEP,
                             };
-                            // LZ match doesn't route through encode_token,
-                            // so the current_predictor state carries
-                            // through unchanged. prev_prev_id is the
-                            // second-to-last matched id when the match
-                            // is long enough, else the prev_id we had
-                            // before the match.
-                            prev_prev_id = if length_us >= 2 {
+                            let last_id = lookahead[length_us - 1].id;
+                            let p2_new = if length_us >= 2 {
                                 Some(lookahead[length_us - 2].id)
                             } else {
-                                prev_id
+                                ctx.p1
                             };
-                            prev_id = Some(last.id);
+                            let p3_new = if length_us >= 3 {
+                                Some(lookahead[length_us - 3].id)
+                            } else if length_us >= 2 {
+                                ctx.p1
+                            } else {
+                                ctx.p2
+                            };
+                            ctx = PredCtx {
+                                p3: p3_new,
+                                p2: p2_new,
+                                p1: Some(last_id),
+                                wiki: ctx.wiki,
+                            };
                             continue;
                         }
 
@@ -470,6 +579,14 @@ impl Codec for XmlTokRouteCodec {
 
                         let end = run_end(&buf, i);
                         let token = &buf[i..end];
+                        // Snapshot wiki sub-mode before consuming the
+                        // token's bytes — that's the sub-mode that
+                        // applies to the token being emitted.
+                        let token_ctx = PredCtx {
+                            wiki: u8::try_from(wiki_class.current_sub().idx())
+                                .expect("WikiSub::idx() < 256"),
+                            ..ctx
+                        };
                         let (new_id, new_current) = encode_token(
                             &mut enc,
                             &mut models,
@@ -477,19 +594,23 @@ impl Codec for XmlTokRouteCodec {
                             &mut comp,
                             class,
                             token,
-                            prev_prev_id,
-                            prev_id,
+                            token_ctx,
                             current_predictor,
                         );
                         if let Some(id) = new_id {
                             matcher.push(id);
                         }
-                        prev_prev_id = prev_id;
-                        prev_id = new_id;
+                        ctx = PredCtx {
+                            p3: ctx.p2,
+                            p2: ctx.p1,
+                            p1: new_id,
+                            wiki: token_ctx.wiki,
+                        };
                         current_predictor = new_current;
 
                         for &b in token {
                             classifier.advance(b);
+                            wiki_class.advance(b);
                         }
                         i = end;
                         last_class_ctx = match class {
@@ -505,10 +626,10 @@ impl Codec for XmlTokRouteCodec {
                         comp.attr += enc.bits_written() - before;
                         models.attr_byte.observe(buf[i] as usize);
                         classifier.advance(buf[i]);
+                        wiki_class.advance(buf[i]);
                         i += 1;
                         last_class_ctx = CLASS_CTX_NONE;
-                        prev_prev_id = None;
-                        prev_id = None;
+                        ctx = PredCtx::NONE;
                     }
                     Mode::TagStructure => {
                         let tag_end = find_tag_run_end(&buf, i, classifier);
@@ -532,11 +653,11 @@ impl Codec for XmlTokRouteCodec {
                         comp.tag += enc.bits_written() - before;
                         for &b in run {
                             classifier.advance(b);
+                            wiki_class.advance(b);
                         }
                         i = tag_end;
                         last_class_ctx = CLASS_CTX_NONE;
-                        prev_prev_id = None;
-                        prev_id = None;
+                        ctx = PredCtx::NONE;
                     }
                 }
             }
@@ -598,6 +719,7 @@ impl Codec for XmlTokRouteCodec {
         let mut dict = Dict::default();
         let mut matcher = TokenMatcher::new();
         let mut current_predictor: usize = 0;
+        let mut wiki_class = WikiClassifier::new();
         prewarm(
             &buf,
             &mut classifier,
@@ -605,29 +727,32 @@ impl Codec for XmlTokRouteCodec {
             &mut dict,
             &mut matcher,
             &mut current_predictor,
+            &mut wiki_class,
         );
 
         let mut reader = BitReader::new(&archive[4..]);
         let mut dec = AcDecoder::new(&mut reader);
         let mut last_class_ctx = CLASS_CTX_NONE;
-        let mut prev_id: Option<u32> = None;
-        let mut prev_prev_id: Option<u32> = None;
+        let mut ctx = PredCtx::NONE;
         let mut uniform_cdf_cache = UniformCdfCache::new();
         while buf.len() - warm_end < measure_len {
             let mode = classifier.current_mode();
             match mode {
                 Mode::Content => {
-                    let mut flag_cdf = [0u32; 3];
-                    models.lz_flag.cdf_to(&mut flag_cdf);
+                    let flag_ctx = lz_flag_ctx(ctx.p1);
+                    let flag_p_zero = models.lz_flag_bit.predict_p_zero(flag_ctx);
+                    let flag_cdf = [0u32, flag_p_zero, TOTAL];
                     let flag = dec.decode(&flag_cdf)?;
-                    models.lz_flag.observe(flag);
+                    let flag_u32 = u32::try_from(flag).expect("bit fits u32");
+                    models.lz_flag_bit.observe(flag_ctx, flag_u32);
 
                     if flag == 1 {
                         // LZ match record.
+                        let row = lz_match_row(ctx.p1);
                         let mut bucket_cdf = [0u32; OFFSET_BUCKET_ALPHABET + 1];
-                        models.lz_offset_bucket.cdf_to(&mut bucket_cdf);
+                        models.lz_offset_bucket_o1.cdf_to(row, &mut bucket_cdf);
                         let bucket = dec.decode(&bucket_cdf)?;
-                        models.lz_offset_bucket.observe(bucket);
+                        models.lz_offset_bucket_o1.observe(row, bucket);
                         let bucket_u32 = u32::try_from(bucket).expect("bucket fits u32");
                         let offset = if bucket_u32 == 0 {
                             1
@@ -638,9 +763,9 @@ impl Codec for XmlTokRouteCodec {
                         };
 
                         let mut length_cdf = [0u32; 257];
-                        models.lz_length.cdf_to(&mut length_cdf);
+                        models.lz_length_o1.cdf_to(row, &mut length_cdf);
                         let length_token = dec.decode(&length_cdf)?;
-                        models.lz_length.observe(length_token);
+                        models.lz_length_o1.observe(row, length_token);
                         let length = tok_lz::MIN_MATCH + length_token;
 
                         let stream_len = matcher.stream_len();
@@ -655,9 +780,22 @@ impl Codec for XmlTokRouteCodec {
                         let copied: Vec<u32> =
                             (0..length).map(|k| matcher.at(src_start + k)).collect();
 
-                        let last_id_in_match = copied[copied.len() - 1];
-                        let second_last_id =
-                            if copied.len() >= 2 { Some(copied[copied.len() - 2]) } else { prev_id };
+                        // Snapshot the last three ids before pushing,
+                        // for the post-match context.
+                        let len_match = copied.len();
+                        let last_id = copied[len_match - 1];
+                        let p2_new = if len_match >= 2 {
+                            Some(copied[len_match - 2])
+                        } else {
+                            ctx.p1
+                        };
+                        let p3_new = if len_match >= 3 {
+                            Some(copied[len_match - 3])
+                        } else if len_match >= 2 {
+                            ctx.p1
+                        } else {
+                            ctx.p2
+                        };
                         for id in copied {
                             let lower = dict.entry(id).lower.clone();
                             let class = TokenClass::from_byte(lower[0]);
@@ -677,6 +815,7 @@ impl Codec for XmlTokRouteCodec {
                             for &b in &bytes {
                                 buf.push(b);
                                 classifier.advance(b);
+                                wiki_class.advance(b);
                             }
                             matcher.push(id);
                             last_class_ctx = match class {
@@ -684,8 +823,12 @@ impl Codec for XmlTokRouteCodec {
                                 TokenClass::Separator => CLASS_CTX_SEP,
                             };
                         }
-                        prev_prev_id = second_last_id;
-                        prev_id = Some(last_id_in_match);
+                        ctx = PredCtx {
+                            p3: p3_new,
+                            p2: p2_new,
+                            p1: Some(last_id),
+                            wiki: ctx.wiki,
+                        };
                         continue;
                     }
 
@@ -696,18 +839,23 @@ impl Codec for XmlTokRouteCodec {
                     let class = sym_to_class(class_sym)
                         .with_context(|| format!("invalid class symbol {class_sym}"))?;
 
+                    let token_ctx = PredCtx {
+                        wiki: u8::try_from(wiki_class.current_sub().idx())
+                            .expect("WikiSub::idx() < 256"),
+                        ..ctx
+                    };
                     let (token_bytes, new_prev, new_current) = decode_token(
                         &mut dec,
                         &mut models,
                         &mut dict,
                         class,
-                        prev_prev_id,
-                        prev_id,
+                        token_ctx,
                         current_predictor,
                     )?;
                     for &b in &token_bytes {
                         buf.push(b);
                         classifier.advance(b);
+                        wiki_class.advance(b);
                     }
                     if let Some(id) = new_prev {
                         matcher.push(id);
@@ -716,8 +864,12 @@ impl Codec for XmlTokRouteCodec {
                         TokenClass::Word => CLASS_CTX_WORD,
                         TokenClass::Separator => CLASS_CTX_SEP,
                     };
-                    prev_prev_id = prev_id;
-                    prev_id = new_prev;
+                    ctx = PredCtx {
+                        p3: ctx.p2,
+                        p2: ctx.p1,
+                        p1: new_prev,
+                        wiki: token_ctx.wiki,
+                    };
                     current_predictor = new_current;
                 }
                 Mode::AttrValue => {
@@ -728,9 +880,9 @@ impl Codec for XmlTokRouteCodec {
                     buf.push(b);
                     models.attr_byte.observe(sym);
                     classifier.advance(b);
+                    wiki_class.advance(b);
                     last_class_ctx = CLASS_CTX_NONE;
-                    prev_prev_id = None;
-                    prev_id = None;
+                    ctx = PredCtx::NONE;
                 }
                 Mode::TagStructure => {
                     let mut tag_cdf = [0u32; TAG_ALPHABET + 1];
@@ -746,6 +898,7 @@ impl Codec for XmlTokRouteCodec {
                             buf.push(b);
                             models.tag_byte.observe(sym);
                             classifier.advance(b);
+                            wiki_class.advance(b);
                             if classifier.current_mode() != Mode::TagStructure {
                                 break;
                             }
@@ -757,11 +910,11 @@ impl Codec for XmlTokRouteCodec {
                         for &b in *entry {
                             buf.push(b);
                             classifier.advance(b);
+                            wiki_class.advance(b);
                         }
                     }
                     last_class_ctx = CLASS_CTX_NONE;
-                    prev_prev_id = None;
-                    prev_id = None;
+                    ctx = PredCtx::NONE;
                 }
             }
         }
@@ -851,8 +1004,7 @@ fn encode_token(
     comp: &mut ComponentBits,
     class: TokenClass,
     token: &[u8],
-    prev_prev_id: Option<u32>,
-    prev_id: Option<u32>,
+    ctx: PredCtx,
     current_predictor: usize,
 ) -> (Option<u32>, usize) {
     // Word tokens carry case info; the dict key is the lowercase form.
@@ -866,34 +1018,35 @@ fn encode_token(
     };
 
     let hit_id = dict.get(&key);
-    let mut oov_cdf = [0u32; 3];
-    models.token_oov.cdf_to(&mut oov_cdf);
-    let oov_sym = usize::from(hit_id.is_none());
+    let oov_ctx = lz_flag_ctx(ctx.p1);
+    let oov_p_zero = models.token_oov_bit.predict_p_zero(oov_ctx);
+    let oov_cdf = [0u32, oov_p_zero, TOTAL];
+    let oov_sym = u32::from(hit_id.is_none());
     let before = enc.bits_written();
-    enc.encode(&oov_cdf, oov_sym);
-    models.token_oov.observe(oov_sym);
+    enc.encode(&oov_cdf, oov_sym as usize);
+    models.token_oov_bit.observe(oov_ctx, oov_sym);
     comp.token_hit += enc.bits_written() - before;
 
     if let Some(id) = hit_id {
         // Phase-18 routing: pick the predictor that minimizes this
         // token's emission cost (with stickiness), emit the router
         // decision, then emit the id under that predictor.
-        let next_predictor =
-            choose_predictor(models, prev_prev_id, prev_id, id, current_predictor);
+        let next_predictor = choose_predictor(models, ctx, id, current_predictor);
         let r_before = enc.bits_written();
-        encode_router(enc, models, prev_id, current_predictor, next_predictor);
+        encode_router(enc, models, ctx.p1, current_predictor, next_predictor);
         comp.router += enc.bits_written() - r_before;
 
         let before = enc.bits_written();
-        encode_dict_id_with(enc, models, prev_prev_id, prev_id, id, next_predictor);
+        encode_dict_id_with(enc, models, ctx, id, next_predictor);
         let id_bits = enc.bits_written() - before;
         comp.token_hit += id_bits;
-        if next_predictor == 0 {
-            comp.token_hit_o1 += id_bits;
-        } else {
-            comp.token_hit_o2 += id_bits;
+        match next_predictor {
+            0 => comp.token_hit_o1 += id_bits,
+            1 => comp.token_hit_o2 += id_bits,
+            2 => comp.token_hit_slot2 += id_bits,
+            _ => comp.token_hit_slot3 += id_bits,
         }
-        observe_id_all(models, prev_prev_id, prev_id, id);
+        observe_id_all(models, ctx, id);
 
         if let (TokenClass::Word, Some(pat)) = (class, case_pat) {
             let cb = enc.bits_written();
@@ -937,19 +1090,20 @@ fn decode_token(
     models: &mut Models,
     dict: &mut Dict,
     class: TokenClass,
-    prev_prev_id: Option<u32>,
-    prev_id: Option<u32>,
+    ctx: PredCtx,
     current_predictor: usize,
 ) -> Result<(Vec<u8>, Option<u32>, usize)> {
-    let mut oov_cdf = [0u32; 3];
-    models.token_oov.cdf_to(&mut oov_cdf);
+    let oov_ctx = lz_flag_ctx(ctx.p1);
+    let oov_p_zero = models.token_oov_bit.predict_p_zero(oov_ctx);
+    let oov_cdf = [0u32, oov_p_zero, TOTAL];
     let oov_sym = dec.decode(&oov_cdf)?;
-    models.token_oov.observe(oov_sym);
+    let oov_sym_u32 = u32::try_from(oov_sym).expect("bit fits u32");
+    models.token_oov_bit.observe(oov_ctx, oov_sym_u32);
 
     if oov_sym == 0 {
-        let next_predictor = decode_router(dec, models, prev_id, current_predictor)?;
-        let id = decode_dict_id_with(dec, models, prev_prev_id, prev_id, next_predictor)?;
-        observe_id_all(models, prev_prev_id, prev_id, id);
+        let next_predictor = decode_router(dec, models, ctx.p1, current_predictor)?;
+        let id = decode_dict_id_with(dec, models, ctx, next_predictor)?;
+        observe_id_all(models, ctx, id);
         let lower = dict.entry(id).lower.clone();
         let bytes = if class == TokenClass::Word {
             let pat = decode_case_with_token_prior(dec, models, dict, id, lower.len())?;
@@ -1035,6 +1189,84 @@ fn id_bit_ctx_o2(
     fnv_mix(h, u64::from(bit_pos))
 }
 
+/// Hash `(prev_prev_prev_id, prev_prev_id, prev_id, prefix, bit_pos)`
+/// into the Order-3 `dict_id` predictor's context space.
+fn id_bit_ctx_o3(
+    prev_prev_prev_id: Option<u32>,
+    prev_prev_id: Option<u32>,
+    prev_id: Option<u32>,
+    prefix: u32,
+    bit_pos: u32,
+) -> u64 {
+    let ppp = prev_prev_prev_id.map_or(u64::MAX, u64::from);
+    let pp = prev_prev_id.map_or(u64::MAX, u64::from);
+    let p = prev_id.map_or(u64::MAX, u64::from);
+    let h = fnv_mix(FNV_OFFSET, ppp);
+    let h = fnv_mix(h, pp);
+    let h = fnv_mix(h, p);
+    let h = fnv_mix(h, u64::from(prefix));
+    fnv_mix(h, u64::from(bit_pos))
+}
+
+/// Hash `(wiki_sub_mode, prev_id, prefix, bit_pos)` into the
+/// wiki-mode-conditional `dict_id` predictor's context space.
+fn id_bit_ctx_wiki(wiki: u8, prev_id: Option<u32>, prefix: u32, bit_pos: u32) -> u64 {
+    let p = prev_id.map_or(u64::MAX, u64::from);
+    let h = fnv_mix(FNV_OFFSET, u64::from(wiki));
+    let h = fnv_mix(h, p);
+    let h = fnv_mix(h, u64::from(prefix));
+    fnv_mix(h, u64::from(bit_pos))
+}
+
+/// Log-scale class of a dict slot, in `0..N_ID_CLASSES`. Slot 0 →
+/// class 0 (top 16); slots get coarser buckets as the id grows.
+/// `None` (no prev-prev token) maps to a sentinel class `u8::MAX`
+/// which has its own row in the class-conditioned predictor.
+fn class_of_slot(slot: u32) -> u8 {
+    // Buckets: [0..16), [16..64), [64..256), [256..1024), [1024..4096),
+    // [4096..16384), [16384..65536), [65536..262144).
+    // class = max(0, ceil(log2((slot + 1).max(16))) - 4).
+    let v = if slot < 16 { 16 } else { slot + 1 };
+    let log = 32 - v.leading_zeros() - 1;
+    if log < 4 {
+        0
+    } else {
+        u8::try_from(log - 4).expect("log fits u8 for any u32 slot")
+    }
+}
+
+/// Hash `(class_of_prev_prev_id, prev_id, prefix, bit_pos)` into the
+/// class-conditioned `dict_id` predictor's context space.
+fn id_bit_ctx_class(class_pp: u8, prev_id: Option<u32>, prefix: u32, bit_pos: u32) -> u64 {
+    let p = prev_id.map_or(u64::MAX, u64::from);
+    let h = fnv_mix(FNV_OFFSET, u64::from(class_pp));
+    let h = fnv_mix(h, p);
+    let h = fnv_mix(h, u64::from(prefix));
+    fnv_mix(h, u64::from(bit_pos))
+}
+
+/// Class of the prev-prev id for context lookups. `None` →
+/// `u8::MAX` sentinel.
+fn class_of_pp(prev_prev_id: Option<u32>) -> u8 {
+    prev_prev_id.map_or(u8::MAX, class_of_slot)
+}
+
+/// Hash `(prev_id)` into the Order-1 `lz_flag` predictor's context.
+fn lz_flag_ctx(prev_id: Option<u32>) -> u64 {
+    let p = prev_id.map_or(u64::MAX, u64::from);
+    fnv_mix(FNV_OFFSET, p)
+}
+
+/// Hash `(prev_id)` into a small context-row index for the Order-1
+/// `lz_offset_bucket` and `lz_length` predictors. Both share the
+/// `LZ_MATCH_NCTX` row count so the same hash works for both.
+#[allow(clippy::cast_possible_truncation)]
+fn lz_match_row(prev_id: Option<u32>) -> usize {
+    let p = prev_id.map_or(u64::MAX, u64::from);
+    let h = fnv_mix(FNV_OFFSET, p);
+    (h as usize) & (LZ_MATCH_NCTX - 1)
+}
+
 /// Router context: `(prev_id, current_predictor)`. The router
 /// predictor returns `P(next predictor == 0)`, so a confident
 /// "stay on predictor 0" or "stay on predictor 1" both collapse to
@@ -1057,53 +1289,92 @@ fn bit_cost(p_zero: u32, bit: u32) -> f64 {
     -(p_actual / f64::from(TOTAL)).log2()
 }
 
-/// Predict the 18-bit emission cost for `id` under the predictor
-/// indexed by `which` (0 = Order-1, 1 = Order-2). No predictor state
-/// is mutated. Used to choose the cheaper path before commitment.
-fn predict_id_cost(
-    models: &Models,
-    prev_prev_id: Option<u32>,
-    prev_id: Option<u32>,
-    id: u32,
-    which: usize,
-) -> f64 {
+/// Bundle of context features available to the predictor stack.
+/// `p1`/`p2`/`p3` are the trailing dict-id history; `wiki` is the
+/// `wiki_classifier` sub-mode (0=Plain, 1=Link, 2=Template) at the
+/// time the token is about to be emitted.
+#[derive(Clone, Copy, Debug)]
+struct PredCtx {
+    p3: Option<u32>,
+    p2: Option<u32>,
+    p1: Option<u32>,
+    wiki: u8,
+}
+
+impl PredCtx {
+    const NONE: Self = Self {
+        p3: None,
+        p2: None,
+        p1: None,
+        wiki: 0,
+    };
+}
+
+/// Return `p_zero` for one bit-step under the predictor of `kind`.
+fn p_zero_for(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32, kind: PredKind) -> u32 {
+    match kind {
+        PredKind::Order1 => models
+            .token_id_bit
+            .predict_p_zero(id_bit_ctx(ctx.p1, prefix, bit_pos)),
+        PredKind::Order2 => models
+            .token_id_bit_o2
+            .predict_p_zero(id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos)),
+        PredKind::Order3 => models
+            .token_id_bit_o3
+            .predict_p_zero(id_bit_ctx_o3(ctx.p3, ctx.p2, ctx.p1, prefix, bit_pos)),
+        PredKind::Wiki => models
+            .token_id_bit_wiki
+            .predict_p_zero(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos)),
+        PredKind::Class => models.token_id_bit_class.predict_p_zero(id_bit_ctx_class(
+            class_of_pp(ctx.p2),
+            ctx.p1,
+            prefix,
+            bit_pos,
+        )),
+    }
+}
+
+/// Return `p_zero` for one bit-step under predictor in slot `which`.
+fn p_zero_at(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32, which: usize) -> u32 {
+    p_zero_for(models, ctx, prefix, bit_pos, PREDICTOR_KINDS[which])
+}
+
+/// Predict the 18-bit emission cost for `id` under predictor `which`.
+/// No predictor state is mutated.
+fn predict_id_cost(models: &Models, ctx: PredCtx, id: u32, which: usize) -> f64 {
     let mut prefix: u32 = 0;
     let mut total = 0.0f64;
     for bit_pos in (0..ID_BITS).rev() {
         let bit = (id >> bit_pos) & 1;
-        let p_zero = match which {
-            0 => {
-                let ctx = id_bit_ctx(prev_id, prefix, bit_pos);
-                models.token_id_bit.predict_p_zero(ctx)
-            }
-            1 => {
-                let ctx = id_bit_ctx_o2(prev_prev_id, prev_id, prefix, bit_pos);
-                models.token_id_bit_o2.predict_p_zero(ctx)
-            }
-            _ => unreachable!("predictor index out of range"),
-        };
+        let p_zero = p_zero_at(models, ctx, prefix, bit_pos, which);
         total += bit_cost(p_zero, bit);
         prefix = (prefix << 1) | bit;
     }
     total
 }
 
-/// Observe `id`'s 18 bits in every predictor's training stream — so
-/// they stay in lock-step on both encoder and decoder regardless of
-/// which path the router took for this token.
-fn observe_id_all(
-    models: &mut Models,
-    prev_prev_id: Option<u32>,
-    prev_id: Option<u32>,
-    id: u32,
-) {
+/// Observe `id`'s 18 bits in every predictor's training stream so
+/// encoder and decoder stay in lock-step regardless of routing.
+fn observe_id_all(models: &mut Models, ctx: PredCtx, id: u32) {
     let mut prefix: u32 = 0;
     for bit_pos in (0..ID_BITS).rev() {
         let bit = (id >> bit_pos) & 1;
-        let ctx1 = id_bit_ctx(prev_id, prefix, bit_pos);
-        models.token_id_bit.observe(ctx1, bit);
-        let ctx2 = id_bit_ctx_o2(prev_prev_id, prev_id, prefix, bit_pos);
-        models.token_id_bit_o2.observe(ctx2, bit);
+        models
+            .token_id_bit
+            .observe(id_bit_ctx(ctx.p1, prefix, bit_pos), bit);
+        models
+            .token_id_bit_o2
+            .observe(id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos), bit);
+        models
+            .token_id_bit_o3
+            .observe(id_bit_ctx_o3(ctx.p3, ctx.p2, ctx.p1, prefix, bit_pos), bit);
+        models
+            .token_id_bit_wiki
+            .observe(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos), bit);
+        models.token_id_bit_class.observe(
+            id_bit_ctx_class(class_of_pp(ctx.p2), ctx.p1, prefix, bit_pos),
+            bit,
+        );
         prefix = (prefix << 1) | bit;
     }
 }
@@ -1163,12 +1434,7 @@ fn router_ctx_bit(prev_id: Option<u32>, current: usize, prefix: u32, bit_pos: u3
 /// Mirror of `encode_router` / `decode_router` for the
 /// observation-only prewarm path — both sides need the router
 /// predictor's counts to land at the same state when measure begins.
-fn observe_router(
-    models: &mut Models,
-    prev_id: Option<u32>,
-    current: usize,
-    next: usize,
-) {
+fn observe_router(models: &mut Models, prev_id: Option<u32>, current: usize, next: usize) {
     let mut prefix: u32 = 0;
     for bit_pos in (0..ROUTER_BITS).rev() {
         let bit = u32::try_from((next >> bit_pos) & 1).expect("bit fits u32");
@@ -1181,20 +1447,14 @@ fn observe_router(
 /// Choose the predictor index that minimizes emission cost, with a
 /// stickiness bias added to non-current predictors. Returns the
 /// chosen index.
-fn choose_predictor(
-    models: &Models,
-    prev_prev_id: Option<u32>,
-    prev_id: Option<u32>,
-    id: u32,
-    current: usize,
-) -> usize {
+fn choose_predictor(models: &Models, ctx: PredCtx, id: u32, current: usize) -> usize {
     let mut best_idx = current;
-    let mut best_cost = predict_id_cost(models, prev_prev_id, prev_id, id, current);
+    let mut best_cost = predict_id_cost(models, ctx, id, current);
     for idx in 0..N_PREDICTORS {
         if idx == current {
             continue;
         }
-        let cost = predict_id_cost(models, prev_prev_id, prev_id, id, idx) + ROUTE_STICKINESS_BITS;
+        let cost = predict_id_cost(models, ctx, id, idx) + ROUTE_STICKINESS_BITS;
         if cost < best_cost {
             best_cost = cost;
             best_idx = idx;
@@ -1204,33 +1464,20 @@ fn choose_predictor(
 }
 
 /// Encode `id` MSB-first as `ID_BITS` bit-level AC emissions using
-/// the predictor selected by `which`. AC state updates only the
-/// chosen predictor's table; the other predictors are caught up via
-/// `observe_id_all` after this call (the encoder couldn't fold
-/// observation into the chosen-predictor encode because it would
-/// double-observe).
+/// the predictor selected by `which`. Only the chosen predictor's
+/// table is read for the CDF; `observe_id_all` is called separately
+/// after the encode to update all predictors in lock-step.
 fn encode_dict_id_with(
     enc: &mut AcEncoder<'_>,
     models: &Models,
-    prev_prev_id: Option<u32>,
-    prev_id: Option<u32>,
+    ctx: PredCtx,
     id: u32,
     which: usize,
 ) {
     let mut prefix: u32 = 0;
     for bit_pos in (0..ID_BITS).rev() {
         let bit = (id >> bit_pos) & 1;
-        let p_zero = match which {
-            0 => {
-                let ctx = id_bit_ctx(prev_id, prefix, bit_pos);
-                models.token_id_bit.predict_p_zero(ctx)
-            }
-            1 => {
-                let ctx = id_bit_ctx_o2(prev_prev_id, prev_id, prefix, bit_pos);
-                models.token_id_bit_o2.predict_p_zero(ctx)
-            }
-            _ => unreachable!("predictor index out of range"),
-        };
+        let p_zero = p_zero_at(models, ctx, prefix, bit_pos, which);
         let cdf = [0u32, p_zero, TOTAL];
         enc.encode(&cdf, bit as usize);
         prefix = (prefix << 1) | bit;
@@ -1240,23 +1487,12 @@ fn encode_dict_id_with(
 fn decode_dict_id_with(
     dec: &mut AcDecoder<'_, '_>,
     models: &Models,
-    prev_prev_id: Option<u32>,
-    prev_id: Option<u32>,
+    ctx: PredCtx,
     which: usize,
 ) -> Result<u32> {
     let mut prefix: u32 = 0;
     for bit_pos in (0..ID_BITS).rev() {
-        let p_zero = match which {
-            0 => {
-                let ctx = id_bit_ctx(prev_id, prefix, bit_pos);
-                models.token_id_bit.predict_p_zero(ctx)
-            }
-            1 => {
-                let ctx = id_bit_ctx_o2(prev_prev_id, prev_id, prefix, bit_pos);
-                models.token_id_bit_o2.predict_p_zero(ctx)
-            }
-            _ => unreachable!("predictor index out of range"),
-        };
+        let p_zero = p_zero_at(models, ctx, prefix, bit_pos, which);
         let cdf = [0u32, p_zero, TOTAL];
         let bit = u32::try_from(dec.decode(&cdf)?).expect("bit symbol fits u32");
         prefix = (prefix << 1) | bit;
@@ -1573,6 +1809,7 @@ fn dict_lookup(run: &[u8]) -> Option<usize> {
     DICTIONARY.iter().position(|entry| *entry == run)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prewarm(
     warm: &[u8],
     classifier: &mut Classifier,
@@ -1580,10 +1817,10 @@ fn prewarm(
     dict: &mut Dict,
     matcher: &mut TokenMatcher,
     current_predictor: &mut usize,
+    wiki_class: &mut WikiClassifier,
 ) {
     let mut last_class_ctx = CLASS_CTX_NONE;
-    let mut prev_id: Option<u32> = None;
-    let mut prev_prev_id: Option<u32> = None;
+    let mut ctx = PredCtx::NONE;
     let mut i = 0;
     while i < warm.len() {
         let mode = classifier.current_mode();
@@ -1595,27 +1832,32 @@ fn prewarm(
 
                 let end = run_end(warm, i);
                 let token = &warm[i..end];
-                let new_id = observe_token(
-                    models,
-                    dict,
-                    class,
-                    token,
-                    prev_prev_id,
-                    prev_id,
-                    current_predictor,
-                );
+                let token_ctx = PredCtx {
+                    wiki: u8::try_from(wiki_class.current_sub().idx())
+                        .expect("WikiSub::idx() < 256"),
+                    ..ctx
+                };
+                let new_id =
+                    observe_token(models, dict, class, token, token_ctx, current_predictor);
                 if let Some(id) = new_id {
                     matcher.push(id);
                 }
-                prev_prev_id = prev_id;
-                prev_id = new_id;
+                ctx = PredCtx {
+                    p3: ctx.p2,
+                    p2: ctx.p1,
+                    p1: new_id,
+                    wiki: token_ctx.wiki,
+                };
                 // Also observe the lz_flag=0 (no-match) for prewarm
                 // so the model arrives at measure with a calibrated
-                // P(no-match) prior.
-                models.lz_flag.observe(0);
+                // P(no-match) prior. Use the prev_id-conditioned
+                // bit predictor (Phase-19f).
+                let flag_ctx = lz_flag_ctx(ctx.p1);
+                models.lz_flag_bit.observe(flag_ctx, 0);
 
                 for &b in token {
                     classifier.advance(b);
+                    wiki_class.advance(b);
                 }
                 i = end;
                 last_class_ctx = match class {
@@ -1626,10 +1868,10 @@ fn prewarm(
             Mode::AttrValue => {
                 models.attr_byte.observe(warm[i] as usize);
                 classifier.advance(warm[i]);
+                wiki_class.advance(warm[i]);
                 i += 1;
                 last_class_ctx = CLASS_CTX_NONE;
-                prev_prev_id = None;
-                prev_id = None;
+                ctx = PredCtx::NONE;
             }
             Mode::TagStructure => {
                 let run_end_ = find_tag_run_end(warm, i, *classifier);
@@ -1644,11 +1886,11 @@ fn prewarm(
                 }
                 for &b in run {
                     classifier.advance(b);
+                    wiki_class.advance(b);
                 }
                 i = run_end_;
                 last_class_ctx = CLASS_CTX_NONE;
-                prev_prev_id = None;
-                prev_id = None;
+                ctx = PredCtx::NONE;
             }
         }
     }
@@ -1666,8 +1908,7 @@ fn observe_token(
     dict: &mut Dict,
     class: TokenClass,
     token: &[u8],
-    prev_prev_id: Option<u32>,
-    prev_id: Option<u32>,
+    ctx: PredCtx,
     current_predictor: &mut usize,
 ) -> Option<u32> {
     let (pat, key) = match class {
@@ -1675,16 +1916,16 @@ fn observe_token(
         TokenClass::Separator => (None, token.to_vec()),
     };
     let hit_id = dict.get(&key);
-    let oov_sym = usize::from(hit_id.is_none());
-    models.token_oov.observe(oov_sym);
+    let oov_ctx = lz_flag_ctx(ctx.p1);
+    let oov_sym = u32::from(hit_id.is_none());
+    models.token_oov_bit.observe(oov_ctx, oov_sym);
 
     if let Some(id) = hit_id {
         // Mirror encode_token's router/observe-all behavior so the
-        // router_bit and both dict_id predictors stay in sync.
-        let next_predictor =
-            choose_predictor(models, prev_prev_id, prev_id, id, *current_predictor);
-        observe_router(models, prev_id, *current_predictor, next_predictor);
-        observe_id_all(models, prev_prev_id, prev_id, id);
+        // router_bit and all dict_id predictors stay in sync.
+        let next_predictor = choose_predictor(models, ctx, id, *current_predictor);
+        observe_router(models, ctx.p1, *current_predictor, next_predictor);
+        observe_id_all(models, ctx, id);
         *current_predictor = next_predictor;
 
         if let Some(p) = pat {
