@@ -263,12 +263,12 @@ const LZ_MATCH_NCTX: usize = 1024;
 const N_MIX_ID: usize = 4;
 
 /// Phase-23A: weight-table size per feature in the `dict_id`
-/// sparse-LR. K=22 → 4 Mi slots × 4 bytes × 3 features = 48 MiB.
-/// Bigger than the natural Order-3 cell count by a factor of ~10⁴,
-/// so hash collisions dominate — fine, since SGD averages noisy
-/// updates across collided cells the same way it averages within
-/// each cell.
-const ID_SPARSE_LR_K: u32 = 22;
+/// sparse-LR. K=24 → 16 Mi slots × 4 bytes × 3 features = 192 MiB.
+/// Phase-23A used K=22 (48 MiB); Phase 23C bumped K=24 to test
+/// whether the Order-3 hashed feature was still
+/// saturation-limited. Memory is fine — the headroom against the
+/// 10 GiB Hutter cap is huge.
+const ID_SPARSE_LR_K: u32 = 24;
 /// Phase-23A: SGD learning rate for the `dict_id` sparse-LR. Same
 /// rate the `LogitMixer` uses; tuned more carefully if the predictor
 /// pulls weight from the existing arms.

@@ -13,6 +13,24 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23C: Bumped `dict_id` LR K=22 → K=24 — 1.881 bpb on Enwik9
+
+One-line change to test the hypothesis that the Phase-23A `dict_id` sparse-LR was still saturation-limited at K=22 (4 Mi slots/feature) on the enwik9 scale.
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes |
+|---|---:|---:|---:|
+| Phase 23B (K=22) | 2.1243 | 1.8810 | 235,124,739 |
+| **Phase 23C (K=24)** | **2.1242** | **1.8805** | **235,066,968** |
+| Δ | -0.0001 | -0.0005 | -57,771 bytes |
+
+Memory: 48 MiB → 192 MiB (16 Mi slots × `f32` × 3 features). Runtime: encode 566 s vs Phase 23B's 559 s (+1.3 %); decode +3 %. Roundtrip OK.
+
+Tiny win — flat on enwik8 (within noise), measurable on enwik9 (the larger corpus warms the bigger table enough that hashed Order-3 collisions hurt less). The cost is +144 MiB of decode-time memory, comfortably under the 10 GiB Hutter cap. Keeping it because it's a clean positive at no runtime price; not a result worth chasing further at the dict_id layer.
+
+The diminishing-returns shape (Phase 23A -0.0129 bpb at K=22, Phase 23C another -0.0005 at K=24) is exactly the saturation curve one would expect: the per-feature gradient signal is bounded by observation density, and K=22 already captures most of it on enwik9.
+
+---
+
 ## 2026-05-13 — Phase 23B: Sparse-LR on `lz_flag` and `token_oov_bit` Mixers — 1.881 bpb on Enwik9
 
 Follow-up to Phase 23A. The same `SparseLR` primitive applied to the two remaining mixed streams — `lz_flag` (was this token an LZ match?) and `token_oov_bit` (was the non-match token an OOV?). Both are 1-bit-per-token decisions already mixing Order-1 + Order-2 count predictors; the sparse-LR adds the same shape of hashed cross-features that worked at the `dict_id` layer.
