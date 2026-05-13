@@ -13,6 +13,65 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 22: 5-Mode Wiki Sub-Mode Classifier + Wiki-Conditioned dict_id Predictor — 1.897 bpb on Enwik9
+
+CDR's roadmap put "Wikitext-syntax parser" as the next major lever after Phase 21's mixing infrastructure. A full parser is multi-week work; this phase scoped a narrower step: **promote the recon's 5-mode `WikiFineClassifier` to a first-class module and use it as a third predictor in the `dict_id` mixer**. The expectation: structural sub-mode (e.g. `LinkTarget` vs `Plain`) has different `dict_id` distributions that Order-1 / Order-2 alone don't capture.
+
+### What landed
+
+1. **5-mode `WikiFineClassifier`** in `src/wiki_classifier.rs`. Splits the old 3-mode classifier's `Link` into `LinkTarget` (before the `|`) and `LinkDisplay` (after); splits `Template` into `TemplateName` and `TemplateArg`. Same Moore-FSM construction, same zero-signaling-bits property. Promoted from a private helper inside `recon.rs`.
+2. **Wiki-conditioned `dict_id` bit predictor** (`token_id_bit_wiki`, K=26 = 64 MiB) as the third arm of the `dict_id` mixer. Context = `(wiki_sub_mode, prev_id, prefix, bit_pos)`.
+
+### Results
+
+Mixer arity bumped to `N_MIX_ID = 3` for the `dict_id` stream while keeping `N_MIX_LZ_FLAG = N_MIX_TOKEN_OOV = 2` (per-stream const generics now).
+
+| Config | enwik8 e2e bpb | Δ vs Phase 21 |
+|---|---:|---:|
+| Phase 21 (no wiki in mix) | 2.1576 | — |
+| Phase 22a (3-mode wiki, K=25) | 2.1564 | -0.0012 |
+| Phase 22 (5-mode wiki, K=26) | 2.1564 | -0.0012 |
+
+| Config | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 21 |
+|---|---:|---:|---:|
+| Phase 21 | 1.8981 | 237,259,434 | — |
+| **Phase 22 (5-mode wiki in mix)** | **1.8970** | **237,120,859** | **-0.0011 / -138 K bytes** |
+
+The mixer correctly down-weights the wiki predictor on `Plain` mode (where `prev_id` alone is enough) and up-weights it on structural sub-modes; what's left is a small but real -0.001 bpb. The 5-mode classifier is the right substrate going forward — it carries the structural information later parser-based codecs will need — but the dict_id stream alone doesn't surface much of its value.
+
+### Negative finding: per-wiki-sub-mode OOV byte model
+
+Tried splitting the Order-4 OOV word letter model into 5 per-wiki-sub-mode sub-models (`Order1Ctx<5 × 27^4, 26>`, 276 MiB). Rationale: page names in `LinkTarget` have very different letter distributions than prose in `LinkDisplay`. Result on enwik8 e2e: **2.1610 / +0.0046 bpb regression**. 1.5 M OOV letters spread across 2.66 M cells = 0.56 obs/cell — too sparse no matter how the wiki mode partitions. The single global Order-4 model is already at the OOV-byte-volume saturation point; structural splitting is the wrong axis here. Reverted.
+
+### Why this matters less than expected
+
+The Phase 22 result reframes what the wiki sub-mode is for. **At the dict-id and OOV-byte streams, wiki sub-mode adds little signal beyond what Order-1/Order-2 already capture.** The bytes are mostly token-id boundaries and English letters; the structural distinction lives at a higher layer — *which tokens appear in `[[...]]` at all*, not *which bits encode the chosen token*. A real wikitext parser would intercept the structural framing (`{{`, `}}`, `[[`, `]]`, `|`) entirely and encode them as small structural codes plus per-stream content, not as bytes interleaved through the same dict.
+
+That's a multi-week build. The 5-mode classifier is the substrate it would need. For now Phase 22 commits the modest in-place gain.
+
+### Phase 22 cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 19k | 249,191,955 | 1.9935 | — |
+| Phase 20l | 241,105,534 | 1.9288 | -0.0647 |
+| Phase 21 | 237,259,434 | 1.8981 | -0.0954 |
+| **Phase 22** | **237,120,859** | **1.8970** | **-0.0965** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1697 bpb / -16.9 MiB on enwik9**. Hutter ratio: **2.16×** target.
+
+### Tables not pursued in Phase 22
+
+| Idea | Where | Result | Reason |
+|---|---|---|---|
+| Per-wiki-sub-mode Order-4 OOV word letter | step b | +0.0046 e2e enwik8 | 5 × 531 K cells / 1.5 M OOV letters = 0.56 obs/cell |
+| 3-mode → 5-mode at K=25 | step a' | wash | 1.67× context expansion at fixed K starves cells |
+| Wiki-conditioned `lz_flag` predictor | (skipped) | n/a | Phase-22's small wiki signal on `dict_id` suggests lz_flag wouldn't move much either |
+
+The realistic next step toward Hutter territory is **#3 from the roadmap — a neural arm** (LSTM / small transformer / pretrained-and-embedded). The wiki parser is the cleanest structural lever once we have a richer base predictor stack to feed.
+
+---
+
 ## 2026-05-13 — Phase 21: PAQ-Style Logit Mixing Replaces the Router — 1.898 bpb on Enwik9
 
 CDR asked for at least five proposals to push toward Hutter territory and indicated I could rewrite anything. The shortlist was (1) PAQ-style logit mixing, (2) Wikitext-syntax parser, (3) on-line / pretrained neural arm, plus minor extensions. We proceeded with #1 first because it's the substrate everything else slots into and the Phase 18 router was a known sub-optimal proxy for it.

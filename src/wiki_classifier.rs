@@ -41,6 +41,130 @@ impl WikiSub {
 
 pub(crate) const N_WIKI_SUB: usize = 3;
 
+/// Phase-22: 5-mode fine wiki sub-classifier. Splits `Link` into
+/// `LinkTarget` (before the `|`) and `LinkDisplay` (after the `|`);
+/// splits `Template` into `TemplateName` and `TemplateArg`. The
+/// recon (2026-05-13) showed these four sub-modes have sharply
+/// different distributions: `LinkTarget` is Zipf-skewed page names,
+/// `LinkDisplay` is mostly prose, `TemplateName` is a small set of
+/// canonical names, `TemplateArg` is mixed structured / prose data.
+///
+/// The `|` flag is global per type rather than per nesting level,
+/// so deeply nested templates with `|` only in the inner one get a
+/// few outer bytes misclassified as `TemplateArg`. Cheap to ignore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum WikiFine {
+    Plain = 0,
+    LinkTarget = 1,
+    LinkDisplay = 2,
+    TemplateName = 3,
+    TemplateArg = 4,
+}
+
+impl WikiFine {
+    pub(crate) const fn idx(self) -> usize {
+        self as usize
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) const N_WIKI_FINE: usize = 5;
+
+/// Mirror of [`WikiClassifier`] with `|`-flag tracking to split
+/// Link into `LinkTarget` / `LinkDisplay` and Template into
+/// `TemplateName` / `TemplateArg`. Same Moore-FSM construction:
+/// both encoder and decoder run it deterministically so no
+/// signaling bits are needed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WikiFineClassifier {
+    link_depth: u16,
+    template_depth: u16,
+    seen_pipe_in_link: bool,
+    seen_pipe_in_template: bool,
+    prev: Option<u8>,
+}
+
+impl WikiFineClassifier {
+    pub(crate) const fn new() -> Self {
+        Self {
+            link_depth: 0,
+            template_depth: 0,
+            seen_pipe_in_link: false,
+            seen_pipe_in_template: false,
+            prev: None,
+        }
+    }
+
+    pub(crate) const fn current_sub(self) -> WikiFine {
+        if self.link_depth > 0 {
+            if self.seen_pipe_in_link {
+                WikiFine::LinkDisplay
+            } else {
+                WikiFine::LinkTarget
+            }
+        } else if self.template_depth > 0 {
+            if self.seen_pipe_in_template {
+                WikiFine::TemplateArg
+            } else {
+                WikiFine::TemplateName
+            }
+        } else {
+            WikiFine::Plain
+        }
+    }
+
+    pub(crate) const fn advance(&mut self, byte: u8) {
+        let pair_open_link = matches!(self.prev, Some(b'[')) && byte == b'[';
+        let pair_close_link = matches!(self.prev, Some(b']')) && byte == b']';
+        let pair_open_tpl = matches!(self.prev, Some(b'{')) && byte == b'{';
+        let pair_close_tpl = matches!(self.prev, Some(b'}')) && byte == b'}';
+
+        if pair_open_link {
+            self.link_depth = self.link_depth.saturating_add(1);
+            if self.link_depth == 1 {
+                self.seen_pipe_in_link = false;
+            }
+            self.prev = None;
+        } else if pair_close_link && self.link_depth > 0 {
+            self.link_depth -= 1;
+            if self.link_depth == 0 {
+                self.seen_pipe_in_link = false;
+            }
+            self.prev = None;
+        } else if pair_open_tpl {
+            self.template_depth = self.template_depth.saturating_add(1);
+            if self.template_depth == 1 {
+                self.seen_pipe_in_template = false;
+            }
+            self.prev = None;
+        } else if pair_close_tpl && self.template_depth > 0 {
+            self.template_depth -= 1;
+            if self.template_depth == 0 {
+                self.seen_pipe_in_template = false;
+            }
+            self.prev = None;
+        } else if byte == b'|' {
+            if self.link_depth > 0 {
+                self.seen_pipe_in_link = true;
+            } else if self.template_depth > 0 {
+                self.seen_pipe_in_template = true;
+            }
+            self.prev = None;
+        } else if matches!(byte, b'[' | b']' | b'{' | b'}') {
+            self.prev = Some(byte);
+        } else {
+            self.prev = None;
+        }
+    }
+}
+
+impl Default for WikiFineClassifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One-byte memory for paired-token detection. Reset to `None` after
 /// a pair fires so `[[[` doesn't double-count.
 #[derive(Clone, Copy, Debug)]

@@ -77,7 +77,7 @@ use crate::tok_lz::{self, TokenMatcher};
 use crate::tokenizer::{
     CasePattern, TokenClass, apply_case, classify_case, lowercase, mixed_mask, run_end,
 };
-use crate::wiki_classifier::WikiClassifier;
+use crate::wiki_classifier::WikiFineClassifier;
 
 const DICTIONARY: &[&[u8]] = &[
     b"page>",
@@ -146,7 +146,10 @@ const LETTER_NCTX: usize = 27;
 /// syms × 4 bytes = ~55 MiB. The Order-2 → Order-3 → Order-4 sweep
 /// gained -0.0207, -0.0063, -0.0013 bpb on enwik8 e2e respectively;
 /// Order-5 (14M rows, ~1.5 GiB) regressed +0.003 because cells went
-/// too cold for the OOV byte volume.
+/// too cold for the OOV byte volume. Phase-22 tested per-wiki-sub-
+/// mode splitting (5 × 531 K cells, ~276 MiB): regressed +0.005 bpb
+/// on enwik8 — 1.5 M OOV letters / 2.66 M cells = 0.56 obs/cell,
+/// too sparse no matter how the wiki mode partitions.
 const LETTER_NCTX_O4: usize = LETTER_NCTX * LETTER_NCTX * LETTER_NCTX * LETTER_NCTX;
 
 /// Byte context for OOV-separator emission: index 256 = "start of
@@ -188,6 +191,14 @@ const OFFSET_BUCKET_ALPHABET: usize = 21;
 /// 1 GiB now (within the 10 GiB judging-machine budget). Phase-20e
 /// bumped to K=29 (2 GiB).
 const ID_BIT_O2_K: u32 = 29;
+
+/// Phase-22: hash-table size for the wiki-mode-conditioned `dict_id`
+/// bit predictor. Context = `(wiki_sub_mode, prev_id, prefix,
+/// bit_pos)`. The 5-mode `WikiFineClassifier` (`Plain` /
+/// `LinkTarget` / `LinkDisplay` / `TemplateName` / `TemplateArg`)
+/// multiplies the Order-1 context space by 5, so K=26 (64 MiB)
+/// keeps roughly Order-1's per-slot density per wiki mode.
+const ID_BIT_WIKI_K: u32 = 26;
 
 /// Phase-21: logit-space mixer of the Order-1 and Order-2 `dict_id`
 /// bit predictors. Replaces the Phase-18 router. The mixer is
@@ -242,13 +253,18 @@ const TOKEN_OOV_MIXER_K: u32 = 10;
 /// regressed +0.016 bpb because the length CDF cells went cold.
 const LZ_MATCH_NCTX: usize = 1024;
 
-/// Phase-21: number of predictors in the mixer. Currently the
-/// `dict_id` mix is `[Order-1, Order-2]`. Order-3 was tested at
-/// N=3 on enwik8 e2e and gave +0.0005 bpb — too sparse at enwik8
-/// scale to add value over the mixer's existing weighting of
-/// Order-1 (cold) vs Order-2 (warm bigram). Worth re-testing at
-/// enwik9 scale once the rest of Phase 21 settles.
-const N_MIX: usize = 2;
+/// Phase-22: number of predictors in the `dict_id` mixer.
+/// `[Order-1, Order-2, Wiki]`. Wiki conditions on the
+/// `wiki_classifier` sub-mode (Plain / Link / Template) and adds
+/// value where the same `prev_id` token has different downstream
+/// distributions inside `[[ ]]` or `{{ }}` than in prose.
+const N_MIX_ID: usize = 3;
+/// Phase-21: number of predictors in the `lz_flag` mixer.
+/// `[Order-1, Order-2]`.
+const N_MIX_LZ_FLAG: usize = 2;
+/// Phase-21: number of predictors in the `token_oov_bit` mixer.
+/// `[Order-1, Order-2]`.
+const N_MIX_TOKEN_OOV: usize = 2;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct XmlTokRouteCodec;
@@ -327,9 +343,8 @@ struct Models {
     lz_length_o1: Order1Ctx<LZ_MATCH_NCTX, 256>,
 
     /// Phase-20j: Order-4 OOV word letter model. Context =
-    /// `p4 * 27^3 + p3 * 27^2 + p2 * 27 + p1`. 531441 rows × 26 syms
-    /// = ~55 MiB. Order-5 (Phase-20k, 14M rows) regressed enwik8
-    /// (+0.003 bpb) — cells too sparse for the OOV-byte volume.
+    /// `p4 * 27^3 + p3 * 27^2 + p2 * 27 + p1`. 531441 rows × 26
+    /// syms × 4 bytes = ~55 MiB.
     oov_word_letter: Order1Ctx<LETTER_NCTX_O4, 26>,
     /// Phase-20g: Order-2 OOV separator byte model. Context =
     /// `prev_prev * 257 + prev`. 66049 rows × 256 syms × 4 bytes =
@@ -346,6 +361,10 @@ struct Models {
     /// Phase-18 / Phase-21: Order-2 `dict_id` bit predictor —
     /// `(prev_prev_id, prev_id, prefix, bit_pos)` context.
     token_id_bit_o2: BitPredictor,
+    /// Phase-19 / Phase-22: wiki-mode-conditioned `dict_id`
+    /// predictor — `(wiki_sub_mode, prev_id, prefix, bit_pos)`.
+    /// Mixed with Order-1 + Order-2 by `token_id_mixer`.
+    token_id_bit_wiki: BitPredictor,
     /// Phase-19f / Phase-21: Order-1 `lz_flag` predictor — context
     /// = `(prev_id)`. Mixed with the Order-2 variant by
     /// `lz_flag_mixer`.
@@ -356,7 +375,7 @@ struct Models {
     /// Phase-21: `lz_flag` mixer. Blends Order-1 + Order-2 per
     /// `prev_id` (warm bigrams favor Order-2; cold `prev_id`s
     /// favor Order-1).
-    lz_flag_mixer: LogitMixer<N_MIX>,
+    lz_flag_mixer: LogitMixer<N_MIX_LZ_FLAG>,
     /// Phase-19g: Order-1 `token_oov` predictor — context =
     /// `(prev_id)`.
     token_oov_bit: BitPredictor,
@@ -365,13 +384,13 @@ struct Models {
     token_oov_bit_o2: BitPredictor,
     /// Phase-21: mixer blending Order-1 + Order-2 OOV bit per
     /// `prev_id`.
-    token_oov_mixer: LogitMixer<N_MIX>,
+    token_oov_mixer: LogitMixer<N_MIX_TOKEN_OOV>,
     /// Phase-21: logit-space mixer for the `dict_id` bit stream.
     /// Takes the two base predictors' `P(bit = 0)` and produces a
     /// per-context blend learned by SGD on log-loss. Replaces the
     /// Phase-18 router (which paid 1 router bit/token plus its own
     /// `BitPredictor` table).
-    token_id_mixer: LogitMixer<N_MIX>,
+    token_id_mixer: LogitMixer<N_MIX_ID>,
 }
 
 impl Models {
@@ -392,6 +411,7 @@ impl Models {
             tag_byte: Order0::new(),
             attr_byte: Order0::new(),
             token_id_bit_o2: BitPredictor::new(ID_BIT_O2_K),
+            token_id_bit_wiki: BitPredictor::new(ID_BIT_WIKI_K),
             lz_flag_bit_o1: BitPredictor::new(LZ_FLAG_BIT_O1_K),
             lz_flag_bit: BitPredictor::new(LZ_FLAG_BIT_O2_K),
             token_oov_bit: BitPredictor::new(TOKEN_OOV_BIT_K),
@@ -430,7 +450,7 @@ impl Codec for XmlTokRouteCodec {
         let mut models = Models::new();
         let mut dict = Dict::default();
         let mut matcher = TokenMatcher::new();
-        let mut wiki_class = WikiClassifier::new();
+        let mut wiki_class = WikiFineClassifier::new();
         prewarm(
             &buf[..warm_end],
             &mut classifier,
@@ -701,7 +721,7 @@ impl Codec for XmlTokRouteCodec {
         let mut models = Models::new();
         let mut dict = Dict::default();
         let mut matcher = TokenMatcher::new();
-        let mut wiki_class = WikiClassifier::new();
+        let mut wiki_class = WikiFineClassifier::new();
         prewarm(
             &buf,
             &mut classifier,
@@ -1168,8 +1188,10 @@ fn lz_match_row(prev_id: Option<u32>) -> usize {
 /// active Phase-21 mix is `(Order-1, Order-2, Order-3)` on
 /// `(p3, p2, p1)`.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 struct PredCtx {
+    /// Reserved for Phase 22+ Order-3 / multi-token-context
+    /// predictors. Tracked through encode/decode but not yet read.
+    #[allow(dead_code)]
     p3: Option<u32>,
     p2: Option<u32>,
     p1: Option<u32>,
@@ -1199,7 +1221,7 @@ const fn mixer_id_ctx(bit_pos: u32, prefix: u32) -> u64 {
 
 /// Read all base predictors' `P(bit = 0)` without touching any
 /// state. Used on the encode path before we know the bit value.
-fn id_bit_p_zeros(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u32; N_MIX] {
+fn id_bit_p_zeros(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u32; N_MIX_ID] {
     [
         models
             .token_id_bit
@@ -1207,6 +1229,9 @@ fn id_bit_p_zeros(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32) -> [
         models
             .token_id_bit_o2
             .predict_p_zero(id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos)),
+        models
+            .token_id_bit_wiki
+            .predict_p_zero(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos)),
     ]
 }
 
@@ -1219,7 +1244,7 @@ fn observe_id_bit(
     prefix: u32,
     bit_pos: u32,
     bit: u32,
-    p_zeros: [u32; N_MIX],
+    p_zeros: [u32; N_MIX_ID],
 ) {
     models
         .token_id_bit
@@ -1228,8 +1253,21 @@ fn observe_id_bit(
         .token_id_bit_o2
         .observe(id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos), bit);
     models
+        .token_id_bit_wiki
+        .observe(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos), bit);
+    models
         .token_id_mixer
         .observe(mixer_id_ctx(bit_pos, prefix), &p_zeros, bit);
+}
+
+/// Hash `(wiki_sub_mode, prev_id, prefix, bit_pos)` into the
+/// wiki-mode-conditioned `dict_id` predictor's context space.
+fn id_bit_ctx_wiki(wiki: u8, prev_id: Option<u32>, prefix: u32, bit_pos: u32) -> u64 {
+    let p = prev_id.map_or(u64::MAX, u64::from);
+    let h = fnv_mix(FNV_OFFSET, u64::from(wiki));
+    let h = fnv_mix(h, p);
+    let h = fnv_mix(h, u64::from(prefix));
+    fnv_mix(h, u64::from(bit_pos))
 }
 
 /// Observe `id` in the entire `dict_id` predictor stack (used
@@ -1266,7 +1304,7 @@ fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, ctx: PredCtx, id
 /// Phase-21: read both `lz_flag` base predictors' `P(no-match)`
 /// and return the mixed value. State is not mutated; call
 /// `observe_lz_flag_bit` after the bit is known.
-fn lz_flag_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX], u32) {
+fn lz_flag_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX_LZ_FLAG], u32) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
     let p_zeros = [
@@ -1280,7 +1318,7 @@ fn lz_flag_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX], u32) {
 /// Phase-21: observe one `lz_flag` bit in both base predictors
 /// and the mixer. `p_zeros` should be the same array returned by
 /// `lz_flag_p_mixed` for the same context.
-fn observe_lz_flag_bit(models: &mut Models, ctx: PredCtx, p_zeros: [u32; N_MIX], bit: u32) {
+fn observe_lz_flag_bit(models: &mut Models, ctx: PredCtx, p_zeros: [u32; N_MIX_LZ_FLAG], bit: u32) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
     models.lz_flag_bit_o1.observe(ctx_o1, bit);
@@ -1290,7 +1328,7 @@ fn observe_lz_flag_bit(models: &mut Models, ctx: PredCtx, p_zeros: [u32; N_MIX],
 
 /// Phase-21: read both `token_oov` base predictors' `P(hit)` and
 /// the mixer-blended value. Same shape as `lz_flag_p_mixed`.
-fn token_oov_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX], u32) {
+fn token_oov_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX_TOKEN_OOV], u32) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
     let p_zeros = [
@@ -1301,7 +1339,12 @@ fn token_oov_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX], u32) {
     (p_zeros, p_mixed)
 }
 
-fn observe_token_oov_bit(models: &mut Models, ctx: PredCtx, p_zeros: [u32; N_MIX], bit: u32) {
+fn observe_token_oov_bit(
+    models: &mut Models,
+    ctx: PredCtx,
+    p_zeros: [u32; N_MIX_TOKEN_OOV],
+    bit: u32,
+) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
     models.token_oov_bit.observe(ctx_o1, bit);
@@ -1659,7 +1702,7 @@ fn prewarm(
     models: &mut Models,
     dict: &mut Dict,
     matcher: &mut TokenMatcher,
-    wiki_class: &mut WikiClassifier,
+    wiki_class: &mut WikiFineClassifier,
 ) {
     let mut last_class_ctx = CLASS_CTX_NONE;
     let mut ctx = PredCtx::NONE;
