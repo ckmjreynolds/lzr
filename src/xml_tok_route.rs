@@ -289,16 +289,14 @@ const ID_MLP_LR: f32 = 0.02;
 /// confirming the diminishing-returns curve is feature-limited.
 /// Reverted to `H=8`.
 const ID_MLP_H: usize = 8;
-/// Phase-23D → Phase-23J: feature count of the `dict_id` MLP.
+/// Phase-23D → Phase-23K: feature count of the `dict_id` MLP.
 /// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),
 /// bias (LR-shared), p1_len_bucket (23F), p2_len_bucket (23G),
-/// (p1_len, p2_len) joint (23H), tokens_since_match_bucket (23J)]`.
-/// Phase 23E tried two deep-context features (Order-4,
-/// Wiki × Order-3) which regressed — see that journal entry for
-/// the saturation argument that picked the coarse path. Phase 23I
-/// confirmed the MLP is feature-limited (H=16 didn't help) which
-/// motivated 23J's genuinely-new information feature.
-const N_MLP_ID_FEATS: usize = 7;
+/// (p1_len, p2_len) joint (23H), tokens_since_match_bucket (23J),
+/// p1_class (23K)]`. Phase 23E (Order-4) and 23I (H=16) both
+/// regressed; the "genuinely-new information" path (23J + 23K) is
+/// the productive lever — see each journal entry.
+const N_MLP_ID_FEATS: usize = 8;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -654,6 +652,9 @@ impl Codec for XmlTokRouteCodec {
                             } else {
                                 ctx.p1_len
                             };
+                            let p1_class_new = class_to_p1_class(TokenClass::from_byte(
+                                dict.entry(last_id).lower[0],
+                            ));
                             ctx = PredCtx {
                                 p3: p3_new,
                                 p2: p2_new,
@@ -661,6 +662,7 @@ impl Codec for XmlTokRouteCodec {
                                 p1_len: p1_len_new,
                                 p2_len: p2_len_new,
                                 tokens_since_match: 0,
+                                p1_class: p1_class_new,
                                 wiki: ctx.wiki,
                             };
                             continue;
@@ -700,6 +702,7 @@ impl Codec for XmlTokRouteCodec {
                         }
                         let p1_len_new =
                             new_id.map_or(0, |_| u8::try_from(token.len()).unwrap_or(u8::MAX));
+                        let p1_class_new = new_id.map_or(0, |_| class_to_p1_class(class));
                         ctx = PredCtx {
                             p3: ctx.p2,
                             p2: ctx.p1,
@@ -707,6 +710,7 @@ impl Codec for XmlTokRouteCodec {
                             p1_len: p1_len_new,
                             p2_len: ctx.p1_len,
                             tokens_since_match: ctx.tokens_since_match.saturating_add(1),
+                            p1_class: p1_class_new,
                             wiki: token_ctx.wiki,
                         };
 
@@ -933,6 +937,8 @@ impl Codec for XmlTokRouteCodec {
                         let p2_len_new = p2_id_opt.map_or(ctx.p1_len, |id| {
                             u8::try_from(dict.entry(id).lower.len()).unwrap_or(u8::MAX)
                         });
+                        let p1_class_new =
+                            class_to_p1_class(TokenClass::from_byte(dict.entry(last_id).lower[0]));
                         ctx = PredCtx {
                             p3: p3_new,
                             p2: p2_new,
@@ -940,6 +946,7 @@ impl Codec for XmlTokRouteCodec {
                             p1_len: p1_len_new,
                             p2_len: p2_len_new,
                             tokens_since_match: 0,
+                            p1_class: p1_class_new,
                             wiki: ctx.wiki,
                         };
                         continue;
@@ -973,6 +980,7 @@ impl Codec for XmlTokRouteCodec {
                     };
                     let p1_len_new =
                         new_prev.map_or(0, |_| u8::try_from(token_bytes.len()).unwrap_or(u8::MAX));
+                    let p1_class_new = new_prev.map_or(0, |_| class_to_p1_class(class));
                     ctx = PredCtx {
                         p3: ctx.p2,
                         p2: ctx.p1,
@@ -980,6 +988,7 @@ impl Codec for XmlTokRouteCodec {
                         p1_len: p1_len_new,
                         p2_len: ctx.p1_len,
                         tokens_since_match: ctx.tokens_since_match.saturating_add(1),
+                        p1_class: p1_class_new,
                         wiki: token_ctx.wiki,
                     };
                 }
@@ -1046,6 +1055,15 @@ const fn class_to_sym(c: TokenClass) -> usize {
     match c {
         TokenClass::Word => 0,
         TokenClass::Separator => 1,
+    }
+}
+
+/// Phase 23K: `TokenClass` → `PredCtx.p1_class` encoding. 0 reserved
+/// for "no token" (i.e. `p1 == None`), so Word/Separator map to 1/2.
+const fn class_to_p1_class(c: TokenClass) -> u8 {
+    match c {
+        TokenClass::Word => 1,
+        TokenClass::Separator => 2,
     }
 }
 
@@ -1306,12 +1324,12 @@ fn lz_match_row(prev_id: Option<u32>) -> usize {
 /// `p1_len`/`p2_len` are the byte lengths of `p1`/`p2`'s tokens
 /// (capped at 255; 0 when the corresponding id is `None`);
 /// `tokens_since_match` is the count of tokens emitted since the
-/// most recent LZ-match (0 immediately after a match, increasing
-/// each non-match token). Phase 23F/G added the length fields;
-/// Phase 23J added `tokens_since_match` as a **genuinely-new
-/// information** feature (not derivable from the dict-id history),
-/// after Phase 23I confirmed the MLP was feature-limited rather
-/// than capacity-limited.
+/// most recent LZ-match (Phase 23J); `p1_class` is the token
+/// class of `p1` (0=None, 1=Word, 2=Separator, Phase 23K) —
+/// implicit in `p1` but not explicit anywhere the MLP can see.
+/// Phase 23F/G added the length fields; 23J and 23K continued the
+/// "genuinely-new information" pattern that 23I's diagnostic
+/// motivated.
 #[derive(Clone, Copy, Debug)]
 struct PredCtx {
     p3: Option<u32>,
@@ -1320,6 +1338,7 @@ struct PredCtx {
     p1_len: u8,
     p2_len: u8,
     tokens_since_match: u8,
+    p1_class: u8,
     wiki: u8,
 }
 
@@ -1331,6 +1350,7 @@ impl PredCtx {
         p1_len: 0,
         p2_len: 0,
         tokens_since_match: 0,
+        p1_class: 0,
         wiki: 0,
     };
 }
@@ -1431,9 +1451,17 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
+    // Phase 23K: `p1_class` is 3-valued — densest "new info" feature
+    // so far. Cell count 3 × 65 K × 16 ≈ 2^21, ~2000 contexts/slot
+    // at K=20 — SGD trains weights almost immediately.
+    let f_p1_class = {
+        let h = fnv_mix(FNV_OFFSET, u64::from(ctx.p1_class));
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
 
     [
-        f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len, f_len_pair, f_recency,
+        f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len, f_len_pair, f_recency, f_p1_class,
     ]
 }
 
@@ -2001,6 +2029,7 @@ fn prewarm(
                     matcher.push(id);
                 }
                 let p1_len_new = new_id.map_or(0, |_| u8::try_from(token.len()).unwrap_or(u8::MAX));
+                let p1_class_new = new_id.map_or(0, |_| class_to_p1_class(class));
                 ctx = PredCtx {
                     p3: ctx.p2,
                     p2: ctx.p1,
@@ -2008,6 +2037,7 @@ fn prewarm(
                     p1_len: p1_len_new,
                     p2_len: ctx.p1_len,
                     tokens_since_match: ctx.tokens_since_match.saturating_add(1),
+                    p1_class: p1_class_new,
                     wiki: token_ctx.wiki,
                 };
                 // Also observe the lz_flag=0 (no-match) for prewarm

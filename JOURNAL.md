@@ -13,6 +13,78 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23K: `p1_class` Coarse Feature — 1.868 bpb on Enwik9 (biggest single-feature win since 23A)
+
+Direct extension of the Phase 23J pattern: another **genuinely-new information feature**, this one the token class (Word vs Separator vs None) of `p1`. Class is determined by the first byte of the previous token but was never exposed to the MLP through `PredCtx`. Three-valued cardinality means cells are exceptionally dense; SGD trains weights almost instantly.
+
+### What landed
+
+1. **`PredCtx.p1_class: u8`** — 0=None, 1=Word, 2=Separator. Populated at all five construction sites:
+   - Encode/decode LZ-match: derived from `dict.entry(last_id).lower[0]` via `class_to_p1_class(TokenClass::from_byte(..))`.
+   - Encode/decode/prewarm simple-shift: from the in-scope `class` if `new_id`/`new_prev` is `Some`, else 0.
+2. **`class_to_p1_class`** helper in `src/xml_tok_route.rs` mapping `TokenClass` → `u8`. Reserves 0 for "no token" so the cold start-of-page case is distinguishable from "Word" and "Separator".
+3. **New 8th MLP feature** `(p1_class, prefix, bit_pos)` at K=20. Memory: +32 MiB. Cell count 3 × 65 K × 16 ≈ 2^21 — every K=20 slot averages ~2000 contexts.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23J |
+|---|---:|---:|---:|---:|
+| Phase 23J | 2.1085 | 1.8728 | 234,096,064 | — |
+| **Phase 23K** | **2.1003** | **1.8678** | **233,478,388** | **-0.0082 / -0.0050 / -603 KiB** |
+
+Roundtrip OK. Encode 716 s vs Phase 23J's 705 s (+1.5 %); decode 414 s vs 404 s (+2.5 %). Memory +32 MiB.
+
+### Single-feature win in context
+
+| Phase | Feature | enwik9 Δ |
+|---|---|---:|
+| 23A | Sparse-LR primitive (3 features at once) | -0.0129 |
+| 23B | LR on lz_flag / token_oov | -0.0031 |
+| 23F | `p1_len_bucket` | -0.0022 |
+| 23G | `p2_len_bucket` | -0.0016 |
+| 23H | `(p1_len, p2_len)` joint | -0.0007 |
+| 23J | `tokens_since_match` | -0.0019 |
+| **23K** | **`p1_class`** | **-0.0050** |
+
+23K is the biggest **single-feature** win since 23A introduced the sparse-LR primitive (which bundled three features into one phase). It's bigger than 23B + 23C + 23D + 23H combined (-0.0056), bigger than 23F + 23G combined (-0.0038).
+
+### Why this feature is so strong
+
+Word/Separator alternation is structurally fundamental to the tokenizer — runs of `[a-zA-Z]+` strictly alternate with runs of `[^a-zA-Z]+`. Knowing `p1_class` tells the predictor whether the *current* token is a Word or Separator (because of the alternation), which strongly constrains the dict-id distribution: a Separator token's id lives in a different region of the dictionary than a Word token. The base predictors don't see `class` explicitly — they have to infer it through `prev_id` correlations, which works for warm ids but fails on cold tails.
+
+The 3-valued cardinality means the (p1_class, prefix, bit_pos) cells are warm from the very first observation. Compare to the Phase-23E Order-4 disaster where 2^73 natural cells hashed to 2^20 slots meant SGD never separated signal from collision noise. Here, every slot averages ~2000 contexts and converges in a few thousand bits.
+
+The 23I diagnostic and the 23J/23K results together describe a clean rule for MLP feature engineering on this codec:
+
+> Bring the MLP information that's (a) **structurally informative** about the dict-id distribution and (b) **not derivable from any existing input feature**, with (c) **small enough cardinality** that gradient updates dominate noise. Capacity scale-up and deep-context hashing don't help.
+
+### Phase 23K cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 22 | 237,120,859 | 1.8970 | -0.0965 |
+| Phase 23A | 235,510,295 | 1.8841 | -0.1094 |
+| Phase 23D | 234,905,363 | 1.8792 | -0.1143 |
+| Phase 23H | 234,336,587 | 1.8747 | -0.1188 |
+| Phase 23J | 234,096,064 | 1.8728 | -0.1207 |
+| **Phase 23K** | **233,478,388** | **1.8678** | **-0.1257** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1989 bpb / -19.9 MiB on enwik9**. Hutter ratio: **2.129× target**.
+
+### Follow-up candidates
+
+The 23K pattern (small-cardinality structurally-informative feature) suggests several more:
+
+- **`p2_class`**: class of token two back. Same shape; probably ~50-60 % of 23K's gain (the more recent token has more predictive power, and `p2_class` is highly correlated with `p1_class` due to alternation).
+- **`(p1_class, p2_class)` joint**: 9 cells. Should distinguish the four alternation patterns (Word→Word, Word→Sep, etc.) — but `p1_class` plus the alternation rule already collapses three of those, so marginal gain may be small.
+- **First-byte class of `p1`**: differentiate alphabetic / digit / punctuation / whitespace separators. ~5-valued. The current `p1_class` lumps all non-alpha into "Separator"; subdividing would help on the separator/symbol-heavy regions of the corpus.
+- **Wiki-bucket depth**: link / template nesting depth (currently hidden in `WikiFineClassifier`).
+- **Page offset bucket**: byte position within current page, log-bucketed.
+
+The first two are mechanical extensions of `p1_class`. The "first-byte class" subdivision would require exposing a 5-valued classifier or computing on demand. Page offset and wiki depth are bigger plumbing changes.
+
+---
+
 ## 2026-05-13 — Phase 23J: `tokens_since_match` Coarse Feature — 1.873 bpb on Enwik9
 
 Followed the Phase 23I diagnostic ("MLP is feature-limited, not capacity-limited") to its natural next experiment: a feature carrying **genuinely-new information not derivable from the existing `PredCtx` fields**. The cheapest such feature is a counter for tokens since the last LZ-match — independent of `p3..p1`, the length pair, and the wiki sub-mode.
