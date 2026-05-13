@@ -30,6 +30,7 @@ mod codec;
 mod eval;
 mod lz;
 mod match_model;
+mod mixer;
 mod models;
 mod mtf;
 mod null;

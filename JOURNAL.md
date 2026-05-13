@@ -13,6 +13,87 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 21: PAQ-Style Logit Mixing Replaces the Router — 1.898 bpb on Enwik9
+
+CDR asked for at least five proposals to push toward Hutter territory and indicated I could rewrite anything. The shortlist was (1) PAQ-style logit mixing, (2) Wikitext-syntax parser, (3) on-line / pretrained neural arm, plus minor extensions. We proceeded with #1 first because it's the substrate everything else slots into and the Phase 18 router was a known sub-optimal proxy for it.
+
+### The mixer primitive
+
+`src/mixer.rs` (`LogitMixer<N>`) blends `N` binary predictors in logit space. Per-context weights `w_i ∈ ℝ` are updated by online SGD on log-loss after each observed bit. Compared to the Phase-18 router (which paid `⌈log₂ N⌉` bits per token plus a `BitPredictor` table to compress the routing decision), the mixer pays **zero signaling bits**: the decoder runs the same weight-update schedule and arrives at the same prediction without any side-channel. Encoder and decoder mirror the observe path exactly, so weight state stays in lock-step.
+
+Determinism: the implementation uses `f32` and the IEEE-754 ops in `stretch`/`squash` (`ln`, `exp`). On a single machine these are bit-exact between encode and decode, which is all the codec needs. The five built-in unit tests cover stretch/squash domain, cold-start uniform behavior, per-context learning convergence, and per-context independence.
+
+### Step 2 — `dict_id` mixer (the big lever)
+
+The Phase-18 router selected between `token_id_bit` (Order-1) and `token_id_bit_o2` (Order-2) per token, emitting 1 router bit per dict-id hit. Replaced with a `LogitMixer<2>` keyed on `(bit_pos, prefix)` — the mixer learns per-bit-position which base predictor wins. Memory: `K=18` slots × 2 weights × 4 B = 2 MiB. Learning rate swept on enwik8 e2e:
+
+| LR | enwik8 e2e bpb |
+|---:|---:|
+| 0.01 | 2.1633 |
+| **0.02** | **2.1625** |
+| 0.05 | 2.1632 |
+| 0.10 | 2.1665 |
+
+LR=0.02 settled. Confirmed on enwik9 e2e: **1.9034 bpb / 237.9 MB — -0.0254 bpb / -3.18 MiB vs Phase 20l (1.9288 / 241.1 MB)**. The router bits disappear and the per-bit mixing produces sharper predictions than per-token routing on warm-vs-cold bigram transitions.
+
+Mixer context experiments:
+
+| Mixer ctx | K | enwik8 e2e bpb | Δ |
+|---|---:|---:|---:|
+| `(bit_pos, prefix)` | 18 | 2.1625 | baseline (selected) |
+| `(bit_pos, prefix, prev_id)` | 18 | 2.1693 | +0.0068 — context too sparse |
+
+Adding `prev_id` to the mixer context expanded the address space ~65 K× without growing the table, leaving every slot starved. The base predictors already carry `prev_id` / `prev_prev_id`; the mixer's job is **per-bit-position** weighting, not per-bigram. Confirmed.
+
+### N=3 with Order-3 — not yet ready at enwik8 scale
+
+Added `token_id_bit_o3` (K=26 = 64 MiB) and bumped N=3. On enwik8 e2e: 2.1630 vs 2.1625 N=2 — essentially noise (+0.0005). The Order-3 table at enwik8 scale has ~0.16 obs per cell on average; the mixer correctly weights it to near-zero, so it neither helps nor hurts. Removed the field for now; should re-test at enwik9 scale (where Phase 19j showed Order-2 K=28 helped) once Phase 22+ settle, since this is the cleanest place to integrate richer base predictors.
+
+### Step 5b — `lz_flag` mixer
+
+Reinstated the Phase-19f Order-1 `lz_flag` predictor (K=20 = 1 MiB) alongside the Phase-20l Order-2 (K=23 = 8 MiB) and a `LogitMixer<2>` keyed on `prev_id` (K=10 = 1024 slots). Result on enwik8 e2e: **2.1599 bpb / -0.0026 bpb / -29 K bytes** over step 2. Small but clean — the lz_flag stream is ~8 % of the archive, and the mixer trims another 0.3 % off that.
+
+### Step 5c — `token_oov` bit mixer (rescues a Phase-20m negative result)
+
+Phase 20m had tested Order-2 alone on the `token_oov_bit` and it regressed +0.003 bpb on enwik8 — the per-bigram cells starved because the OOV/hit ratio is dominated by unigram `prev_id` stats. The mixer fixes this exactly: it learns per-`prev_id` whether to trust Order-2 (warm bigram) or Order-1 (cold bigram).
+
+Added `token_oov_bit_o2` (K=23 = 8 MiB) and `token_oov_mixer` (K=10, prev-id-keyed). enwik8 e2e: **2.1576 bpb / -0.0023 bpb / -29 K bytes** over step 5b. The mixer turns a -0.003 bpb regression into a +0.0023 win — a 0.005 bpb swing — by routing usage to the warm bigrams while keeping Order-1 dominant on cold ones.
+
+### End-to-end on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 20l |
+|---|---:|---:|---:|
+| Phase 20l baseline | 241,105,534 | 1.9288 | — |
+| Phase 21 step 2 (`dict_id` mixer) | 237,921,727 | 1.9034 | -0.0254 |
+| **Phase 21 final (+ lz_flag + token_oov mixers)** | **237,259,434** | **1.8981** | **-0.0307** |
+
+The full archive drops **3.67 MiB on enwik9** and the codec is now at **2.16× the Hutter target** (down from 2.20× after Phase 20).
+
+Cumulative from xml-tok Phase 16 (2.0667 bpb): **-0.1686 bpb / -16.8 MiB** on enwik9.
+
+Encode time on enwik9 grew slightly: 489 s (Phase 20l) → 494 s (Phase 21). The mixer adds three lookup-and-update steps per emitted bit but each is `O(N)` with `N=2`, so the per-token cost increase is small.
+
+### Methodology notes
+
+- **The mixer rescues the panel-vs-e2e divergence pattern** seen all through Phases 19–20. Phase 19f Order-1 lz_flag was +0.059 bpb on panel and -0.011 on e2e; the mixer's adaptive weighting handles the cold→warm transition the same way that pattern manifests *within* a panel window. Future predictor additions can rely on the mixer to down-weight them when cold rather than tuning around panel quirks.
+- **Mixers compose with Order-N upgrades from earlier phases.** The mixer replaces the *routing decision*, not the underlying predictors — every bit-budget gain from Phases 18-20 (Order-2 table K=29, Order-4 OOV word, Order-2 OOV sep, Order-2 lz_flag) still applies.
+- **A small mixer LR (0.02) and a single (bit_pos, prefix) context is robust.** Initial Phase-21 instinct was to enrich the mixer context with `prev_id` for "per-bigram weight learning"; that regressed because the base predictors already carry `prev_id`. The mixer's job is *which base to trust*, which has a much smaller learnable surface than the bases themselves.
+
+### What's left and what's next
+
+Per the 5-suggestion roadmap, Step 1 of the plan (mixing infrastructure) is now live. Three streams (`dict_id`, `lz_flag`, `token_oov_bit`) are mixed; the multi-symbol OOV byte streams (`oov_word_letter`, `oov_sep_byte`) are not — adapting `LogitMixer` to multi-symbol mixing is a structural change that's deferred. Next step in the plan: **Wikitext-syntax parser** (proposal #4), independent of #1 and the biggest non-neural lever available.
+
+### Tables not pursued
+
+| Idea | Where | Result | Reason |
+|---|---|---|---|
+| Order-3 in mix at enwik8 | step 4 | +0.0005 | Order-3 table cold at enwik8 scale; revisit on enwik9 |
+| `(bit_pos, prefix, prev_id)` mixer ctx | step 2 | +0.007 | mixer context too sparse |
+| LR=0.05, LR=0.10 | step 3 | +0.0007, +0.004 | too fast, weights oscillate |
+| LR=0.01 | step 3 | +0.0008 | too slow, weights under-converged at enwik8 scale |
+
+---
+
 ## 2026-05-13 — Phase 20: Order-N Byte Modeling on OOV Streams + Order-2 lz_flag — 1.929 bpb on Enwik9
 
 CDR returned and said "continue." The Phase 19k summary had handed off three candidates (PPM-D escape, OOV stream Order-2, mixing layer). With no further direction the cheapest first step was a fresh bit decomposition of the panel: where do the bits actually live in `xml-tok-route` Phase 19k? The answer reframed the next moves.
