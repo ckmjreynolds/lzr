@@ -13,6 +13,60 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23G: Adding `p2_len` Coarse Warm Feature for the MLP — 1.875 bpb on Enwik9
+
+Layer the same coarse-warm-feature pattern Phase 23F validated, one slot deeper in the token history. `p2_len` (length of the token two back) feeds a sibling `(p2_len_bucket, prefix, bit_pos)` feature in the `dict_id` MLP.
+
+### What landed
+
+1. **Extended `PredCtx`** with `p2_len: u8`. Same six construction sites updated — the simple-shift case becomes `p2_len: ctx.p1_len`; the LZ-match-shift case picks `dict.entry(lookahead[length_us - 2].id).lower.len()` when `length_us >= 2`, else `ctx.p1_len`. Decode side mirrors this from `copied[len_match - 2]`.
+2. **New 5th MLP feature** `(p2_len_bucket, prefix, bit_pos)` with the same 4-bit cap as `p1_len`. `N_MLP_ID_FEATS` 4 → 5. Memory: 128 MiB → 160 MiB (+32 MiB).
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23F |
+|---|---:|---:|---:|---:|
+| Phase 23F | 2.1141 | 1.8770 | 234,619,206 | — |
+| **Phase 23G** | **2.1114** | **1.8754** | **234,426,423** | **-0.0027 / -0.0016 / -188 KiB** |
+
+Roundtrip verified. Encode 673 s on enwik9 vs Phase 23F's 682 s (within noise — adding one cheap feature is rounding error against the rest of the codec). Memory +32 MiB, peak still ~5.4 GiB.
+
+### Diminishing returns, but still positive
+
+| Feature added | enwik8 Δ | enwik9 Δ | Cumulative enwik9 from 23D |
+|---|---:|---:|---:|
+| Phase 23F: `p1_len_bucket` | -0.0058 | -0.0022 | -0.0022 |
+| Phase 23G: `p2_len_bucket` | -0.0027 | -0.0016 | -0.0038 |
+
+The second length feature delivers ~70% of the first one's enwik9 gain. That's consistent with the intuition: `p1_len` captures what the *immediate* previous token was; `p2_len` adds context one step further out, which is correlated with `p1_len` (because of the Word/Separator alternation, lengths tend to cluster pairwise) but still adds independent signal.
+
+### Phase 23G cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 19k | 249,191,955 | 1.9935 | — |
+| Phase 22 | 237,120,859 | 1.8970 | -0.0965 |
+| Phase 23A | 235,510,295 | 1.8841 | -0.1094 |
+| Phase 23B | 235,124,739 | 1.8810 | -0.1125 |
+| Phase 23C | 235,066,968 | 1.8805 | -0.1130 |
+| Phase 23D | 234,905,363 | 1.8792 | -0.1143 |
+| Phase 23F | 234,619,206 | 1.8770 | -0.1165 |
+| **Phase 23G** | **234,426,423** | **1.8754** | **-0.1181** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1913 bpb / -19.1 MiB on enwik9**. Hutter ratio: **2.137× target**.
+
+### Open portfolio
+
+Still on the table from 23F's "open feature space" list:
+- `p1_class`, `p2_class`: 3-valued token class. Even denser cells than length buckets.
+- `(p1_len, p2_len)` joint: pairs the two existing length features. Natural cells ~2^28; should stay warm.
+- `recency_bucket`: bytes since last LZ-match. New information not derivable from `p3..p1`.
+- `page_offset_bucket`: byte position within current page.
+
+Following the 23F → 23G ratio (~0.7×), the next portfolio addition should land between -0.0010 and -0.0016 bpb on enwik9. Cheap enough to stay in this groove until the diminishing-returns curve flattens.
+
+---
+
 ## 2026-05-13 — Phase 23F: Coarse Warm Feature `(p1_len, prefix, bit_pos)` for the MLP — 1.877 bpb on Enwik9
 
 Direct test of the Phase-23E lesson — "MLP features need observation density per slot, not deeper word-history order". The minimal experiment: add a **single coarse warm feature** built from a small-cardinality input (`p1`'s byte length, capped at 16 buckets) and see whether it does what the deep Order-4 feature couldn't.

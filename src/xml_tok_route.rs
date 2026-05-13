@@ -285,13 +285,14 @@ const ID_MLP_K: u32 = 20;
 const ID_MLP_LR: f32 = 0.02;
 /// Phase-23D: hidden dimension of the `dict_id` MLP.
 const ID_MLP_H: usize = 8;
-/// Phase-23D / Phase-23F: feature count of the `dict_id` MLP. Phase
-/// 23D shared 3 features with the sparse-LR; Phase 23F adds a
-/// coarse warm feature (`p1_len_bucket × prefix × bit_pos`) the LR
-/// doesn't have. Phase 23E tried two deep-context features
-/// (Order-4, Wiki × Order-3) which regressed — see that journal
-/// entry for the saturation argument that picked the coarse path.
-const N_MLP_ID_FEATS: usize = 4;
+/// Phase-23D / Phase-23F / Phase-23G: feature count of the
+/// `dict_id` MLP. Layout: `[Order-3 (LR-shared), Wiki × Order-2
+/// (LR-shared), bias (LR-shared), p1_len_bucket (Phase 23F),
+/// p2_len_bucket (Phase 23G)]`. Phase 23E tried two deep-context
+/// features (Order-4, Wiki × Order-3) which regressed — see that
+/// journal entry for the saturation argument that picked the
+/// coarse path.
+const N_MLP_ID_FEATS: usize = 5;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -641,11 +642,18 @@ impl Codec for XmlTokRouteCodec {
                             };
                             let p1_len_new =
                                 u8::try_from(dict.entry(last_id).lower.len()).unwrap_or(u8::MAX);
+                            let p2_len_new = if length_us >= 2 {
+                                u8::try_from(dict.entry(lookahead[length_us - 2].id).lower.len())
+                                    .unwrap_or(u8::MAX)
+                            } else {
+                                ctx.p1_len
+                            };
                             ctx = PredCtx {
                                 p3: p3_new,
                                 p2: p2_new,
                                 p1: Some(last_id),
                                 p1_len: p1_len_new,
+                                p2_len: p2_len_new,
                                 wiki: ctx.wiki,
                             };
                             continue;
@@ -690,6 +698,7 @@ impl Codec for XmlTokRouteCodec {
                             p2: ctx.p1,
                             p1: new_id,
                             p1_len: p1_len_new,
+                            p2_len: ctx.p1_len,
                             wiki: token_ctx.wiki,
                         };
 
@@ -876,6 +885,14 @@ impl Codec for XmlTokRouteCodec {
                         } else {
                             ctx.p2
                         };
+                        // Snapshot p2_len before the loop consumes `copied`.
+                        // p1_len is read from `last_id` after the loop, which
+                        // is fine because `last_id` is a `u32` (Copy).
+                        let p2_id_opt = if len_match >= 2 {
+                            Some(copied[len_match - 2])
+                        } else {
+                            None
+                        };
                         for id in copied {
                             let lower = dict.entry(id).lower.clone();
                             let class = TokenClass::from_byte(lower[0]);
@@ -905,11 +922,15 @@ impl Codec for XmlTokRouteCodec {
                         }
                         let p1_len_new =
                             u8::try_from(dict.entry(last_id).lower.len()).unwrap_or(u8::MAX);
+                        let p2_len_new = p2_id_opt.map_or(ctx.p1_len, |id| {
+                            u8::try_from(dict.entry(id).lower.len()).unwrap_or(u8::MAX)
+                        });
                         ctx = PredCtx {
                             p3: p3_new,
                             p2: p2_new,
                             p1: Some(last_id),
                             p1_len: p1_len_new,
+                            p2_len: p2_len_new,
                             wiki: ctx.wiki,
                         };
                         continue;
@@ -948,6 +969,7 @@ impl Codec for XmlTokRouteCodec {
                         p2: ctx.p1,
                         p1: new_prev,
                         p1_len: p1_len_new,
+                        p2_len: ctx.p1_len,
                         wiki: token_ctx.wiki,
                     };
                 }
@@ -1271,17 +1293,19 @@ fn lz_match_row(prev_id: Option<u32>) -> usize {
 /// Bundle of context features available to the predictor stack.
 /// `p1`/`p2`/`p3` are the trailing dict-id history; `wiki` is the
 /// `wiki_classifier` sub-mode (0=Plain, 1=Link, 2=Template);
-/// `p1_len` is the byte length of `p1`'s token, capped at 255 (0
-/// when `p1` is `None`). Phase 23F added `p1_len` as a **coarse
-/// warm feature** for the MLP — small natural cardinality means
-/// dense observations per hashed slot, the opposite of the failed
-/// Phase-23E Order-4 hash. None of the count predictors read it.
+/// `p1_len`/`p2_len` are the byte lengths of `p1`/`p2`'s tokens
+/// (capped at 255; 0 when the corresponding id is `None`). Phase
+/// 23F added `p1_len` as a **coarse warm feature**; Phase 23G
+/// extended with `p2_len` so the MLP can see a length pair, not
+/// just the most recent length. None of the count predictors read
+/// either field.
 #[derive(Clone, Copy, Debug)]
 struct PredCtx {
     p3: Option<u32>,
     p2: Option<u32>,
     p1: Option<u32>,
     p1_len: u8,
+    p2_len: u8,
     wiki: u8,
 }
 
@@ -1291,6 +1315,7 @@ impl PredCtx {
         p2: None,
         p1: None,
         p1_len: 0,
+        p2_len: 0,
         wiki: 0,
     };
 }
@@ -1354,32 +1379,33 @@ fn id_lr_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_LR_ID_FEAT
     [f_o3, f_wiki_o2, f_bias]
 }
 
-/// Phase-23F: feature hashes for the `dict_id` MLP. Superset of
-/// [`id_lr_features`] with one extra **coarse warm feature** —
-/// `(p1_len_bucket, prefix, bit_pos)` — the LR doesn't carry. The
-/// length bucket is a 4-bit cap of `p1`'s byte length so the
-/// natural cell count is small (16 × 65 K × 16 ≈ 2^24); hashed
-/// into K=20 each slot averages ~16 contexts and stays warm even
-/// at enwik8 scale. Phase 23E established that "warm coarse
-/// features beat sparse deep ones" for the MLP — see that journal
-/// entry.
+/// Phase-23F / Phase-23G: feature hashes for the `dict_id` MLP.
+/// Superset of [`id_lr_features`] plus two coarse warm features
+/// the LR doesn't carry: `p1_len_bucket` (Phase 23F) and
+/// `p2_len_bucket` (Phase 23G). Each is built from a 4-bit cap of
+/// the corresponding length so the natural cell count stays small
+/// (16 × 65 K × 16 ≈ 2^24) and hashed-slot observation density
+/// stays high.
 fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FEATS] {
     let [f_o3, f_wiki_o2, f_bias] = id_lr_features(ctx, prefix, bit_pos);
+    let prefix64 = u64::from(prefix);
+    let bit_pos64 = u64::from(bit_pos);
 
-    // Length bucket: clip `p1_len` to 4 bits (0..=15). Tokens
-    // longer than 15 bytes all share the top bucket; that loses
-    // length resolution on long OOV runs but they're a tiny
-    // fraction of total tokens, and the bucket is meant to
-    // separate "short separator" from "typical word" from "long
-    // template/url", not to count bytes precisely.
     let p1_len_bucket = u64::from(ctx.p1_len.min(15));
     let f_p1_len = {
         let h = fnv_mix(FNV_OFFSET, p1_len_bucket);
-        let h = fnv_mix(h, u64::from(prefix));
-        fnv_mix(h, u64::from(bit_pos))
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
     };
 
-    [f_o3, f_wiki_o2, f_bias, f_p1_len]
+    let p2_len_bucket = u64::from(ctx.p2_len.min(15));
+    let f_p2_len = {
+        let h = fnv_mix(FNV_OFFSET, p2_len_bucket);
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
+
+    [f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len]
 }
 
 /// Read all base predictors' `P(bit = 0)` without touching any
@@ -1951,6 +1977,7 @@ fn prewarm(
                     p2: ctx.p1,
                     p1: new_id,
                     p1_len: p1_len_new,
+                    p2_len: ctx.p1_len,
                     wiki: token_ctx.wiki,
                 };
                 // Also observe the lz_flag=0 (no-match) for prewarm
