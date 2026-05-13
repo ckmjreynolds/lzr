@@ -285,14 +285,14 @@ const ID_MLP_K: u32 = 20;
 const ID_MLP_LR: f32 = 0.02;
 /// Phase-23D: hidden dimension of the `dict_id` MLP.
 const ID_MLP_H: usize = 8;
-/// Phase-23D / Phase-23F / Phase-23G: feature count of the
-/// `dict_id` MLP. Layout: `[Order-3 (LR-shared), Wiki × Order-2
-/// (LR-shared), bias (LR-shared), p1_len_bucket (Phase 23F),
-/// p2_len_bucket (Phase 23G)]`. Phase 23E tried two deep-context
-/// features (Order-4, Wiki × Order-3) which regressed — see that
-/// journal entry for the saturation argument that picked the
-/// coarse path.
-const N_MLP_ID_FEATS: usize = 5;
+/// Phase-23D → Phase-23H: feature count of the `dict_id` MLP.
+/// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),
+/// bias (LR-shared), p1_len_bucket (23F), p2_len_bucket (23G),
+/// (p1_len, p2_len) joint (23H)]`. Phase 23E tried two deep-
+/// context features (Order-4, Wiki × Order-3) which regressed —
+/// see that journal entry for the saturation argument that picked
+/// the coarse path.
+const N_MLP_ID_FEATS: usize = 6;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -1379,33 +1379,39 @@ fn id_lr_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_LR_ID_FEAT
     [f_o3, f_wiki_o2, f_bias]
 }
 
-/// Phase-23F / Phase-23G: feature hashes for the `dict_id` MLP.
-/// Superset of [`id_lr_features`] plus two coarse warm features
-/// the LR doesn't carry: `p1_len_bucket` (Phase 23F) and
-/// `p2_len_bucket` (Phase 23G). Each is built from a 4-bit cap of
-/// the corresponding length so the natural cell count stays small
-/// (16 × 65 K × 16 ≈ 2^24) and hashed-slot observation density
-/// stays high.
+/// Phase-23F → Phase-23H: feature hashes for the `dict_id` MLP.
+/// Superset of [`id_lr_features`] plus three coarse warm features:
+/// `p1_len_bucket` (23F), `p2_len_bucket` (23G), and an explicit
+/// `(p1_len, p2_len)` joint (23H). The joint has cell count
+/// 16 × 16 × 65 K × 16 ≈ 2^28 — still warm at K=20 (~256
+/// contexts/slot). With `H=8` the MLP's hidden layer can only
+/// represent a small number of feature interactions; an explicit
+/// joint adds a dedicated weight row for the length-pair signal.
 fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FEATS] {
     let [f_o3, f_wiki_o2, f_bias] = id_lr_features(ctx, prefix, bit_pos);
     let prefix64 = u64::from(prefix);
     let bit_pos64 = u64::from(bit_pos);
 
     let p1_len_bucket = u64::from(ctx.p1_len.min(15));
+    let p2_len_bucket = u64::from(ctx.p2_len.min(15));
     let f_p1_len = {
         let h = fnv_mix(FNV_OFFSET, p1_len_bucket);
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
-
-    let p2_len_bucket = u64::from(ctx.p2_len.min(15));
     let f_p2_len = {
         let h = fnv_mix(FNV_OFFSET, p2_len_bucket);
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
+    let f_len_pair = {
+        let h = fnv_mix(FNV_OFFSET, p1_len_bucket);
+        let h = fnv_mix(h, p2_len_bucket);
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
 
-    [f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len]
+    [f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len, f_len_pair]
 }
 
 /// Read all base predictors' `P(bit = 0)` without touching any

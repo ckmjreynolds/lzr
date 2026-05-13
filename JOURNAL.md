@@ -13,6 +13,61 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23H: `(p1_len, p2_len)` Joint Coarse Feature — 1.875 bpb on Enwik9
+
+Cheapest extension after 23F/23G — combine the two existing length fields into an explicit `(p1_len_bucket, p2_len_bucket, prefix, bit_pos)` joint feature, no new `PredCtx` plumbing.
+
+### What landed
+
+One new MLP feature, `f_len_pair`, in `id_mlp_features`. `N_MLP_ID_FEATS` 5 → 6. Memory: 160 MiB → 192 MiB (+32 MiB). Cell count for the joint: 16 × 16 × 65 K × 16 ≈ 2^28; at K=20 (1 Mi slots) that's ~256 contexts per slot — still warm enough to learn.
+
+The intuition: with `H=8` the MLP's hidden layer can only represent ~8 effective feature combinations. An explicit joint adds a dedicated weight row the hidden layer would otherwise have to allocate one of its 8 directions to.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23G |
+|---|---:|---:|---:|---:|
+| Phase 23G | 2.1114 | 1.8754 | 234,426,423 | — |
+| **Phase 23H** | **2.1106** | **1.8747** | **234,336,587** | **-0.0008 / -0.0007 / -88 KiB** |
+
+Encode 692 s vs 23G's 673 s (+3 %), decode 393 s vs 378 s (+4 %). Roundtrip OK.
+
+### Diminishing returns curve
+
+| Step | Feature | enwik8 Δ | enwik9 Δ | enwik8/enwik9 ratio |
+|---|---|---:|---:|---:|
+| 23F | `p1_len_bucket` | -0.0058 | -0.0022 | 2.64× |
+| 23G | `p2_len_bucket` | -0.0027 | -0.0016 | 1.69× |
+| 23H | `(p1_len, p2_len)` joint | -0.0008 | -0.0007 | 1.14× |
+
+The enwik8/enwik9 ratio is collapsing toward 1.0, the **coarse-feature signature**: both scales saturate similarly because the natural cardinality is small enough that even enwik8 sees enough observations per slot. Compare Phase 23A's deep-context feature (LR's Order-3 hashed), where the enwik8 Δ was 2.6× the enwik9 Δ — the LR's Order-3 had room to keep concentrating signal as the corpus grew.
+
+### Diagnostic: feature space or architecture?
+
+23F → 23G → 23H delivered -0.0022, -0.0016, -0.0007 enwik9 bpb respectively. The shrinking gains say "we're running out of independent information at the current MLP capacity". Two ways to read it:
+
+- **Feature exhaustion**: the length pair really has only ~0.005 bpb of signal in it (cumulative across F/G/H) and we've now mostly extracted it.
+- **Capacity exhaustion**: the MLP with `H=8` can only decompose a few feature directions; adding more features competes for the same 8 hidden units.
+
+Phase 23I will test the capacity hypothesis directly: bump `H=8 → H=16` with no feature changes, measure the delta. If the MLP is feature-limited, this lands at near-zero. If it's capacity-limited, the broader hidden space frees the existing features to specialize further.
+
+### Phase 23H cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 22 | 237,120,859 | 1.8970 | -0.0965 |
+| Phase 23A | 235,510,295 | 1.8841 | -0.1094 |
+| Phase 23B | 235,124,739 | 1.8810 | -0.1125 |
+| Phase 23C | 235,066,968 | 1.8805 | -0.1130 |
+| Phase 23D | 234,905,363 | 1.8792 | -0.1143 |
+| Phase 23F | 234,619,206 | 1.8770 | -0.1165 |
+| Phase 23G | 234,426,423 | 1.8754 | -0.1181 |
+| **Phase 23H** | **234,336,587** | **1.8747** | **-0.1188** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1920 bpb / -19.2 MiB on enwik9**. Hutter ratio: **2.136× target**.
+
+---
+
 ## 2026-05-13 — Phase 23G: Adding `p2_len` Coarse Warm Feature for the MLP — 1.875 bpb on Enwik9
 
 Layer the same coarse-warm-feature pattern Phase 23F validated, one slot deeper in the token history. `p2_len` (length of the token two back) feeds a sibling `(p2_len_bucket, prefix, bit_pos)` feature in the `dict_id` MLP.
