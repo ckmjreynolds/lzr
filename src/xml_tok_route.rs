@@ -73,7 +73,7 @@ use crate::classifier::{Classifier, Mode};
 use crate::codec::{Codec, Decomposition};
 use crate::mixer::LogitMixer;
 use crate::models::{Order0, Order1Ctx};
-use crate::neural::SparseLR;
+use crate::neural::{OnlineMLP, SparseLR};
 use crate::tok_lz::{self, TokenMatcher};
 use crate::tokenizer::{
     CasePattern, TokenClass, apply_case, classify_case, lowercase, mixed_mask, run_end,
@@ -254,13 +254,12 @@ const TOKEN_OOV_MIXER_K: u32 = 10;
 /// regressed +0.016 bpb because the length CDF cells went cold.
 const LZ_MATCH_NCTX: usize = 1024;
 
-/// Phase-22 / Phase-23A: number of predictors in the `dict_id`
-/// mixer. `[Order-1, Order-2, Wiki, SparseLR]`. The 4th arm is a
-/// sparse logistic regression (see [`crate::neural::SparseLR`])
-/// that learns higher-order word context the count tables can't
-/// afford — hashed Order-3, Wiki × Order-2, and a `(bit_pos,
-/// prefix)` bias. Adds ~50 MiB of weights.
-const N_MIX_ID: usize = 4;
+/// Phase-22 / Phase-23A / Phase-23D: number of predictors in the
+/// `dict_id` mixer. `[Order-1, Order-2, Wiki, SparseLR, MLP]`. The
+/// 5th arm is a small online MLP ([`crate::neural::OnlineMLP`])
+/// that adds a `tanh` nonlinearity and a learned hidden dimension
+/// over the same hashed feature set the sparse-LR uses.
+const N_MIX_ID: usize = 5;
 
 /// Phase-23A: weight-table size per feature in the `dict_id`
 /// sparse-LR. K=24 → 16 Mi slots × 4 bytes × 3 features = 192 MiB.
@@ -276,6 +275,20 @@ const ID_SPARSE_LR_LR: f32 = 0.02;
 /// Phase-23A: number of features the `dict_id` sparse-LR carries.
 /// `[Order-3-hashed, Wiki × Order-2, (bit_pos, prefix) bias]`.
 const N_LR_ID_FEATS: usize = 3;
+
+/// Phase-23D: weight-table size per feature in the `dict_id` MLP.
+/// K=20 (1 Mi slots) × `H=8` × `f32` × 3 features = 96 MiB. Smaller
+/// than the LR's K=24 table because each MLP slot stores an
+/// `H`-dim embedding row rather than a single scalar.
+const ID_MLP_K: u32 = 20;
+/// Phase-23D: SGD learning rate for the `dict_id` MLP.
+const ID_MLP_LR: f32 = 0.02;
+/// Phase-23D: hidden dimension of the `dict_id` MLP.
+const ID_MLP_H: usize = 8;
+/// Phase-23D: feature count of the `dict_id` MLP. Shares the same
+/// 3-feature shape as the Phase-23A sparse-LR — the MLP's value-add
+/// is the learned nonlinearity, not different features.
+const N_MLP_ID_FEATS: usize = 3;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -439,6 +452,12 @@ struct Models {
     /// 3rd arm of `token_oov_mixer`. Same feature shape as the
     /// `lz_flag` LR with independent weights (the target bit differs).
     token_oov_sparse_lr: SparseLR<N_LR_FLAG_FEATS>,
+    /// Phase-23D: small online MLP that joins the `dict_id` mixer as
+    /// the 5th arm. Shares the Phase-23A LR's 3-feature shape but
+    /// adds a learned `H`-dim hidden layer and a `tanh`
+    /// nonlinearity, letting it capture interactions a single
+    /// linear layer can't.
+    token_id_mlp: OnlineMLP<N_MLP_ID_FEATS, ID_MLP_H>,
 }
 
 impl Models {
@@ -470,6 +489,7 @@ impl Models {
             token_id_sparse_lr: SparseLR::new(ID_SPARSE_LR_K, ID_SPARSE_LR_LR),
             lz_flag_sparse_lr: SparseLR::new(FLAG_SPARSE_LR_K, FLAG_SPARSE_LR_LR),
             token_oov_sparse_lr: SparseLR::new(FLAG_SPARSE_LR_K, FLAG_SPARSE_LR_LR),
+            token_id_mlp: OnlineMLP::new(ID_MLP_K, ID_MLP_LR),
         }
     }
 }
@@ -1329,6 +1349,7 @@ fn id_bit_p_zeros(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32) -> [
             .token_id_bit_wiki
             .predict_p_zero(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos)),
         models.token_id_sparse_lr.predict(&feats),
+        models.token_id_mlp.predict(&feats),
     ]
 }
 
@@ -1354,6 +1375,7 @@ fn observe_id_bit(
         .observe(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos), bit);
     let feats = id_lr_features(ctx, prefix, bit_pos);
     models.token_id_sparse_lr.observe(&feats, bit);
+    models.token_id_mlp.observe(&feats, bit);
     models
         .token_id_mixer
         .observe(mixer_id_ctx(bit_pos, prefix), &p_zeros, bit);

@@ -124,6 +124,173 @@ impl<const M: usize> SparseLR<M> {
     }
 }
 
+/// Two-layer online MLP for binary bit prediction. `M` sparse
+/// categorical features each map to an `H`-dim embedding vector;
+/// the embeddings are summed, passed through `tanh`, then
+/// projected to a scalar logit. SGD on log-loss flows through
+/// the output layer and tanh derivative into the embedding tables.
+///
+/// Architecturally this is the smallest step up from
+/// [`SparseLR`] that adds a nonlinearity and a learned hidden
+/// dimension. cmix-style: per-feature embeddings replace per-feature
+/// scalars, and a small dense layer (one set of output weights)
+/// learns how to combine the hidden activations.
+///
+/// Per-bit work is `O(M · H)` for the forward pass and the same
+/// for the backward pass — for the codec's typical `M=3, H=8`
+/// that is ~100 scalar `f32` ops per emitted bit. Comfortably
+/// inside the Hutter time budget.
+///
+/// Determinism: pure scalar `f32` adds and `mul_add`s, plus
+/// `tanh` and `exp` for the output. Bit-exact across encode and
+/// decode on the same machine; CPU-only, no matmul library, no
+/// GPU primitives.
+pub(crate) struct OnlineMLP<const M: usize, const H: usize> {
+    /// Embedding tables. Feature `i`'s embedding for slot `s`
+    /// occupies `embeddings[(i << k_bits + h_shift) | (s << h_shift) | h]`
+    /// — laid out so a single slot's `H` floats are contiguous.
+    /// The flat backing storage keeps the allocation simple and
+    /// cache-friendly: each embedding lookup pulls one cache line
+    /// (assuming `H` ≤ 16 with `f32`).
+    embeddings: Vec<f32>,
+    /// Bias added to the pre-`tanh` sum.
+    hidden_bias: [f32; H],
+    /// Final linear layer that produces the scalar logit.
+    output_weight: [f32; H],
+    output_bias: f32,
+    k_bits: u32,
+    /// `2^k_bits − 1`, used to mask the hashed feature key into a
+    /// valid slot.
+    slot_mask: u64,
+    learning_rate: f32,
+}
+
+impl<const M: usize, const H: usize> OnlineMLP<M, H> {
+    /// New MLP with `1 << k_bits` slots per feature. Output weights
+    /// initialize at `1/H` (not zero) so the first observed bit
+    /// produces a nonzero gradient into the embedding tables; if
+    /// the output weights were zero the embeddings would never
+    /// receive any signal (`tanh(0) = 0`, dead-tanh problem).
+    pub(crate) fn new(k_bits: u32, learning_rate: f32) -> Self {
+        assert!(M >= 1, "OnlineMLP needs at least one feature");
+        assert!(H >= 1, "OnlineMLP needs at least one hidden unit");
+        let n_slots: usize = 1 << k_bits;
+        let total: usize = M
+            .checked_mul(n_slots)
+            .and_then(|x| x.checked_mul(H))
+            .expect("M * 2^k * H fits usize");
+        let init_output: f32 = 1.0 / (H as f32);
+        Self {
+            embeddings: vec![0.0_f32; total],
+            hidden_bias: [0.0_f32; H],
+            output_weight: [init_output; H],
+            output_bias: 0.0,
+            k_bits,
+            slot_mask: u64::try_from(n_slots - 1).expect("table size fits u64"),
+            learning_rate,
+        }
+    }
+
+    /// Starting index of feature `i`'s embedding row at slot `s` in
+    /// the flat `embeddings` vector. The row occupies the next `H`
+    /// floats.
+    fn embed_row(&self, feature_idx: usize, hash: u64) -> usize {
+        let s = usize::try_from(hash & self.slot_mask).expect("masked u64 fits usize");
+        let n_slots: usize = 1 << self.k_bits;
+        ((feature_idx * n_slots) + s) * H
+    }
+
+    /// Forward pass — returns `(hidden_post, logit)`. `hidden_post`
+    /// is the post-`tanh` hidden activation; the pre-tanh sum isn't
+    /// needed downstream (the `tanh'` derivative is computed from
+    /// `hidden_post` via the identity `1 − tanh²`).
+    fn forward(&self, feature_hashes: &[u64; M]) -> ([f32; H], f32) {
+        let mut hidden_pre = self.hidden_bias;
+        for (i, &h) in feature_hashes.iter().enumerate() {
+            let row = self.embed_row(i, h);
+            for (k, hp) in hidden_pre.iter_mut().enumerate() {
+                *hp += self.embeddings[row + k];
+            }
+        }
+        let mut hidden_post = [0.0_f32; H];
+        for (post, &pre) in hidden_post.iter_mut().zip(hidden_pre.iter()) {
+            *post = pre.tanh();
+        }
+        let mut logit = self.output_bias;
+        for (w, &post) in self.output_weight.iter().zip(hidden_post.iter()) {
+            logit = w.mul_add(post, logit);
+        }
+        (hidden_post, logit)
+    }
+
+    fn squash_to_ac(logit: f32) -> u32 {
+        // Match the SparseLR clamp so a runaway logit can't push the
+        // mixer's `stretch` to ±∞.
+        let z = logit.clamp(-LOGIT_CLAMP, LOGIT_CLAMP);
+        let p = 1.0 / (1.0 + (-z).exp());
+        let scaled = (p * (TOTAL as f32)) as i32;
+        scaled.clamp(1, (TOTAL as i32) - 1) as u32
+    }
+
+    pub(crate) fn predict(&self, feature_hashes: &[u64; M]) -> u32 {
+        let (_, logit) = self.forward(feature_hashes);
+        Self::squash_to_ac(logit)
+    }
+
+    /// Predict and SGD-update from the observed bit. Returns the
+    /// AC-scaled `P(bit = 0)` reported pre-update so callers can
+    /// feed it into a mixer in one pass.
+    pub(crate) fn predict_and_observe(&mut self, feature_hashes: &[u64; M], bit: u32) -> u32 {
+        let (hidden_post, logit) = self.forward(feature_hashes);
+        let p_zero_f = 1.0 / (1.0 + (-logit.clamp(-LOGIT_CLAMP, LOGIT_CLAMP)).exp());
+        let target: f32 = if bit == 0 { 1.0 } else { 0.0 };
+        // `error` is `target − P(0)`. Standard sign convention used
+        // throughout this codec; `+= lr · error · ...` ascends the
+        // log-likelihood gradient.
+        let error = target - p_zero_f;
+        let step = self.learning_rate * error;
+
+        // Hidden-layer gradients before applying the output update —
+        // we still need the pre-update output weights to backprop.
+        // tanh'(x) = 1 − tanh(x)² = (−hidden_post[k]).mul_add(hidden_post[k], 1).
+        let mut hidden_pre_grad = [0.0_f32; H];
+        for ((grad, &post), &w) in hidden_pre_grad
+            .iter_mut()
+            .zip(hidden_post.iter())
+            .zip(self.output_weight.iter())
+        {
+            let tanh_deriv = (-post).mul_add(post, 1.0);
+            *grad = step * w * tanh_deriv;
+        }
+
+        // Output-layer SGD.
+        for (w, &post) in self.output_weight.iter_mut().zip(hidden_post.iter()) {
+            *w = step.mul_add(post, *w);
+        }
+        self.output_bias += step;
+
+        // Embedding-row SGD — each active row gets the same
+        // `hidden_pre_grad` because the forward sum is symmetric in
+        // the per-feature contributions.
+        for (i, &h) in feature_hashes.iter().enumerate() {
+            let row = self.embed_row(i, h);
+            for (k, &grad) in hidden_pre_grad.iter().enumerate() {
+                self.embeddings[row + k] += grad;
+            }
+        }
+        for (b, &grad) in self.hidden_bias.iter_mut().zip(hidden_pre_grad.iter()) {
+            *b += grad;
+        }
+
+        Self::squash_to_ac(logit)
+    }
+
+    /// Prewarm path — update only, no return value.
+    pub(crate) fn observe(&mut self, feature_hashes: &[u64; M], bit: u32) {
+        let _ = self.predict_and_observe(feature_hashes, bit);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +347,45 @@ mod tests {
         // And the predict path agrees for a zero-weight predictor.
         let p = lr.predict(&[0]);
         assert!((1..TOTAL).contains(&p));
+    }
+
+    #[test]
+    fn mlp_cold_predictor_returns_neutral_probability() {
+        let mlp: OnlineMLP<3, 8> = OnlineMLP::new(8, 0.05);
+        let p = mlp.predict(&[1, 2, 3]);
+        // Output bias and embeddings are zero; output_weight is 1/H;
+        // hidden = 0 → tanh(0) = 0 → logit = 0 → P(0) = 0.5.
+        let diff = (p as i32 - (TOTAL / 2) as i32).abs();
+        assert!(diff <= 1, "cold p_zero = {p}, expected ~{}", TOTAL / 2);
+    }
+
+    #[test]
+    fn mlp_learns_constant_target() {
+        let mut mlp: OnlineMLP<3, 8> = OnlineMLP::new(8, 0.05);
+        let feats = [42u64, 17u64, 99u64];
+        for _ in 0..5000 {
+            mlp.predict_and_observe(&feats, 0);
+        }
+        let p = mlp.predict(&feats);
+        assert!(
+            p > TOTAL * 9 / 10,
+            "MLP didn't learn: p_zero = {p} (expected > {})",
+            TOTAL * 9 / 10,
+        );
+    }
+
+    #[test]
+    fn mlp_distinct_features_train_independently() {
+        let mut mlp: OnlineMLP<2, 4> = OnlineMLP::new(10, 0.05);
+        let feats_a = [1u64, 2u64];
+        let feats_b = [3u64, 4u64];
+        for _ in 0..5000 {
+            mlp.predict_and_observe(&feats_a, 0);
+            mlp.predict_and_observe(&feats_b, 1);
+        }
+        let p_a = mlp.predict(&feats_a);
+        let p_b = mlp.predict(&feats_b);
+        assert!(p_a > TOTAL * 6 / 10, "feats_a should favor 0: {p_a}");
+        assert!(p_b < TOTAL * 4 / 10, "feats_b should favor 1: {p_b}");
     }
 }

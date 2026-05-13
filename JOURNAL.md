@@ -13,6 +13,64 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23D: Small Online MLP Joins the `dict_id` Mixer — 1.879 bpb on Enwik9
+
+Step B of the A → B → C neural-arm path CDR sketched: a two-layer online MLP, the smallest architecture that adds a `tanh` nonlinearity and a learned hidden dimension on top of the Phase-23A sparse-LR.
+
+### What landed
+
+1. **`crate::neural::OnlineMLP<M, H>`** in `src/neural.rs`. Per-feature embedding tables (`H` floats per slot) summed into an `H`-dim hidden vector → `tanh` → linear scalar logit. Online SGD via the standard hidden-output backprop, with output weights initialised at `1/H` (not zero — otherwise the embedding tables get no gradient because `tanh'(0) · 0 = 0`, the dead-tanh problem).
+2. **Wired as the 5th `dict_id` mixer arm** (`N_MIX_ID` 4 → 5). The mixer arms are now `[Order-1, Order-2, Wiki, SparseLR, MLP]`. Shares the same 3-feature shape as the sparse-LR — hashed Order-3, wiki × Order-2, `(bit_pos, prefix)` bias — so the MLP's value-add is the learned nonlinearity, not different features.
+3. **Sizing**: `K=20` (1 Mi slots/feature), `H=8` hidden, `lr=0.02`. Memory: 3 × 1 Mi × 8 × `f32` = **96 MiB** for embeddings, plus 8 output weights + 1 bias.
+
+Per-bit work: `O(M · H) = O(24)` for forward + same for backward. Pure scalar `f32` adds, `mul_add`s, one `tanh`, one `exp`. Bit-exact deterministic on a single machine, CPU-only — no matmul library, no GPU primitives. Determinism and runtime trivially satisfy CDR's two constraints (no GPU at test time; Hutter time budget).
+
+### Results
+
+| Config | enwik8 e2e bpb | Δ vs Phase 23C |
+|---|---:|---:|
+| Phase 23C | 2.1242 | — |
+| **Phase 23D** | **2.1199** | **-0.0043** |
+
+| Config | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23C |
+|---|---:|---:|---:|
+| Phase 23C | 1.8805 | 235,066,968 | — |
+| **Phase 23D** | **1.8792** | **234,905,363** | **-0.0013 / -158 KiB** |
+
+Encode time: 654 s on enwik9 vs Phase 23C's 566 s (+15.5 %). Decode: 360 s vs 276 s (+30 %). The decode hit is bigger because decode pays the full forward+backward (the SGD update keeps state in lock-step with the encoder). Both ratios are well inside the Hutter time budget — total enwik9 encode+decode is 16.9 minutes versus the budget's hours-on-the-judging-machine.
+
+Roundtrip verified.
+
+### Why the gain is smaller than expected
+
+Pre-build prediction was -0.05 to -0.15 bpb. Actual: -0.0013 bpb on enwik9. Two reasons:
+
+1. **Feature reuse.** The MLP shares the same 3 hashed features as the Phase-23A sparse-LR. The LR already extracts what a linear model can from those features; the MLP can only add interactions among them through its nonlinearity. With M=3 the interaction space is small.
+2. **Diminishing returns at the dict_id layer.** Phases 23A/B/C have already pulled the mixer-arm portfolio to a fairly tight bound on what hashed-feature predictors can extract. cmix's gains come from much larger MLPs (~50 K params) eating dozens of features.
+
+Both observations suggest the next probe should be **new features for the MLP**, not bigger weights. Candidates: `(bit_pos, prefix, wiki, prev_class)` (token class as wiki cross), a hashed `(p4, p3, p2, p1)` Order-4 feature, or a `(byte-offset-since-LZ-match)` recency feature. None of these are in the LR's feature set.
+
+### Phase 23D cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 19k | 249,191,955 | 1.9935 | — |
+| Phase 20l | 241,105,534 | 1.9288 | -0.0647 |
+| Phase 21 | 237,259,434 | 1.8981 | -0.0954 |
+| Phase 22 | 237,120,859 | 1.8970 | -0.0965 |
+| Phase 23A | 235,510,295 | 1.8841 | -0.1094 |
+| Phase 23B | 235,124,739 | 1.8810 | -0.1125 |
+| Phase 23C | 235,066,968 | 1.8805 | -0.1130 |
+| **Phase 23D** | **234,905,363** | **1.8792** | **-0.1143** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1875 bpb / -18.8 MiB on enwik9**. Hutter ratio: **2.14× target**.
+
+### Memory note
+
+CDR confirmed peak resident size during enwik9 encode + verify is ~5.4 GiB. The biggest single consumer is `token_id_bit_o2` (Order-2 count, K=29 → 2 GiB); next-largest is the corpus + decoded-buffer pair held by `run_compress` for the verify step (2 GiB combined; collapses to ~1 GiB on the judging machine where compress and decompress run as separate invocations). Headroom against the 10 GiB Hutter cap is ample for now, but future MLP-arm growth (larger `K` or `H`) and step C (pretrained transformer) need to budget against that 2 GiB Order-2 anchor.
+
+---
+
 ## 2026-05-13 — Phase 23C: Bumped `dict_id` LR K=22 → K=24 — 1.881 bpb on Enwik9
 
 One-line change to test the hypothesis that the Phase-23A `dict_id` sparse-LR was still saturation-limited at K=22 (4 Mi slots/feature) on the enwik9 scale.
