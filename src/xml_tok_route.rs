@@ -154,7 +154,11 @@ const BYTE_START: usize = 256;
 const BYTE_NCTX: usize = 257;
 /// Phase-20g: joint context for the Order-2 OOV separator byte
 /// model. `ctx = prev_prev * 257 + prev` over `(BYTE_NCTX, BYTE_NCTX)`.
-/// 66049 rows × 256 syms × 4 bytes = ~64 MiB.
+/// 66049 rows × 256 syms × 4 bytes = ~64 MiB. Phase-20o tested
+/// Order-3 hashed (64 K rows × 256 = 16 M cells, hashed via FNV)
+/// and it regressed +0.018 bpb on enwik8 — the OOV sep byte volume
+/// (~1 M bytes on enwik8) over 16 M cells is ~0.06 obs/cell, too
+/// sparse to converge regardless of how the trigram is mapped.
 const BYTE_NCTX_O2: usize = BYTE_NCTX * BYTE_NCTX;
 
 /// Hash-table size (log₂) for the bit-level dict-id predictor.

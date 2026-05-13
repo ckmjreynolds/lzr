@@ -141,6 +141,7 @@ The OOV/lz_flag wins are the cleanest extraction of the per-stream-Order-N patte
 | `ID_BIT_K = 28` | (not measured) | n/a | already at saturation curve at K=27 |
 | Order-5 OOV word | 20k | +0.003 from O4 | 14 M cells too sparse for OOV volume |
 | Order-2 `token_oov_bit` K=23 | 20m | +0.003 e2e | OOV/hit dominated by unigram |
+| Order-3 hashed OOV sep (64 K rows × 256 syms, FNV-mix trigram) | 20o | +0.018 e2e | ~1 M OOV sep bytes / 16 M cells = 0.06 obs/cell — sparse no matter how the trigram maps |
 
 ---
 
