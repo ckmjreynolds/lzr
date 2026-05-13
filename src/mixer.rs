@@ -100,7 +100,7 @@ impl<const N: usize> LogitMixer<N> {
         let w = &self.weights[slot];
         let mut z = 0.0_f32;
         for i in 0..N {
-            z += w[i] * stretch(p_zeros[i]);
+            z = w[i].mul_add(stretch(p_zeros[i]), z);
         }
         squash(z)
     }
@@ -126,14 +126,14 @@ impl<const N: usize> LogitMixer<N> {
         let w = &mut self.weights[slot];
         let mut z = 0.0_f32;
         for i in 0..N {
-            z += w[i] * logits[i];
+            z = w[i].mul_add(logits[i], z);
         }
         let p_mixed_f = 1.0 / (1.0 + (-z).exp());
         let target = if bit == 0 { 1.0 } else { 0.0 };
         let error = target - p_mixed_f;
         let step = self.learning_rate * error;
         for i in 0..N {
-            w[i] += step * logits[i];
+            w[i] = step.mul_add(logits[i], w[i]);
         }
         squash(z)
     }

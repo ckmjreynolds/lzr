@@ -13,6 +13,72 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23A: Sparse-LR as Fourth `dict_id` Mixer Arm — 1.884 bpb on Enwik9
+
+CDR set the next major lever as a neural arm with an explicit A → B → C path (sparse-LR → small online MLP → pretrained-and-embedded transformer), under two hard constraints: no GPU at test time, and the Hutter time budget (70,000 / Geekbench5 hours). Step A is the cheapest move that still exercises the integration path — a sparse logistic regression as a 4th arm of the Phase-22 `dict_id` mixer. It lives entirely in CPU scalar `f32` + one `exp` per bit, so determinism and runtime are trivially satisfied; the only open question was whether it would buy real bits.
+
+### What landed
+
+1. **`crate::neural::SparseLR<M>`** in `src/neural.rs`. `M` categorical features, each backed by a hashed weight table of `1 << K` `f32` slots. Forward: `P(0) = sigmoid(bias + Σ w_i[hash_i mod 2^K])`. Online SGD on log-loss: `w_i += lr · (target − P(0))` for each active weight, plus the bias. Pure scalar; no matmul, no transcendentals beyond `exp`.
+2. **Wired as the 4th `dict_id` mixer arm** (`N_MIX_ID` 3 → 4). Features:
+   - **Hashed Order-3**: `(p3, p2, p1, prefix, bit_pos)`. The natural cell count is ~2^57 — a direct count table is impossible; hashed SGD at K=22 (4 Mi slots × `f32` = 16 MiB) averages noisy updates within and across collisions.
+   - **Wiki × Order-2**: `(wiki, p2, p1, prefix, bit_pos)`. The Phase-22 wiki predictor stopped at Order-1 because its count table couldn't afford the cross; the LR can.
+   - **`(bit_pos, prefix)` bias**: a per-position marginal that lets the LR carry an honest intercept when both higher-order features land in cold slots.
+3. **K=22, learning rate 0.02**. Total LR memory: 48 MiB (3 features × 16 MiB) plus 4 MiB for the now-4-arm mixer table. The `LogitMixer<4>` cold weight is `1/4`, so a never-trained sparse-LR arm contributes a neutral `sigmoid(0) = 0.5` that the mixer ignores until SGD warms it.
+
+### Results
+
+| Config | enwik8 e2e bpb | Δ vs Phase 22 |
+|---|---:|---:|
+| Phase 22 (3-arm mix) | 2.1564 | — |
+| **Phase 23A (4-arm with sparse-LR)** | **2.1274** | **-0.0290** |
+
+| Config | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 22 |
+|---|---:|---:|---:|
+| Phase 22 | 1.8970 | 237,120,859 | — |
+| **Phase 23A** | **1.8841** | **235,510,295** | **-0.0129 / -1.61 MiB** |
+
+Roundtrip verified. Encode time on enwik9: 555 s (vs ~600 s typical for Phase 22 — the additional per-bit work is well inside noise of the rest of the codec). Decode: 253 s.
+
+### Why this works
+
+The base `dict_id` predictors are count-table Order-1, Order-2, and Order-1-within-wiki-sub-mode. Phase 21's mixer already learns *which base wins per bit position*, but every base is unigram or bigram on `prev_id`. The sparse-LR adds **Order-3 word context** and **wiki × bigram** — signals the count tables literally cannot afford to materialize (a count-Order-3 with K=22 would have 0.16 obs/cell on enwik8; the LR happily learns gradients from a handful of updates per slot because there's no Laplace floor to drown the signal). The mixer then learns to weight the LR arm up exactly when the higher-order context is informative and down when it's noise.
+
+The relative enwik8-vs-enwik9 gain (-0.029 vs -0.013 bpb) is consistent with this story: enwik8 is small enough that the LR's hashed Order-3 is one of the few ways to extract trigram signal at all; on enwik9 the count tables get warmer and the relative win shrinks but stays solidly positive.
+
+### Phase 23A cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 19k | 249,191,955 | 1.9935 | — |
+| Phase 20l | 241,105,534 | 1.9288 | -0.0647 |
+| Phase 21 | 237,259,434 | 1.8981 | -0.0954 |
+| Phase 22 | 237,120,859 | 1.8970 | -0.0965 |
+| **Phase 23A** | **235,510,295** | **1.8841** | **-0.1094** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1826 bpb / -18.3 MiB on enwik9**. Hutter ratio: **2.15× target** (target 109,685,197 bytes).
+
+### Constraint check
+
+| Constraint | Budget | Phase 23A actual |
+|---|---|---|
+| GPU at test time | none | none — scalar `f32` + `exp` only |
+| Encode + decode time, enwik9 | ≪ 20 h (well under 70,000 / Geekbench5 hours on the judging machine) | 808 s total ≈ 0.22 h |
+| RAM | 10 GiB | ~50 MiB sparse-LR + existing tables (≪ budget) |
+| Determinism encode ↔ decode | bit-exact required | bit-exact (same machine, same SGD schedule, same hash) |
+
+### What this opens up
+
+Step A was scoped to validate the integration path with the smallest possible move. The result is large enough that the same primitive deserves wider deployment before climbing to step B (small online MLP). Likely next probes, before going neural:
+
+- **Sparse-LR on `lz_flag` / `token_oov_bit`** — both have mixers but their arms are Order-1 + Order-2 count only. Hashed cross-features (wiki × Order-2, prev-id × prev-prev-class) at SGD-amortized cost are a free probe.
+- **Larger K on the dict_id LR** — K=22 is roughly where Order-3 cells average ~1 obs each on enwik9; K=24 (256 MiB total) might still help on the longer run.
+- **An additional LR arm for sep/wordsep word-letter prediction** — the OOV byte streams have the same shape and Phase 22 confirmed structural splitting alone is too sparse.
+
+Step B (small online MLP) remains the next architectural step, but the size of step A's win argues for harvesting the easy gains in the LR family first — each is a one-day probe with bit-budget discipline already wired.
+
+---
+
 ## 2026-05-13 — Phase 22: 5-Mode Wiki Sub-Mode Classifier + Wiki-Conditioned dict_id Predictor — 1.897 bpb on Enwik9
 
 CDR's roadmap put "Wikitext-syntax parser" as the next major lever after Phase 21's mixing infrastructure. A full parser is multi-week work; this phase scoped a narrower step: **promote the recon's 5-mode `WikiFineClassifier` to a first-class module and use it as a third predictor in the `dict_id` mixer**. The expectation: structural sub-mode (e.g. `LinkTarget` vs `Plain`) has different `dict_id` distributions that Order-1 / Order-2 alone don't capture.

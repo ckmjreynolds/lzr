@@ -33,6 +33,7 @@ mod match_model;
 mod mixer;
 mod models;
 mod mtf;
+mod neural;
 mod null;
 mod paq_codec;
 mod ppm;

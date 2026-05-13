@@ -73,6 +73,7 @@ use crate::classifier::{Classifier, Mode};
 use crate::codec::{Codec, Decomposition};
 use crate::mixer::LogitMixer;
 use crate::models::{Order0, Order1Ctx};
+use crate::neural::SparseLR;
 use crate::tok_lz::{self, TokenMatcher};
 use crate::tokenizer::{
     CasePattern, TokenClass, apply_case, classify_case, lowercase, mixed_mask, run_end,
@@ -253,12 +254,28 @@ const TOKEN_OOV_MIXER_K: u32 = 10;
 /// regressed +0.016 bpb because the length CDF cells went cold.
 const LZ_MATCH_NCTX: usize = 1024;
 
-/// Phase-22: number of predictors in the `dict_id` mixer.
-/// `[Order-1, Order-2, Wiki]`. Wiki conditions on the
-/// `wiki_classifier` sub-mode (Plain / Link / Template) and adds
-/// value where the same `prev_id` token has different downstream
-/// distributions inside `[[ ]]` or `{{ }}` than in prose.
-const N_MIX_ID: usize = 3;
+/// Phase-22 / Phase-23A: number of predictors in the `dict_id`
+/// mixer. `[Order-1, Order-2, Wiki, SparseLR]`. The 4th arm is a
+/// sparse logistic regression (see [`crate::neural::SparseLR`])
+/// that learns higher-order word context the count tables can't
+/// afford — hashed Order-3, Wiki × Order-2, and a `(bit_pos,
+/// prefix)` bias. Adds ~50 MiB of weights.
+const N_MIX_ID: usize = 4;
+
+/// Phase-23A: weight-table size per feature in the `dict_id`
+/// sparse-LR. K=22 → 4 Mi slots × 4 bytes × 3 features = 48 MiB.
+/// Bigger than the natural Order-3 cell count by a factor of ~10⁴,
+/// so hash collisions dominate — fine, since SGD averages noisy
+/// updates across collided cells the same way it averages within
+/// each cell.
+const ID_SPARSE_LR_K: u32 = 22;
+/// Phase-23A: SGD learning rate for the `dict_id` sparse-LR. Same
+/// rate the `LogitMixer` uses; tuned more carefully if the predictor
+/// pulls weight from the existing arms.
+const ID_SPARSE_LR_LR: f32 = 0.02;
+/// Phase-23A: number of features the `dict_id` sparse-LR carries.
+/// `[Order-3-hashed, Wiki × Order-2, (bit_pos, prefix) bias]`.
+const N_LR_ID_FEATS: usize = 3;
 /// Phase-21: number of predictors in the `lz_flag` mixer.
 /// `[Order-1, Order-2]`.
 const N_MIX_LZ_FLAG: usize = 2;
@@ -386,11 +403,16 @@ struct Models {
     /// `prev_id`.
     token_oov_mixer: LogitMixer<N_MIX_TOKEN_OOV>,
     /// Phase-21: logit-space mixer for the `dict_id` bit stream.
-    /// Takes the two base predictors' `P(bit = 0)` and produces a
+    /// Takes the four base predictors' `P(bit = 0)` and produces a
     /// per-context blend learned by SGD on log-loss. Replaces the
     /// Phase-18 router (which paid 1 router bit/token plus its own
     /// `BitPredictor` table).
     token_id_mixer: LogitMixer<N_MIX_ID>,
+    /// Phase-23A: sparse logistic regression that joins the
+    /// `dict_id` mixer as the 4th arm. Features are deliberately
+    /// chosen to be signals the count-table base predictors miss:
+    /// hashed Order-3, wiki × Order-2, and a position-prefix bias.
+    token_id_sparse_lr: SparseLR<N_LR_ID_FEATS>,
 }
 
 impl Models {
@@ -419,6 +441,7 @@ impl Models {
             token_id_mixer: LogitMixer::new(MIXER_K, MIXER_LR),
             lz_flag_mixer: LogitMixer::new(LZ_FLAG_MIXER_K, MIXER_LR),
             token_oov_mixer: LogitMixer::new(TOKEN_OOV_MIXER_K, MIXER_LR),
+            token_id_sparse_lr: SparseLR::new(ID_SPARSE_LR_K, ID_SPARSE_LR_LR),
         }
     }
 }
@@ -1185,13 +1208,10 @@ fn lz_match_row(prev_id: Option<u32>) -> usize {
 /// Bundle of context features available to the predictor stack.
 /// `p1`/`p2`/`p3` are the trailing dict-id history; `wiki` is the
 /// `wiki_classifier` sub-mode (0=Plain, 1=Link, 2=Template). The
-/// active Phase-21 mix is `(Order-1, Order-2, Order-3)` on
-/// `(p3, p2, p1)`.
+/// active Phase-23A `dict_id` mix is `(Order-1, Order-2, Wiki,
+/// SparseLR)`; the sparse-LR reads `p3` (Phase 23A first use).
 #[derive(Clone, Copy, Debug)]
 struct PredCtx {
-    /// Reserved for Phase 22+ Order-3 / multi-token-context
-    /// predictors. Tracked through encode/decode but not yet read.
-    #[allow(dead_code)]
     p3: Option<u32>,
     p2: Option<u32>,
     p1: Option<u32>,
@@ -1219,9 +1239,57 @@ const fn mixer_id_ctx(bit_pos: u32, prefix: u32) -> u64 {
     fnv_mix(h, prefix as u64)
 }
 
+/// Phase-23A: feature hashes for the `dict_id` sparse-LR. Each
+/// feature lives in its own table; together they cover signals the
+/// count-based base predictors can't afford to materialize
+/// directly — hashed Order-3, wiki × Order-2, and a position-prefix
+/// bias.
+fn id_lr_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_LR_ID_FEATS] {
+    let p1 = ctx.p1.map_or(u64::MAX, u64::from);
+    let p2 = ctx.p2.map_or(u64::MAX, u64::from);
+    let p3 = ctx.p3.map_or(u64::MAX, u64::from);
+    let prefix64 = u64::from(prefix);
+    let bit_pos64 = u64::from(bit_pos);
+
+    // Order-3 hashed: (p3, p2, p1, prefix, bit_pos). Natural cell
+    // count is ~2^57, far past any direct table; SGD with hash
+    // collisions averages noisy updates the same way it averages
+    // within each surviving cell.
+    let f_o3 = {
+        let h = fnv_mix(FNV_OFFSET, p3);
+        let h = fnv_mix(h, p2);
+        let h = fnv_mix(h, p1);
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
+
+    // Wiki × Order-2: lets the wiki sub-mode bend the bigram
+    // distribution. The Phase-22 wiki predictor stopped at Order-1
+    // because its count table couldn't afford the cross.
+    let f_wiki_o2 = {
+        let h = fnv_mix(FNV_OFFSET, u64::from(ctx.wiki));
+        let h = fnv_mix(h, p2);
+        let h = fnv_mix(h, p1);
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
+
+    // (bit_pos, prefix) bias — a position-level marginal that
+    // applies uniformly across contexts. Lets the LR carry an
+    // honest intercept even when both higher-order features are in
+    // cold slots.
+    let f_bias = {
+        let h = fnv_mix(FNV_OFFSET, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
+
+    [f_o3, f_wiki_o2, f_bias]
+}
+
 /// Read all base predictors' `P(bit = 0)` without touching any
 /// state. Used on the encode path before we know the bit value.
 fn id_bit_p_zeros(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u32; N_MIX_ID] {
+    let feats = id_lr_features(ctx, prefix, bit_pos);
     [
         models
             .token_id_bit
@@ -1232,6 +1300,7 @@ fn id_bit_p_zeros(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32) -> [
         models
             .token_id_bit_wiki
             .predict_p_zero(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos)),
+        models.token_id_sparse_lr.predict(&feats),
     ]
 }
 
@@ -1255,6 +1324,8 @@ fn observe_id_bit(
     models
         .token_id_bit_wiki
         .observe(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos), bit);
+    let feats = id_lr_features(ctx, prefix, bit_pos);
+    models.token_id_sparse_lr.observe(&feats, bit);
     models
         .token_id_mixer
         .observe(mixer_id_ctx(bit_pos, prefix), &p_zeros, bit);
