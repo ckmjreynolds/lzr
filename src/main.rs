@@ -49,6 +49,7 @@ mod xml_lz_word;
 mod xml_ppm;
 mod xml_tok;
 mod xml_tok_pc;
+mod xml_tok_route;
 mod xml_wiki_lz_cp;
 
 use std::fs;

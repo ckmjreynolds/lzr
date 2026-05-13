@@ -13,6 +13,65 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-15 — Phase 18: Cost-Aware Predictor Switching (New Best, −0.028 bpb on Enwik9)
+
+CDR's idea: instead of mixing predictions cmix-style, maintain N predictors in lock-step and have the encoder emit a per-token "router" bit selecting whichever predictor minimizes that specific token's emission cost. Switching is **strictly more flexible** than PPM-D escape (which is a special case where the router decision is deterministic from context-count) and can exploit the encoder's per-token hindsight in a way the mixer can't — the mixer's weights are computed from past data, not from the actual token about to be emitted.
+
+Implementation lands as `xml-tok-route` with N = 2 predictors over the 18-bit `dict_id` emission:
+
+- **Order-1**: existing `(prev_id, prefix, bit_pos)` bit predictor (xml-tok's `token_id_bit`).
+- **Order-2**: new `(prev_prev_id, prev_id, prefix, bit_pos)` predictor, 2²⁶ slots (~256 MiB table).
+
+Per Content hit-token: encoder computes the 18-bit cost under each predictor (no AC state mutation — just `predict_p_zero` rollouts), adds a `ROUTE_STICKINESS_BITS = 1.0` penalty to non-current predictors to suppress flip-flop on near-ties, picks the cheaper. A 1-bit router via a `BitPredictor` keyed on `(prev_id, current_predictor)` encodes the choice; the predictor learns `P(stay)` and collapses to ~0.06 bits/token at scale. Both predictors observe every token regardless of which path was chosen, so encoder and decoder maintain identical state.
+
+### Result scales with corpus size
+
+| Scale | xml-tok bpb | xml-tok-route bpb | Δ |
+|---|---:|---:|---:|
+| enwik8 full panel (20 × 256 KiB measure, fresh predictor per window) | 2.381 | 2.390 | +0.009 (regression) |
+| enwik8 end-to-end (`encode_window(b"", &enwik8)`) | 2.2576 | 2.2532 | -0.004 |
+| **enwik9 end-to-end** (`encode_window(b"", &enwik9)`) | **2.0667** | **2.0392** | **-0.0275** |
+
+Archive size on enwik9 drops from **258,332,159 → 254,898,774** bytes (3.43 MiB smaller). New v2/v3 best, putting the codec at **2.32× the Hutter target** (109,685,197 bytes). Encode time 5m 57 s (essentially unchanged from xml-tok's 5m 50 s — the per-token Order-2 lookup is amortized in the same hash table the Order-1 predictor uses). Decode 2m 13 s, 25% slower than xml-tok's 1m 46 s because the decoder also maintains both predictors and runs the router decode loop.
+
+### Mechanism: the saturation effect that hurt Phase 17 now helps
+
+Phase 17's failure mode was that as the corpus grew, the bit-level `dict_id` predictor accumulated enough per-context observations to predict rare-but-page-repeated tokens nearly as cheaply as the cache path could — the cache's amortization win shrank to zero by enwik9 scale. Phase 18 turns that mechanism around: the Order-2 predictor needs training volume to be competitive at all, and at enwik9 scale common bigrams (`(of, the)`, `(United, States)`, `(in, a)`) accumulate enough observations to beat Order-1 by 1–3 bits per token, while cold bigrams stay where the encoder routes them to Order-1 (Order-2 returns near-uniform with no observations).
+
+Panel-vs-end-to-end calibration table from the decomposition:
+
+| Component (per-window avg, full panel) | xml-tok | xml-tok-route | Δ |
+|---|---:|---:|---:|
+| token_hit_ac | 195,922 | 186,079 | **-9,843** |
+| router_ac | 0 | 12,412 | +12,412 |
+| Others | (same) | (same) | ~0 |
+
+On the panel, Order-2 saves 9,843 bits/window but the router costs 12,412 — Order-2 just isn't trained enough on 256 KiB of measure window to pay back the routing overhead. At enwik8 end-to-end (100 MB measure), Order-2 saturation begins; at enwik9 (1 GB), Order-2 wins on enough tokens to net 27 K bits per MB.
+
+### Methodology lesson (reversed from Phase 17)
+
+Phase 17's lesson was: **panel can overstate** gain for codec changes that compete with adaptive-state cost reduction. Phase 18 adds the mirror image: **panel can understate** gain for codec changes that depend on adaptive-state saturation. The rule of thumb generalizes to: panel-vs-end-to-end divergence is the diagnostic — when they disagree by >0.02 bpb, the change is interacting with predictor training volume, which means the panel decision is unreliable.
+
+End-to-end enwik8 was used as the **first reliable signal** (panel said +0.009; e2e said -0.004), then enwik9 confirmed the trend. The same two-stage calibration (panel → e2e enwik8 → e2e enwik9) should be the default discipline going forward.
+
+### Extension path: N > 2 predictors
+
+The codec is structured so adding a third or fourth predictor is small. `N_PREDICTORS`, `ROUTER_BITS = log2(N_PREDICTORS)`, and the `which: usize` parameter in `predict_id_cost` / `encode_dict_id_with` / `decode_dict_id_with` are the only places where N appears explicitly. The natural next candidates:
+
+1. **Order-0 (page-conditioned)**: a per-page-reset predictor (similar in spirit to Phase 17's cache but without explicit indexing). Could capture topical drift inside long pages.
+2. **Co-occurrence model**: keyed on a hash of recent dict ids in the page rather than a fixed-window order.
+3. **Length-conditioned**: separate predictor when the previous token is a long separator (sentence break heuristic).
+
+The risk of more predictors: as N grows, the encoder's stickiness penalty per non-current predictor (currently 1 bit) compounds, and the router cost per token grows as `log2(N)`. Empirically the right N is the one where each added predictor's savings cover its share of the router-bit growth — that's a per-predictor decision that needs the same panel → e2e enwik8 → e2e enwik9 calibration ladder.
+
+### Tunable parameter audit
+
+- `ROUTE_STICKINESS_BITS = 1.0`: encoder switches only if the new predictor saves at least 1 bit. Untuned. A sweep (0.0, 0.5, 1.0, 1.5) on enwik8 end-to-end is the natural next experiment if we want to squeeze another 0.005-0.01 bpb out of Phase 18 before adding predictor #3.
+- `ID_BIT_O2_K = 26`: Order-2 table at 64 M slots (~256 MiB). Memory-vs-collision trade-off; the actually-populated set after 200 M tokens is ~50 M, so 26 has ~30% headroom. Could shrink to 24 to free 192 MiB without much accuracy loss.
+- `ROUTER_BIT_K = 18`: 256 K-slot router predictor. Likely oversized for the `(prev_id, current_predictor)` context space; 16 (~64 K slots) would be enough.
+
+---
+
 ## 2026-05-14 — Phase 17: Page-Local Cache (Negative at Enwik9, +0.008 bpb)
 
 Following the Phase-0 recon, the candidate Proposal C — a per-page ring-buffer cache of dictionary ids reset at every `<page>` boundary — looked like the most promising novel angle. The recon showed mean `avg_in_page = 2.89` across enwik9's top-1000 word types (with mid-rank outliers like "td" at avg 76 per page), suggesting substantial in-page repetition to amortize over. The implementation lands as `xml-tok-pc`: an additive layer over `xml-tok` that emits a `cache_flag` bit (BitPredictor on `prev_id`) before each Content hit-token, and on `cache_flag=1` emits a recency-relative position via a second BitPredictor whose context drops `prev_id` to converge on the MRU-dominant rel distribution.
