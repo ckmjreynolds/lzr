@@ -285,10 +285,13 @@ const ID_MLP_K: u32 = 20;
 const ID_MLP_LR: f32 = 0.02;
 /// Phase-23D: hidden dimension of the `dict_id` MLP.
 const ID_MLP_H: usize = 8;
-/// Phase-23D: feature count of the `dict_id` MLP. Shares the same
-/// 3-feature shape as the Phase-23A sparse-LR — the MLP's value-add
-/// is the learned nonlinearity, not different features.
-const N_MLP_ID_FEATS: usize = 3;
+/// Phase-23D / Phase-23F: feature count of the `dict_id` MLP. Phase
+/// 23D shared 3 features with the sparse-LR; Phase 23F adds a
+/// coarse warm feature (`p1_len_bucket × prefix × bit_pos`) the LR
+/// doesn't have. Phase 23E tried two deep-context features
+/// (Order-4, Wiki × Order-3) which regressed — see that journal
+/// entry for the saturation argument that picked the coarse path.
+const N_MLP_ID_FEATS: usize = 4;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -636,10 +639,13 @@ impl Codec for XmlTokRouteCodec {
                             } else {
                                 ctx.p2
                             };
+                            let p1_len_new =
+                                u8::try_from(dict.entry(last_id).lower.len()).unwrap_or(u8::MAX);
                             ctx = PredCtx {
                                 p3: p3_new,
                                 p2: p2_new,
                                 p1: Some(last_id),
+                                p1_len: p1_len_new,
                                 wiki: ctx.wiki,
                             };
                             continue;
@@ -677,10 +683,13 @@ impl Codec for XmlTokRouteCodec {
                         if let Some(id) = new_id {
                             matcher.push(id);
                         }
+                        let p1_len_new =
+                            new_id.map_or(0, |_| u8::try_from(token.len()).unwrap_or(u8::MAX));
                         ctx = PredCtx {
                             p3: ctx.p2,
                             p2: ctx.p1,
                             p1: new_id,
+                            p1_len: p1_len_new,
                             wiki: token_ctx.wiki,
                         };
 
@@ -894,10 +903,13 @@ impl Codec for XmlTokRouteCodec {
                                 TokenClass::Separator => CLASS_CTX_SEP,
                             };
                         }
+                        let p1_len_new =
+                            u8::try_from(dict.entry(last_id).lower.len()).unwrap_or(u8::MAX);
                         ctx = PredCtx {
                             p3: p3_new,
                             p2: p2_new,
                             p1: Some(last_id),
+                            p1_len: p1_len_new,
                             wiki: ctx.wiki,
                         };
                         continue;
@@ -929,10 +941,13 @@ impl Codec for XmlTokRouteCodec {
                         TokenClass::Word => CLASS_CTX_WORD,
                         TokenClass::Separator => CLASS_CTX_SEP,
                     };
+                    let p1_len_new =
+                        new_prev.map_or(0, |_| u8::try_from(token_bytes.len()).unwrap_or(u8::MAX));
                     ctx = PredCtx {
                         p3: ctx.p2,
                         p2: ctx.p1,
                         p1: new_prev,
+                        p1_len: p1_len_new,
                         wiki: token_ctx.wiki,
                     };
                 }
@@ -1255,14 +1270,18 @@ fn lz_match_row(prev_id: Option<u32>) -> usize {
 
 /// Bundle of context features available to the predictor stack.
 /// `p1`/`p2`/`p3` are the trailing dict-id history; `wiki` is the
-/// `wiki_classifier` sub-mode (0=Plain, 1=Link, 2=Template). The
-/// active Phase-23A `dict_id` mix is `(Order-1, Order-2, Wiki,
-/// SparseLR)`; the sparse-LR reads `p3` (Phase 23A first use).
+/// `wiki_classifier` sub-mode (0=Plain, 1=Link, 2=Template);
+/// `p1_len` is the byte length of `p1`'s token, capped at 255 (0
+/// when `p1` is `None`). Phase 23F added `p1_len` as a **coarse
+/// warm feature** for the MLP — small natural cardinality means
+/// dense observations per hashed slot, the opposite of the failed
+/// Phase-23E Order-4 hash. None of the count predictors read it.
 #[derive(Clone, Copy, Debug)]
 struct PredCtx {
     p3: Option<u32>,
     p2: Option<u32>,
     p1: Option<u32>,
+    p1_len: u8,
     wiki: u8,
 }
 
@@ -1271,6 +1290,7 @@ impl PredCtx {
         p3: None,
         p2: None,
         p1: None,
+        p1_len: 0,
         wiki: 0,
     };
 }
@@ -1334,10 +1354,39 @@ fn id_lr_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_LR_ID_FEAT
     [f_o3, f_wiki_o2, f_bias]
 }
 
+/// Phase-23F: feature hashes for the `dict_id` MLP. Superset of
+/// [`id_lr_features`] with one extra **coarse warm feature** —
+/// `(p1_len_bucket, prefix, bit_pos)` — the LR doesn't carry. The
+/// length bucket is a 4-bit cap of `p1`'s byte length so the
+/// natural cell count is small (16 × 65 K × 16 ≈ 2^24); hashed
+/// into K=20 each slot averages ~16 contexts and stays warm even
+/// at enwik8 scale. Phase 23E established that "warm coarse
+/// features beat sparse deep ones" for the MLP — see that journal
+/// entry.
+fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FEATS] {
+    let [f_o3, f_wiki_o2, f_bias] = id_lr_features(ctx, prefix, bit_pos);
+
+    // Length bucket: clip `p1_len` to 4 bits (0..=15). Tokens
+    // longer than 15 bytes all share the top bucket; that loses
+    // length resolution on long OOV runs but they're a tiny
+    // fraction of total tokens, and the bucket is meant to
+    // separate "short separator" from "typical word" from "long
+    // template/url", not to count bytes precisely.
+    let p1_len_bucket = u64::from(ctx.p1_len.min(15));
+    let f_p1_len = {
+        let h = fnv_mix(FNV_OFFSET, p1_len_bucket);
+        let h = fnv_mix(h, u64::from(prefix));
+        fnv_mix(h, u64::from(bit_pos))
+    };
+
+    [f_o3, f_wiki_o2, f_bias, f_p1_len]
+}
+
 /// Read all base predictors' `P(bit = 0)` without touching any
 /// state. Used on the encode path before we know the bit value.
 fn id_bit_p_zeros(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u32; N_MIX_ID] {
-    let feats = id_lr_features(ctx, prefix, bit_pos);
+    let lr_feats = id_lr_features(ctx, prefix, bit_pos);
+    let mlp_feats = id_mlp_features(ctx, prefix, bit_pos);
     [
         models
             .token_id_bit
@@ -1348,8 +1397,8 @@ fn id_bit_p_zeros(models: &Models, ctx: PredCtx, prefix: u32, bit_pos: u32) -> [
         models
             .token_id_bit_wiki
             .predict_p_zero(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos)),
-        models.token_id_sparse_lr.predict(&feats),
-        models.token_id_mlp.predict(&feats),
+        models.token_id_sparse_lr.predict(&lr_feats),
+        models.token_id_mlp.predict(&mlp_feats),
     ]
 }
 
@@ -1373,9 +1422,10 @@ fn observe_id_bit(
     models
         .token_id_bit_wiki
         .observe(id_bit_ctx_wiki(ctx.wiki, ctx.p1, prefix, bit_pos), bit);
-    let feats = id_lr_features(ctx, prefix, bit_pos);
-    models.token_id_sparse_lr.observe(&feats, bit);
-    models.token_id_mlp.observe(&feats, bit);
+    let lr_feats = id_lr_features(ctx, prefix, bit_pos);
+    let mlp_feats = id_mlp_features(ctx, prefix, bit_pos);
+    models.token_id_sparse_lr.observe(&lr_feats, bit);
+    models.token_id_mlp.observe(&mlp_feats, bit);
     models
         .token_id_mixer
         .observe(mixer_id_ctx(bit_pos, prefix), &p_zeros, bit);
@@ -1895,10 +1945,12 @@ fn prewarm(
                 if let Some(id) = new_id {
                     matcher.push(id);
                 }
+                let p1_len_new = new_id.map_or(0, |_| u8::try_from(token.len()).unwrap_or(u8::MAX));
                 ctx = PredCtx {
                     p3: ctx.p2,
                     p2: ctx.p1,
                     p1: new_id,
+                    p1_len: p1_len_new,
                     wiki: token_ctx.wiki,
                 };
                 // Also observe the lz_flag=0 (no-match) for prewarm

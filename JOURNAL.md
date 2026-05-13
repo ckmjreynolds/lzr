@@ -13,6 +13,76 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23F: Coarse Warm Feature `(p1_len, prefix, bit_pos)` for the MLP — 1.877 bpb on Enwik9
+
+Direct test of the Phase-23E lesson — "MLP features need observation density per slot, not deeper word-history order". The minimal experiment: add a **single coarse warm feature** built from a small-cardinality input (`p1`'s byte length, capped at 16 buckets) and see whether it does what the deep Order-4 feature couldn't.
+
+### What landed
+
+1. **Extended `PredCtx`** with a `p1_len: u8` field — the byte length of `p1`'s emitted token, capped at 255 (0 when `p1` is `None`). Updated all six `PredCtx` construction sites (encode/decode/prewarm × simple-shift and LZ-match-shift) to populate it from either the just-emitted `token.len()` or `dict.entry(last_id).lower.len()`.
+2. **Added `id_mlp_features`** as a superset of `id_lr_features`. New 4th feature: `(p1_len_bucket, prefix, bit_pos)` where `p1_len_bucket = min(p1_len, 15)`. The bucket clips to 4 bits so the natural cell count is 16 × 65 K × 16 ≈ 2^24 — at K=20 each slot averages ~16 contexts, so SGD sees ~10⁴ observations per slot at enwik9 scale. Dense, the way 23E's hashed Order-4 wasn't.
+3. **Bumped `N_MLP_ID_FEATS` 3 → 4**. MLP memory: 96 MiB → 128 MiB (+32 MiB, half of Phase 23E's +64 MiB).
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23D |
+|---|---:|---:|---:|---:|
+| Phase 23D | 2.1199 | 1.8792 | 234,905,363 | — |
+| **Phase 23F** | **2.1141** | **1.8770** | **234,619,206** | **-0.0058 / -0.0022 / -280 KiB** |
+| Phase 23E (reverted) | 2.1203 | 1.8792 | 234,901,166 | +0.0004 / 0.0000 |
+
+Roundtrip verified. Encode time on enwik9: 682 s vs Phase 23D's 654 s (+4 %). Decode: 379 s vs 360 s (+5 %). Total enwik9 encode+decode: 17.7 min — comfortably inside the Hutter budget. Memory peak unchanged at ~5.4 GiB (the +32 MiB is rounding error against the 2 GiB Order-2 anchor).
+
+### Why this is the right confirmation of the 23E lesson
+
+Side-by-side memory and bpb for the two feature-engineering experiments on top of Phase 23D:
+
+| Experiment | Feature kind | Natural cells | K=20 obs/slot (enwik9) | Δ memory | Δ enwik8 bpb | Δ enwik9 bpb |
+|---|---|---:|---:|---:|---:|---:|
+| 23E (Order-4 + Wiki × Order-3) | Deep + sparse | ~2^73 / ~2^60 | ~10⁻⁴ | +64 MiB | +0.0004 | 0.0000 |
+| 23F (`p1_len_bucket`) | Coarse + dense | ~2^24 | ~10⁴ | +32 MiB | **-0.0058** | **-0.0022** |
+
+Half the memory, a clean positive instead of a noisy zero. The hypothesis from the 23E journal lands: SGD needs the per-slot observation count to dominate the per-slot context variance, otherwise gradient updates are noise. Order-4 fails on both axes; `p1_len_bucket` wins on both.
+
+### What `p1_len_bucket` is actually measuring
+
+The feature is "given the byte length of the previous token, what is the dict-id bit distribution for the next token?". Concrete examples this should resonate with:
+
+- Length-1 separators (a single `\n`, ` `, `>`, `:`) are followed by very different `prev_id` → `next_id` distributions than length-3+ separators (` -- `, `\n  `, `''`, etc.).
+- Length-2/3 short words (`is`, `of`, `the`) tend to be followed by longer content words; length-12+ words are usually nouns inside templates and tend to be followed by `]]` / `|` / `}}` patterns.
+- OOV-flag patterns: `p1_len = 0` (the new-OOV-this-page case) has a very different downstream distribution than `p1_len ≥ 1` (a dict-known token).
+
+None of these signals are *new information* in the strict sense — the dict id `p1` already encodes the length and class of the token. But they're new **conditioning axes** for the MLP, which lets the model partition the space along directions the Zipfian-mass-on-id partition can't reach for tail tokens.
+
+### Phase 23F cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 19k | 249,191,955 | 1.9935 | — |
+| Phase 20l | 241,105,534 | 1.9288 | -0.0647 |
+| Phase 21 | 237,259,434 | 1.8981 | -0.0954 |
+| Phase 22 | 237,120,859 | 1.8970 | -0.0965 |
+| Phase 23A | 235,510,295 | 1.8841 | -0.1094 |
+| Phase 23B | 235,124,739 | 1.8810 | -0.1125 |
+| Phase 23C | 235,066,968 | 1.8805 | -0.1130 |
+| Phase 23D | 234,905,363 | 1.8792 | -0.1143 |
+| **Phase 23F** | **234,619,206** | **1.8770** | **-0.1165** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.1897 bpb / -19.0 MiB on enwik9**. Hutter ratio: **2.139× target**.
+
+### Open feature space
+
+Phase 23F validates the path. Other coarse warm features that fit the same recipe:
+
+- `p2_len_bucket`: length of token two back. Pairs with `p1_len_bucket` for a joint feature `(p1_len, p2_len, prefix, bit_pos)`.
+- `p1_class`, `p2_class`: 3-valued token class (none / word / separator). Tiny cardinality, very warm.
+- `recency_bucket`: bytes since last LZ-match, capped at 64. New information not present in `p3..p1`.
+- `page_offset_bucket`: byte position within current page, log-bucketed. Captures "early-in-page-templates vs. mid-page-prose" structure.
+
+Each is a small, well-bounded experiment. The next phase should pick one and measure; if positive, add the rest as a portfolio.
+
+---
+
 ## 2026-05-13 — Phase 23E (Negative): New MLP Features (Order-4, Wiki × Order-3) Don't Pay — Reverted
 
 Phase 23D ended with the observation that the MLP shared all three features with the sparse-LR, so the MLP could only add a nonlinearity, not new information. The Phase 23E experiment tested the obvious counter-move: give the MLP **its own additional features** the LR doesn't have.
