@@ -69,13 +69,14 @@ Replacing it with a `BitPredictor` keyed on `prev_id` turns it into Order-1: `P(
 | **19f**: Order-1 `lz_flag` | `BitPredictor` on `prev_id`, replaces `Order0<2>` | 2.2426 | 2.0287 | **-0.0105** |
 | **19g**: + Order-1 `token_oov` | Same shape, replaces the second `Order0<2>` | 2.2394 | 2.0216 | **-0.0176** |
 | **19h**: + Order-1 `lz_offset_bucket` + `lz_length` | `Order1Ctx<1024, ...>` hashed on `prev_id` | 2.2340 | 2.0062 | -0.0330 |
-| **19i**: + `ID_BIT_O2_K` = 26 → 27 (Order-2 table 256 → 512 MiB) | doubles slots, halves collisions on the long bigram tail | 2.2324 | **1.9997** | **-0.0395** |
+| **19i**: + `ID_BIT_O2_K` = 26 → 27 (Order-2 table 256 → 512 MiB) | doubles slots, halves collisions on the long bigram tail | 2.2324 | 1.9997 | -0.0395 |
+| **19j**: + `ID_BIT_O2_K` = 27 → 28 (Order-2 table 1 GiB) | another 2× | 2.2316 | **1.9957** | **-0.0435** |
 
-The full enwik9 archive drops from **254,898,774 → 249,967,249 bytes (4.7 MiB smaller)**. Cumulative vs the original xml-tok (Phase 16 stack from 2026-05-13): **2.0667 → 1.9997 = -0.0670 bpb**. The codec is now under **2.0 bpb** on enwik9 for the first time, at **2.28× the Hutter target** (down from 2.32× after Phase 18, 2.35× after Phase 17, 2.41× after Phase 16).
+The full enwik9 archive drops from **254,898,774 → 249,467,334 bytes (5.2 MiB smaller)**. Cumulative vs the original xml-tok (Phase 16 stack from 2026-05-13): **2.0667 → 1.9957 = -0.0710 bpb**. The codec is now under **2.0 bpb** on enwik9 for the first time, at **2.27× the Hutter target** (down from 2.32× after Phase 18, 2.35× after Phase 17, 2.41× after Phase 16).
 
 The pattern from Phase 17/18 holds: panel results understate the gain when the change depends on adaptive-state saturation. Each Order-1 upgrade was modestly positive on enwik8 e2e and ~2× larger on enwik9.
 
-**Phase 19i** bumped `ID_BIT_O2_K` from 26 to 27 (Order-2 table from 256 MiB to 512 MiB). On enwik8 e2e the delta was -0.0016 (within noise); on enwik9 it was **-0.0065** (more than the enwik8 e2e suggested, again matching the "saturation grows with corpus" pattern). The same change to K=28 (1 GiB table) is the natural next test if memory permits.
+**Phase 19i** bumped `ID_BIT_O2_K` from 26 to 27 (Order-2 table from 256 MiB to 512 MiB). On enwik8 e2e the delta was -0.0016 (within noise); on enwik9 it was **-0.0065**, matching the "saturation grows with corpus" pattern. **Phase 19j** scaled once more to K=28 (1 GiB table) for another -0.0040 on enwik9. K=29 (2 GiB) is the natural next test but past the point of meaningful return (the gains are halving with each doubling of the table; this is collision-vs-data-density limited).
 
 ### Class-based, Wiki-fine, and a methodology note
 

@@ -167,8 +167,8 @@ const OFFSET_BUCKET_ALPHABET: usize = 21;
 /// `(prev_prev_id, prev_id, prefix, bit_pos)` context space is much
 /// larger than Order-1's. Phase-19i bumped from 2 ^ 26 to 2 ^ 27 to
 /// reduce collisions on the long tail of warm bigrams; the table is
-/// 512 MiB now (within the 10 GiB judging-machine budget).
-const ID_BIT_O2_K: u32 = 27;
+/// 1 GiB now (within the 10 GiB judging-machine budget).
+const ID_BIT_O2_K: u32 = 28;
 
 /// Hash-table size for the Order-3 `dict_id` bit predictor. Trigram
 /// context space is so large that hashing to 2 ^ 26 puts roughly one
