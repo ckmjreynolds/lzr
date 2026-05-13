@@ -70,9 +70,10 @@ Replacing it with a `BitPredictor` keyed on `prev_id` turns it into Order-1: `P(
 | **19g**: + Order-1 `token_oov` | Same shape, replaces the second `Order0<2>` | 2.2394 | 2.0216 | **-0.0176** |
 | **19h**: + Order-1 `lz_offset_bucket` + `lz_length` | `Order1Ctx<1024, ...>` hashed on `prev_id` | 2.2340 | 2.0062 | -0.0330 |
 | **19i**: + `ID_BIT_O2_K` = 26 → 27 (Order-2 table 256 → 512 MiB) | doubles slots, halves collisions on the long bigram tail | 2.2324 | 1.9997 | -0.0395 |
-| **19j**: + `ID_BIT_O2_K` = 27 → 28 (Order-2 table 1 GiB) | another 2× | 2.2316 | **1.9957** | **-0.0435** |
+| **19j**: + `ID_BIT_O2_K` = 27 → 28 (Order-2 table 1 GiB) | another 2× | 2.2316 | 1.9957 | -0.0435 |
+| **19k**: + `ID_BIT_K` = 24 → 25 (Order-1 table 128 → 256 MiB) | same idea for the Order-1 predictor | 2.2299 | **1.9935** | **-0.0457** |
 
-The full enwik9 archive drops from **254,898,774 → 249,467,334 bytes (5.2 MiB smaller)**. Cumulative vs the original xml-tok (Phase 16 stack from 2026-05-13): **2.0667 → 1.9957 = -0.0710 bpb**. The codec is now under **2.0 bpb** on enwik9 for the first time, at **2.27× the Hutter target** (down from 2.32× after Phase 18, 2.35× after Phase 17, 2.41× after Phase 16).
+The full enwik9 archive drops from **254,898,774 → 249,191,955 bytes (5.4 MiB smaller)**. Cumulative vs the original xml-tok (Phase 16 stack from 2026-05-13): **2.0667 → 1.9935 = -0.0732 bpb**. The codec is now under **2.0 bpb** on enwik9 for the first time, at **2.27× the Hutter target** (down from 2.32× after Phase 18, 2.35× after Phase 17, 2.41× after Phase 16).
 
 The pattern from Phase 17/18 holds: panel results understate the gain when the change depends on adaptive-state saturation. Each Order-1 upgrade was modestly positive on enwik8 e2e and ~2× larger on enwik9.
 

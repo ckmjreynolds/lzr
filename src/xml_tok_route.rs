@@ -152,7 +152,9 @@ const BYTE_NCTX: usize = 257;
 /// larger than `(bit_pos, prefix)` alone. v3 Phase 1 widens IDs to
 /// 18 bits and bumps the table to 2^24 = 16 M slots (64 MiB) to
 /// keep collision rate near zero at the new context-space size.
-const ID_BIT_K: u32 = 24;
+/// Phase-19k: bumped from 2 ^ 24 to 2 ^ 25 (128 MiB → 256 MiB) so
+/// the long tail of Order-1 contexts has less collision pressure.
+const ID_BIT_K: u32 = 25;
 /// Hash-table size for the bit-level length predictor. Length is
 /// independent of `prev_id`, so the context space stays as in
 /// Phase 14: 2^18 slots = 1 MiB.
