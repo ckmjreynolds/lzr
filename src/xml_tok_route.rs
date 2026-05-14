@@ -289,14 +289,14 @@ const ID_MLP_LR: f32 = 0.02;
 /// confirming the diminishing-returns curve is feature-limited.
 /// Reverted to `H=8`.
 const ID_MLP_H: usize = 8;
-/// Phase-23D → Phase-23K: feature count of the `dict_id` MLP.
+/// Phase-23D → Phase-23L: feature count of the `dict_id` MLP.
 /// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),
 /// bias (LR-shared), p1_len_bucket (23F), p2_len_bucket (23G),
 /// (p1_len, p2_len) joint (23H), tokens_since_match_bucket (23J),
-/// p1_class (23K)]`. Phase 23E (Order-4) and 23I (H=16) both
-/// regressed; the "genuinely-new information" path (23J + 23K) is
-/// the productive lever — see each journal entry.
-const N_MLP_ID_FEATS: usize = 8;
+/// p1_class (23K), p2_class (23L)]`. Phase 23E (Order-4) and 23I
+/// (H=16) both regressed; the "genuinely-new information" path
+/// (23J/K/L) is the productive lever — see each journal entry.
+const N_MLP_ID_FEATS: usize = 9;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -655,6 +655,13 @@ impl Codec for XmlTokRouteCodec {
                             let p1_class_new = class_to_p1_class(TokenClass::from_byte(
                                 dict.entry(last_id).lower[0],
                             ));
+                            let p2_class_new = if length_us >= 2 {
+                                class_to_p1_class(TokenClass::from_byte(
+                                    dict.entry(lookahead[length_us - 2].id).lower[0],
+                                ))
+                            } else {
+                                ctx.p1_class
+                            };
                             ctx = PredCtx {
                                 p3: p3_new,
                                 p2: p2_new,
@@ -663,6 +670,7 @@ impl Codec for XmlTokRouteCodec {
                                 p2_len: p2_len_new,
                                 tokens_since_match: 0,
                                 p1_class: p1_class_new,
+                                p2_class: p2_class_new,
                                 wiki: ctx.wiki,
                             };
                             continue;
@@ -711,6 +719,7 @@ impl Codec for XmlTokRouteCodec {
                             p2_len: ctx.p1_len,
                             tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                             p1_class: p1_class_new,
+                            p2_class: ctx.p1_class,
                             wiki: token_ctx.wiki,
                         };
 
@@ -939,6 +948,9 @@ impl Codec for XmlTokRouteCodec {
                         });
                         let p1_class_new =
                             class_to_p1_class(TokenClass::from_byte(dict.entry(last_id).lower[0]));
+                        let p2_class_new = p2_id_opt.map_or(ctx.p1_class, |id| {
+                            class_to_p1_class(TokenClass::from_byte(dict.entry(id).lower[0]))
+                        });
                         ctx = PredCtx {
                             p3: p3_new,
                             p2: p2_new,
@@ -947,6 +959,7 @@ impl Codec for XmlTokRouteCodec {
                             p2_len: p2_len_new,
                             tokens_since_match: 0,
                             p1_class: p1_class_new,
+                            p2_class: p2_class_new,
                             wiki: ctx.wiki,
                         };
                         continue;
@@ -989,6 +1002,7 @@ impl Codec for XmlTokRouteCodec {
                         p2_len: ctx.p1_len,
                         tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                         p1_class: p1_class_new,
+                        p2_class: ctx.p1_class,
                         wiki: token_ctx.wiki,
                     };
                 }
@@ -1324,12 +1338,12 @@ fn lz_match_row(prev_id: Option<u32>) -> usize {
 /// `p1_len`/`p2_len` are the byte lengths of `p1`/`p2`'s tokens
 /// (capped at 255; 0 when the corresponding id is `None`);
 /// `tokens_since_match` is the count of tokens emitted since the
-/// most recent LZ-match (Phase 23J); `p1_class` is the token
-/// class of `p1` (0=None, 1=Word, 2=Separator, Phase 23K) —
-/// implicit in `p1` but not explicit anywhere the MLP can see.
-/// Phase 23F/G added the length fields; 23J and 23K continued the
-/// "genuinely-new information" pattern that 23I's diagnostic
-/// motivated.
+/// most recent LZ-match (Phase 23J); `p1_class`/`p2_class` are
+/// the token classes of `p1`/`p2` (0=None, 1=Word, 2=Separator,
+/// Phases 23K/23L) — implicit in the dict ids but not explicit
+/// anywhere the MLP can see. Phase 23F/G/H added the length
+/// fields; 23J/K/L continued the "genuinely-new information"
+/// pattern that 23I's diagnostic motivated.
 #[derive(Clone, Copy, Debug)]
 struct PredCtx {
     p3: Option<u32>,
@@ -1339,6 +1353,7 @@ struct PredCtx {
     p2_len: u8,
     tokens_since_match: u8,
     p1_class: u8,
+    p2_class: u8,
     wiki: u8,
 }
 
@@ -1351,6 +1366,7 @@ impl PredCtx {
         p2_len: 0,
         tokens_since_match: 0,
         p1_class: 0,
+        p2_class: 0,
         wiki: 0,
     };
 }
@@ -1459,9 +1475,18 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
+    // Phase 23L: sibling of `p1_class` one step back. Same shape;
+    // the marginal information value is smaller because of
+    // Word/Separator alternation, but boundary cases at structural
+    // breaks still carry independent signal.
+    let f_p2_class = {
+        let h = fnv_mix(FNV_OFFSET, u64::from(ctx.p2_class));
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
 
     [
-        f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len, f_len_pair, f_recency, f_p1_class,
+        f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len, f_len_pair, f_recency, f_p1_class, f_p2_class,
     ]
 }
 
@@ -2038,6 +2063,7 @@ fn prewarm(
                     p2_len: ctx.p1_len,
                     tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                     p1_class: p1_class_new,
+                    p2_class: ctx.p1_class,
                     wiki: token_ctx.wiki,
                 };
                 // Also observe the lz_flag=0 (no-match) for prewarm

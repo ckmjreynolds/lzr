@@ -13,6 +13,60 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23L: `p2_class` Coarse Feature — 1.866 bpb on Enwik9 (cumulative -0.2005 bpb)
+
+Sibling of Phase 23K — extend the class portfolio one slot back. `p2_class` shadows `p1_class` through the Word/Separator alternation rule, so most of its information is correlated, but boundary cases (after structural breaks, at page starts) still carry independent signal.
+
+### What landed
+
+1. **`PredCtx.p2_class: u8`** — same encoding as `p1_class` (0=None, 1=Word, 2=Separator). Populated at all five construction sites: simple-shift gets `p2_class: ctx.p1_class`; LZ-match-shift derives from the second-to-last token (`lookahead[length_us - 2]` on encode, `p2_id_opt` on decode), falling back to `ctx.p1_class` for length-1 matches.
+2. **New 9th MLP feature** `(p2_class, prefix, bit_pos)` at K=20. +32 MiB to MLP tables.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23K |
+|---|---:|---:|---:|---:|
+| Phase 23K | 2.1003 | 1.8678 | 233,478,388 | — |
+| **Phase 23L** | **2.0980** | **1.8662** | **233,280,411** | **-0.0023 / -0.0016 / -193 KiB** |
+
+Roundtrip OK. Encode 720 s vs 23K's 716 s (+0.5 %); decode 424 s vs 414 s (+2.4 %). Memory +32 MiB.
+
+### Diminishing returns inside the class family
+
+| Step | Feature | enwik8 Δ | enwik9 Δ |
+|---|---|---:|---:|
+| 23K | `p1_class` | -0.0082 | -0.0050 |
+| 23L | `p2_class` | -0.0023 | -0.0016 |
+
+23L delivers ~32 % of 23K's enwik9 gain. The Word/Separator alternation means that **given `p1_class`, `p2_class` is fully determined except at boundary positions** (the first token of a page, or after a `<page>`/`</page>` reset). The residual signal lives in those boundaries — which the MLP can now exploit.
+
+### Phase 23L cumulative on enwik9 — crossed −0.2 bpb
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23A | 235,510,295 | 1.8841 | -0.1094 |
+| Phase 23D | 234,905,363 | 1.8792 | -0.1143 |
+| Phase 23H | 234,336,587 | 1.8747 | -0.1188 |
+| Phase 23J | 234,096,064 | 1.8728 | -0.1207 |
+| Phase 23K | 233,478,388 | 1.8678 | -0.1257 |
+| **Phase 23L** | **233,280,411** | **1.8662** | **-0.1273** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2005 bpb / -20.1 MiB on enwik9**. Hutter ratio: **2.127× target**.
+
+This is the first phase to cross the −0.2 bpb cumulative threshold against the v3 starting point.
+
+### Next angles
+
+Word-class portfolio is approaching its limit. The next "genuinely-new information" candidates:
+
+- **First-byte sub-class of `p1`** — separators lump whitespace, digits, punctuation, brackets, etc. into one bucket. Subdividing into ~5-7 categories (None / Word / Digit / Whitespace / ASCII-punctuation / Other) gives a denser signal at the structurally-charged separator boundaries.
+- **`page_offset_bucket`** — byte position within current page, log-bucketed. Independent of everything in PredCtx. Heavier plumbing (need a counter that resets on `<page>` boundaries).
+- **`lz_match_length_last`** — length of the most-recent LZ-match (1..=N). Pairs with `tokens_since_match` for a "how big was the last match, and how long ago" signal.
+
+The first-byte sub-class is the cheapest probe and most closely mirrors the 23K mechanism that produced the biggest single-feature win.
+
+---
+
 ## 2026-05-13 — Phase 23K: `p1_class` Coarse Feature — 1.868 bpb on Enwik9 (biggest single-feature win since 23A)
 
 Direct extension of the Phase 23J pattern: another **genuinely-new information feature**, this one the token class (Word vs Separator vs None) of `p1`. Class is determined by the first byte of the previous token but was never exposed to the MLP through `PredCtx`. Three-valued cardinality means cells are exceptionally dense; SGD trains weights almost instantly.
