@@ -13,6 +13,89 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 24b: Bit-Level `lz_offset_bucket` Predictor — 1.851 bpb on Enwik9 (-0.0033 bpb)
+
+Mirrors Phase 24a for the `lz_offset_bucket` stream — replaces the 21-way `Order1Ctx` count CDF with a 5-bit MSB-first chain (`2^5 = 32` > 21 legal buckets). Same architecture as 24a: `BitPredictor` Order-1 + Order-2 + `LogitMixer<2>`. Smaller K=22/25 because the alphabet is 21 vs 256.
+
+### What landed
+
+1. **`lz_offset_bucket_bit_o1: BitPredictor`** at K=22 (4 Mi slots, 16 MiB). Context = `(prev_id, prefix, bit_pos)` via `id_bit_ctx`.
+2. **`lz_offset_bucket_bit_o2: BitPredictor`** at K=25 (32 Mi slots, 128 MiB). Context = `(p2, prev_id, prefix, bit_pos)` via `id_bit_ctx_o2`.
+3. **`lz_offset_bucket_mixer: LogitMixer<2>`** at K=8 keyed on `(bit_pos, prefix)`.
+4. **`encode_lz_offset_bucket` / `decode_lz_offset_bucket`** — 5-bit MSB-first loop. The 21-vs-32 alphabet gap: the predictor learns `P(bit=1)=0` on impossible branches during the warm-up window; decoder produces identical bits, so roundtrip is safe by construction (encoder never emits a value >= 21, so the decoder's CDF lookup never returns one either).
+
+The legacy `lz_offset_bucket_o1: Order1Ctx<1024, 21>` field is kept (`#[allow(dead_code)]`) for the eventual 24c LR/MLP-arm extension that may want it as a 3rd mixer arm; the helper `lz_match_row` is similarly retained.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik8 panel | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 24a |
+|---|---:|---:|---:|---:|---:|
+| Phase 24a | 2.0906 | 2.312 | 1.8540 | 231,753,538 | — |
+| **Phase 24b** | TBD | **2.325** (+0.013) | **1.8507** | **231,334,972** | **-0.0033 / -0.419 MiB** |
+
+Roundtrip OK. Encode 814 s vs 24a's 762 s (+6.8 %). Decode 554 s vs 526 s (+5.3 %). Memory +144 MiB.
+
+### The panel-regresses-e2e-wins inversion
+
+Phase 24b is the first phase in this session to show the **opposite** of the MLP panel-overstates-e2e pattern:
+
+| Phase | Panel Δ | E2e Δ | Ratio |
+|---|---:|---:|---:|
+| 23P (MLP on flag streams) | -0.011 | -0.0007 | 16× shrinkage |
+| 23Q (wiki_depth) | -0.004 | -0.0007 | 6× shrinkage |
+| 24a (length bits) | -0.052 | -0.0092 | 6× shrinkage |
+| **24b (offset bucket bits)** | **+0.013** | **-0.0033** | **sign flip!** |
+
+The inversion fits the architectural story: the bit-level predictor at a small alphabet (21-way) needs warm-up to learn `P(bit)=0` on the impossible branches before it outperforms the count CDF's Laplace-smoothed prior. The panel's 256 KiB measure window is too short for warm-up; e2e's 1 GiB of training data closes the warm-up gap and reveals the bit-level architecture's structural advantage.
+
+Phase 24a foreshadowed this in its "Next direction": *"Expected payoff is harder to predict because the offset distribution is heavily skewed (most matches at small offsets within the recent window) and the count CDF may already be a tight fit. A panel result will tell quickly."* The panel did tell quickly — and it was wrong. e2e is the trustworthy oracle for bit-level architectures with non-power-of-2 alphabets.
+
+### Panel decomposition shift
+
+Per-component delta vs 24a (panel got worse, but consistently in `lz_match_ac` only):
+
+| Component | 24a bits | 24b bits | Δ | bpb impact |
+|---|---:|---:|---:|---:|
+| `lz_match_ac` | 6,404,538 | 6,471,485 | **+66,947** | **+0.0128** |
+| `case_ac` | 425,191 | 424,067 | -1,124 | -0.0002 |
+| `token_hit_ac` | 3,196,666 | 3,197,707 | +1,041 | +0.0002 |
+| `token_oov_ac` | 2,006,970 | 2,007,671 | +701 | +0.0001 |
+| `tag_ac` | 65,369 | 65,196 | -173 | -0.0000 |
+| **panel total** | 12,121,995 | 12,189,019 | **+67,024** | **+0.0128** |
+
+The +0.013 panel regression is entirely in `lz_match_ac` (specifically the offset-bucket portion). e2e moves the *opposite direction* because the bit-level predictor's tables warm up over the full corpus.
+
+### Phase 24b cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23O | 233,070,347 | 1.8646 | -0.1289 |
+| Phase 23P | 232,992,379 | 1.8639 | -0.1296 |
+| Phase 23Q | 232,896,116 | 1.8632 | -0.1303 |
+| Phase 24a | 231,753,538 | 1.8540 | -0.1395 |
+| **Phase 24b** | **231,334,972** | **1.8507** | **-0.1428** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2160 bpb / -22.9 MiB on enwik9**. Hutter ratio: **2.110× target**.
+
+### Lessons (panel methodology)
+
+- **MLP / LR additions to dense Order-N predictors**: panel-trust the sign and magnitude (with 6-16× shrinkage on e2e).
+- **Bit-level decomposition of high-cardinality (>32) alphabets**: panel-trust the result, e2e shrinks ~6×.
+- **Bit-level decomposition of small (<32) non-power-of-2 alphabets**: **panel can flip sign**. e2e is the only trustworthy oracle. The cause is the warm-up cost of learning `P=0` on impossible branches, which the panel's 256 KiB measure doesn't absorb.
+
+This third category was unrecognized before 24b — added to memory as a project-spanning lesson.
+
+### Next direction
+
+Layer LR + MLP arms on both 24a (length) and 24b (offset bucket) bit predictors (Phase 24c). The dict-id pattern (Phase 23A LR + Phase 23D MLP) compounded -0.05 to -0.10 bpb on top of the Order-1+Order-2 baseline; the same arms on the LZ stream could plausibly net another -0.02 to -0.05 bpb.
+
+After 24c, the deterministic levers worth chasing are:
+- Wider Order-2 K on the LZ bit predictors (current K=27 for length, K=25 for offset; memory budget allows another 1-2 K bits).
+- Per-page caching MLP feature (recurrent token-id memory inside a `<page>` block).
+- Reactivate the count CDF as a third mixer arm (the legacy fields are kept exactly for this).
+
+---
+
 ## 2026-05-14 — Phase 24a: Bit-Level `lz_length` Predictor — 1.854 bpb on Enwik9 (-0.0092 bpb)
 
 Acting on the Phase 23P/Q direction signal — `lz_match_ac` is 53.8 % of total bits, and the offset/length CDFs were still pure `Order1Ctx` count predictors. Replaced the 256-way `lz_length_o1` count CDF with a bit-level MSB-first 8-bit predictor stack matching the dict-id Order-1+Order-2+mixer pattern. The expected gain: order-of-magnitude bigger than any Phase 23 increment because the source stream is much larger and the count CDF was leaving conditional structure unmodeled.

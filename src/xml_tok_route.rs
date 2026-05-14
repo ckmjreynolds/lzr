@@ -273,10 +273,34 @@ const LZ_LENGTH_MIXER_K: u32 = 10;
 /// Phase 24a: bit count for LZ-length MSB-first emission.
 /// `length_token = length - MIN_MATCH` ranges 0..=255 → 8 bits.
 const LZ_LENGTH_BITS: u32 = 8;
-/// Phase 24a: arm count of the `lz_length` mixer.
-/// `[Order-1, Order-2]`. LR/MLP arms are deferred to 24b/c after
+/// Phase 24a → 24c: arm count of the `lz_length` mixer.
+/// `[Order-1, Order-2]`. LR/MLP arms are deferred to 24c after
 /// the Order-1+2 baseline is calibrated.
 const N_MIX_LZ_LENGTH: usize = 2;
+
+/// Phase 24b: bit-level Order-1 `lz_offset_bucket` predictor. The
+/// offset bucket is 21-way (`OFFSET_BUCKET_ALPHABET`); 5 MSB-first
+/// bits cover it (`2^5 = 32`), with buckets 21-31 unreachable. The
+/// predictor learns `P(bit=1)=0` for impossible branches during
+/// warm-up; decoder produces identical bits, so roundtrip is safe.
+/// K=22 (4 Mi slots, 16 MiB) — smaller than `lz_length`'s K=24
+/// because the alphabet is 21 vs 256 and the observation rate is
+/// identical (one per match), so the per-slot density is similar
+/// at this lower K.
+const LZ_OFFSET_BUCKET_BIT_K: u32 = 22;
+/// Phase 24b: Order-2 `lz_offset_bucket` predictor. K=25 (32 Mi
+/// slots, 128 MiB), 3 bits more than Order-1 — same ratio as
+/// `lz_length`.
+const LZ_OFFSET_BUCKET_BIT_O2_K: u32 = 25;
+/// Phase 24b: hash-table size for the `lz_offset_bucket` bit-level
+/// mixer. Keyed on `(bit_pos, prefix)`. 5 × 32 = 160 cells; K=8
+/// covers it without collisions.
+const LZ_OFFSET_BUCKET_MIXER_K: u32 = 8;
+/// Phase 24b: bit count for `lz_offset_bucket` MSB-first emission.
+/// `2^5 = 32` covers the 21 legal buckets.
+const LZ_OFFSET_BUCKET_BITS: u32 = 5;
+/// Phase 24b → 24c: arm count of the `lz_offset_bucket` mixer.
+const N_MIX_LZ_OFFSET_BUCKET: usize = 2;
 
 /// Phase-22 / Phase-23A / Phase-23D: number of predictors in the
 /// `dict_id` mixer. `[Order-1, Order-2, Wiki, SparseLR, MLP]`. The
@@ -435,15 +459,18 @@ struct Models {
     /// the `lz_flag` emission to `lz_flag_bit` (`BitPredictor`).
     #[allow(dead_code)]
     lz_flag: Order0<2>,
-    /// Phase-19h: Order-1 `lz_offset_bucket`. Context = hashed
-    /// `prev_id` mod `LZ_MATCH_NCTX`.
+    /// Phase-19h → Phase-24b: legacy Order-1 `lz_offset_bucket`
+    /// 21-way count CDF. Retained for future LR/MLP-arm extensions;
+    /// the encode/decode path uses [`Self::lz_offset_bucket_bit_o1`]
+    /// / `_o2` bit-level predictors as of Phase 24b.
+    #[allow(dead_code)]
     lz_offset_bucket_o1: Order1Ctx<LZ_MATCH_NCTX, OFFSET_BUCKET_ALPHABET>,
     /// Phase-19h → Phase-24a: legacy Order-1 `lz_length` 256-way
     /// count CDF. Retained only to support the panel-historical
     /// baseline regression; the actual encode/decode path uses
     /// [`Self::lz_length_bit_o1`] / `_o2` bit-level predictors as of
     /// Phase 24a. Reserved for the deferred LR/MLP-arm extension
-    /// in 24b/c.
+    /// in 24c.
     #[allow(dead_code)]
     lz_length_o1: Order1Ctx<LZ_MATCH_NCTX, 256>,
     /// Phase-24a: bit-level Order-1 `lz_length` predictor — context
@@ -458,6 +485,14 @@ struct Models {
     /// Phase-24a: mixer for `lz_length` bit-level predictors.
     /// Blends Order-1 / Order-2 per `(bit_pos, prefix)`.
     lz_length_mixer: LogitMixer<N_MIX_LZ_LENGTH>,
+    /// Phase-24b: bit-level Order-1 `lz_offset_bucket` predictor —
+    /// context = `(prev_id, prefix, bit_pos)`. 5-bit MSB-first chain
+    /// over the 21-bucket alphabet.
+    lz_offset_bucket_bit_o1: BitPredictor,
+    /// Phase-24b: Order-2 `lz_offset_bucket` predictor.
+    lz_offset_bucket_bit_o2: BitPredictor,
+    /// Phase-24b: mixer for `lz_offset_bucket` bit-level predictors.
+    lz_offset_bucket_mixer: LogitMixer<N_MIX_LZ_OFFSET_BUCKET>,
 
     /// Phase-20j: Order-4 OOV word letter model. Context =
     /// `p4 * 27^3 + p3 * 27^2 + p2 * 27 + p1`. 531441 rows × 26
@@ -551,6 +586,9 @@ impl Models {
             lz_length_bit_o1: BitPredictor::new(LZ_LENGTH_BIT_K),
             lz_length_bit_o2: BitPredictor::new(LZ_LENGTH_BIT_O2_K),
             lz_length_mixer: LogitMixer::new(LZ_LENGTH_MIXER_K, MIXER_LR),
+            lz_offset_bucket_bit_o1: BitPredictor::new(LZ_OFFSET_BUCKET_BIT_K),
+            lz_offset_bucket_bit_o2: BitPredictor::new(LZ_OFFSET_BUCKET_BIT_O2_K),
+            lz_offset_bucket_mixer: LogitMixer::new(LZ_OFFSET_BUCKET_MIXER_K, MIXER_LR),
             oov_word_letter: Order1Ctx::new(),
             oov_sep_byte: Order1Ctx::new(),
             case_pattern_global: Order0::new(),
@@ -659,13 +697,9 @@ impl Codec for XmlTokRouteCodec {
                         if let Some((offset, length)) = lz_match {
                             let length_us = length as usize;
                             let lz_before = enc.bits_written();
-                            let row = lz_match_row(ctx.p1);
 
                             let bucket = log2_floor(offset);
-                            let mut bucket_cdf = [0u32; OFFSET_BUCKET_ALPHABET + 1];
-                            models.lz_offset_bucket_o1.cdf_to(row, &mut bucket_cdf);
-                            enc.encode(&bucket_cdf, bucket as usize);
-                            models.lz_offset_bucket_o1.observe(row, bucket as usize);
+                            encode_lz_offset_bucket(&mut enc, &mut models, ctx, bucket);
                             if bucket > 0 {
                                 let rel = offset - (1u32 << bucket);
                                 encode_uniform_bits(&mut enc, &mut uniform_cdf_cache, rel, bucket);
@@ -967,12 +1001,13 @@ impl Codec for XmlTokRouteCodec {
 
                     if flag == 1 {
                         // LZ match record.
-                        let row = lz_match_row(ctx.p1);
-                        let mut bucket_cdf = [0u32; OFFSET_BUCKET_ALPHABET + 1];
-                        models.lz_offset_bucket_o1.cdf_to(row, &mut bucket_cdf);
-                        let bucket = dec.decode(&bucket_cdf)?;
-                        models.lz_offset_bucket_o1.observe(row, bucket);
-                        let bucket_u32 = u32::try_from(bucket).expect("bucket fits u32");
+                        let bucket_u32 = decode_lz_offset_bucket(&mut dec, &mut models, ctx)?;
+                        if bucket_u32 >= OFFSET_BUCKET_ALPHABET as u32 {
+                            bail!(
+                                "decoded lz_offset_bucket {bucket_u32} >= alphabet \
+                                 {OFFSET_BUCKET_ALPHABET}"
+                            );
+                        }
                         let offset = if bucket_u32 == 0 {
                             1
                         } else {
@@ -1495,10 +1530,13 @@ fn lz_flag_ctx_o2(prev_prev_id: Option<u32>, prev_id: Option<u32>) -> u64 {
     fnv_mix(h, p)
 }
 
-/// Hash `(prev_id)` into a small context-row index for the Order-1
-/// `lz_offset_bucket` and `lz_length` predictors. Both share the
-/// `LZ_MATCH_NCTX` row count so the same hash works for both.
-#[allow(clippy::cast_possible_truncation)]
+/// Hash `(prev_id)` into a small context-row index for the legacy
+/// Order-1 `lz_offset_bucket` and `lz_length` count CDFs. Retained
+/// alongside the legacy [`Order1Ctx`] fields for the deferred
+/// LR/MLP-arm extension where the count CDF can land as a 3rd
+/// mixer arm. Phase 24a/24b's bit-level path uses
+/// `id_bit_ctx`/`id_bit_ctx_o2` directly.
+#[allow(clippy::cast_possible_truncation, dead_code)]
 fn lz_match_row(prev_id: Option<u32>) -> usize {
     let p = prev_id.map_or(u64::MAX, u64::from);
     let h = fnv_mix(FNV_OFFSET, p);
@@ -1905,6 +1943,88 @@ fn decode_lz_length(
         let cdf = [0u32, p_mixed, TOTAL];
         let bit = u32::try_from(dec.decode(&cdf)?).expect("bit symbol fits u32");
         observe_length_bit(models, ctx, prefix, bit_pos, bit, p_zeros);
+        prefix = (prefix << 1) | bit;
+    }
+    Ok(prefix)
+}
+
+/// Phase-24b: read both `lz_offset_bucket` bit predictors'
+/// `P(bit=0)` and the mixer-blended value.
+fn offset_bucket_bit_p_zeros(
+    models: &Models,
+    ctx: PredCtx,
+    prefix: u32,
+    bit_pos: u32,
+) -> [u32; N_MIX_LZ_OFFSET_BUCKET] {
+    let ctx_o1 = id_bit_ctx(ctx.p1, prefix, bit_pos);
+    let ctx_o2 = id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos);
+    [
+        models.lz_offset_bucket_bit_o1.predict_p_zero(ctx_o1),
+        models.lz_offset_bucket_bit_o2.predict_p_zero(ctx_o2),
+    ]
+}
+
+/// Phase-24b: observe one `lz_offset_bucket` bit in both base
+/// predictors and the mixer.
+fn observe_offset_bucket_bit(
+    models: &mut Models,
+    ctx: PredCtx,
+    prefix: u32,
+    bit_pos: u32,
+    bit: u32,
+    p_zeros: [u32; N_MIX_LZ_OFFSET_BUCKET],
+) {
+    let ctx_o1 = id_bit_ctx(ctx.p1, prefix, bit_pos);
+    let ctx_o2 = id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos);
+    let mixer_ctx = mixer_id_ctx(bit_pos, prefix);
+    models.lz_offset_bucket_bit_o1.observe(ctx_o1, bit);
+    models.lz_offset_bucket_bit_o2.observe(ctx_o2, bit);
+    models
+        .lz_offset_bucket_mixer
+        .observe(mixer_ctx, &p_zeros, bit);
+}
+
+/// Phase-24b: encode `bucket` (0..=20) MSB-first as 5 bits with
+/// mixer-blended `P(bit=0)`. Replaces the Phase-19h
+/// `lz_offset_bucket_o1.cdf_to` count CDF. The 21-vs-32 alphabet
+/// gap is handled by letting the predictor learn `P(bit=1)=0` on
+/// impossible branches during warm-up.
+fn encode_lz_offset_bucket(
+    enc: &mut AcEncoder<'_>,
+    models: &mut Models,
+    ctx: PredCtx,
+    bucket: u32,
+) {
+    let mut prefix: u32 = 0;
+    for bit_pos in (0..LZ_OFFSET_BUCKET_BITS).rev() {
+        let bit = (bucket >> bit_pos) & 1;
+        let p_zeros = offset_bucket_bit_p_zeros(models, ctx, prefix, bit_pos);
+        let p_mixed = models
+            .lz_offset_bucket_mixer
+            .predict(mixer_id_ctx(bit_pos, prefix), &p_zeros);
+        let cdf = [0u32, p_mixed, TOTAL];
+        enc.encode(&cdf, bit as usize);
+        observe_offset_bucket_bit(models, ctx, prefix, bit_pos, bit, p_zeros);
+        prefix = (prefix << 1) | bit;
+    }
+}
+
+/// Phase-24b: decode a 5-bit `bucket` MSB-first. Mirror of
+/// `encode_lz_offset_bucket`.
+fn decode_lz_offset_bucket(
+    dec: &mut AcDecoder<'_, '_>,
+    models: &mut Models,
+    ctx: PredCtx,
+) -> Result<u32> {
+    let mut prefix: u32 = 0;
+    for bit_pos in (0..LZ_OFFSET_BUCKET_BITS).rev() {
+        let p_zeros = offset_bucket_bit_p_zeros(models, ctx, prefix, bit_pos);
+        let p_mixed = models
+            .lz_offset_bucket_mixer
+            .predict(mixer_id_ctx(bit_pos, prefix), &p_zeros);
+        let cdf = [0u32, p_mixed, TOTAL];
+        let bit = u32::try_from(dec.decode(&cdf)?).expect("bit symbol fits u32");
+        observe_offset_bucket_bit(models, ctx, prefix, bit_pos, bit, p_zeros);
         prefix = (prefix << 1) | bit;
     }
     Ok(prefix)
