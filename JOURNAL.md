@@ -13,6 +13,95 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 24c: LR + MLP Arms on Bit-Level LZ Predictors — 1.844 bpb on Enwik9 (-0.0066 bpb)
+
+Layered the dict-id LR/MLP-arm pattern (Phase 23A/23D) onto the 24a/24b bit-level predictors. Added a 3-arm `SparseLR<3>` + 4-arm `OnlineMLP<3, 8>` to each stream's mixer, both reusing `id_lr_features` for their hashed-feature shape (`[Order-3 (p3, p2, p1, prefix, bit_pos), Wiki × Order-2, (bit_pos, prefix) bias]`).
+
+### What landed
+
+| Stream | New arm | Shape |
+|---|---|---|
+| `lz_length` | `lz_length_sparse_lr: SparseLR<3>` | K=18, 3 features, 12 MiB |
+| `lz_length` | `lz_length_mlp: OnlineMLP<3, 8>` | K=18, H=8, 96 MiB |
+| `lz_offset_bucket` | `lz_offset_bucket_sparse_lr: SparseLR<3>` | K=18, 3 features, 12 MiB |
+| `lz_offset_bucket` | `lz_offset_bucket_mlp: OnlineMLP<3, 8>` | K=18, H=8, 96 MiB |
+
+Total +216 MiB. Each stream's mixer goes from 2 arms (`[Order-1, Order-2]`) to 4 (`[Order-1, Order-2, SparseLR, MLP]`), matching the dict-id mixer's shape.
+
+### Results
+
+| Config | enwik8 panel | enwik8 e2e | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 24b |
+|---|---:|---:|---:|---:|---:|
+| Phase 24b | 2.325 | TBD | 1.8507 | 231,334,972 | — |
+| **Phase 24c** | **2.182** (-0.143) | TBD | **1.8441** | **230,510,448** | **-0.0066 / -806 KiB** |
+
+Roundtrip OK. Encode 929 s vs 24b's 814 s (+14 %). Decode 642 s vs 554 s (+16 %). Memory +216 MiB.
+
+### Panel decomposition shift
+
+Per-component delta vs Phase 24b (enwik8 panel, 20×256 KiB):
+
+| Component | 24b bits | 24c bits | Δ | bpb impact |
+|---|---:|---:|---:|---:|
+| `lz_match_ac` | 6,471,485 | 5,719,536 | **-751,949** | **-0.1434** |
+| `case_ac` | 424,067 | 424,373 | +306 | +0.0001 |
+| `token_class_ac` | 6,190 | 6,303 | +113 | +0.0000 |
+| `attr_ac` | 16,889 | 16,911 | +22 | +0.0000 |
+| `token_hit_ac` | 3,197,707 | 3,197,717 | +10 | +0.0000 |
+| `token_oov_ac` | 2,007,671 | 2,007,557 | -114 | -0.0000 |
+| `tag_ac` | 65,196 | 64,845 | -351 | -0.0001 |
+| **panel total** | 12,189,019 | 11,938,265 | **-250,754** | **-0.0478** |
+
+Panel mean 2.325 → 2.182 (-0.143 bpb). The entire panel win is in `lz_match_ac`. The LR+MLP arms add structurally orthogonal predictive capacity over the Order-1/Order-2 baseline; the cross-Order-3-and-wiki feature shape captures correlations the BitPredictor's pure (prev_id, prefix, bit_pos) hash misses (e.g., bigram dependencies on the wiki sub-mode that warp the offset/length distributions).
+
+### Panel-vs-e2e shrinkage for 24c
+
+Panel -0.143 bpb, e2e -0.0066 bpb → ~22× shrinkage. The largest e2e-to-panel divergence yet recorded, but in the standard MLP direction (panel overstates). The interpretation:
+- The LR and MLP arms warm up quickly on the panel (4 MiB warm is enough for their hashed-feature SGD to stabilize).
+- At e2e scale, the underlying Order-1 (K=24) and Order-2 (K=27) tables also fully warm up, becoming much stronger competitors.
+- The mixer ends up weighting the LR/MLP arms less heavily at e2e because the base predictors have caught up.
+
+This is consistent with the recurring pattern: SGD-trained arms (LR, MLP) close the gap to count-based predictors faster than vice versa, so the marginal win shrinks as the baseline warms.
+
+### Phase 24c cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23P | 232,992,379 | 1.8639 | -0.1296 |
+| Phase 23Q | 232,896,116 | 1.8632 | -0.1303 |
+| Phase 24a | 231,753,538 | 1.8540 | -0.1395 |
+| Phase 24b | 231,334,972 | 1.8507 | -0.1428 |
+| **Phase 24c** | **230,510,448** | **1.8441** | **-0.1494** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2226 bpb / -23.6 MiB on enwik9**. Hutter ratio: **2.102× target**.
+
+### Phase 24 arc summary
+
+| Phase | Description | enwik9 Δ |
+|---|---|---:|
+| 24a | Bit-level `lz_length` (8-bit MSB chain + Order-1/Order-2 mixer) | -0.0092 |
+| 24b | Bit-level `lz_offset_bucket` (5-bit MSB chain + Order-1/Order-2 mixer) | -0.0033 |
+| 24c | LR + MLP arms on both bit-level mixers | -0.0066 |
+| **Phase 24 total** | | **-0.0191** |
+
+In aggregate, Phase 24 is ~10× bigger than any single Phase 23 phase. The session's full delta from Phase 23O baseline is **-0.0205 bpb / -2.56 MiB on enwik9** across five commits (23P, 23Q, 24a, 24b, 24c).
+
+The Phase 24 wins validate the journal's pre-24a hypothesis: **lz_match_ac at 53.8% of total bits was the right lever to attack, and the bit-level + mixer + LR/MLP architecture from dict-id transfers cleanly to the LZ stream**.
+
+### Encode-time / memory budget
+
+Encode rate dropped from 23O's 1.24 MiB/s to 24c's 1.03 MiB/s (-17 %). Still well inside the Hutter time budget. Memory rose by ~840 MiB across the session (mostly 24a's K=27 Order-2 length table at 512 MiB plus 24c's MLPs at 192 MiB). Peak RSS during encode is now likely ~6.3 GiB — comfortable inside the 10 GiB Hutter cap but the next major addition needs to budget against ~3.7 GiB remaining headroom.
+
+### Next direction
+
+Phase 24c saturates the bit-level + LR + MLP pattern on the LZ stream. Further deterministic gains on `lz_match_ac` would require either:
+- **24d: 5th arm — count-CDF fallback**. The legacy `lz_length_o1` / `lz_offset_bucket_o1` Order1Ctx fields are retained `#[allow(dead_code)]` exactly for this. A count CDF as a 5th mixer arm covers cold contexts where Order-1/Order-2 are sparse and the LR/MLP haven't seen enough data.
+- **24e: Wider Order-2 K**. `lz_length_bit_o2` is K=27 (128 MiB). K=28 (256 MiB) is within budget but marginal — the existing curve says Order-2 is observation-limited, not capacity-limited.
+
+After 24d/e, the deterministic floor on this codec is genuinely close. Step C — the pretrained transformer arm targeting the residual — remains the only path to the ~1 bpb gap to Hutter. Phase 24's success specifically vindicates the architectural choice of bit-level + mixer for the residual arm's *outputs* (the neural arm should predict bits the same way the existing predictors do, so it integrates as an N+1-th mixer arm rather than a parallel codec).
+
+---
+
 ## 2026-05-14 — Phase 24b: Bit-Level `lz_offset_bucket` Predictor — 1.851 bpb on Enwik9 (-0.0033 bpb)
 
 Mirrors Phase 24a for the `lz_offset_bucket` stream — replaces the 21-way `Order1Ctx` count CDF with a 5-bit MSB-first chain (`2^5 = 32` > 21 legal buckets). Same architecture as 24a: `BitPredictor` Order-1 + Order-2 + `LogitMixer<2>`. Smaller K=22/25 because the alphabet is 21 vs 256.

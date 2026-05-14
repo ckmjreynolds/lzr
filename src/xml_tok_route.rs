@@ -274,9 +274,21 @@ const LZ_LENGTH_MIXER_K: u32 = 10;
 /// `length_token = length - MIN_MATCH` ranges 0..=255 → 8 bits.
 const LZ_LENGTH_BITS: u32 = 8;
 /// Phase 24a → 24c: arm count of the `lz_length` mixer.
-/// `[Order-1, Order-2]`. LR/MLP arms are deferred to 24c after
-/// the Order-1+2 baseline is calibrated.
-const N_MIX_LZ_LENGTH: usize = 2;
+/// `[Order-1, Order-2, SparseLR, MLP]`.
+const N_MIX_LZ_LENGTH: usize = 4;
+
+/// Phase 24c: weight-table size per feature for the `lz_length` /
+/// `lz_offset_bucket` sparse-LR and MLP. Length emits 8 bits per
+/// match × ~30 % match rate; per-bit-pos observation rate is
+/// ~3.75 % per token. At K=18, with the 3-feature `id_lr_features`
+/// shape and `(prefix, bit_pos)` in the hash, slots see ~1-2 obs
+/// over the 1 GiB warm.
+const LZ_LENGTH_LR_K: u32 = 18;
+/// Phase 24c: SGD step size for `lz_length` / `lz_offset_bucket`
+/// LR/MLP — matches the rest of the codec's SGD predictors.
+const LZ_LENGTH_LR_LR: f32 = 0.02;
+/// Phase 24c: hidden dim for the MLP arms. Same as dict-id.
+const LZ_LENGTH_MLP_H: usize = 8;
 
 /// Phase 24b: bit-level Order-1 `lz_offset_bucket` predictor. The
 /// offset bucket is 21-way (`OFFSET_BUCKET_ALPHABET`); 5 MSB-first
@@ -300,7 +312,8 @@ const LZ_OFFSET_BUCKET_MIXER_K: u32 = 8;
 /// `2^5 = 32` covers the 21 legal buckets.
 const LZ_OFFSET_BUCKET_BITS: u32 = 5;
 /// Phase 24b → 24c: arm count of the `lz_offset_bucket` mixer.
-const N_MIX_LZ_OFFSET_BUCKET: usize = 2;
+/// `[Order-1, Order-2, SparseLR, MLP]`.
+const N_MIX_LZ_OFFSET_BUCKET: usize = 4;
 
 /// Phase-22 / Phase-23A / Phase-23D: number of predictors in the
 /// `dict_id` mixer. `[Order-1, Order-2, Wiki, SparseLR, MLP]`. The
@@ -493,6 +506,18 @@ struct Models {
     lz_offset_bucket_bit_o2: BitPredictor,
     /// Phase-24b: mixer for `lz_offset_bucket` bit-level predictors.
     lz_offset_bucket_mixer: LogitMixer<N_MIX_LZ_OFFSET_BUCKET>,
+    /// Phase-24c: sparse-LR arm for `lz_length` bit emission.
+    /// Same 3-feature `id_lr_features` shape as the dict-id LR;
+    /// independent weight table because the target stream differs.
+    lz_length_sparse_lr: SparseLR<N_LR_ID_FEATS>,
+    /// Phase-24c: MLP arm for `lz_length` bit emission. Adds a
+    /// learned `H`-dim hidden layer and `tanh` over the LR's
+    /// hashed feature shape.
+    lz_length_mlp: OnlineMLP<N_LR_ID_FEATS, LZ_LENGTH_MLP_H>,
+    /// Phase-24c: sparse-LR arm for `lz_offset_bucket` bit emission.
+    lz_offset_bucket_sparse_lr: SparseLR<N_LR_ID_FEATS>,
+    /// Phase-24c: MLP arm for `lz_offset_bucket` bit emission.
+    lz_offset_bucket_mlp: OnlineMLP<N_LR_ID_FEATS, LZ_LENGTH_MLP_H>,
 
     /// Phase-20j: Order-4 OOV word letter model. Context =
     /// `p4 * 27^3 + p3 * 27^2 + p2 * 27 + p1`. 531441 rows × 26
@@ -589,6 +614,10 @@ impl Models {
             lz_offset_bucket_bit_o1: BitPredictor::new(LZ_OFFSET_BUCKET_BIT_K),
             lz_offset_bucket_bit_o2: BitPredictor::new(LZ_OFFSET_BUCKET_BIT_O2_K),
             lz_offset_bucket_mixer: LogitMixer::new(LZ_OFFSET_BUCKET_MIXER_K, MIXER_LR),
+            lz_length_sparse_lr: SparseLR::new(LZ_LENGTH_LR_K, LZ_LENGTH_LR_LR),
+            lz_length_mlp: OnlineMLP::new(LZ_LENGTH_LR_K, LZ_LENGTH_LR_LR),
+            lz_offset_bucket_sparse_lr: SparseLR::new(LZ_LENGTH_LR_K, LZ_LENGTH_LR_LR),
+            lz_offset_bucket_mlp: OnlineMLP::new(LZ_LENGTH_LR_K, LZ_LENGTH_LR_LR),
             oov_word_letter: Order1Ctx::new(),
             oov_sep_byte: Order1Ctx::new(),
             case_pattern_global: Order0::new(),
@@ -1866,11 +1895,11 @@ fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, ctx: PredCtx, id
     }
 }
 
-/// Phase-24a: read both `lz_length` bit predictors' `P(bit = 0)`
-/// and the mixer-blended value. Context = same `(prev_id, prefix,
-/// bit_pos)` hash space as the dict-id bit predictors — each
-/// `BitPredictor` has its own backing storage so the hash reuse
-/// doesn't cause weight collisions.
+/// Phase-24a / 24c: read all four `lz_length` bit predictors'
+/// `P(bit = 0)` (Order-1, Order-2, LR, MLP) and the mixer-blended
+/// value. The LR/MLP share the dict-id `id_lr_features` feature
+/// shape; each predictor has its own backing storage so the hash
+/// reuse doesn't cause weight collisions.
 fn length_bit_p_zeros(
     models: &Models,
     ctx: PredCtx,
@@ -1879,14 +1908,17 @@ fn length_bit_p_zeros(
 ) -> [u32; N_MIX_LZ_LENGTH] {
     let ctx_o1 = id_bit_ctx(ctx.p1, prefix, bit_pos);
     let ctx_o2 = id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos);
+    let feats = id_lr_features(ctx, prefix, bit_pos);
     [
         models.lz_length_bit_o1.predict_p_zero(ctx_o1),
         models.lz_length_bit_o2.predict_p_zero(ctx_o2),
+        models.lz_length_sparse_lr.predict(&feats),
+        models.lz_length_mlp.predict(&feats),
     ]
 }
 
-/// Phase-24a: observe one `lz_length` bit in both base predictors
-/// and the mixer.
+/// Phase-24a / 24c: observe one `lz_length` bit in all base
+/// predictors and the mixer.
 fn observe_length_bit(
     models: &mut Models,
     ctx: PredCtx,
@@ -1897,9 +1929,12 @@ fn observe_length_bit(
 ) {
     let ctx_o1 = id_bit_ctx(ctx.p1, prefix, bit_pos);
     let ctx_o2 = id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos);
+    let feats = id_lr_features(ctx, prefix, bit_pos);
     let mixer_ctx = mixer_id_ctx(bit_pos, prefix);
     models.lz_length_bit_o1.observe(ctx_o1, bit);
     models.lz_length_bit_o2.observe(ctx_o2, bit);
+    models.lz_length_sparse_lr.observe(&feats, bit);
+    models.lz_length_mlp.observe(&feats, bit);
     models.lz_length_mixer.observe(mixer_ctx, &p_zeros, bit);
 }
 
@@ -1948,7 +1983,7 @@ fn decode_lz_length(
     Ok(prefix)
 }
 
-/// Phase-24b: read both `lz_offset_bucket` bit predictors'
+/// Phase-24b / 24c: read all four `lz_offset_bucket` predictors'
 /// `P(bit=0)` and the mixer-blended value.
 fn offset_bucket_bit_p_zeros(
     models: &Models,
@@ -1958,13 +1993,16 @@ fn offset_bucket_bit_p_zeros(
 ) -> [u32; N_MIX_LZ_OFFSET_BUCKET] {
     let ctx_o1 = id_bit_ctx(ctx.p1, prefix, bit_pos);
     let ctx_o2 = id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos);
+    let feats = id_lr_features(ctx, prefix, bit_pos);
     [
         models.lz_offset_bucket_bit_o1.predict_p_zero(ctx_o1),
         models.lz_offset_bucket_bit_o2.predict_p_zero(ctx_o2),
+        models.lz_offset_bucket_sparse_lr.predict(&feats),
+        models.lz_offset_bucket_mlp.predict(&feats),
     ]
 }
 
-/// Phase-24b: observe one `lz_offset_bucket` bit in both base
+/// Phase-24b / 24c: observe one `lz_offset_bucket` bit in all base
 /// predictors and the mixer.
 fn observe_offset_bucket_bit(
     models: &mut Models,
@@ -1976,9 +2014,12 @@ fn observe_offset_bucket_bit(
 ) {
     let ctx_o1 = id_bit_ctx(ctx.p1, prefix, bit_pos);
     let ctx_o2 = id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos);
+    let feats = id_lr_features(ctx, prefix, bit_pos);
     let mixer_ctx = mixer_id_ctx(bit_pos, prefix);
     models.lz_offset_bucket_bit_o1.observe(ctx_o1, bit);
     models.lz_offset_bucket_bit_o2.observe(ctx_o2, bit);
+    models.lz_offset_bucket_sparse_lr.observe(&feats, bit);
+    models.lz_offset_bucket_mlp.observe(&feats, bit);
     models
         .lz_offset_bucket_mixer
         .observe(mixer_ctx, &p_zeros, bit);
