@@ -299,14 +299,16 @@ const ID_MLP_H: usize = 8;
 /// "genuinely-new information" path is the productive lever — see
 /// each journal entry.
 const N_MLP_ID_FEATS: usize = 12;
-/// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
-/// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
-/// Order-3 + wiki cross-features at SGD-amortized cost.
-const N_MIX_LZ_FLAG: usize = 3;
-/// Phase-21 / Phase-23B: number of predictors in the
-/// `token_oov_bit` mixer. `[Order-1, Order-2, SparseLR]`. Mirrors
+/// Phase-21 / Phase-23B / Phase-23P: number of predictors in the
+/// `lz_flag` mixer. `[Order-1, Order-2, SparseLR, MLP]`. The 4th arm
+/// (Phase-23P) mirrors the dict-id MLP pattern: same feature shape as
+/// the LR, but with a learned `H`-dim hidden layer and a `tanh`
+/// nonlinearity for cheap nonlinear feature interactions.
+const N_MIX_LZ_FLAG: usize = 4;
+/// Phase-21 / Phase-23B / Phase-23P: number of predictors in the
+/// `token_oov_bit` mixer. `[Order-1, Order-2, SparseLR, MLP]`. Mirrors
 /// the `lz_flag` mix — same context, different target bit.
-const N_MIX_TOKEN_OOV: usize = 3;
+const N_MIX_TOKEN_OOV: usize = 4;
 
 /// Phase-23B: weight-table size per feature in the binary-decision
 /// sparse-LRs (`lz_flag`, `token_oov_bit`). K=20 → 1 Mi slots ×
@@ -320,8 +322,24 @@ const FLAG_SPARSE_LR_LR: f32 = 0.02;
 /// Phase-23B: number of features each binary-decision sparse-LR
 /// carries. `[Order-3-hashed, Wiki × Order-2, Wiki × Order-1]`.
 /// `lz_flag` and `token_oov_bit` share the feature shape; the
-/// per-stream weight tables differ because the target bits differ.
+/// per-stream weight tables differ because the targets differ. The
+/// Phase-23P MLP arms reuse the same feature shape.
 const N_LR_FLAG_FEATS: usize = 3;
+
+/// Phase-23P: weight-table size per feature for the flag-stream
+/// MLPs. K=18 → 256 Ki slots × 8 H × 4 bytes × 3 features × 2
+/// streams = 48 MiB total. Smaller than the dict-id MLP's K=20
+/// because the flag streams emit one bit per token (~16× lower
+/// observation density); K=18 matches the LR's parameter count at
+/// `H=8` so per-slot saturation stays near the LR's regime.
+const FLAG_MLP_K: u32 = 18;
+/// Phase-23P: SGD learning rate for the flag-stream MLPs. Same as
+/// every other SGD-trained predictor in this codec.
+const FLAG_MLP_LR: f32 = 0.02;
+/// Phase-23P: hidden dimension of the flag-stream MLPs. Matches the
+/// dict-id MLP's `H=8`. The dict-id 23I probe at `H=16` regressed
+/// (capacity wasn't the limit), so we start at `H=8` here too.
+const FLAG_MLP_H: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct XmlTokRouteCodec;
@@ -468,6 +486,14 @@ struct Models {
     /// nonlinearity, letting it capture interactions a single
     /// linear layer can't.
     token_id_mlp: OnlineMLP<N_MLP_ID_FEATS, ID_MLP_H>,
+    /// Phase-23P: small online MLP joining the `lz_flag` mixer as the
+    /// 4th arm. Same 3-feature shape as `lz_flag_sparse_lr`, but with
+    /// a learned `H`-dim hidden layer and `tanh` nonlinearity.
+    lz_flag_mlp: OnlineMLP<N_LR_FLAG_FEATS, FLAG_MLP_H>,
+    /// Phase-23P: small online MLP joining the `token_oov_bit` mixer
+    /// as the 4th arm. Mirrors `lz_flag_mlp` with independent weights
+    /// (different target bit).
+    token_oov_mlp: OnlineMLP<N_LR_FLAG_FEATS, FLAG_MLP_H>,
 }
 
 impl Models {
@@ -500,6 +526,8 @@ impl Models {
             lz_flag_sparse_lr: SparseLR::new(FLAG_SPARSE_LR_K, FLAG_SPARSE_LR_LR),
             token_oov_sparse_lr: SparseLR::new(FLAG_SPARSE_LR_K, FLAG_SPARSE_LR_LR),
             token_id_mlp: OnlineMLP::new(ID_MLP_K, ID_MLP_LR),
+            lz_flag_mlp: OnlineMLP::new(FLAG_MLP_K, FLAG_MLP_LR),
+            token_oov_mlp: OnlineMLP::new(FLAG_MLP_K, FLAG_MLP_LR),
         }
     }
 }
@@ -1611,7 +1639,6 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
-
     [
         f_o3,
         f_wiki_o2,
@@ -1768,14 +1795,15 @@ fn lz_flag_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX_LZ_FLAG], u32)
         models.lz_flag_bit_o1.predict_p_zero(ctx_o1),
         models.lz_flag_bit.predict_p_zero(ctx_o2),
         models.lz_flag_sparse_lr.predict(&feats),
+        models.lz_flag_mlp.predict(&feats),
     ];
     let p_mixed = models.lz_flag_mixer.predict(ctx_o1, &p_zeros);
     (p_zeros, p_mixed)
 }
 
-/// Phase-21 / Phase-23B: observe one `lz_flag` bit in every base
-/// predictor and the mixer. `p_zeros` should be the same array
-/// returned by `lz_flag_p_mixed` for the same context.
+/// Phase-21 / Phase-23B / Phase-23P: observe one `lz_flag` bit in
+/// every base predictor and the mixer. `p_zeros` should be the same
+/// array returned by `lz_flag_p_mixed` for the same context.
 fn observe_lz_flag_bit(models: &mut Models, ctx: PredCtx, p_zeros: [u32; N_MIX_LZ_FLAG], bit: u32) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
     let ctx_o2 = lz_flag_ctx_o2(ctx.p2, ctx.p1);
@@ -1783,11 +1811,12 @@ fn observe_lz_flag_bit(models: &mut Models, ctx: PredCtx, p_zeros: [u32; N_MIX_L
     models.lz_flag_bit_o1.observe(ctx_o1, bit);
     models.lz_flag_bit.observe(ctx_o2, bit);
     models.lz_flag_sparse_lr.observe(&feats, bit);
+    models.lz_flag_mlp.observe(&feats, bit);
     models.lz_flag_mixer.observe(ctx_o1, &p_zeros, bit);
 }
 
-/// Phase-21 / Phase-23B: read all `token_oov` base predictors'
-/// `P(hit)` and the mixer-blended value. Same shape as
+/// Phase-21 / Phase-23B / Phase-23P: read all `token_oov` base
+/// predictors' `P(hit)` and the mixer-blended value. Same shape as
 /// `lz_flag_p_mixed`.
 fn token_oov_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX_TOKEN_OOV], u32) {
     let ctx_o1 = lz_flag_ctx(ctx.p1);
@@ -1797,6 +1826,7 @@ fn token_oov_p_mixed(models: &Models, ctx: PredCtx) -> ([u32; N_MIX_TOKEN_OOV], 
         models.token_oov_bit.predict_p_zero(ctx_o1),
         models.token_oov_bit_o2.predict_p_zero(ctx_o2),
         models.token_oov_sparse_lr.predict(&feats),
+        models.token_oov_mlp.predict(&feats),
     ];
     let p_mixed = models.token_oov_mixer.predict(ctx_o1, &p_zeros);
     (p_zeros, p_mixed)
@@ -1814,6 +1844,7 @@ fn observe_token_oov_bit(
     models.token_oov_bit.observe(ctx_o1, bit);
     models.token_oov_bit_o2.observe(ctx_o2, bit);
     models.token_oov_sparse_lr.observe(&feats, bit);
+    models.token_oov_mlp.observe(&feats, bit);
     models.token_oov_mixer.observe(ctx_o1, &p_zeros, bit);
 }
 

@@ -13,6 +13,66 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 23P: MLP Arms on `lz_flag` / `token_oov_bit` — 1.864 bpb on Enwik9
+
+Following the Phase 23N/O direction signal, applied the dict-id MLP pattern to the two binary-decision streams that had been on sparse-LR only since Phase 23B. The hypothesis: `lz_flag` and `token_oov_bit` share the same feature shape (`[Order-3-hashed, Wiki × Order-2, Wiki × Order-1]`); whatever nonlinearity the dict-id MLP captures over those features should pay on these streams too. Expected gain (from the 23N entry's direction signal): -0.001 to -0.003 bpb at +96 MiB.
+
+### What landed
+
+1. **`FLAG_MLP_K = 18`, `FLAG_MLP_H = 8`, `FLAG_MLP_LR = 0.02`** — matches the dict-id MLP's `H` and learning rate but `K-2` smaller (one-bit-per-token observation density is ~16× lower than dict-id's 16-bit-per-token). 3 features × 2^18 slots × 8 H × 4 bytes × 2 streams = 48 MiB.
+2. **`lz_flag_mlp` and `token_oov_mlp`** added to `Models` as 4th arm of their respective `N_MIX_LZ_FLAG=4` / `N_MIX_TOKEN_OOV=4` mixers.
+3. **Wiring** in `lz_flag_p_mixed` / `observe_lz_flag_bit` / `token_oov_p_mixed` / `observe_token_oov_bit` — MLP predict/observe alongside the existing SparseLR.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23O |
+|---|---:|---:|---:|---:|
+| Phase 23O | 2.0966 | 1.8646 | 233,070,347 | — |
+| **Phase 23P** | **2.0957** | **1.8639** | **232,992,379** | **-0.0009 / -0.0007 / -78 KiB** |
+
+Roundtrip OK. Encode 765 s vs 23O's 769 s (flat). Decode 485 s vs 460 s (+5 %). Memory +48 MiB.
+
+### Panel decomposition shift (enwik8, 20×256 KiB)
+
+Per-component delta after re-running both 23O and 23P binaries against the same panel:
+
+| Component | 23O bits | 23P bits | Δ | bpb impact |
+|---|---:|---:|---:|---:|
+| `lz_match_ac` | 6,732,959 | 6,676,115 | **-56,844** | **-0.0108** |
+| `token_hit_ac` | 3,221,682 | 3,216,354 | -5,328 | -0.0010 |
+| `token_oov_ac` | 2,006,639 | 2,007,215 | +576 | +0.0001 |
+| `case_ac` | 424,749 | 424,950 | +201 | +0.0000 |
+| `tag_ac` | 65,460 | 65,087 | -373 | -0.0001 |
+| **panel total** | 12,475,392 | 12,413,744 | **-61,648** | **-0.0118** |
+
+Panel mean 2.379 → 2.368 (-0.011 bpb).
+
+The `lz_match_ac` win is essentially the entire delta. `token_oov_ac` is flat-to-slightly-negative at the panel scale — the MLP's value over the LR is bounded by what the underlying feature shape (3-feature Order-3 + wiki crosses) can express, and the OOV target bit is already well-fit by the LR. Kept the `token_oov_mlp` arm in anyway; the mixer's per-bit-pos weights will route most signal through the LR if the MLP doesn't add value.
+
+### Why enwik9 is so much smaller than panel
+
+Panel -0.011 bpb collapsed to e2e -0.0007 bpb. The panel uses 4 MiB warm + 256 KiB measure — the MLP's embedding tables are sparsely populated when measure begins, and the LR's hashed weights are also still warming. The MLP's nonlinearity buys most of its gain in the cold-to-warm transition, which the e2e absorbs into prewarm.
+
+The pattern (panel-favors-MLP, e2e-narrows-the-gap) suggests the SGD-trained LR is a stronger competitor at e2e scale than the panel hints. Future MLP additions should be evaluated against e2e, not panel.
+
+### Phase 23P cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23L | 233,280,411 | 1.8662 | -0.1273 |
+| Phase 23M | 233,232,992 | 1.8659 | -0.1276 |
+| Phase 23N | 233,195,523 | 1.8656 | -0.1279 |
+| Phase 23O | 233,070,347 | 1.8646 | -0.1289 |
+| **Phase 23P** | **232,992,379** | **1.8639** | **-0.1296** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2028 bpb / -20.3 MiB on enwik9**. Hutter ratio: **2.124× target**.
+
+### Next direction
+
+The bit decomposition shows `lz_match_ac` is **53.8 % of the panel's total bits** (1.273 bpb of 2.368 bpb). The Phase 23P MLP only touched the `lz_flag` portion (one bit per Content token); the bulk of `lz_match_ac` is the `lz_offset_bucket` CDF (21-way) and the `lz_length` CDF (256-way), both still pure `Order1Ctx<1024, ...>` count predictors with no LR/MLP arms. Mirror the dict-id bit-level decomposition there (Phase 24 candidate: 8 MSB-first bits for length, 5 for offset bucket, each with its own `BitPredictor` + Order-1/Order-2 + mixer) — biggest deterministic lever remaining.
+
+---
+
 ## 2026-05-13 — Phase 23O: `page_offset_bucket` Coarse Feature — 1.865 bpb on Enwik9
 
 Followed the saturation curve in Phase 23N to the last truly-orthogonal positional feature: a log₂-bucketed counter of tokens emitted since the most recent `<page>` boundary. Unlike the 23L–N additions, this carries information **not derivable from any other PredCtx field** — the dict-id history says nothing about whether the page is fresh or 10 K tokens deep.
