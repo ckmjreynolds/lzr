@@ -263,8 +263,10 @@ const LZ_MATCH_NCTX: usize = 1024;
 /// 3 bits less than dict-id because the observation rate is ~8× lower.
 const LZ_LENGTH_BIT_K: u32 = 24;
 /// Phase 24a: bit-level Order-2 LZ-length predictor. Context =
-/// `(p2, prev_id, prefix, bit_pos)`. K=27 (128 MiB), 3 bits more
-/// than Order-1 — matches the dict-id Order-1→Order-2 ratio.
+/// `(p2, prev_id, prefix, bit_pos)`. K=27 (512 MiB), 3 bits more
+/// than Order-1 — matches the dict-id Order-1→Order-2 ratio. Phase
+/// 24e tested K=28 and confirmed observation-limit saturation: -536
+/// bytes / ~0 bpb at +512 MiB memory, so K=27 is retained.
 const LZ_LENGTH_BIT_O2_K: u32 = 27;
 /// Phase 24a: hash-table size for the `lz_length` bit-level mixer.
 /// Keyed on `(bit_pos, prefix)` — 8 × 128 = 1 K cells. K=10 covers
@@ -1942,12 +1944,7 @@ fn observe_length_bit(
 /// mixer-blended `P(bit=0)`. Replaces the Phase-19h
 /// `lz_length_o1.cdf_to` count CDF, capturing per-bit-position
 /// conditional structure that an Order-1 count CDF can't.
-fn encode_lz_length(
-    enc: &mut AcEncoder<'_>,
-    models: &mut Models,
-    ctx: PredCtx,
-    length_token: u32,
-) {
+fn encode_lz_length(enc: &mut AcEncoder<'_>, models: &mut Models, ctx: PredCtx, length_token: u32) {
     let mut prefix: u32 = 0;
     for bit_pos in (0..LZ_LENGTH_BITS).rev() {
         let bit = (length_token >> bit_pos) & 1;
@@ -1964,11 +1961,7 @@ fn encode_lz_length(
 
 /// Phase-24a: decode an 8-bit `length_token` MSB-first using the
 /// mixer-blended `P(bit=0)`. Mirror of `encode_lz_length`.
-fn decode_lz_length(
-    dec: &mut AcDecoder<'_, '_>,
-    models: &mut Models,
-    ctx: PredCtx,
-) -> Result<u32> {
+fn decode_lz_length(dec: &mut AcDecoder<'_, '_>, models: &mut Models, ctx: PredCtx) -> Result<u32> {
     let mut prefix: u32 = 0;
     for bit_pos in (0..LZ_LENGTH_BITS).rev() {
         let p_zeros = length_bit_p_zeros(models, ctx, prefix, bit_pos);

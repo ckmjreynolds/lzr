@@ -13,6 +13,110 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 24e: Wider LZ-Length Order-2 (K=27→28) — Flat / Reverted
+
+Tested the second hypothesis from Phase 24c's "next direction" block: bump `LZ_LENGTH_BIT_O2_K` from 27 (512 MiB) to 28 (1 GiB) to probe whether the bit-level Order-2 stream is observation-limited or capacity-limited. The Phase 24d saturation finding suggested observation-limited, but K-bumps are a cheap direct test.
+
+### What was tried
+
+Single one-line constant change: `LZ_LENGTH_BIT_O2_K: u32 = 28` (was 27). All other code paths untouched. Memory delta: +512 MiB. Per-slot observation rate at K=28: ~1.3 obs/slot (was ~2.7 at K=27).
+
+### Results
+
+| Config | enwik8 panel | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 24c |
+|---|---:|---:|---:|---:|
+| Phase 24c | 2.182 | 1.8441 | 230,510,448 | — |
+| Phase 24d | 2.180 | 1.8441 | 230,514,792 | +4,344 bytes |
+| **Phase 24e** | **2.182** | **1.8441** | **230,509,912** | **-536 bytes / ~0 bpb** |
+
+The -536 bytes is below measurement noise on a 1 GiB corpus. Memory cost: +512 MiB. Decision: **K=27 retained; the constant change is reverted from the codebase** (the journal entry preserves the experiment). Phase 24e is *not* committed as a code change.
+
+### What the saturation pattern means
+
+Two consecutive Phase-24 experiments (24d's count-CDF arm, 24e's wider Order-2 K) returned net-zero on enwik9 e2e. Both targeted the LZ stream — by far the largest bit budget (5.72 Mbit, 47.9 % of `xml-tok-route`'s total panel bits after 24c). The bit-level + LR + MLP architecture's information capacity for the `(prev_id, prefix, bit_pos, p2, hashed Order-3, wiki × Order-2)` context space is exhausted on enwik9-scale data. Wider hash tables only spread the same observation budget over more slots — sparser, not richer.
+
+The deterministic-mining literature pattern is now confirmed: predictor depth (Order-N) and breadth (LR/MLP arms over hashed feature shapes) trade off against observation density, and the LZ stream has reached the right side of that curve.
+
+### Implication for the deterministic roadmap
+
+Phase 24's `lz_match_ac` arc:
+
+| Phase | Description | enwik9 Δ |
+|---|---|---:|
+| 24a | Bit-level `lz_length` predictor | -0.0092 |
+| 24b | Bit-level `lz_offset_bucket` predictor | -0.0033 |
+| 24c | LR + MLP arms on bit-level mixers | -0.0066 |
+| 24d | Count-CDF 5th arm (negative result) | ~0 |
+| 24e | Wider Order-2 K (flat / reverted) | ~0 |
+| **Phase 24 total** | | **-0.0191** |
+
+24a/b/c delivered -0.0191 bpb on the biggest stream. 24d/e are the saturation envelope. Further deterministic phases on `lz_match_ac` would need a *new feature class* — long-range context (preceding paragraph topic, document section, prior page's match history) the current `PredCtx` doesn't expose. Adding feature classes is open-ended and per-feature returns shrink as the feature shape grows (see Phase 23K-23Q's 7 successive coarse features for an average of -0.0012 bpb each on `token_hit_ac`, the dict-id stream).
+
+The second-biggest stream is `token_hit_ac` (3.20 Mbit, 26.8 % of panel bits). It has *not* been tested for saturation in the same way — Phase 23 series added features only, never tested wider K or fifth arms. There is plausibly still -0.005 to -0.015 bpb available there at the Phase 24 architecture's pace.
+
+But: the 24d/e findings move the prior. The deterministic floor on this codec is genuinely close. Continuing to mine sub-percent gains forecloses time on the only path with order-of-magnitude headroom (Step C).
+
+### Decision: Step C now
+
+This concludes the Phase 24 arc. Step C — the online-trained transformer arm — is the next phase. Reasoning in the dedicated entry below.
+
+---
+
+## 2026-05-14 — Step C Readiness Decision: Start the Neural Arm
+
+After Phase 24d (count-CDF, ~0) and Phase 24e (wider Order-2, ~0), the bit-level + LR + MLP architecture has saturated on the LZ stream (47.9 % of total bits). The deterministic stack is at 1.844 bpb on enwik9; the Hutter target is 0.878 bpb; the residual gap is 0.966 bpb. No remaining deterministic lever has order-of-magnitude headroom — even the largest unexplored direction (dict-id stream wider K / 5th arms) is bounded by Phase 23's per-phase -0.001 to -0.005 bpb pace.
+
+### Why Step C, why now
+
+The 24d/e saturation results are the strongest argument for starting Step C immediately. The case is:
+
+1. **Capacity is fungible.** Adding deterministic capacity (new features, wider tables, more arms) competes against the *same* information budget the existing arms already extract. Recent phases show diminishing returns.
+2. **Neural capacity is orthogonal.** A transformer with attention over a long byte history extracts a fundamentally different signal than per-(prev_id, prefix) count tables. Its predictions integrate into the existing mixer as an N+1-th arm without disrupting the deterministic stack.
+3. **Hutter SOTA validates the path.** NNCP (~0.86 bpb on enwik9) is a CPU-only online-trained transformer codec. cmix (~1.1 bpb) combines a neural arm with a deterministic LZ-class backbone — close to LZR's architecture pattern. Both demonstrate that the residual from where LZR sits is reachable.
+4. **No further deterministic phases planned.** Continuing 24f/g/h on the dict-id stream is the only meaningful alternative, with an estimated ceiling of -0.01 to -0.03 bpb across several phases of effort. Step C has an estimated ceiling of -0.5 to -1.0 bpb.
+
+### Step C architecture (proposed, subject to revision)
+
+The submission constraint is single-core, 10 GiB RAM, time ≤ 70K/Geekbench5 hours (~9-12 hours on reference hardware). This forecloses on-disk dataset training during decode. The only viable pattern: online training on the corpus bytes as they stream. NNCP and cmix both use this.
+
+| Concern | Choice |
+|---|---|
+| Architecture | Small transformer: ~1-4M params, 4-8 layers, hidden 256-384, byte-level vocab. |
+| Training | SGD during encode AND decode on the same byte stream, deterministically (no random seed). |
+| L(D) cost | Architecture spec + initial weight seed (RNG seed + initialization formula). ~0 bytes amortized. |
+| Output | Per-bit P(bit=0) emitted to the existing `LogitMixer` as a new arm. |
+| Integration | Add to `token_id_mixer` first (dict-id is 26.8 % of bits, behaves most like "predict next word"). Then `lz_length_mixer` / `lz_offset_bucket_mixer`. |
+| Memory budget | ≤2 GiB peak (current peak ~6.3 GiB; cap 10 GiB; existing headroom ~3.7 GiB). |
+| Compute budget | ≤1 forward + 1 SGD step per emitted bit. At 16 bits/token × ~150M tokens × ~50 µs/step = ~33 hours. Likely over the time cap — will need careful budget planning, possibly per-token (not per-bit) prediction. |
+
+### Step C work breakdown (estimated)
+
+| Step | Description | Estimate |
+|---|---|---:|
+| C.1 | Architecture spec + Rust skeleton (forward + backward, scalar code, clean for auto-vec) | ~3 days |
+| C.2 | Inference + SGD path verified deterministic (encode/decode produce identical weights) | ~3 days |
+| C.3 | Standalone bpb measurement: transformer-only on enwik8 | ~2 days |
+| C.4 | Mixer integration on `token_id_mixer` (dict-id stream) | ~5 days |
+| C.5 | Panel + enwik9 measurement; tune learning rate / model size | ~1 week |
+| C.6 | Integration on `lz_length_mixer` / `lz_offset_bucket_mixer` | ~1 week |
+| C.7 | Architecture search / final tuning | open-ended |
+| **Step C total** | (to first integration win) | **~3-4 weeks** |
+
+### What does *not* change
+
+The build invariants (single-threaded submission binary, `#![deny(unsafe_code)]`, no rayon / gemm / mlx / safetensors, stable Rust, `./build.sh` discipline) all stand. The neural arm gets a feature flag if it grows new dependencies during development; the submission path stays minimal. Per the CLAUDE.md constraint, the existing trust-LLVM-auto-vec policy applies — clean scalar matmul/attention, only reach for `std::arch` intrinsics when a measurement justifies it.
+
+### Subordinate decision: which stream first?
+
+`token_id_mixer` (dict-id) is the right starting target:
+- The transformer's natural prediction shape ("next token given prior tokens") closely matches dict-id emission.
+- The LZ streams encode `(offset_bucket, length)` — a *learned* representation of repetition structure that the transformer doesn't naturally predict unless given the same dict-id history as a feature shape.
+- 26.8 % of bits is a meaningful win target without needing to fight the saturated LZ-stream architecture.
+
+Once `token_id_mixer` has a working transformer arm and ships net-positive at e2e, the same architecture lifts and re-applies to the LZ mixers.
+
+---
+
 ## 2026-05-14 — Phase 24d: Count-CDF 5th Mixer Arm — Negative Result (Flat at e2e)
 
 Tried the 24c journal's hypothetical "24d: 5th arm — count-CDF fallback" — wiring the legacy `lz_length_o1: Order1Ctx<1024, 256>` and `lz_offset_bucket_o1: Order1Ctx<1024, 21>` count tables back into the bit-level mixers as the 5th arm. Both tables had been left allocated `#[allow(dead_code)]` precisely for this experiment.
