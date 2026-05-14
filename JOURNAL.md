@@ -13,6 +13,65 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23N: `lz_match_length_last` Coarse Feature — 1.866 bpb on Enwik9 (marginal)
+
+Cheapest "structural" follow-up after Phase 23J's `tokens_since_match` win: pair recency with **the length of the most-recent LZ-match**. Phases 23K/L delivered big single-feature wins; 23N tests whether the LZ-behaviour story has more juice in it once recency is factored out.
+
+### What landed
+
+1. **`PredCtx.lz_match_length_last: u8`** — set to the new match length on every LZ-match (encode + decode); preserved across non-match tokens at all simple-shift / prewarm sites. 0 means "no LZ-match yet on this page".
+2. **New 11th MLP feature** `(lz_match_length_bucket, prefix, bit_pos)` at K=20. Bucket = `min(lz_match_length_last, 15)`. +32 MiB to MLP tables.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23M |
+|---|---:|---:|---:|---:|
+| Phase 23M | 2.0975 | 1.8659 | 233,232,992 | — |
+| **Phase 23N** | **2.0973** | **1.8656** | **233,195,523** | **-0.0002 / -0.0003 / -37 KiB** |
+
+Roundtrip OK. Encode 757 s vs 23M's 735 s (+3 %); decode 447 s vs 432 s (+3 %). Memory +32 MiB.
+
+### Saturation curve
+
+| Phase | Feature | enwik9 Δ |
+|---|---|---:|
+| 23K | `p1_class` (3-valued, Word/Sep alternation) | -0.0050 |
+| 23L | `p2_class` | -0.0016 |
+| 23M | `p1_first_byte_class` (7-way Separator subdivision) | -0.0003 |
+| **23N** | **`lz_match_length_last`** | **-0.0003** |
+
+Four-phase trajectory: -0.0050 → -0.0016 → -0.0003 → -0.0003. The marginal coarse feature is now at the noise floor.
+
+Why this saturated faster than the length-feature family (23F/G/H):
+
+- Each new class feature is highly correlated with `p1_class` (alternation rule for `p2_class`; per-id byte pattern already in LR Order-3 for `p1_first_byte_class`).
+- `lz_match_length_last` is highly correlated with `tokens_since_match` — both describe LZ-region behaviour, so once recency is in, length adds little.
+
+The pattern from the 23J/K wins (structural feature → big gain) holds, but we've enumerated the cheap structural features in this family. The next genuinely-orthogonal signal is **page-position**, which doesn't correlate with any existing feature.
+
+### Phase 23N cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23K | 233,478,388 | 1.8678 | -0.1257 |
+| Phase 23L | 233,280,411 | 1.8662 | -0.1273 |
+| Phase 23M | 233,232,992 | 1.8659 | -0.1276 |
+| **Phase 23N** | **233,195,523** | **1.8656** | **-0.1279** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2011 bpb / -20.1 MiB on enwik9**. Hutter ratio: **2.126× target**.
+
+### Direction signal for Phase 23O+
+
+Three remaining angles, in decreasing expected payoff:
+
+1. **`page_offset_bucket`** — byte position within current page (log-bucketed). Reset on `<page>` boundary. Fully orthogonal to PredCtx. Heavier plumbing but the most likely meaningful gain.
+2. **MLP arms on `lz_flag` / `token_oov_bit`** — the Phase-23B sparse-LR pattern but with MLPs. Adds ~96 MiB; ~7% encode hit; expected -0.001 to -0.003 bpb.
+3. **Wiki-classifier depth exposure** — `WikiFineClassifier`'s internal `link_depth` / `template_depth`. Promote to a public counter and add as an MLP feature.
+
+Memory and encode-time pressure are now the rate-limiters as much as features. The encode rate dropped from 1.72 MiB/s at Phase 23A to 1.26 MiB/s at 23N (-27 % over 13 phases). Still well within the Hutter time budget but worth tracking.
+
+---
+
 ## 2026-05-13 — Phase 23M: `p1_first_byte_class` 7-Way Subdivision — 1.866 bpb on Enwik9 (small)
 
 Hypothesis: subdivide `p1_class`'s Separator bucket into byte-family sub-categories (whitespace / digit / punctuation / symbol / other) so the MLP gets finer structural information at separator boundaries. Predicted by the Phase 23K pattern — 23K's huge win came from making Word/Separator alternation explicit; this refines the Separator side.

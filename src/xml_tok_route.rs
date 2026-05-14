@@ -289,15 +289,15 @@ const ID_MLP_LR: f32 = 0.02;
 /// confirming the diminishing-returns curve is feature-limited.
 /// Reverted to `H=8`.
 const ID_MLP_H: usize = 8;
-/// Phase-23D → Phase-23M: feature count of the `dict_id` MLP.
+/// Phase-23D → Phase-23N: feature count of the `dict_id` MLP.
 /// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),
 /// bias (LR-shared), p1_len_bucket (23F), p2_len_bucket (23G),
 /// (p1_len, p2_len) joint (23H), tokens_since_match_bucket (23J),
-/// p1_class (23K), p2_class (23L), p1_first_byte_class (23M)]`.
-/// Phase 23E (Order-4) and 23I (H=16) both regressed; the
-/// "genuinely-new information" path is the productive lever — see
-/// each journal entry.
-const N_MLP_ID_FEATS: usize = 10;
+/// p1_class (23K), p2_class (23L), p1_first_byte_class (23M),
+/// lz_match_length_last_bucket (23N)]`. Phase 23E (Order-4) and
+/// 23I (H=16) both regressed; the "genuinely-new information"
+/// path is the productive lever — see each journal entry.
+const N_MLP_ID_FEATS: usize = 11;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -665,6 +665,8 @@ impl Codec for XmlTokRouteCodec {
                             };
                             let p1_first_byte_class_new =
                                 first_byte_subclass(dict.entry(last_id).lower[0]);
+                            let lz_match_length_last_new =
+                                u8::try_from(length_us).unwrap_or(u8::MAX);
                             ctx = PredCtx {
                                 p3: p3_new,
                                 p2: p2_new,
@@ -672,6 +674,7 @@ impl Codec for XmlTokRouteCodec {
                                 p1_len: p1_len_new,
                                 p2_len: p2_len_new,
                                 tokens_since_match: 0,
+                                lz_match_length_last: lz_match_length_last_new,
                                 p1_class: p1_class_new,
                                 p2_class: p2_class_new,
                                 p1_first_byte_class: p1_first_byte_class_new,
@@ -724,6 +727,7 @@ impl Codec for XmlTokRouteCodec {
                             p1_len: p1_len_new,
                             p2_len: ctx.p1_len,
                             tokens_since_match: ctx.tokens_since_match.saturating_add(1),
+                            lz_match_length_last: ctx.lz_match_length_last,
                             p1_class: p1_class_new,
                             p2_class: ctx.p1_class,
                             p1_first_byte_class: p1_first_byte_class_new,
@@ -960,6 +964,7 @@ impl Codec for XmlTokRouteCodec {
                         });
                         let p1_first_byte_class_new =
                             first_byte_subclass(dict.entry(last_id).lower[0]);
+                        let lz_match_length_last_new = u8::try_from(len_match).unwrap_or(u8::MAX);
                         ctx = PredCtx {
                             p3: p3_new,
                             p2: p2_new,
@@ -967,6 +972,7 @@ impl Codec for XmlTokRouteCodec {
                             p1_len: p1_len_new,
                             p2_len: p2_len_new,
                             tokens_since_match: 0,
+                            lz_match_length_last: lz_match_length_last_new,
                             p1_class: p1_class_new,
                             p2_class: p2_class_new,
                             p1_first_byte_class: p1_first_byte_class_new,
@@ -1013,6 +1019,7 @@ impl Codec for XmlTokRouteCodec {
                         p1_len: p1_len_new,
                         p2_len: ctx.p1_len,
                         tokens_since_match: ctx.tokens_since_match.saturating_add(1),
+                        lz_match_length_last: ctx.lz_match_length_last,
                         p1_class: p1_class_new,
                         p2_class: ctx.p1_class,
                         p1_first_byte_class: p1_first_byte_class_new,
@@ -1385,6 +1392,10 @@ struct PredCtx {
     p1_len: u8,
     p2_len: u8,
     tokens_since_match: u8,
+    /// Phase 23N: token length of the most-recent LZ-match (1..=255).
+    /// Persists across non-match tokens; updates only on a match.
+    /// 0 means "no LZ-match has happened yet on this page".
+    lz_match_length_last: u8,
     p1_class: u8,
     p2_class: u8,
     p1_first_byte_class: u8,
@@ -1399,6 +1410,7 @@ impl PredCtx {
         p1_len: 0,
         p2_len: 0,
         tokens_since_match: 0,
+        lz_match_length_last: 0,
         p1_class: 0,
         p2_class: 0,
         p1_first_byte_class: 0,
@@ -1529,6 +1541,17 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
+    // Phase 23N: length of the most-recent LZ-match. Pairs with
+    // `tokens_since_match` to encode "how big was the last match,
+    // and how long ago" — distinguishes a templated region (long
+    // matches near zero recency) from sporadic phrase repetition
+    // (short matches, larger recency).
+    let lz_match_length_bucket = u64::from(ctx.lz_match_length_last.min(15));
+    let f_lz_match_length = {
+        let h = fnv_mix(FNV_OFFSET, lz_match_length_bucket);
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
 
     [
         f_o3,
@@ -1541,6 +1564,7 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         f_p1_class,
         f_p2_class,
         f_p1_first_byte,
+        f_lz_match_length,
     ]
 }
 
@@ -2117,6 +2141,7 @@ fn prewarm(
                     p1_len: p1_len_new,
                     p2_len: ctx.p1_len,
                     tokens_since_match: ctx.tokens_since_match.saturating_add(1),
+                    lz_match_length_last: ctx.lz_match_length_last,
                     p1_class: p1_class_new,
                     p2_class: ctx.p1_class,
                     p1_first_byte_class: p1_first_byte_class_new,
