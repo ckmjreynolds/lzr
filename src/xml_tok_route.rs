@@ -289,14 +289,15 @@ const ID_MLP_LR: f32 = 0.02;
 /// confirming the diminishing-returns curve is feature-limited.
 /// Reverted to `H=8`.
 const ID_MLP_H: usize = 8;
-/// Phase-23D → Phase-23L: feature count of the `dict_id` MLP.
+/// Phase-23D → Phase-23M: feature count of the `dict_id` MLP.
 /// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),
 /// bias (LR-shared), p1_len_bucket (23F), p2_len_bucket (23G),
 /// (p1_len, p2_len) joint (23H), tokens_since_match_bucket (23J),
-/// p1_class (23K), p2_class (23L)]`. Phase 23E (Order-4) and 23I
-/// (H=16) both regressed; the "genuinely-new information" path
-/// (23J/K/L) is the productive lever — see each journal entry.
-const N_MLP_ID_FEATS: usize = 9;
+/// p1_class (23K), p2_class (23L), p1_first_byte_class (23M)]`.
+/// Phase 23E (Order-4) and 23I (H=16) both regressed; the
+/// "genuinely-new information" path is the productive lever — see
+/// each journal entry.
+const N_MLP_ID_FEATS: usize = 10;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -662,6 +663,8 @@ impl Codec for XmlTokRouteCodec {
                             } else {
                                 ctx.p1_class
                             };
+                            let p1_first_byte_class_new =
+                                first_byte_subclass(dict.entry(last_id).lower[0]);
                             ctx = PredCtx {
                                 p3: p3_new,
                                 p2: p2_new,
@@ -671,6 +674,7 @@ impl Codec for XmlTokRouteCodec {
                                 tokens_since_match: 0,
                                 p1_class: p1_class_new,
                                 p2_class: p2_class_new,
+                                p1_first_byte_class: p1_first_byte_class_new,
                                 wiki: ctx.wiki,
                             };
                             continue;
@@ -711,6 +715,8 @@ impl Codec for XmlTokRouteCodec {
                         let p1_len_new =
                             new_id.map_or(0, |_| u8::try_from(token.len()).unwrap_or(u8::MAX));
                         let p1_class_new = new_id.map_or(0, |_| class_to_p1_class(class));
+                        let p1_first_byte_class_new =
+                            new_id.map_or(0, |_| first_byte_subclass(token[0]));
                         ctx = PredCtx {
                             p3: ctx.p2,
                             p2: ctx.p1,
@@ -720,6 +726,7 @@ impl Codec for XmlTokRouteCodec {
                             tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                             p1_class: p1_class_new,
                             p2_class: ctx.p1_class,
+                            p1_first_byte_class: p1_first_byte_class_new,
                             wiki: token_ctx.wiki,
                         };
 
@@ -951,6 +958,8 @@ impl Codec for XmlTokRouteCodec {
                         let p2_class_new = p2_id_opt.map_or(ctx.p1_class, |id| {
                             class_to_p1_class(TokenClass::from_byte(dict.entry(id).lower[0]))
                         });
+                        let p1_first_byte_class_new =
+                            first_byte_subclass(dict.entry(last_id).lower[0]);
                         ctx = PredCtx {
                             p3: p3_new,
                             p2: p2_new,
@@ -960,6 +969,7 @@ impl Codec for XmlTokRouteCodec {
                             tokens_since_match: 0,
                             p1_class: p1_class_new,
                             p2_class: p2_class_new,
+                            p1_first_byte_class: p1_first_byte_class_new,
                             wiki: ctx.wiki,
                         };
                         continue;
@@ -994,6 +1004,8 @@ impl Codec for XmlTokRouteCodec {
                     let p1_len_new =
                         new_prev.map_or(0, |_| u8::try_from(token_bytes.len()).unwrap_or(u8::MAX));
                     let p1_class_new = new_prev.map_or(0, |_| class_to_p1_class(class));
+                    let p1_first_byte_class_new =
+                        new_prev.map_or(0, |_| first_byte_subclass(token_bytes[0]));
                     ctx = PredCtx {
                         p3: ctx.p2,
                         p2: ctx.p1,
@@ -1003,6 +1015,7 @@ impl Codec for XmlTokRouteCodec {
                         tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                         p1_class: p1_class_new,
                         p2_class: ctx.p1_class,
+                        p1_first_byte_class: p1_first_byte_class_new,
                         wiki: token_ctx.wiki,
                     };
                 }
@@ -1078,6 +1091,26 @@ const fn class_to_p1_class(c: TokenClass) -> u8 {
     match c {
         TokenClass::Word => 1,
         TokenClass::Separator => 2,
+    }
+}
+
+/// Phase 23M: subdivide the first byte of `p1`'s token into a small
+/// category. Subclass 0 is the cold "no `p1`" case; Word tokens fall
+/// into the alpha bucket (1); the Separator buckets (2..=6) split
+/// by character family. The split is chosen for structurally-
+/// meaningful boundaries in Wikipedia / XML: whitespace separates
+/// prose runs; digits introduce numerical content; ASCII
+/// punctuation marks clause/sentence boundaries; brackets/symbols
+/// mark tag and template structure.
+const fn first_byte_subclass(b: u8) -> u8 {
+    match b {
+        b'a'..=b'z' | b'A'..=b'Z' => 1,
+        b' ' | b'\t' | b'\n' | b'\r' => 2,
+        b'0'..=b'9' => 3,
+        b'.' | b',' | b'!' | b'?' | b';' | b':' | b'\'' | b'"' | b'-' => 4,
+        b'<' | b'>' | b'{' | b'}' | b'[' | b']' | b'(' | b')' | b'=' | b'&' | b'|' | b'/'
+        | b'\\' => 5,
+        _ => 6,
     }
 }
 
@@ -1354,6 +1387,7 @@ struct PredCtx {
     tokens_since_match: u8,
     p1_class: u8,
     p2_class: u8,
+    p1_first_byte_class: u8,
     wiki: u8,
 }
 
@@ -1367,6 +1401,7 @@ impl PredCtx {
         tokens_since_match: 0,
         p1_class: 0,
         p2_class: 0,
+        p1_first_byte_class: 0,
         wiki: 0,
     };
 }
@@ -1484,9 +1519,28 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
+    // Phase 23M: subdivide the first byte of `p1`'s token into
+    // Alpha / Whitespace / Digit / Punctuation / Symbol / Other.
+    // Refines `p1_class` — same machinery, finer resolution at
+    // separator boundaries (which is where Word/Sep alternation
+    // leaves the most predictive uncertainty).
+    let f_p1_first_byte = {
+        let h = fnv_mix(FNV_OFFSET, u64::from(ctx.p1_first_byte_class));
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
 
     [
-        f_o3, f_wiki_o2, f_bias, f_p1_len, f_p2_len, f_len_pair, f_recency, f_p1_class, f_p2_class,
+        f_o3,
+        f_wiki_o2,
+        f_bias,
+        f_p1_len,
+        f_p2_len,
+        f_len_pair,
+        f_recency,
+        f_p1_class,
+        f_p2_class,
+        f_p1_first_byte,
     ]
 }
 
@@ -2055,6 +2109,7 @@ fn prewarm(
                 }
                 let p1_len_new = new_id.map_or(0, |_| u8::try_from(token.len()).unwrap_or(u8::MAX));
                 let p1_class_new = new_id.map_or(0, |_| class_to_p1_class(class));
+                let p1_first_byte_class_new = new_id.map_or(0, |_| first_byte_subclass(token[0]));
                 ctx = PredCtx {
                     p3: ctx.p2,
                     p2: ctx.p1,
@@ -2064,6 +2119,7 @@ fn prewarm(
                     tokens_since_match: ctx.tokens_since_match.saturating_add(1),
                     p1_class: p1_class_new,
                     p2_class: ctx.p1_class,
+                    p1_first_byte_class: p1_first_byte_class_new,
                     wiki: token_ctx.wiki,
                 };
                 // Also observe the lz_flag=0 (no-match) for prewarm

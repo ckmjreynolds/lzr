@@ -13,6 +13,58 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23M: `p1_first_byte_class` 7-Way Subdivision — 1.866 bpb on Enwik9 (small)
+
+Hypothesis: subdivide `p1_class`'s Separator bucket into byte-family sub-categories (whitespace / digit / punctuation / symbol / other) so the MLP gets finer structural information at separator boundaries. Predicted by the Phase 23K pattern — 23K's huge win came from making Word/Separator alternation explicit; this refines the Separator side.
+
+### What landed
+
+1. **`first_byte_subclass(b: u8) -> u8`** in `src/xml_tok_route.rs`: 6 categories `[Alpha=1, Whitespace=2, Digit=3, ASCII-punct=4, ASCII-symbol=5, Other=6]`, plus `0` reserved for the cold `p1=None` case.
+2. **`PredCtx.p1_first_byte_class: u8`** populated at all five construction sites from `dict.entry(last_id).lower[0]` (LZ-match paths) or `token[0]` / `token_bytes[0]` (simple-shift paths).
+3. **New 10th MLP feature** `(p1_first_byte_class, prefix, bit_pos)` at K=20. +32 MiB to MLP tables.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23L |
+|---|---:|---:|---:|---:|
+| Phase 23L | 2.0980 | 1.8662 | 233,280,411 | — |
+| **Phase 23M** | **2.0975** | **1.8659** | **233,232,992** | **-0.0005 / -0.0003 / -46 KiB** |
+
+Roundtrip OK. Encode 735 s vs 23L's 720 s (+2 %); decode 432 s vs 424 s (+2 %). Memory +32 MiB.
+
+### Why the gain is so much smaller than 23K
+
+Three-way Word/Sep/None alternation (23K's signal) is **structural** — it determines which slice of the dict's id space the next token comes from. The base predictors don't see Word/Sep directly (they see `prev_id`, which encodes class implicitly), so 23K's class feature was a big information gain.
+
+Phase 23M's byte-family subdivision is **byte-level** — and the existing LR Order-3 feature `(p3, p2, p1, prefix, bit_pos)` already hashes the exact id of each separator into its weight table, which means it already discriminates separators by their byte pattern. Subdividing into 6 family buckets adds only the marginal information of "this is a digit vs. whitespace vs. punctuation" beyond what the LR already encodes per-id.
+
+The pattern is now clear:
+
+> **Structural** features that bridge an information gap between the codec's internal state and the MLP's inputs pay big (23K: -0.0050).
+> **Byte-level** features that overlap with what the LR Order-3 already captures pay small (23M: -0.0003).
+
+### Phase 23M cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23K | 233,478,388 | 1.8678 | -0.1257 |
+| Phase 23L | 233,280,411 | 1.8662 | -0.1273 |
+| **Phase 23M** | **233,232,992** | **1.8659** | **-0.1276** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2008 bpb / -20.1 MiB on enwik9**. Hutter ratio: **2.126× target**.
+
+### Next direction
+
+The byte-level subdivision being a wash makes the path clear: the high-value features remaining are **structural/positional**, not byte-level. Candidates:
+
+- **`page_offset_bucket`** — byte position within current page, log-bucketed. Reset on `<page>` entry. Fully orthogonal to PredCtx; requires new state plumbing.
+- **`lz_match_length_last`** — length of the most-recent LZ-match. Pairs with `tokens_since_match` to encode "how big was the last match and how long ago".
+- **Wiki nesting depth** — exposed from `WikiFineClassifier`'s currently-internal `link_depth` / `template_depth` counters. The 5-mode sub-classification is already in `PredCtx.wiki`, but raw depth (especially `>= 2`) would distinguish flat templates from nested ones.
+
+Page offset is the biggest plumbing change but the most likely to pay; the others are mechanically cheap.
+
+---
+
 ## 2026-05-13 — Phase 23L: `p2_class` Coarse Feature — 1.866 bpb on Enwik9 (cumulative -0.2005 bpb)
 
 Sibling of Phase 23K — extend the class portfolio one slot back. `p2_class` shadows `p1_class` through the Word/Separator alternation rule, so most of its information is correlated, but boundary cases (after structural breaks, at page starts) still carry independent signal.
