@@ -13,6 +13,55 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 24d: Count-CDF 5th Mixer Arm — Negative Result (Flat at e2e)
+
+Tried the 24c journal's hypothetical "24d: 5th arm — count-CDF fallback" — wiring the legacy `lz_length_o1: Order1Ctx<1024, 256>` and `lz_offset_bucket_o1: Order1Ctx<1024, 21>` count tables back into the bit-level mixers as the 5th arm. Both tables had been left allocated `#[allow(dead_code)]` precisely for this experiment.
+
+### What was tried
+
+1. Added `Order1Ctx::predict_bit_p_zero(ctx, prefix, bit_pos) -> u32` (in `src/models.rs`). Projects the NSYM-way count CDF onto a single bit decision: zero-branch is `counts[lo..mid].sum()`, one-branch is `counts[mid..hi].sum()`, with `hi.min(NSYM)` clamping for the offset_bucket case where 21 < 32. Falls back to `TOTAL/2` when both branches are empty.
+2. Bumped `N_MIX_LZ_LENGTH` and `N_MIX_LZ_OFFSET_BUCKET` from 4 to 5. Wired the projection as `p_zeros[4]` in `length_bit_p_zeros` and `offset_bucket_bit_p_zeros`.
+3. Re-attached the observations: `encode_lz_length` / `decode_lz_length` now `models.lz_length_o1.observe(row, length_token)` after the bit loop; same for `lz_offset_bucket_o1` (guarded by `prefix < OFFSET_BUCKET_ALPHABET` on the decoder for safety, though the encoder never emits illegal buckets).
+
+Memory delta: ~0 (the legacy tables were already allocated). Build clean (`cargo build --release`, 158 tests passing including three new `predict_bit_p_zero` unit tests).
+
+### Results
+
+| Config | enwik8 panel | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 24c |
+|---|---:|---:|---:|---:|
+| Phase 24c | 2.182 | 1.8441 | 230,510,448 | — |
+| **Phase 24d** | **2.180** (-0.002) | **1.8441** | **230,514,792** | **+4,344 bytes / ~+0.0000 bpb** |
+
+The panel reported a -0.002 bpb micro-improvement; e2e showed a 4,344-byte (~0.000035 bpb) regression. Effectively flat with a slight wrong-sign tilt.
+
+### Why the count CDF added no signal
+
+The legacy `lz_*_o1` tables condition on `lz_match_row(prev_id)` — a 1024-row hash of `prev_id` alone, with NSYM-wide observation tracking at the symbol level. The Phase-24a/b bit-level Order-1 conditions on `id_bit_ctx(prev_id, prefix, bit_pos)` — a 16 Mi-slot hash that already encodes the same `prev_id` signal plus the bit-level position. The Phase 24c MLP's hashed-feature shape `[Order-3, Wiki × Order-2, (bit_pos, prefix) bias]` covers the cross-bit-position correlations as well.
+
+In information terms, the count CDF carries **no Shannon information** the existing four arms don't already have access to:
+- `prev_id` conditioning: covered by bit-level Order-1.
+- Symbol-level joint structure: the bit-level Order-1's per-bit-position state captures it through `prefix`-conditioning.
+- Coarse rare-context smoothing: the LR's `(bit_pos, prefix) bias` feature already smooths cold contexts at the same granularity.
+
+The mixer with 5 vs 4 arms has marginally more SGD parameters to warm up; the +4,344 bytes are likely the mixer's transient cost during the first ~10 MiB of `enwik9` before the 5th arm's weight collapses to near-zero. (After that, the arm contributes ~no information, and the mixer learns to ignore it.)
+
+### Saturation finding
+
+This is the **first phase in the 24-arc to land net-zero**, and it's diagnostic: the LZ-stream bit-level predictor stack `[Order-1-bit, Order-2-bit, SparseLR, MLP]` has saturated. Adding more deterministic arms of the same family (count tables, hashed-feature LRs, hashed-feature MLPs) on this stream will not yield new bits. The remaining bits on `lz_match_ac` are either:
+- **Conditional entropy** — true randomness in offset/length given the observable context. Beyond reach of any per-token deterministic predictor.
+- **Long-range structure** — span-level context (preceding paragraph topic, document section, prior page's LZ match history) that the current `PredCtx` doesn't expose. A *new* feature class is required, not a new arm shape.
+
+### Decision
+
+Phase 24d's code is **not committed**. Stashed locally (`phase-24d-negative-result-archived`) for reference and immediately dropped. The codebase remains at Phase 24c. The legacy `lz_*_o1` `Order1Ctx` fields stay `#[allow(dead_code)]` — they are now confirmed non-load-bearing and can be deleted in a future cleanup phase if memory pressure ever increases.
+
+### What it implies for 24e and Step C
+
+- **24e** (wider Order-2 K) is still worth trying, but the prior on it has weakened: the LZ Order-2 bit table at K=27 sees ~2.7 obs/slot on enwik9 — if it's observation-limited rather than capacity-limited, K=28 (1.3 obs/slot) makes it sparser without gaining new context.
+- **Step C** (pretrained transformer arm) becomes the only meaningful remaining lever for `lz_match_ac` improvement, and through it for the overall residual. The 24d saturation finding is the strongest argument so far for *starting* Step C work: there is no remaining deterministic territory on the largest bit component to explore first.
+
+---
+
 ## 2026-05-14 — Phase 24c: LR + MLP Arms on Bit-Level LZ Predictors — 1.844 bpb on Enwik9 (-0.0066 bpb)
 
 Layered the dict-id LR/MLP-arm pattern (Phase 23A/23D) onto the 24a/24b bit-level predictors. Added a 3-arm `SparseLR<3>` + 4-arm `OnlineMLP<3, 8>` to each stream's mixer, both reusing `id_lr_features` for their hashed-feature shape (`[Order-3 (p3, p2, p1, prefix, bit_pos), Wiki × Order-2, (bit_pos, prefix) bias]`).
