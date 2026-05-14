@@ -114,6 +114,15 @@ impl WikiFineClassifier {
         }
     }
 
+    /// Phase-23Q: total nesting depth (links + templates), saturating
+    /// to `u16::MAX`. Exposed so downstream predictors can distinguish
+    /// "depth 1 link inside Plain" from "depth 2 template inside a
+    /// link" — the [`Self::current_sub`] enum only reveals the
+    /// innermost mode, not how deep we are.
+    pub(crate) const fn depth_total(self) -> u16 {
+        self.link_depth.saturating_add(self.template_depth)
+    }
+
     pub(crate) const fn advance(&mut self, byte: u8) {
         let pair_open_link = matches!(self.prev, Some(b'[')) && byte == b'[';
         let pair_close_link = matches!(self.prev, Some(b']')) && byte == b']';

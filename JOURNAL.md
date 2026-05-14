@@ -13,6 +13,78 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 23Q: `wiki_depth_bucket` Coarse Feature — 1.863 bpb on Enwik9
+
+Following Phase 23N's direction signal, exposed the `WikiFineClassifier`'s internal nesting state as a new MLP feature. `ctx.wiki` (5-mode `WikiFine`) carries the *innermost* mode (Plain / LinkTarget / LinkDisplay / TemplateName / TemplateArg) but not the *depth* — a depth-1 link inside Plain looks identical to a depth-2 link inside a template. The recon suggested depth-2+ templates skew toward citation arguments (digits, ISBN, dates) while depth-1 templates are mostly infoboxes (English prose values).
+
+### What landed
+
+1. **`WikiFineClassifier::depth_total(self) -> u16`** — returns `link_depth + template_depth`. Saturating add, by-value (per clippy `trivially_copy_pass_by_ref`).
+2. **`PredCtx.wiki_depth_bucket: u8`** — 4-bin categorical from `wiki_depth_bucket_u8(d) = min(d, 3) as u8`. 0 = Plain, 1 = single link/template, 2 = one nested level, 3+ = deeper.
+3. Populated at all 8 PredCtx construction sites (3 encode, 3 decode, 2 prewarm). Carry pattern matches `wiki:` — fresh sample from `wiki_class.depth_total()` at `token_ctx` snapshots; carry from prior ctx at the LZ-match / simple-shift ctx updates.
+4. **New 13th MLP feature** `(wiki_depth_bucket, prefix, bit_pos)` at K=20 in `id_mlp_features`. +32 MiB to MLP tables.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23P |
+|---|---:|---:|---:|---:|
+| Phase 23P | 2.0957 | 1.8639 | 232,992,379 | — |
+| **Phase 23Q** | **2.0940** | **1.8632** | **232,896,116** | **-0.0017 / -0.0007 / -94 KiB** |
+
+Roundtrip OK. Encode 795 s vs 23P's 765 s (+3.9 %). Decode 514 s vs 485 s (+6.0 %). Memory +32 MiB.
+
+### Panel decomposition shift (enwik8, 20×256 KiB)
+
+Per-component delta after re-running both 23P and 23Q binaries against the same panel:
+
+| Component | 23P bits | 23Q bits | Δ | bpb impact |
+|---|---:|---:|---:|---:|
+| `token_hit_ac` | 3,216,354 | 3,195,669 | **-20,685** | **-0.0039** |
+| `case_ac` | 424,950 | 425,507 | +557 | +0.0001 |
+| `lz_match_ac` | 6,676,115 | 6,677,868 | +1,753 | +0.0003 |
+| `tag_ac` | 65,087 | 65,238 | +151 | +0.0000 |
+| `attr_ac` | 16,872 | 16,772 | -100 | -0.0000 |
+| `token_oov_ac` | 2,007,215 | 2,006,805 | -410 | -0.0001 |
+| **panel total** | 12,413,744 | 12,393,963 | **-19,781** | **-0.0038** |
+
+Panel mean 2.368 → 2.364 (-0.004 bpb).
+
+The win is entirely in `token_hit_ac` (the dict_id stream), exactly where adding a 13th feature to `token_id_mlp` was supposed to pay. The slight increases in `case_ac` and `lz_match_ac` are second-order: the MLP's gradient flows over a shared budget, so other components get fractionally less of the optimizer's "attention" per bit.
+
+### Why the 23P pattern (panel-overstates-e2e) repeats
+
+Panel -0.004 bpb vs e2e -0.0007 bpb on enwik9. Same 5-6× ratio as Phase 23P (-0.011 panel → -0.0007 e2e). The dict_id MLP's K=20 tables are nowhere near cold at the e2e scale — adding a 13th feature provides marginal capacity that gets absorbed into the same global bit budget the existing 12 features compete for. The e2e gain represents what's *not* already captured by the existing feature mix.
+
+### Phase 23Q cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23M | 233,232,992 | 1.8659 | -0.1276 |
+| Phase 23N | 233,195,523 | 1.8656 | -0.1279 |
+| Phase 23O | 233,070,347 | 1.8646 | -0.1289 |
+| Phase 23P | 232,992,379 | 1.8639 | -0.1296 |
+| **Phase 23Q** | **232,896,116** | **1.8632** | **-0.1303**(saturating) |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2035 bpb / -20.4 MiB on enwik9**. Hutter ratio: **2.123× target**.
+
+### Saturation curve and the path forward
+
+Five consecutive phases at -0.0003 to -0.001 bpb each:
+
+| Phase | Feature | enwik9 Δ |
+|---|---|---:|
+| 23M | `p1_first_byte_class` | -0.0003 |
+| 23N | `lz_match_length_last` | -0.0003 |
+| 23O | `page_offset_bucket` | -0.0010 |
+| 23P | MLP arms on flag streams | -0.0007 |
+| 23Q | `wiki_depth_bucket` | -0.0007 |
+
+The dict-id MLP's 13-feature, H=8 capacity is saturating. The next phase must either (1) attack a different stream entirely — Phase 24 candidate is bit-level `lz_length` / `lz_offset_bucket`, the biggest unmined deterministic lever (lz_match_ac is 53.8 % of total bits, with the offset+length CDFs still pure `Order1Ctx` count predictors), or (2) revisit the dict-id MLP architecture (H=12 or a 2-layer MLP), where the 23I H=16 experiment already showed capacity isn't the limit *if* the feature set is the same.
+
+Going (1) first: option-3-from-Phase-23O's roadmap is concretely lined up.
+
+---
+
 ## 2026-05-14 — Phase 23P: MLP Arms on `lz_flag` / `token_oov_bit` — 1.864 bpb on Enwik9
 
 Following the Phase 23N/O direction signal, applied the dict-id MLP pattern to the two binary-decision streams that had been on sparse-LR only since Phase 23B. The hypothesis: `lz_flag` and `token_oov_bit` share the same feature shape (`[Order-3-hashed, Wiki × Order-2, Wiki × Order-1]`); whatever nonlinearity the dict-id MLP captures over those features should pay on these streams too. Expected gain (from the 23N entry's direction signal): -0.001 to -0.003 bpb at +96 MiB.

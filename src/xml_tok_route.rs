@@ -289,16 +289,16 @@ const ID_MLP_LR: f32 = 0.02;
 /// confirming the diminishing-returns curve is feature-limited.
 /// Reverted to `H=8`.
 const ID_MLP_H: usize = 8;
-/// Phase-23D → Phase-23O: feature count of the `dict_id` MLP.
+/// Phase-23D → Phase-23Q: feature count of the `dict_id` MLP.
 /// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),
 /// bias (LR-shared), p1_len_bucket (23F), p2_len_bucket (23G),
 /// (p1_len, p2_len) joint (23H), tokens_since_match_bucket (23J),
 /// p1_class (23K), p2_class (23L), p1_first_byte_class (23M),
-/// lz_match_length_last_bucket (23N), page_offset_bucket (23O)]`.
-/// Phase 23E (Order-4) and 23I (H=16) both regressed; the
-/// "genuinely-new information" path is the productive lever — see
-/// each journal entry.
-const N_MLP_ID_FEATS: usize = 12;
+/// lz_match_length_last_bucket (23N), page_offset_bucket (23O),
+/// wiki_depth_bucket (23Q)]`. Phase 23E (Order-4) and 23I (H=16)
+/// both regressed; the "genuinely-new information" path is the
+/// productive lever — see each journal entry.
+const N_MLP_ID_FEATS: usize = 13;
 /// Phase-21 / Phase-23B / Phase-23P: number of predictors in the
 /// `lz_flag` mixer. `[Order-1, Order-2, SparseLR, MLP]`. The 4th arm
 /// (Phase-23P) mirrors the dict-id MLP pattern: same feature shape as
@@ -716,6 +716,7 @@ impl Codec for XmlTokRouteCodec {
                                 p1_first_byte_class: p1_first_byte_class_new,
                                 page_offset_bucket: log2_bucket(page_token_offset),
                                 wiki: ctx.wiki,
+                                wiki_depth_bucket: ctx.wiki_depth_bucket,
                             };
                             continue;
                         }
@@ -738,6 +739,7 @@ impl Codec for XmlTokRouteCodec {
                         let token_ctx = PredCtx {
                             wiki: u8::try_from(wiki_class.current_sub().idx())
                                 .expect("WikiSub::idx() < 256"),
+                            wiki_depth_bucket: wiki_depth_bucket_u8(wiki_class.depth_total()),
                             ..ctx
                         };
                         let new_id = encode_token(
@@ -771,6 +773,7 @@ impl Codec for XmlTokRouteCodec {
                             p1_first_byte_class: p1_first_byte_class_new,
                             page_offset_bucket: log2_bucket(page_token_offset),
                             wiki: token_ctx.wiki,
+                            wiki_depth_bucket: token_ctx.wiki_depth_bucket,
                         };
 
                         for &b in token {
@@ -1028,6 +1031,7 @@ impl Codec for XmlTokRouteCodec {
                             p1_first_byte_class: p1_first_byte_class_new,
                             page_offset_bucket: log2_bucket(page_token_offset),
                             wiki: ctx.wiki,
+                            wiki_depth_bucket: ctx.wiki_depth_bucket,
                         };
                         continue;
                     }
@@ -1042,6 +1046,7 @@ impl Codec for XmlTokRouteCodec {
                     let token_ctx = PredCtx {
                         wiki: u8::try_from(wiki_class.current_sub().idx())
                             .expect("WikiSub::idx() < 256"),
+                        wiki_depth_bucket: wiki_depth_bucket_u8(wiki_class.depth_total()),
                         ..ctx
                     };
                     let (token_bytes, new_prev) =
@@ -1077,6 +1082,7 @@ impl Codec for XmlTokRouteCodec {
                         p1_first_byte_class: p1_first_byte_class_new,
                         page_offset_bucket: log2_bucket(page_token_offset),
                         wiki: token_ctx.wiki,
+                        wiki_depth_bucket: token_ctx.wiki_depth_bucket,
                     };
                 }
                 Mode::AttrValue => {
@@ -1170,6 +1176,17 @@ const fn class_to_p1_class(c: TokenClass) -> u8 {
 const fn log2_bucket(x: u32) -> u8 {
     let raw = 32u32 - x.leading_zeros();
     if raw >= 15 { 15 } else { raw as u8 }
+}
+
+/// Phase 23Q: bucket the [`WikiFineClassifier`]'s combined nesting
+/// depth (link + template) into a 4-bin categorical: 0 (Plain), 1
+/// (single link or template), 2 (one nested level), 3+ (deeper).
+/// Coarse on purpose — deep nesting is rare; the feature's value is
+/// mostly in distinguishing Plain / depth-1 / depth-2-or-more rather
+/// than resolving the long tail.
+#[allow(clippy::cast_possible_truncation)]
+const fn wiki_depth_bucket_u8(depth: u16) -> u8 {
+    if depth >= 3 { 3 } else { depth as u8 }
 }
 
 /// Phase 23M: subdivide the first byte of `p1`'s token into a small
@@ -1477,6 +1494,13 @@ struct PredCtx {
     /// this field at every Content-mode `PredCtx` update.
     page_offset_bucket: u8,
     wiki: u8,
+    /// Phase 23Q: total wiki nesting depth (`link_depth` +
+    /// `template_depth`), saturating to 3. `wiki` only reveals the
+    /// innermost mode; this field distinguishes shallow (depth 1)
+    /// from nested (depth 2 / 3+) syntactic contexts where dict-id
+    /// distributions differ (e.g. depth-2 templates are mostly
+    /// citation-template arguments).
+    wiki_depth_bucket: u8,
 }
 
 impl PredCtx {
@@ -1493,6 +1517,7 @@ impl PredCtx {
         p1_first_byte_class: 0,
         page_offset_bucket: 0,
         wiki: 0,
+        wiki_depth_bucket: 0,
     };
 }
 
@@ -1639,6 +1664,18 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
+    // Phase 23Q: 4-bin wiki nesting depth (link_depth +
+    // template_depth, saturating to 3). `ctx.wiki` only carries the
+    // innermost sub-mode; this distinguishes "depth-1 inside Plain"
+    // from "depth-2 template inside a link", which have measurably
+    // different dict-id distributions (deep templates are mostly
+    // citation arguments — high digit / punct content).
+    let f_wiki_depth = {
+        let h = fnv_mix(FNV_OFFSET, u64::from(ctx.wiki_depth_bucket));
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
+
     [
         f_o3,
         f_wiki_o2,
@@ -1652,6 +1689,7 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         f_p1_first_byte,
         f_lz_match_length,
         f_page_offset,
+        f_wiki_depth,
     ]
 }
 
@@ -2219,6 +2257,7 @@ fn prewarm(
                 let token_ctx = PredCtx {
                     wiki: u8::try_from(wiki_class.current_sub().idx())
                         .expect("WikiSub::idx() < 256"),
+                    wiki_depth_bucket: wiki_depth_bucket_u8(wiki_class.depth_total()),
                     ..ctx
                 };
                 let new_id = observe_token(models, dict, class, token, token_ctx);
@@ -2242,6 +2281,7 @@ fn prewarm(
                     p1_first_byte_class: p1_first_byte_class_new,
                     page_offset_bucket: log2_bucket(page_token_offset),
                     wiki: token_ctx.wiki,
+                    wiki_depth_bucket: token_ctx.wiki_depth_bucket,
                 };
                 // Also observe the lz_flag=0 (no-match) for prewarm
                 // so the model arrives at measure with a calibrated
