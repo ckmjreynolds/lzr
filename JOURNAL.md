@@ -13,6 +13,72 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-13 — Phase 23O: `page_offset_bucket` Coarse Feature — 1.865 bpb on Enwik9
+
+Followed the saturation curve in Phase 23N to the last truly-orthogonal positional feature: a log₂-bucketed counter of tokens emitted since the most recent `<page>` boundary. Unlike the 23L–N additions, this carries information **not derivable from any other PredCtx field** — the dict-id history says nothing about whether the page is fresh or 10 K tokens deep.
+
+### What landed
+
+1. **`log2_bucket(x: u32) -> u8`** in `src/xml_tok_route.rs`: 16-bucket log₂ index, saturating at bucket 15 for counts ≥ 16 384.
+2. **`PredCtx.page_offset_bucket: u8`** added to the struct (cold value 0).
+3. **`page_token_offset: u32`** introduced as a loop-local counter in encode (`encode_window`), decode (`decode_window`), and prewarm (`observe_warm_prefix`). It starts at 0, increments by 1 (or `length_us` / `len_match`) on every Content-mode `PredCtx` update, and resets to 0 inside the `Mode::TagStructure` arm whenever `tag_dict` emits dictionary index 0 (`page>` token).
+4. **New 12th MLP feature** `(page_offset_bucket, prefix, bit_pos)` at K=20. +32 MiB.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23N |
+|---|---:|---:|---:|---:|
+| Phase 23N | 2.0973 | 1.8656 | 233,195,523 | — |
+| **Phase 23O** | **2.0966** | **1.8646** | **233,070,347** | **-0.0007 / -0.0010 / -122 KiB** |
+
+Roundtrip OK. Encode 769 s vs 23N's 757 s (+1.6 %); decode 460 s vs 447 s (+3 %). Memory +32 MiB.
+
+The enwik9 Δ exceeds the enwik8 Δ — coarse-feature signature (cells warm at both scales), and the enwik9 corpus has much more page-internal variance to exploit.
+
+### Curve reset after the 23M/N tail
+
+| Phase | Feature | enwik9 Δ |
+|---|---|---:|
+| 23K | `p1_class` (Word/Sep/None) | -0.0050 |
+| 23L | `p2_class` | -0.0016 |
+| 23M | `p1_first_byte_class` (separator subdivision) | -0.0003 |
+| 23N | `lz_match_length_last` | -0.0003 |
+| **23O** | **`page_offset_bucket`** | **-0.0010** |
+
+23O breaks out of the 23M/N saturation tail because it brings information **none of the prior 11 features encoded**. The dict-id history says nothing about whether we're at byte 200 or byte 20 000 of the current page; the wiki sub-mode tracks `[[ ]]` / `{{ }}` boundaries but not page-level position; the LZ-recency feature counts time since a match, not absolute page position.
+
+Concretely, the kinds of structural patterns the feature should capture:
+- Pages open with `<title>...</title>` then `<id>...</id>` — predictable tag sequence at low page offset.
+- Mid-page is usually free-text Content, dominated by prose.
+- Late pages frequently end in `<references/>` / `<ref>...</ref>` runs, then `</revision></page>`.
+- Long Wikipedia articles have predictable section transitions (Lead → main body → See also → References) at recognizable offsets.
+
+The MLP can now down-weight prose-friendly features in low-offset and high-offset regions while up-weighting them mid-page.
+
+### Phase 23O cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23K | 233,478,388 | 1.8678 | -0.1257 |
+| Phase 23L | 233,280,411 | 1.8662 | -0.1273 |
+| Phase 23M | 233,232,992 | 1.8659 | -0.1276 |
+| Phase 23N | 233,195,523 | 1.8656 | -0.1279 |
+| **Phase 23O** | **233,070,347** | **1.8646** | **-0.1289** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2021 bpb / -20.2 MiB on enwik9**. Hutter ratio: **2.125× target**.
+
+### Open angles
+
+The dict-id MLP now carries 12 features and is approaching the point where each new feature competes for the same `H=8` hidden dimensions. Productive next moves probably target other streams or substantive architecture changes:
+
+- **MLP arms on `lz_flag` / `token_oov_bit`** (the Phase 23B pattern, but with MLPs instead of sparse LR). +96 MiB, expected ~-0.001 to -0.003 bpb.
+- **Wiki nesting depth** exposed from `WikiFineClassifier`. Promote internal `link_depth`/`template_depth` counters to public state and add as MLP features.
+- **Byte-granularity page-offset** as a finer second feature alongside the token-granularity one. Cheap but probably redundant.
+
+The cumulative encode-time creep is at +37 % (1.72 → 1.24 MiB/s from Phase 23A to 23O); decode at +50 %. Still well within the Hutter time budget but each new feature adds ~2 % to both. The next phase should weigh "more dict-id features" vs "MLP on a different stream" carefully.
+
+---
+
 ## 2026-05-13 — Phase 23N: `lz_match_length_last` Coarse Feature — 1.866 bpb on Enwik9 (marginal)
 
 Cheapest "structural" follow-up after Phase 23J's `tokens_since_match` win: pair recency with **the length of the most-recent LZ-match**. Phases 23K/L delivered big single-feature wins; 23N tests whether the LZ-behaviour story has more juice in it once recency is factored out.

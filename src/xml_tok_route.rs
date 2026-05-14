@@ -289,15 +289,16 @@ const ID_MLP_LR: f32 = 0.02;
 /// confirming the diminishing-returns curve is feature-limited.
 /// Reverted to `H=8`.
 const ID_MLP_H: usize = 8;
-/// Phase-23D → Phase-23N: feature count of the `dict_id` MLP.
+/// Phase-23D → Phase-23O: feature count of the `dict_id` MLP.
 /// Layout: `[Order-3 (LR-shared), Wiki × Order-2 (LR-shared),
 /// bias (LR-shared), p1_len_bucket (23F), p2_len_bucket (23G),
 /// (p1_len, p2_len) joint (23H), tokens_since_match_bucket (23J),
 /// p1_class (23K), p2_class (23L), p1_first_byte_class (23M),
-/// lz_match_length_last_bucket (23N)]`. Phase 23E (Order-4) and
-/// 23I (H=16) both regressed; the "genuinely-new information"
-/// path is the productive lever — see each journal entry.
-const N_MLP_ID_FEATS: usize = 11;
+/// lz_match_length_last_bucket (23N), page_offset_bucket (23O)]`.
+/// Phase 23E (Order-4) and 23I (H=16) both regressed; the
+/// "genuinely-new information" path is the productive lever — see
+/// each journal entry.
+const N_MLP_ID_FEATS: usize = 12;
 /// Phase-21 / Phase-23B: number of predictors in the `lz_flag`
 /// mixer. `[Order-1, Order-2, SparseLR]`. The LR arm adds hashed
 /// Order-3 + wiki cross-features at SGD-amortized cost.
@@ -548,6 +549,11 @@ impl Codec for XmlTokRouteCodec {
             let mut last_class_ctx = CLASS_CTX_NONE;
             let mut ctx = PredCtx::NONE;
             let mut uniform_cdf_cache = UniformCdfCache::new();
+            // Phase 23O: token counter since the most recent `<page>`
+            // boundary; reset to 0 when `tag_dict` emits idx 0
+            // (`page>`). Bucketed into `ctx.page_offset_bucket` at
+            // every Content-mode PredCtx update.
+            let mut page_token_offset: u32 = 0;
             let mut i = warm_end;
             while i < buf.len() {
                 let mode = classifier.current_mode();
@@ -667,6 +673,8 @@ impl Codec for XmlTokRouteCodec {
                                 first_byte_subclass(dict.entry(last_id).lower[0]);
                             let lz_match_length_last_new =
                                 u8::try_from(length_us).unwrap_or(u8::MAX);
+                            page_token_offset = page_token_offset
+                                .saturating_add(u32::try_from(length_us).unwrap_or(u32::MAX));
                             ctx = PredCtx {
                                 p3: p3_new,
                                 p2: p2_new,
@@ -678,6 +686,7 @@ impl Codec for XmlTokRouteCodec {
                                 p1_class: p1_class_new,
                                 p2_class: p2_class_new,
                                 p1_first_byte_class: p1_first_byte_class_new,
+                                page_offset_bucket: log2_bucket(page_token_offset),
                                 wiki: ctx.wiki,
                             };
                             continue;
@@ -720,6 +729,7 @@ impl Codec for XmlTokRouteCodec {
                         let p1_class_new = new_id.map_or(0, |_| class_to_p1_class(class));
                         let p1_first_byte_class_new =
                             new_id.map_or(0, |_| first_byte_subclass(token[0]));
+                        page_token_offset = page_token_offset.saturating_add(1);
                         ctx = PredCtx {
                             p3: ctx.p2,
                             p2: ctx.p1,
@@ -731,6 +741,7 @@ impl Codec for XmlTokRouteCodec {
                             p1_class: p1_class_new,
                             p2_class: ctx.p1_class,
                             p1_first_byte_class: p1_first_byte_class_new,
+                            page_offset_bucket: log2_bucket(page_token_offset),
                             wiki: token_ctx.wiki,
                         };
 
@@ -763,7 +774,8 @@ impl Codec for XmlTokRouteCodec {
                         let mut tag_cdf = [0u32; TAG_ALPHABET + 1];
                         models.tag_dict.cdf_to(&mut tag_cdf);
                         let before = enc.bits_written();
-                        if let Some(idx) = dict_lookup(run) {
+                        let dict_idx = dict_lookup(run);
+                        if let Some(idx) = dict_idx {
                             enc.encode(&tag_cdf, idx);
                             models.tag_dict.observe(idx);
                         } else {
@@ -784,6 +796,11 @@ impl Codec for XmlTokRouteCodec {
                         i = tag_end;
                         last_class_ctx = CLASS_CTX_NONE;
                         ctx = PredCtx::NONE;
+                        // Phase 23O: `page>` is dictionary index 0 — reset
+                        // the page-offset counter on every page start.
+                        if dict_idx == Some(0) {
+                            page_token_offset = 0;
+                        }
                     }
                 }
             }
@@ -857,6 +874,9 @@ impl Codec for XmlTokRouteCodec {
         let mut last_class_ctx = CLASS_CTX_NONE;
         let mut ctx = PredCtx::NONE;
         let mut uniform_cdf_cache = UniformCdfCache::new();
+        // Phase 23O: token counter since the most recent `<page>`
+        // boundary; mirrors the encode side.
+        let mut page_token_offset: u32 = 0;
         while buf.len() - warm_end < measure_len {
             let mode = classifier.current_mode();
             match mode {
@@ -965,6 +985,8 @@ impl Codec for XmlTokRouteCodec {
                         let p1_first_byte_class_new =
                             first_byte_subclass(dict.entry(last_id).lower[0]);
                         let lz_match_length_last_new = u8::try_from(len_match).unwrap_or(u8::MAX);
+                        page_token_offset = page_token_offset
+                            .saturating_add(u32::try_from(len_match).unwrap_or(u32::MAX));
                         ctx = PredCtx {
                             p3: p3_new,
                             p2: p2_new,
@@ -976,6 +998,7 @@ impl Codec for XmlTokRouteCodec {
                             p1_class: p1_class_new,
                             p2_class: p2_class_new,
                             p1_first_byte_class: p1_first_byte_class_new,
+                            page_offset_bucket: log2_bucket(page_token_offset),
                             wiki: ctx.wiki,
                         };
                         continue;
@@ -1012,6 +1035,7 @@ impl Codec for XmlTokRouteCodec {
                     let p1_class_new = new_prev.map_or(0, |_| class_to_p1_class(class));
                     let p1_first_byte_class_new =
                         new_prev.map_or(0, |_| first_byte_subclass(token_bytes[0]));
+                    page_token_offset = page_token_offset.saturating_add(1);
                     ctx = PredCtx {
                         p3: ctx.p2,
                         p2: ctx.p1,
@@ -1023,6 +1047,7 @@ impl Codec for XmlTokRouteCodec {
                         p1_class: p1_class_new,
                         p2_class: ctx.p1_class,
                         p1_first_byte_class: p1_first_byte_class_new,
+                        page_offset_bucket: log2_bucket(page_token_offset),
                         wiki: token_ctx.wiki,
                     };
                 }
@@ -1069,6 +1094,11 @@ impl Codec for XmlTokRouteCodec {
                     }
                     last_class_ctx = CLASS_CTX_NONE;
                     ctx = PredCtx::NONE;
+                    // Phase 23O: `page>` is dictionary index 0 — reset
+                    // the page-offset counter on every page start.
+                    if idx == 0 {
+                        page_token_offset = 0;
+                    }
                 }
             }
         }
@@ -1099,6 +1129,19 @@ const fn class_to_p1_class(c: TokenClass) -> u8 {
         TokenClass::Word => 1,
         TokenClass::Separator => 2,
     }
+}
+
+/// Phase 23O: 16-bucket log₂ index of a non-negative count. Used
+/// for `page_offset_bucket` so the natural unbounded counter folds
+/// into a small categorical feature. Bucket 0 = count zero;
+/// bucket k = count in `[2^(k-1), 2^k)`; bucket 15 is the saturating
+/// top (count ≥ 16384). Compact enough to keep the hashed feature
+/// dense; coarse enough to absorb the long-tailed page-size
+/// distribution.
+#[allow(clippy::cast_possible_truncation)]
+const fn log2_bucket(x: u32) -> u8 {
+    let raw = 32u32 - x.leading_zeros();
+    if raw >= 15 { 15 } else { raw as u8 }
 }
 
 /// Phase 23M: subdivide the first byte of `p1`'s token into a small
@@ -1399,6 +1442,12 @@ struct PredCtx {
     p1_class: u8,
     p2_class: u8,
     p1_first_byte_class: u8,
+    /// Phase 23O: log₂-bucketed token offset within the current
+    /// `<page>` block (0 right after page start, growing through 15
+    /// for "deep into a long page"). Tracked outside `PredCtx` via
+    /// the `page_token_offset` loop variable and snapshotted into
+    /// this field at every Content-mode `PredCtx` update.
+    page_offset_bucket: u8,
     wiki: u8,
 }
 
@@ -1414,6 +1463,7 @@ impl PredCtx {
         p1_class: 0,
         p2_class: 0,
         p1_first_byte_class: 0,
+        page_offset_bucket: 0,
         wiki: 0,
     };
 }
@@ -1552,6 +1602,15 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         let h = fnv_mix(h, prefix64);
         fnv_mix(h, bit_pos64)
     };
+    // Phase 23O: log₂-bucketed token offset within the current
+    // `<page>`. Genuinely orthogonal to every other PredCtx field —
+    // captures structural position (early infobox / mid prose /
+    // late references) the dict-id history can't reconstruct.
+    let f_page_offset = {
+        let h = fnv_mix(FNV_OFFSET, u64::from(ctx.page_offset_bucket));
+        let h = fnv_mix(h, prefix64);
+        fnv_mix(h, bit_pos64)
+    };
 
     [
         f_o3,
@@ -1565,6 +1624,7 @@ fn id_mlp_features(ctx: PredCtx, prefix: u32, bit_pos: u32) -> [u64; N_MLP_ID_FE
         f_p2_class,
         f_p1_first_byte,
         f_lz_match_length,
+        f_page_offset,
     ]
 }
 
@@ -2111,6 +2171,9 @@ fn prewarm(
 ) {
     let mut last_class_ctx = CLASS_CTX_NONE;
     let mut ctx = PredCtx::NONE;
+    // Phase 23O: token counter since the most recent `<page>`
+    // boundary; same semantics as in encode/decode.
+    let mut page_token_offset: u32 = 0;
     let mut i = 0;
     while i < warm.len() {
         let mode = classifier.current_mode();
@@ -2134,6 +2197,7 @@ fn prewarm(
                 let p1_len_new = new_id.map_or(0, |_| u8::try_from(token.len()).unwrap_or(u8::MAX));
                 let p1_class_new = new_id.map_or(0, |_| class_to_p1_class(class));
                 let p1_first_byte_class_new = new_id.map_or(0, |_| first_byte_subclass(token[0]));
+                page_token_offset = page_token_offset.saturating_add(1);
                 ctx = PredCtx {
                     p3: ctx.p2,
                     p2: ctx.p1,
@@ -2145,6 +2209,7 @@ fn prewarm(
                     p1_class: p1_class_new,
                     p2_class: ctx.p1_class,
                     p1_first_byte_class: p1_first_byte_class_new,
+                    page_offset_bucket: log2_bucket(page_token_offset),
                     wiki: token_ctx.wiki,
                 };
                 // Also observe the lz_flag=0 (no-match) for prewarm
@@ -2176,7 +2241,8 @@ fn prewarm(
             Mode::TagStructure => {
                 let run_end_ = find_tag_run_end(warm, i, *classifier);
                 let run = &warm[i..run_end_];
-                if let Some(idx) = dict_lookup(run) {
+                let dict_idx = dict_lookup(run);
+                if let Some(idx) = dict_idx {
                     models.tag_dict.observe(idx);
                 } else {
                     models.tag_dict.observe(TAG_ESCAPE);
@@ -2191,6 +2257,10 @@ fn prewarm(
                 i = run_end_;
                 last_class_ctx = CLASS_CTX_NONE;
                 ctx = PredCtx::NONE;
+                // Phase 23O: mirror encode/decode page-offset reset.
+                if dict_idx == Some(0) {
+                    page_token_offset = 0;
+                }
             }
         }
     }
