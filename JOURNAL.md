@@ -13,6 +13,101 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Step C Kickoff: lzr-neural Training Repo + First Pretraining Run
+
+Following the corrected Step C framing (pretrained + embedded, 1-10 M params at int8 quant, ~1 M FLOPS/token forward), CDR/Claude bootstrapped the training infrastructure as a sibling repo at `/Users/creynolds/Programming/lzr-neural/` — distinct from the retired `/Users/creynolds/Programming/lzr-train/` (MLX-based, Apple-only, abandoned per CLAUDE.md).
+
+### Repo layout
+
+| Path | Purpose |
+|---|---|
+| `pyproject.toml` | PyTorch 2.12 + numpy 2.4 + tqdm via uv |
+| `src/lzr_neural/config.py` | `ModelConfig` / `TrainConfig` dataclasses, `tiny`/`small`/`smoke` presets |
+| `src/lzr_neural/model.py` | byte-level decoder transformer |
+| `src/lzr_neural/data.py` | mmap'd enwik8 loader with 90/10 train/val split |
+| `scripts/train.py` | AdamW + cosine LR + grad clip + checkpointing |
+| `scripts/eval_bpb.py` | standalone bpb measurement on enwik9 |
+| `ckpts/` | gitignored checkpoints |
+
+### Architecture choices (every one constrained by "must port cleanly to scalar Rust")
+
+| Decision | Rationale |
+|---|---|
+| Byte-level (vocab=256) | Avoids tokenizer/codec coupling for the first iteration; same alphabet as the AC stream |
+| 4 layers × 128 hidden, 4 heads (head_dim=32), d_ff=512 | ~1.5 M params, fits 1× inference FLOPS budget at context=512 |
+| RMSNorm pre-norm | Single mean op per token, one fewer pass than LayerNorm, quant-friendly |
+| GELU activation | Single tanh approx, vectorizes cleanly; SwiGLU adds a third linear with marginal gain at this scale |
+| Learned absolute position embeddings | Simpler Rust port than RoPE's complex-number arithmetic; context=512 is short enough that absolute capacity isn't a bottleneck |
+| No bias on linears | Llama/Gemma standard; saves params at no quality cost |
+| Tied input/output embeddings | Halves L(D) tax on the 256 × 128 head; small accuracy win at byte-level |
+| Plain causal attention (no flash, no sliding window) | Auto-vec'd `Q K^T` → softmax → V matmul in Rust |
+
+The `ModelConfig` exposes `approx_params` and `approx_flops_per_token` properties so future architecture sweeps can budget against the Hutter inference cap directly.
+
+### Smoke run (2 layers × 64 hidden, 131 K params, 200 steps, MPS)
+
+```
+val_bpb: 7.53 → 5.18  (3.1 seconds on Apple Silicon MPS)
+```
+
+End-to-end pipeline verified (model, data loader, optimizer, eval, checkpointing).
+
+### First real pretraining run — `small` preset
+
+Config: 4 layers × 128 hidden, 1.5 M params, seq_len=256, batch=16, 2000 steps, cosine LR 0→3e-4→0, warmup 100, MPS device.
+
+| Step | val_bpb |
+|---:|---:|
+| 200 | 4.10 |
+| 400 | 3.80 |
+| 1000 | 3.56 |
+| 1500 | 3.41 |
+| 2000 | **3.35** |
+
+Training tokens seen: 2000 × 16 × 256 = ~8.2 M — well under one epoch on enwik8's 90 M-byte train split. Curve was still descending at termination, with the per-200-step delta narrowing from -0.30 (steps 0-200) to -0.01 (steps 1800-2000). Final val_bpb at ~Order-1 byte entropy on enwik8.
+
+### Standalone bpb on enwik9 (first 5 MB)
+
+```
+small_42_step2000.pt on enwik9[:5MB]: 3.9149 bpb
+```
+
+Slightly worse than enwik8 val (3.35) because the leading 5 MB of enwik9 is dense XML header + meta-page structure the model hasn't seen much of in its limited training.
+
+### Reference points
+
+| System | enwik9 bpb |
+|---|---:|
+| Random byte | 8.000 |
+| Order-1 byte entropy | ~3.8 |
+| **Step C small_42_step2000 (this run)** | **3.91** |
+| gzip | ~2.3 |
+| bzip2 | ~1.8 |
+| **LZR v3 deterministic (Phase 24c)** | **1.844** |
+| cmix-class | ~1.1 |
+| NNCP (byte-level SOTA) | 0.86 |
+| Hutter target | 0.878 |
+
+### Framing: standalone bpb is not the integration metric
+
+The neural arm's standalone byte-level bpb (3.91) is *worse* than v3's deterministic 1.844 because the deterministic codec exploits token-aligned context (dict-id stream, XML structure, LZ matches) that a raw byte-level LM doesn't see. The Step C win comes from **orthogonal signal**: the neural arm provides bits the deterministic predictors miss (long-range context, paragraph topic, cross-sentence dependencies), which the mixer blends in for *combined* bpb below 1.844.
+
+This is the same dynamic as v1's RWKV arm, which standalone hit ~2.5 bpb but added -0.06 bpb to the v1 ensemble.
+
+### What's next
+
+| Phase | Description | Estimate |
+|---|---|---:|
+| 25a (next) | **Phase 25: Rust inference port.** Translate `ByteTransformer` to scalar Rust with KV cache; verify forward-pass parity against PyTorch by checking logits on a fixed input | ~1 week |
+| 25b | Int8 post-training quantization with calibration on enwik8 tail; verify ≤0.05 bpb degradation | ~3 days |
+| 25c | Embed quantized weights as `const` arrays via `include_bytes!`; wire as N+1-th arm on `token_id_mixer` | ~3 days |
+| 25d | First panel/e2e measurement of the integrated codec; check whether the mixer learns to use the neural arm | ~2 days |
+| Parallel | Continue training in the background (scale to 20 K-50 K steps, larger context, possibly larger model) | open-ended |
+
+The pretraining can scale arbitrarily while Phase 25 lands. A 4-6 hour MPS run at the small config's settings, scaled to 50 K steps with a 1024-context, should land val_bpb closer to 2.5-3.0 — well within the "useful for ensemble integration" range. The Rust inference path can be validated against the existing 2000-step checkpoint and re-validated against larger checkpoints as they land.
+
+---
+
 ## 2026-05-14 — Correction to Step C Readiness Decision: Pretrained, Not Online-Trained
 
 The 2026-05-14 "Step C Readiness Decision" entry below mis-framed Step C as online-trained (NNCP-pattern) and proposed a "1-4 M params" model. Two parts of the constraint structure were wrong and the correction matters:
