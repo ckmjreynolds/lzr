@@ -254,6 +254,30 @@ const TOKEN_OOV_MIXER_K: u32 = 10;
 /// regressed +0.016 bpb because the length CDF cells went cold.
 const LZ_MATCH_NCTX: usize = 1024;
 
+/// Phase 24a: bit-level Order-1 LZ-length predictor. Context =
+/// `(prev_id, prefix, bit_pos)` for 8-bit MSB-first length emission.
+/// Length emission is once-per-match with the match count ~30 % of
+/// Content tokens, so the per-slot observation rate is ~3× lower
+/// than `token_id_bit` (16-bit × every token). K=24 → 16 Mi slots
+/// × 4 bytes = 64 MiB. Mirrors the dict-id Order-1 size budget,
+/// 3 bits less than dict-id because the observation rate is ~8× lower.
+const LZ_LENGTH_BIT_K: u32 = 24;
+/// Phase 24a: bit-level Order-2 LZ-length predictor. Context =
+/// `(p2, prev_id, prefix, bit_pos)`. K=27 (128 MiB), 3 bits more
+/// than Order-1 — matches the dict-id Order-1→Order-2 ratio.
+const LZ_LENGTH_BIT_O2_K: u32 = 27;
+/// Phase 24a: hash-table size for the `lz_length` bit-level mixer.
+/// Keyed on `(bit_pos, prefix)` — 8 × 128 = 1 K cells. K=10 covers
+/// it without collisions.
+const LZ_LENGTH_MIXER_K: u32 = 10;
+/// Phase 24a: bit count for LZ-length MSB-first emission.
+/// `length_token = length - MIN_MATCH` ranges 0..=255 → 8 bits.
+const LZ_LENGTH_BITS: u32 = 8;
+/// Phase 24a: arm count of the `lz_length` mixer.
+/// `[Order-1, Order-2]`. LR/MLP arms are deferred to 24b/c after
+/// the Order-1+2 baseline is calibrated.
+const N_MIX_LZ_LENGTH: usize = 2;
+
 /// Phase-22 / Phase-23A / Phase-23D: number of predictors in the
 /// `dict_id` mixer. `[Order-1, Order-2, Wiki, SparseLR, MLP]`. The
 /// 5th arm is a small online MLP ([`crate::neural::OnlineMLP`])
@@ -414,8 +438,26 @@ struct Models {
     /// Phase-19h: Order-1 `lz_offset_bucket`. Context = hashed
     /// `prev_id` mod `LZ_MATCH_NCTX`.
     lz_offset_bucket_o1: Order1Ctx<LZ_MATCH_NCTX, OFFSET_BUCKET_ALPHABET>,
-    /// Phase-19h: Order-1 `lz_length`.
+    /// Phase-19h → Phase-24a: legacy Order-1 `lz_length` 256-way
+    /// count CDF. Retained only to support the panel-historical
+    /// baseline regression; the actual encode/decode path uses
+    /// [`Self::lz_length_bit_o1`] / `_o2` bit-level predictors as of
+    /// Phase 24a. Reserved for the deferred LR/MLP-arm extension
+    /// in 24b/c.
+    #[allow(dead_code)]
     lz_length_o1: Order1Ctx<LZ_MATCH_NCTX, 256>,
+    /// Phase-24a: bit-level Order-1 `lz_length` predictor — context
+    /// = `(prev_id, prefix, bit_pos)`. Replaces the 256-way count
+    /// CDF with an MSB-first 8-bit chain, allowing per-bit-position
+    /// conditional distributions and Order-2 mixing.
+    lz_length_bit_o1: BitPredictor,
+    /// Phase-24a: Order-2 `lz_length` predictor — `(p2, prev_id,
+    /// prefix, bit_pos)`. Wins on warm bigrams where the
+    /// `prev_prev_id` adds genuine information beyond `prev_id`.
+    lz_length_bit_o2: BitPredictor,
+    /// Phase-24a: mixer for `lz_length` bit-level predictors.
+    /// Blends Order-1 / Order-2 per `(bit_pos, prefix)`.
+    lz_length_mixer: LogitMixer<N_MIX_LZ_LENGTH>,
 
     /// Phase-20j: Order-4 OOV word letter model. Context =
     /// `p4 * 27^3 + p3 * 27^2 + p2 * 27 + p1`. 531441 rows × 26
@@ -506,6 +548,9 @@ impl Models {
             lz_flag: Order0::new(),
             lz_offset_bucket_o1: Order1Ctx::new(),
             lz_length_o1: Order1Ctx::new(),
+            lz_length_bit_o1: BitPredictor::new(LZ_LENGTH_BIT_K),
+            lz_length_bit_o2: BitPredictor::new(LZ_LENGTH_BIT_O2_K),
+            lz_length_mixer: LogitMixer::new(LZ_LENGTH_MIXER_K, MIXER_LR),
             oov_word_letter: Order1Ctx::new(),
             oov_sep_byte: Order1Ctx::new(),
             case_pattern_global: Order0::new(),
@@ -627,10 +672,12 @@ impl Codec for XmlTokRouteCodec {
                             }
 
                             let length_token = length_us - tok_lz::MIN_MATCH;
-                            let mut length_cdf = [0u32; 257];
-                            models.lz_length_o1.cdf_to(row, &mut length_cdf);
-                            enc.encode(&length_cdf, length_token);
-                            models.lz_length_o1.observe(row, length_token);
+                            encode_lz_length(
+                                &mut enc,
+                                &mut models,
+                                ctx,
+                                u32::try_from(length_token).expect("length_token fits u32"),
+                            );
 
                             comp.lz_match += enc.bits_written() - lz_before;
 
@@ -934,11 +981,9 @@ impl Codec for XmlTokRouteCodec {
                             (1u32 << bucket_u32) + rel
                         };
 
-                        let mut length_cdf = [0u32; 257];
-                        models.lz_length_o1.cdf_to(row, &mut length_cdf);
-                        let length_token = dec.decode(&length_cdf)?;
-                        models.lz_length_o1.observe(row, length_token);
-                        let length = tok_lz::MIN_MATCH + length_token;
+                        let length_token = decode_lz_length(&mut dec, &mut models, ctx)?;
+                        let length =
+                            tok_lz::MIN_MATCH + usize::try_from(length_token).expect("length fits");
 
                         let stream_len = matcher.stream_len();
                         let src_start =
@@ -1781,6 +1826,88 @@ fn encode_dict_id(enc: &mut AcEncoder<'_>, models: &mut Models, ctx: PredCtx, id
         observe_id_bit(models, ctx, prefix, bit_pos, bit, p_zeros);
         prefix = (prefix << 1) | bit;
     }
+}
+
+/// Phase-24a: read both `lz_length` bit predictors' `P(bit = 0)`
+/// and the mixer-blended value. Context = same `(prev_id, prefix,
+/// bit_pos)` hash space as the dict-id bit predictors — each
+/// `BitPredictor` has its own backing storage so the hash reuse
+/// doesn't cause weight collisions.
+fn length_bit_p_zeros(
+    models: &Models,
+    ctx: PredCtx,
+    prefix: u32,
+    bit_pos: u32,
+) -> [u32; N_MIX_LZ_LENGTH] {
+    let ctx_o1 = id_bit_ctx(ctx.p1, prefix, bit_pos);
+    let ctx_o2 = id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos);
+    [
+        models.lz_length_bit_o1.predict_p_zero(ctx_o1),
+        models.lz_length_bit_o2.predict_p_zero(ctx_o2),
+    ]
+}
+
+/// Phase-24a: observe one `lz_length` bit in both base predictors
+/// and the mixer.
+fn observe_length_bit(
+    models: &mut Models,
+    ctx: PredCtx,
+    prefix: u32,
+    bit_pos: u32,
+    bit: u32,
+    p_zeros: [u32; N_MIX_LZ_LENGTH],
+) {
+    let ctx_o1 = id_bit_ctx(ctx.p1, prefix, bit_pos);
+    let ctx_o2 = id_bit_ctx_o2(ctx.p2, ctx.p1, prefix, bit_pos);
+    let mixer_ctx = mixer_id_ctx(bit_pos, prefix);
+    models.lz_length_bit_o1.observe(ctx_o1, bit);
+    models.lz_length_bit_o2.observe(ctx_o2, bit);
+    models.lz_length_mixer.observe(mixer_ctx, &p_zeros, bit);
+}
+
+/// Phase-24a: encode `length_token` (0..=255) MSB-first using the
+/// mixer-blended `P(bit=0)`. Replaces the Phase-19h
+/// `lz_length_o1.cdf_to` count CDF, capturing per-bit-position
+/// conditional structure that an Order-1 count CDF can't.
+fn encode_lz_length(
+    enc: &mut AcEncoder<'_>,
+    models: &mut Models,
+    ctx: PredCtx,
+    length_token: u32,
+) {
+    let mut prefix: u32 = 0;
+    for bit_pos in (0..LZ_LENGTH_BITS).rev() {
+        let bit = (length_token >> bit_pos) & 1;
+        let p_zeros = length_bit_p_zeros(models, ctx, prefix, bit_pos);
+        let p_mixed = models
+            .lz_length_mixer
+            .predict(mixer_id_ctx(bit_pos, prefix), &p_zeros);
+        let cdf = [0u32, p_mixed, TOTAL];
+        enc.encode(&cdf, bit as usize);
+        observe_length_bit(models, ctx, prefix, bit_pos, bit, p_zeros);
+        prefix = (prefix << 1) | bit;
+    }
+}
+
+/// Phase-24a: decode an 8-bit `length_token` MSB-first using the
+/// mixer-blended `P(bit=0)`. Mirror of `encode_lz_length`.
+fn decode_lz_length(
+    dec: &mut AcDecoder<'_, '_>,
+    models: &mut Models,
+    ctx: PredCtx,
+) -> Result<u32> {
+    let mut prefix: u32 = 0;
+    for bit_pos in (0..LZ_LENGTH_BITS).rev() {
+        let p_zeros = length_bit_p_zeros(models, ctx, prefix, bit_pos);
+        let p_mixed = models
+            .lz_length_mixer
+            .predict(mixer_id_ctx(bit_pos, prefix), &p_zeros);
+        let cdf = [0u32, p_mixed, TOTAL];
+        let bit = u32::try_from(dec.decode(&cdf)?).expect("bit symbol fits u32");
+        observe_length_bit(models, ctx, prefix, bit_pos, bit, p_zeros);
+        prefix = (prefix << 1) | bit;
+    }
+    Ok(prefix)
 }
 
 /// Phase-23B: feature hashes shared by the `lz_flag` and

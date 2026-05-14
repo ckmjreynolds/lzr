@@ -13,6 +13,86 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 24a: Bit-Level `lz_length` Predictor — 1.854 bpb on Enwik9 (-0.0092 bpb)
+
+Acting on the Phase 23P/Q direction signal — `lz_match_ac` is 53.8 % of total bits, and the offset/length CDFs were still pure `Order1Ctx` count predictors. Replaced the 256-way `lz_length_o1` count CDF with a bit-level MSB-first 8-bit predictor stack matching the dict-id Order-1+Order-2+mixer pattern. The expected gain: order-of-magnitude bigger than any Phase 23 increment because the source stream is much larger and the count CDF was leaving conditional structure unmodeled.
+
+### What landed
+
+1. **`lz_length_bit_o1: BitPredictor`** at `K=24` (16 Mi slots, 64 MiB). Context = `(prev_id, prefix, bit_pos)` via the dict-id's `id_bit_ctx` hash (separate backing table, so no weight collisions).
+2. **`lz_length_bit_o2: BitPredictor`** at `K=27` (128 Mi slots, 512 MiB). Context = `(p2, prev_id, prefix, bit_pos)` via `id_bit_ctx_o2`. Same K-ratio as dict-id Order-1→Order-2.
+3. **`lz_length_mixer: LogitMixer<2>`** at `K=10` keyed on `(bit_pos, prefix)`. Blends Order-1 and Order-2 per bit position.
+4. **`encode_lz_length` / `decode_lz_length`** — 8-bit MSB-first loop matching `encode_dict_id`. Replaces the `lz_length_o1.cdf_to → enc.encode` pair in encode (one site) and decode (one site).
+5. **`length_bit_p_zeros` / `observe_length_bit`** helpers parallel to `id_bit_p_zeros` / `observe_id_bit`.
+
+The Order1Ctx `lz_length_o1` field is retained (marked `#[allow(dead_code)]`) — kept for the LR/MLP arm extension landing in 24b/c where the legacy CDF can be a 3rd mixer arm.
+
+### Results
+
+| Config | enwik8 e2e bpb | enwik9 e2e bpb | enwik9 bytes | Δ vs Phase 23Q |
+|---|---:|---:|---:|---:|
+| Phase 23Q | 2.0940 | 1.8632 | 232,896,116 | — |
+| **Phase 24a** | **2.0906** | **1.8540** | **231,753,538** | **-0.0034 / -0.0092 / -1.09 MiB** |
+
+Roundtrip OK. Encode 762 s vs 23Q's 795 s (**-4 %, faster**). Decode 526 s vs 514 s (+2 %). Memory +576 MiB (mostly the Order-2 table at K=27).
+
+The encode speed-up is real: the bit-level path emits 8 AC events of 2 symbols vs the count-CDF path emitting 1 AC event of 257 symbols; the AC encoder is faster per-event than per-symbol when the symbol cardinality is high, and the bit-level loop's per-iteration arithmetic is cheaper than the cumulative-CDF setup the count path required.
+
+### Panel decomposition shift (enwik8, 20×256 KiB)
+
+Per-component delta vs Phase 23Q:
+
+| Component | 23Q bits | 24a bits | Δ | bpb impact |
+|---|---:|---:|---:|---:|
+| `lz_match_ac` | 6,677,868 | 6,404,538 | **-273,330** | **-0.0521** |
+| `token_hit_ac` | 3,195,669 | 3,196,666 | +997 | +0.0002 |
+| `case_ac` | 425,507 | 425,191 | -316 | -0.0001 |
+| `tag_ac` | 65,238 | 65,369 | +131 | +0.0000 |
+| `token_oov_ac` | 2,006,805 | 2,006,970 | +165 | +0.0000 |
+| **panel total** | 12,393,963 | 12,121,995 | **-271,968** | **-0.0519** |
+
+Panel mean 2.364 → 2.312 (-0.052 bpb). The entire panel win lives in `lz_match_ac` — exactly the targeted stream. The new bit-level predictor's per-bit-position conditional CDF captures structure the 256-way count predictor was averaging over.
+
+### Why this is structurally different from Phase 23P
+
+Phase 23P's MLP-on-lz_flag also moved `lz_match_ac` (-56,844 bits panel), but only on the 1-bit `lz_flag` portion of the stream. Phase 24a touches the **8-bit `lz_length`** portion. The lz_match stream's bit budget is dominated by length and offset bits, not the flag bit, so this is closer to the real lever.
+
+The panel-vs-e2e ratio is also closer to 1:1 than the MLP additions:
+- Phase 23P: panel -0.011, e2e -0.0007 → ~16× shrinkage
+- Phase 23Q: panel -0.004, e2e -0.0007 → ~6× shrinkage
+- **Phase 24a: panel -0.052, e2e -0.0092 → ~6× shrinkage**
+
+The bit-level predictor's e2e shrinkage is the same factor as Phase 23Q's MLP, suggesting the new architecture isn't itself overfitting on the panel — the absolute panel gain is just 13× larger.
+
+### Phase 24a cumulative on enwik9
+
+| Phase | enwik9 bytes | enwik9 bpb | Δ vs Phase 19k |
+|---|---:|---:|---:|
+| Phase 23N | 233,195,523 | 1.8656 | -0.1279 |
+| Phase 23O | 233,070,347 | 1.8646 | -0.1289 |
+| Phase 23P | 232,992,379 | 1.8639 | -0.1296 |
+| Phase 23Q | 232,896,116 | 1.8632 | -0.1303 |
+| **Phase 24a** | **231,753,538** | **1.8540** | **-0.1395** |
+
+Cumulative from `xml-tok` Phase 16 baseline (2.0667): **-0.2127 bpb / -22.5 MiB on enwik9**. Hutter ratio: **2.113× target** (was 2.123× at 23Q).
+
+### Memory budget after 24a
+
+`lz_length_bit_o2` at K=27 is 512 MiB — by far the biggest single new allocation. Combined with the existing predictor stack, peak RSS during enwik9 encode is now likely ~6 GiB (the 5.4 GiB measured at Phase 19k plus the 576 MiB of new tables, minus a bit for the encode-decode-buffer dedup that happens on the judging machine). Still well within the 10 GiB Hutter cap, but **the offset-bucket extension (24b) needs to budget against this** — adding another K=27 Order-2 table would push us to ~6.6 GiB, getting close to the corpus-buffer-dominated headroom.
+
+### Next direction
+
+The same architecture extends naturally to `lz_offset_bucket` (21-way, 5 MSB-first bits): Phase 24b. Expected payoff is harder to predict because the offset distribution is heavily skewed (most matches at small offsets within the recent window) and the count CDF may already be a tight fit. A panel result will tell quickly.
+
+After the offset-bucket bit-level decomposition, the remaining levers on `xml-tok-route`'s deterministic path are:
+- LR/MLP arms on the new bit-level length/offset predictors (Phase 24c) — same pattern as Phase 23A→23D took dict_id from LR to MLP.
+- Increase `lz_length_bit_o2` K (currently 27; observation rate is high enough that K=28 might pay).
+- Phase 25: bring per-page caching back as an MLP feature — the Phase 23O page_offset_bucket was the cheap version of this; a token-cache hit predictor is the richer version.
+
+Step C — pretrained-and-embedded transformer — remains the only path to closing the ~1 bpb residual to Hutter; Phase 24a's -0.0092 / -1.09 MiB is the biggest *deterministic* increment recorded, but it's still 10× too small per phase if we're to reach 0.878 bpb by deterministic mining alone.
+
+---
+
 ## 2026-05-14 — Phase 23Q: `wiki_depth_bucket` Coarse Feature — 1.863 bpb on Enwik9
 
 Following Phase 23N's direction signal, exposed the `WikiFineClassifier`'s internal nesting state as a new MLP feature. `ctx.wiki` (5-mode `WikiFine`) carries the *innermost* mode (Plain / LinkTarget / LinkDisplay / TemplateName / TemplateArg) but not the *depth* — a depth-1 link inside Plain looks identical to a depth-2 link inside a template. The recon suggested depth-2+ templates skew toward citation arguments (digits, ISBN, dates) while depth-1 templates are mostly infoboxes (English prose values).
