@@ -13,6 +13,68 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Correction to Step C Readiness Decision: Pretrained, Not Online-Trained
+
+The 2026-05-14 "Step C Readiness Decision" entry below mis-framed Step C as online-trained (NNCP-pattern) and proposed a "1-4 M params" model. Two parts of the constraint structure were wrong and the correction matters:
+
+### What was wrong
+
+1. **"Online-trained"** — Hutter does not constrain *training* compute. Training is offline (GPUs, weeks, anything we have access to). The compete-on-the-judge's-machine constraint is **test-time wall clock** for encode + decode. So Step C should be **pretrained** and **embedded**, not online-trained. NNCP uses online training because it ships with no prior weights; we should use the pretrained pattern because we can.
+2. **Test-time FLOPS budget was understated**. The previous entry estimated ~1 GFLOP/s single-core scalar Rust and concluded "char-RNN-scale, ~40 K-200 K params." Realistic single-core with `target-cpu=native` auto-vec (AVX2 / NEON 8-wide SIMD f32) is **5-10 GFLOPS**. Combined with the ~8 hr test-time headroom after subtracting the deterministic stack's ~26 min, the per-token forward budget is **~1 M FLOPS / token**, not ~200 K.
+
+### Corrected constraint table
+
+| Constraint | Bound | Source |
+|---|---|---|
+| Training compute | unlimited (offline) | Hutter judge rule |
+| Test-time wall clock | ~9-12 hr total encode+decode | 70K / Geekbench5 hours per CLAUDE.md |
+| Single-core scalar FLOPS | ~5-10 GFLOPS f32 with auto-vec | empirical for AVX2 / NEON |
+| Headroom after deterministic stack | ~8 hr ≈ 160 TFLOPS | total - current 26 min |
+| Per-token forward budget | ~1 M FLOPS | 160 TFLOPS / 150 M tokens |
+| L(D) weight tax | 1× embedded-weight bytes | Hutter scoring (single-binary submission) |
+
+### v1 precedent
+
+CLAUDE.md records v1's neural arm as a **4 M-param RWKV byte-level**, fit within this same budget. v1's ensemble result (1.985 bpb on enwik8) included the RWKV contribution of approximately -0.06 bpb. Two implications:
+- 4 M-param models *do* fit the test-time budget — this is the empirical reference scale.
+- v1's RWKV was online-trained (no embedded weights); a pretrained variant should perform substantially better at the same parameter count because the optimizer doesn't have to discover language from scratch during a single pass over the corpus.
+
+### Corrected Step C target
+
+| Spec | Corrected value | (Previous entry's value) |
+|---|---|---|
+| Model | Pretrained byte- or BPE-level transformer / RWKV / SSM | (online-trained) |
+| Params | **1-10 M** | (1-4 M, but for online training) |
+| Pretraining | Wikipedia-like corpus, weeks of GPU time, offline | (none — online SGD) |
+| Quantization | Int8 mandatory; int4 desirable | (not analyzed) |
+| L(D) weight cost | ~1-10 MB embedded | (~0 — was wrong; pretrained weights *do* pay L(D)) |
+| Per-token FLOPS | ~1-10 M (1× param) | (~30-80 K) |
+| Integration | N+1-th arm on `token_id_mixer` first (LZ stream second) | (same — unchanged) |
+
+### L(D) math for Hutter
+
+To win Hutter (target 0.878 bpb, current 1.844 bpb, gap **-0.966 bpb on archive content**), the neural arm at e.g. **4 MB int8 weights** pays an L(D) tax of ~0.03 bpb. So the arm's archive-content contribution needs to be ≥ **-0.99 bpb**. For reference: NNCP-solo hits ~0.86 bpb, cmix-ensemble hits ~1.10 bpb.
+
+### Honest feasibility framing
+
+A 4 MB pretrained transformer giving -0.5 to -0.8 bpb on archive content (realistic for ~4 M pretrained params after quantization vs random init) puts v3 in the **1.0-1.3 bpb range** — substantially beats v1 (which was 1.985 on enwik8), closes most of the residual, but **still ~0.2-0.4 bpb above Hutter**. Closing fully requires either:
+- A bigger pretrained model (more L(D), tight against the budget — diminishing returns past ~50 MB quantized)
+- An ensemble of arms (transformer + PPM + improved deterministic), cmix-class strategy
+- A different decomposition altogether (cross-stream prediction, span-level features)
+
+The honest assessment: **Step C as one arm probably does not win Hutter solo**. It moves the codec from "deterministic-saturated" to "competitive with cmix-class on enwik9," and a Hutter win is then an ensemble question. This is still the right next phase — every alternative direction has smaller headroom and stalls sooner.
+
+### Work-breakdown revision
+
+The previous entry's 6-step ~3-4 week estimate is roughly intact for the Rust inference path, mixer integration, and tuning. The new work the corrected framing adds:
+- **Pretraining infrastructure** (PyTorch or JAX, GPU rented for ~$200-2000 of compute, weeks of background training while the inference path lands)
+- **Quantization-aware fine-tuning** (post-training int8 / int4 quantization with calibration on a held-out enwik subset)
+- **Weight-embedding mechanism** (Rust `const` arrays from a baked binary, or a compressed weight file embedded via `include_bytes!`)
+
+Total Step C work estimate: **~4-6 weeks** (vs the previous entry's ~3-4). The pretraining can run in the background while the inference + integration code is built and tested against a dummy model with random weights; the real pretrained weights swap in once available.
+
+---
+
 ## 2026-05-14 — Phase 24e: Wider LZ-Length Order-2 (K=27→28) — Flat / Reverted
 
 Tested the second hypothesis from Phase 24c's "next direction" block: bump `LZ_LENGTH_BIT_O2_K` from 27 (512 MiB) to 28 (1 GiB) to probe whether the bit-level Order-2 stream is observation-limited or capacity-limited. The Phase 24d saturation finding suggested observation-limited, but K-bumps are a cheap direct test.
