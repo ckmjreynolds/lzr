@@ -174,6 +174,129 @@ impl ByteTransformer {
         logits
     }
 
+    /// Single-step streaming forward with KV caching. Feeds one new
+    /// token and returns the `[vocab_size]` next-byte logits for it.
+    /// `cache` must be sized for this model's config and must have
+    /// `cache.pos < cfg.context` (caller resets the cache between
+    /// `context`-sized chunks; absolute position embeddings tie us
+    /// to the trained 0..context window).
+    ///
+    /// Per-call cost vs the batched `forward`:
+    /// - `forward(seq_len=t)`: `O(t · n_layer · (d_model^2 + d_model · d_ff + d_model · t))`
+    /// - `forward_step` (`cache.pos = p`): `O(n_layer · (d_model^2 + d_model · d_ff + d_model · p))`
+    ///
+    /// — i.e., the per-token cost scales linearly in the cache size,
+    /// not quadratically. For 1024-byte chunks the speedup vs
+    /// re-batching the full chunk every step is ~512×.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::needless_range_loop,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        clippy::similar_names
+    )]
+    pub(crate) fn forward_step(&self, cache: &mut KvCache, token: u8) -> Vec<f32> {
+        let cfg = &self.cfg;
+        assert_eq!(cache.layers.len(), cfg.n_layer);
+        assert!(
+            cache.pos < cfg.context,
+            "KV cache full at pos={} (context={}); caller must reset between chunks",
+            cache.pos,
+            cfg.context
+        );
+        let d = cfg.d_model;
+        let h = cfg.n_head;
+        let hd = cfg.head_dim();
+        let p = cache.pos;
+
+        // Token + position embedding.
+        let mut x = vec![0f32; d];
+        let tok_row = &self.tok_emb[token as usize * d..(token as usize + 1) * d];
+        let pos_row = &self.pos_emb[p * d..(p + 1) * d];
+        for i in 0..d {
+            x[i] = tok_row[i] + pos_row[i];
+        }
+
+        for (l, block) in self.blocks.iter().enumerate() {
+            // ---- attention residual branch ----
+            let mut x_norm = vec![0f32; d];
+            x_norm.copy_from_slice(&x);
+            rmsnorm_inplace(&mut x_norm, &block.norm1_w);
+
+            // Compute Q, K, V for just this token.
+            let mut qkv = vec![0f32; 3 * d];
+            matmul_x_w_t(&x_norm, &block.qkv_w, &mut qkv, 1, d, 3 * d);
+
+            // Stash this position's K and V into the per-layer cache.
+            let layer_cache = &mut cache.layers[l];
+            layer_cache.k[p * d..(p + 1) * d].copy_from_slice(&qkv[d..2 * d]);
+            layer_cache.v[p * d..(p + 1) * d].copy_from_slice(&qkv[2 * d..3 * d]);
+
+            // Per-head attention against all cached positions 0..=p.
+            let mut attn_out = vec![0f32; d];
+            for head in 0..h {
+                let q_h = &qkv[head * hd..head * hd + hd];
+
+                // Scores [p+1].
+                let scale = 1.0 / (hd as f32).sqrt();
+                let mut scores = vec![0f32; p + 1];
+                for j in 0..=p {
+                    let kj = &layer_cache.k[j * d + head * hd..j * d + head * hd + hd];
+                    let mut s = 0f32;
+                    for i in 0..hd {
+                        s += q_h[i] * kj[i];
+                    }
+                    scores[j] = s * scale;
+                }
+                softmax_inplace(&mut scores);
+
+                // Weighted sum of cached V.
+                let out_h = &mut attn_out[head * hd..head * hd + hd];
+                for j in 0..=p {
+                    let vj = &layer_cache.v[j * d + head * hd..j * d + head * hd + hd];
+                    let s_j = scores[j];
+                    for i in 0..hd {
+                        out_h[i] += s_j * vj[i];
+                    }
+                }
+            }
+
+            // Output projection + residual.
+            let mut proj_out = vec![0f32; d];
+            matmul_x_w_t(&attn_out, &block.proj_w, &mut proj_out, 1, d, d);
+            for i in 0..d {
+                x[i] += proj_out[i];
+            }
+
+            // ---- FFN residual branch ----
+            x_norm.copy_from_slice(&x);
+            rmsnorm_inplace(&mut x_norm, &block.norm2_w);
+
+            let mut ff_hidden = vec![0f32; cfg.d_ff];
+            matmul_x_w_t(&x_norm, &block.fc1_w, &mut ff_hidden, 1, d, cfg.d_ff);
+            gelu_inplace(&mut ff_hidden);
+
+            let mut ff_out = vec![0f32; d];
+            matmul_x_w_t(&ff_hidden, &block.fc2_w, &mut ff_out, 1, cfg.d_ff, d);
+            for i in 0..d {
+                x[i] += ff_out[i];
+            }
+        }
+
+        // Final RMSNorm + tied output projection.
+        rmsnorm_inplace(&mut x, &self.norm_f);
+        let mut logits = vec![0f32; cfg.vocab_size];
+        matmul_x_w_t(&x, &self.tok_emb, &mut logits, 1, d, cfg.vocab_size);
+
+        cache.pos += 1;
+        logits
+    }
+
+    /// Allocate a fresh KV cache sized for this model.
+    pub(crate) fn new_kv_cache(&self) -> KvCache {
+        KvCache::new(&self.cfg)
+    }
+
     #[allow(
         clippy::many_single_char_names,
         clippy::needless_range_loop,
@@ -273,6 +396,41 @@ impl ByteTransformer {
         for i in 0..t * d {
             x[i] += s.h2[i];
         }
+    }
+}
+
+/// Per-layer K and V cache for streaming inference. Sized for the
+/// model's `context` length; the caller resets `pos` to 0 at every
+/// `context`-boundary so the trained absolute position embeddings
+/// stay in-distribution.
+#[derive(Debug)]
+pub(crate) struct KvCache {
+    pub(crate) layers: Vec<KvCacheLayer>,
+    pub(crate) pos: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct KvCacheLayer {
+    pub(crate) k: Vec<f32>, // [context, d_model]
+    pub(crate) v: Vec<f32>, // [context, d_model]
+}
+
+impl KvCache {
+    pub(crate) fn new(cfg: &TransformerConfig) -> Self {
+        let layers = (0..cfg.n_layer)
+            .map(|_| KvCacheLayer {
+                k: vec![0f32; cfg.context * cfg.d_model],
+                v: vec![0f32; cfg.context * cfg.d_model],
+            })
+            .collect();
+        Self { layers, pos: 0 }
+    }
+
+    /// Reset cursor to 0; storage stays allocated. Only positions
+    /// `0..pos` are ever read in `forward_step`, so leftover bytes
+    /// beyond the old `pos` don't need zeroing.
+    pub(crate) const fn reset(&mut self) {
+        self.pos = 0;
     }
 }
 
@@ -572,6 +730,44 @@ mod tests {
     #[test]
     fn pytorch_logit_parity_medium_42_step20000() {
         run_parity_check("medium_42_step20000");
+    }
+
+    /// `forward` and `forward_step` must produce identical (within
+    /// f32 noise) logits for the same input. This is the contract
+    /// that makes the streaming KV-cache path safe to use in the
+    /// codec: per-byte streaming predictions match the batched
+    /// reference exactly.
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn forward_step_matches_forward() {
+        let lzrn_path = "/Users/creynolds/Programming/lzr-neural/ckpts/small_42_step2000.lzrn";
+        if !std::path::Path::new(lzrn_path).exists() {
+            eprintln!("parity artifacts missing — skipping");
+            return;
+        }
+        let model = ByteTransformer::load_lzrn(&std::fs::read(lzrn_path).unwrap()).unwrap();
+        let seq_len: u8 = 32;
+        let input: Vec<u8> = (0..seq_len).collect();
+        let reference = model.forward(&input);
+        let vocab = model.cfg.vocab_size;
+
+        let mut cache = model.new_kv_cache();
+        let mut max_abs = 0f32;
+        for (i, &tok) in input.iter().enumerate() {
+            let step_logits = model.forward_step(&mut cache, tok);
+            let ref_slice = &reference[i * vocab..(i + 1) * vocab];
+            for (a, b) in step_logits.iter().zip(ref_slice.iter()) {
+                let d = (a - b).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+            }
+        }
+        eprintln!("forward_step vs forward: max_abs={max_abs:.6}");
+        assert!(
+            max_abs < 1e-3,
+            "forward_step diverges from forward: max_abs={max_abs}"
+        );
     }
 
     #[test]
