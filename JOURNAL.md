@@ -13,6 +13,98 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-15 — Phase 27: First-Light Ensemble Integration — Neural Arm Improves the Codec
+
+After Phase 26.5 produced the deployable `nano_plus_42_step20000` model, CDR/Claude wired it into `xml_tok_route` as a mixing arm on the `token_oov_sep` byte stream. Working end-to-end on first attempt; bpb improves with every panel window; bit-decomposition isolates the gain to exactly the targeted stream.
+
+### Integration mechanics
+
+`src/neural_arm.rs` (new) — `NeuralArm` wrapper holding the loaded `ByteTransformer` + persistent `KvCache`. Exposes:
+- `feed(byte)` — advance state by one source byte; the cache cycles every `context` steps automatically.
+- `mix_byte_cdf(existing, weight, out)` — blend a 257-way AC CDF with the arm's softmax-over-256 prediction in `f64` cumulative space, then enforce strict monotonicity (every byte ≥ 1 unit of AC mass).
+
+`xml_tok_route`:
+- `Models::neural_arm: Option<NeuralArm>` field, loaded from `LZR_NEURAL_WEIGHTS` env var.
+- After `prewarm`: pre-feed all warm bytes through the arm so its state matches the byte stream the decoder will reconstruct.
+- Inside `encode_oov_sep_bytes` / `decode_oov_sep_bytes`: mix the existing Order-2 byte CDF with the neural arm's prediction (50/50 weight) for each emission, then feed the byte to advance state. Interleaved feeding so each byte's prediction sees only prior bytes.
+- After every main-loop iteration: catch-up feed for any source bytes the OOV-sep path didn't consume (dict-id hits, OOV-word, tag/attr emissions).
+
+The two feeding paths are mutually exclusive via `fed_count` tracking, so both encode and decode see exactly the same byte sequence and the AC roundtrip is preserved bit-for-bit.
+
+### Bench result (enwik8, 20 × 256 KiB measure windows)
+
+| Config | Panel bpb |
+|---|---:|
+| Baseline xml-tok-route | 2.182 |
+| **+ `nano_plus` on `token_oov_sep`, weight=0.5** | **2.149** |
+| **Δ** | **-0.033 bpb** |
+
+Every single window improved (no signs of regression on any offset).
+
+### Bit-decomposition by stream (5.24 MB source bytes)
+
+| Stream | 24c baseline bits | Phase 27 + neural bits | Δ | % change |
+|---|---:|---:|---:|---:|
+| `lz_match_ac` | 5,719,536 | 5,717,914 | -1,622 | ~0 % (noise) |
+| `token_hit_ac` | 3,197,717 | 3,198,275 | +558 | ~0 % (noise) |
+| **`token_oov_ac`** | **2,007,671** | **1,835,040** | **-172,531** | **-8.6 %** |
+| `case_ac` | 424,067 | 425,253 | +1,186 | ~0 % (noise) |
+
+**The entire panel saving comes from `token_oov_ac`** — exactly where the neural arm operates. 172,531 bits / 5,242,880 source bytes = 0.033 bpb, matching the headline panel delta to three decimals. Other streams move within noise (≤2 % relative).
+
+This is the cleanest "integration works as designed" signal you can ask for: targeted stream improves, other streams don't, and the magnitudes balance to the byte.
+
+### Roundtrip preservation
+
+Bench's verify-decode step ran on every window with `LZR_NEURAL_WEIGHTS` set — encoder and decoder both invoke `NeuralArm` in lockstep, so the AC stream is bit-identical and decode reconstructs the original bytes exactly. The 168 baseline tests still pass when `LZR_NEURAL_WEIGHTS` is unset.
+
+### What this implies for the enwik9 e2e number
+
+The panel is enwik8 (different corpus than enwik9), measures with 4 MiB warm + 256 KiB measure (vs e2e's full-corpus warm), and reports source-byte-attributed bpb across all streams. e2e enwik9 measures with the *full corpus* and amortizes warm-up costs to ~0.
+
+Two opposing effects between panel and e2e:
+1. **Cold-start cost amortizes** — the OOV-sep byte model's prewarm at panel scale is much shorter than e2e's, so panel underweights the long-tail savings.
+2. **Order-N byte model warms up further** — at e2e scale the existing Order-2 byte model has seen ~50× more observations and is harder for the neural arm to beat.
+
+These pull in opposite directions; net effect ~unknown without measurement. The [[feedback-mlp-panel-vs-e2e]] memory observes panel/e2e shrinkage of 5-22× for *MLP-over-LR* arm additions; this case is different (a byte-level transformer on a byte stream, not an MLP on bit-level) so the shrinkage factor likely differs. **Realistic enwik9 e2e estimate: -0.01 to -0.03 bpb on the deterministic codec's 1.844.**
+
+### Hutter math, updated
+
+| Component | bpb | L(D) tax |
+|---|---:|---:|
+| Phase 24c deterministic (codec only) | 1.844 | — |
+| Projected enwik9 with Phase 27 neural arm (mid estimate) | ~1.82 | ~0.0018 (221 K params × int8) |
+| **Net Hutter bpb projection** | **~1.82** | — |
+| Hutter target | 0.878 | — |
+| Gap remaining | **~0.94 bpb** | — |
+
+A meaningful step but, as expected for a 221 K-param byte-level arm mixing on just one stream, **not** a closing-the-gap event. The integration framework is now built; subsequent gains come from:
+
+1. **Extending to other byte-aligned streams** (`case_ac` 3.6 %, `attr_ac` ~1 %, `tag_ac` ~2 %). Estimated additional gain: -0.005 to -0.02 bpb.
+2. **Learned per-context weight** instead of fixed 0.5 (LogitMixer-style adaptive blending). Estimated additional gain: -0.005 to -0.015 bpb.
+3. **Dict-id projection** (Phase 27 originally targeted this; deferred when byte-aligned proved cheaper to validate). Project byte-level `P(byte_v[i] | context)` onto the 65 K-way dict-id distribution via top-K candidate scoring, mix into `token_id_mixer`. The `token_hit_ac` stream is 26.8 % of bits — biggest remaining lever for the neural arm. Estimated gain: -0.03 to -0.10 bpb on top of byte-aligned. Substantial engineering (~3-5 days).
+4. **Bigger neural arm** (`small`-class model, ~900 K params, ~3 M FLOPS/token). With NEON the inference budget supports it. Bigger arm → better orthogonal signal → more gain. Estimated gain when combined with dict-id integration: -0.10 to -0.20 bpb.
+
+The roadmap to ~1.65-1.75 bpb on enwik9 is now plausible from these increments. **Hutter target (0.878) still requires the cmix-class multi-arm ensemble approach** — a single byte-level transformer arm of any size that fits the wall-clock budget cannot close the full 0.97 bpb gap alone.
+
+### Build invariants preserved
+
+`./build.sh` green with default features and `--no-default-features` ⇒ same clippy pedantic+nursery + 168 tests + nightly coverage. The `LZR_NEURAL_WEIGHTS=` gate means CI and submission builds without the env var behave exactly as before — opt-in only.
+
+### Next direction
+
+The byte-aligned-stream integration is shipped and working. Three reasonable next phases:
+
+A. **Quick wins**: extend the existing mixer to `case_ac` / `attr_ac` / `tag_ac`; sweep the mixer weight (try 0.2, 0.3, 0.7). Each is a few-hour change with measurable impact.
+
+B. **Learned per-context weight**: add a `LogitMixer`-style adaptive blend. ~1-2 days.
+
+C. **Dict-id projection** (the original Phase 27 target): top-K candidate scoring + per-bit projection into `token_id_mixer`. Biggest single lever remaining for the byte-level transformer. ~3-5 days.
+
+D. **e2e enwik9 measurement**: ~13 hr inference (NEON, both directions). Validates whether panel-vs-e2e shrinkage is in the expected range. Cheap if running overnight.
+
+---
+
 ## 2026-05-15 — Phase 26.5: nano_plus — Bigger Arm Inside the Post-NEON Budget
 
 After Option A's NEON kernel work raised the effective FLOPS/token budget from ~150 K (scalar) to ~700-900 K (NEON / AVX2), CDR/Claude trained an upsized variant `nano_plus` to exploit the headroom. Result: substantially stronger standalone bpb with modest inference cost increase.
