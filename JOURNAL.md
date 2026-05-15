@@ -13,6 +13,76 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-15 — Phase 25c Integration Analysis: Inference Cost Wall + Where the Transformer Can Actually Help
+
+CDR/Claude built the Rust streaming inference path (Phase 25a.5 KV cache, bit-identical to batched forward) and the `lzr neural-eval` measurement subcommand, then ran the medium model end-to-end through scalar Rust on real corpus bytes. Two findings reshape the Step C integration plan.
+
+### Finding 1 — The medium model is ~70× over the Hutter inference budget
+
+```
+medium_42_step20000 (~4.85 M params, 12.7 M FLOPS/token at ctx=1024)
+neural-eval --bytes 100000 --corpus assets/enwik9
+  → 100,000 bytes processed in 251 seconds
+  → standalone byte-level bpb: 1.7265 (vs Python's 1.357 on 10 MB —
+    different prefix; first 100 KB of enwik9 is XML metadata, denser)
+```
+
+At 0.4 KB/sec scalar single-core Rust, 1 GB of enwik9 would take **~29 days** of inference. Hutter judge wall-clock budget is ~9-12 hours for encode + decode combined. Conclusion: **the medium model is structurally too large for the submission binary**, regardless of how clean the integration is.
+
+Budget-derived inference target: ~1-2 M FLOPS/token at 5-20 GFLOPS scalar Rust → roughly **a 2-layer × 64-hidden × 256-context model (~130 K params)**. Medium was trained as the "best architecture quality data point" — it tells us how far the byte-level transformer can go; it is **not** the model that ships.
+
+### Finding 2 — Byte-aligned streams are the wrong integration target
+
+The medium model's standalone enwik9 bpb (~1.4 byte-level) is well below the LZR v3 deterministic codec's 1.844 (token-aligned). On the surface, integrating as a mixer arm anywhere looks promising. But the existing byte-aligned streams (`token_oov_ac` 16.8 %, `case_ac` 3.6 %, `attr_ac` + `tag_ac` ~4 %) emit bytes that are **uncommon by construction** (OOV tokens are the dictionary fallback), and the codec's Order-N byte CDFs already capture local n-gram structure well. The transformer's strength is long-range coherence — exactly the signal that has the smallest leverage on local OOV byte streams.
+
+Per-stream bit budget on the panel (enwik8, 20 × 256 KiB):
+
+| Stream | Panel bits | Share | bpb attribution |
+|---|---:|---:|---:|
+| `lz_match_ac` (saturated per 24d/e) | 5.72 M | 47.9 % | 1.090 |
+| `token_hit_ac` (dict-id) | 3.20 M | 26.8 % | 0.610 |
+| `token_oov_ac` | 2.01 M | 16.8 % | 0.383 |
+| `case_ac` | 0.42 M | 3.6 % | 0.081 |
+| `tag_ac`, `attr_ac`, others | ~0.59 M | ~5 % | ~0.11 |
+| **Total** | **11.94 M** | 100 % | **2.277** |
+
+A best-case byte-aligned-only integration that drops `token_oov_ac` + `case_ac` + `tag_ac` + `attr_ac` by say 30 %: 30 % × 0.66 bpb = **~0.20 bpb savings** on enwik9. Useful but not Hutter-class. The real ensemble lever is **`token_hit_ac` (the dict-id stream at 26.8 %)** — but the byte-level transformer doesn't directly predict dict-ids.
+
+### What dict-id integration would need
+
+The codec emits dict-ids as 16-bit values bit-by-bit through `token_id_mixer`. To plug the transformer in there, the byte-level `P(byte | context)` distribution must be projected into dict-id space:
+
+```
+P(dict_id = v | context) = ∏_{i=0..len(v)} P(byte_v[i] | context, byte_v[0..i])
+```
+
+i.e., for each candidate dict-id, score its byte sequence under the transformer's autoregressive distribution starting from the current context. Then normalize across all dict-ids and project to per-bit `P(bit = 0)` for each of the 16 bits.
+
+Cost: per dict-id emission, evaluate the transformer once per byte of the candidate token. The dict has ~65 K entries averaging ~5 bytes; computing the full distribution would be 65 K × 5 = 325 K forward calls per emission — completely impractical. Realistic approach: rank candidates by prior (cheap), forward-score only the top-K (say K=32), use the prior as the fallback for the tail.
+
+### Roadmap revision
+
+| Phase | Description | Status / Next |
+|---|---|---|
+| Step C / phase 25a (Rust port) | f32 forward with KV cache, parity verified | ✅ complete |
+| Step C / phase 25c byte-aligned | Integrate medium model on `token_oov_ac` — ceiling ~0.20 bpb on enwik9, model too big for Hutter inference budget | **skipped** — limited upside |
+| **Step C / phase 26** | Train a **tiny** byte-level transformer (~150 K params, 2L × 64H × ctx=256). Inference budget ~150 K FLOPS/token → ~1-2 hr for 1 GB enwik9 on scalar Rust | **next** |
+| Step C / phase 27 | Build the dict-id projection (top-K candidate scoring) and integrate as N+1-th arm on `token_id_mixer` | after 26 |
+| Step C / phase 28 | Panel + e2e enwik9 measurement; iterate on tiny architecture / dict-id projection if the ensemble win is positive | after 27 |
+| Step C / phase 29 | Int8 quantization + Rust embedded weights via `include_bytes!` | after 28 |
+
+### Why this is a course correction, not a setback
+
+The medium model run was strictly worth doing — it told us:
+1. **The architecture trains**: 5 M-param byte-level transformer to 1.36 bpb on enwik9 in 8.9 hr on Apple Silicon MPS.
+2. **The Rust port is correct**: max_abs=17e-6 vs `PyTorch` over the full forward path.
+3. **The inference cost ceiling is real**: ~150 K FLOPS/token is the budget, not the 12 M of medium.
+4. **The integration target is dict-id**, not byte-aligned streams.
+
+The next training run targets the deployable model size with full understanding of what it has to do. The path to a working Step C integration is now well-scoped: train tiny, build dict-id projection, integrate, measure.
+
+---
+
 ## 2026-05-15 — Step C `medium` Pretraining Complete — 1.357 bpb Standalone on Enwik9
 
 The 5 M-param `medium` configuration trained to completion (20 K steps, 8.93 hours on MPS). Final val_bpb on the enwik8 tail held-out split was **1.4350**; standalone evaluation on the first 10 MB of enwik9 (the Hutter target corpus) lands at **1.3568 bpb** — paq8-class byte-level, substantially below the LZR v3 deterministic codec's 1.844 bpb (token-aligned, different measurement; still a striking comparison).
