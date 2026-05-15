@@ -13,6 +13,88 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-15 — Phase 26 + Option A: Nano Model Trained, NEON Matmul Closes the Inference Gap
+
+Following the inference-cost finding in the Phase 25c analysis (medium model ~70× over Hutter budget), CDR/Claude trained a Hutter-budget-sized "nano" model and then SIMD-tuned the matmul kernel. Together these bring the neural arm inside the Hutter wall-clock envelope.
+
+### Phase 26 — nano training
+
+| Knob | Value |
+|---|---|
+| Architecture | 2 layers × 64 hidden × 4 heads (head_dim=16), d_ff=256, ctx=256 |
+| Params | 131 072 |
+| FLOPS/token (KV-cache forward at last context position) | 294 912 |
+| Training | seq_len=256, batch=32, 20 000 steps cosine LR 3e-4, AdamW, MPS |
+| Wall time | 833 s (14 min) |
+| Final val_bpb (enwik8 tail) | 2.69 (best: 2.65 at step 19 000) |
+| Standalone bpb (enwik9 first 1 MB) | 3.96 |
+| .lzrn weight size at f32 | 525 568 bytes (513 KiB) |
+| .lzrn weight size at int8 (projected) | ~131 KiB → ~0.001 bpb L(D) tax on 1 GB |
+| Rust forward parity vs `PyTorch` | max_abs=23e-6 (well under 1e-3 threshold) |
+
+The standalone enwik9 bpb of **3.96** is much weaker than medium's **1.36** — expected, since nano has 37× fewer parameters and 4× less context. But this is the deployable model: the size that fits Hutter's wall-clock budget.
+
+### Option A — SIMD matmul (NEON + AVX2)
+
+The hot kernel is `matmul_x_w_t`'s inner dot-product loop. Replacing the auto-vec'd scalar with explicit SIMD intrinsics:
+
+- **aarch64**: NEON (mandatory on aarch64; no runtime detection needed). Four independent 4-lane FMA accumulators, unrolled by 16.
+- **x86_64**: AVX2+FMA, runtime feature-detected via `is_x86_feature_detected!`. Four independent 8-lane FMA accumulators, unrolled by 32.
+- **fallback**: strict-order scalar dot product (also serves as the parity-test reference).
+
+Each path is in its own `unsafe fn` with a `#[target_feature(...)]` gate and a documented safety contract (in-bounds invariant from the slice length equality + explicit `p + N <= k` chunk checks). The crate-level `#![deny(unsafe_code)]` stands; the SIMD functions carry per-function `#[allow(unsafe_code)]`.
+
+### Speedup measurement (nano on 1 MB of enwik9)
+
+| Path | Wall time | Effective GFLOPS | Extrapolated 1 GB |
+|---|---:|---:|---:|
+| Scalar auto-vec (pre-Option-A) | 43.9 s | 6.7 | ~12.2 hr |
+| **NEON (this commit)** | **16.9 s** | **17.5** | **~4.7 hr / direction** |
+
+**Speedup: 2.6×**. Total Hutter time at 4.7 hr × 2 directions + ~26 min codec = **~9.6 hr**. Under the ~10-hr judge cap with margin. **Nano is now Hutter-deployable.**
+
+### Parity preserved
+
+All three pretraining checkpoints' parity tests pass under the NEON path:
+
+| Checkpoint | max_abs (scalar before) | max_abs (NEON now) |
+|---|---:|---:|
+| `small_42_step2000` (886 K params) | 7e-6 | 8e-6 |
+| `medium_42_step20000` (4.85 M params) | 17e-6 | 16e-6 |
+| `nano_42_step20000` (131 K params) | 23e-6 | 19e-6 |
+
+The SIMD reordering of additions changes f32 results by ~1 lane width of noise. The 1e-3 acceptance threshold is wide enough to absorb this; tight enough to catch any real arithmetic mistake.
+
+### Build invariants
+
+`./build.sh` green: cargo fmt + nightly clippy `pedantic`/`nursery` at `-Dwarnings` (default features + `--no-default-features`) + 167 release tests pass + nightly coverage. All SIMD paths gated by `cfg!(target_arch)` so the build works on every supported target. No new dependencies; the submission-binary zero-threading-dep invariant stands.
+
+### What's resolved
+
+| Question | Answer |
+|---|---|
+| Does the Rust transformer port work numerically? | ✅ max_abs=23e-6 vs `PyTorch` |
+| Does the KV cache work? | ✅ bit-identical to batched forward |
+| Can a byte-level transformer fit Hutter's wall-clock budget? | ✅ **131 K params at 295 K FLOPS/token, ~4.7 hr/direction with NEON** |
+| Will the AVX2 path on the judge machine deliver similar throughput? | **Untested** — depends on the actual Hutter judging CPU. Modern x86_64 AVX2+FMA should match aarch64 NEON within a factor of 2; if the judge runs old hardware without FMA we fall back to scalar (12 hr/direction, over budget). |
+
+### What's not yet resolved
+
+| Question | Plan |
+|---|---|
+| Does nano + the existing codec ensemble compress better than the codec alone? | Phase 27: dict-id projection + mixer integration. The unique signal nano adds is long-range context (full 256-byte window vs codec's 1-2 prev dict-ids), but the question is how much of dict-id entropy comes from that vs the codec's existing arms. Realistic gain estimate: **-0.03 to -0.06 bpb on enwik9**. |
+| Could a slightly larger model fit the new budget? | With NEON at 17.5 GFLOPS the budget rises to ~900 K FLOPS/token at 4.7 hr/direction. Doubling d_model (64→96) at the same n_layer/ctx → ~480 K FLOPS/token, ~280 K params, ~2.2 bpb expected standalone. Cheap experiment worth running before committing to nano-only. |
+| Could distillation salvage medium's quality at nano's size? | Train nano with KL-divergence loss against medium's logits. Multi-day experiment; realistic gain ~0.3-0.5 bpb on the nano floor. |
+
+### Next direction
+
+1. **Train one upsized variant** (~280 K params at d_model=96, same n_layer=2 / ctx=256): 30-60 min on MPS. Measure standalone bpb + Rust inference rate. If it's clearly better and still fits budget, that becomes the deployment model instead of nano.
+2. **Then** start Phase 27 (dict-id projection + mixer integration) with the best deployable checkpoint.
+
+The kernel-optimization win means we can deploy a more capable model than I'd budgeted for at the start of the speed-improvements work. That changes the ensemble math noticeably — instead of nano's 3.96 standalone bpb fighting the codec's 1.844, an upsized model at ~2.2 bpb is much closer to par. The transformer-arm advantage on long-range context is amplified when the arm itself is closer to the codec's bpb.
+
+---
+
 ## 2026-05-15 — Phase 25c Integration Analysis: Inference Cost Wall + Where the Transformer Can Actually Help
 
 CDR/Claude built the Rust streaming inference path (Phase 25a.5 KV cache, bit-identical to batched forward) and the `lzr neural-eval` measurement subcommand, then ran the medium model end-to-end through scalar Rust on real corpus bytes. Two findings reshape the Step C integration plan.
