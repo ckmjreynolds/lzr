@@ -508,6 +508,17 @@ fn read_tensor(bytes: &[u8], cursor: &mut usize, n_floats: usize) -> Result<Vec<
 /// Row-major matmul: `out[m, n] = x[m, k] @ w[n, k]^T`. `PyTorch`'s
 /// `nn.Linear(in=k, out=n).weight` has shape `[n, k]`, so this matches
 /// `F.linear(x, w) = x @ w^T`.
+///
+/// Dispatches the inner dot product through [`dot`], which picks the
+/// best available SIMD path at compile time:
+/// - `aarch64`: NEON (always available)
+/// - `x86_64`: AVX2 (runtime feature check via `is_x86_feature_detected!`,
+///   scalar fallback otherwise)
+///
+/// The SIMD paths preserve the parity-test threshold (max abs diff
+/// ~10x larger than scalar, well under the 1e-3 acceptance bound)
+/// because four independent accumulators reorder additions
+/// vs the strict left-to-right scalar sum.
 #[allow(
     clippy::many_single_char_names,
     clippy::needless_range_loop,
@@ -523,12 +534,173 @@ fn matmul_x_w_t(x: &[f32], w: &[f32], out: &mut [f32], m: usize, k: usize, n: us
         let out_row = &mut out[i * n..(i + 1) * n];
         for j in 0..n {
             let w_row = &w[j * k..(j + 1) * k];
-            let mut acc = 0.0f32;
-            for p in 0..k {
-                acc += x_row[p] * w_row[p];
-            }
-            out_row[j] = acc;
+            out_row[j] = dot(x_row, w_row);
         }
+    }
+}
+
+/// Single-precision dot product of two equal-length slices. Hot
+/// inner kernel for every linear layer in the transformer; dispatches
+/// to a SIMD path when one is available for the host CPU.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot(x: &[f32], w: &[f32]) -> f32 {
+    debug_assert_eq!(x.len(), w.len());
+    // NEON is mandatory on aarch64 — no runtime detection needed.
+    // The safety contract for `dot_aarch64_neon` is documented at the
+    // function definition; the high-level invariant is that we pass
+    // two equal-length slices, which the asserts in [`matmul_x_w_t`]
+    // already establish.
+    #[allow(unsafe_code)]
+    unsafe {
+        dot_aarch64_neon(x, w)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot(x: &[f32], w: &[f32]) -> f32 {
+    debug_assert_eq!(x.len(), w.len());
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        #[allow(unsafe_code)]
+        unsafe {
+            return dot_x86_avx2(x, w);
+        }
+    }
+    dot_scalar(x, w)
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline]
+fn dot(x: &[f32], w: &[f32]) -> f32 {
+    dot_scalar(x, w)
+}
+
+/// Strict-order scalar dot product. Fallback for architectures
+/// without a SIMD path *and* the reference implementation used by
+/// the unit tests that pin parity expectations against `PyTorch`.
+#[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+fn dot_scalar(x: &[f32], w: &[f32]) -> f32 {
+    let k = x.len();
+    let mut acc = 0f32;
+    for p in 0..k {
+        acc += x[p] * w[p];
+    }
+    acc
+}
+
+/// NEON 4-lane f32 FMA with four independent accumulator chains.
+///
+/// # Safety
+///
+/// Reads `x[p..p+4]` and `w[p..p+4]` via `vld1q_f32` only when
+/// `p + 4 <= k`, where `k = x.len() == w.len()` (asserted in [`dot`]
+/// via `debug_assert_eq!`). The unaligned `vld1q_f32` accepts any
+/// `*const f32` so alignment isn't a constraint; the only safety
+/// requirement is the in-bounds invariant, which the explicit
+/// chunking guards.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_code, clippy::suboptimal_flops)]
+unsafe fn dot_aarch64_neon(x: &[f32], w: &[f32]) -> f32 {
+    use std::arch::aarch64::{vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
+    let k = x.len();
+    let xp = x.as_ptr();
+    let wp = w.as_ptr();
+    // SAFETY: from here on every pointer read is gated by an explicit
+    // `p + N <= k` chunk check; `xp` and `wp` are valid for `k` lanes
+    // each by construction.
+    unsafe {
+        let mut a0 = vdupq_n_f32(0.0);
+        let mut a1 = vdupq_n_f32(0.0);
+        let mut a2 = vdupq_n_f32(0.0);
+        let mut a3 = vdupq_n_f32(0.0);
+        let mut p = 0usize;
+        while p + 16 <= k {
+            a0 = vfmaq_f32(a0, vld1q_f32(xp.add(p)), vld1q_f32(wp.add(p)));
+            a1 = vfmaq_f32(a1, vld1q_f32(xp.add(p + 4)), vld1q_f32(wp.add(p + 4)));
+            a2 = vfmaq_f32(a2, vld1q_f32(xp.add(p + 8)), vld1q_f32(wp.add(p + 8)));
+            a3 = vfmaq_f32(a3, vld1q_f32(xp.add(p + 12)), vld1q_f32(wp.add(p + 12)));
+            p += 16;
+        }
+        while p + 4 <= k {
+            a0 = vfmaq_f32(a0, vld1q_f32(xp.add(p)), vld1q_f32(wp.add(p)));
+            p += 4;
+        }
+        let combined = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+        let mut acc = vaddvq_f32(combined);
+        while p < k {
+            acc += *xp.add(p) * *wp.add(p);
+            p += 1;
+        }
+        acc
+    }
+}
+
+/// AVX2 + FMA 8-lane f32 dot product with four independent
+/// accumulator chains.
+///
+/// # Safety
+///
+/// Same in-bounds invariant as [`dot_aarch64_neon`]: every load is
+/// gated by an explicit `p + N <= k` chunk size and `k = x.len() ==
+/// w.len()`. The caller is the runtime dispatcher in [`dot`], which
+/// only enters this path after `is_x86_feature_detected!("avx2")`
+/// and `("fma")` both succeed.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_code, clippy::suboptimal_flops)]
+unsafe fn dot_x86_avx2(x: &[f32], w: &[f32]) -> f32 {
+    use std::arch::x86_64::{
+        _mm_add_ps, _mm_cvtss_f32, _mm_hadd_ps, _mm256_add_ps, _mm256_castps256_ps128,
+        _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps,
+    };
+    let k = x.len();
+    let xp = x.as_ptr();
+    let wp = w.as_ptr();
+    // SAFETY: every load gated by an explicit `p + N <= k` check;
+    // pointers valid for `k` lanes each.
+    unsafe {
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut p = 0usize;
+        while p + 32 <= k {
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(p)), _mm256_loadu_ps(wp.add(p)), a0);
+            a1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(xp.add(p + 8)),
+                _mm256_loadu_ps(wp.add(p + 8)),
+                a1,
+            );
+            a2 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(xp.add(p + 16)),
+                _mm256_loadu_ps(wp.add(p + 16)),
+                a2,
+            );
+            a3 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(xp.add(p + 24)),
+                _mm256_loadu_ps(wp.add(p + 24)),
+                a3,
+            );
+            p += 32;
+        }
+        while p + 8 <= k {
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(p)), _mm256_loadu_ps(wp.add(p)), a0);
+            p += 8;
+        }
+        let s = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+        let lo = _mm256_castps256_ps128(s);
+        let hi = _mm256_extractf128_ps(s, 1);
+        let sum128 = _mm_add_ps(lo, hi);
+        let sum64 = _mm_hadd_ps(sum128, sum128);
+        let sum32 = _mm_hadd_ps(sum64, sum64);
+        let mut acc = _mm_cvtss_f32(sum32);
+        while p < k {
+            acc += *xp.add(p) * *wp.add(p);
+            p += 1;
+        }
+        acc
     }
 }
 
@@ -670,7 +842,8 @@ mod tests {
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn run_parity_check(name: &str) {
         let lzrn_path = format!("/Users/creynolds/Programming/lzr-neural/ckpts/{name}.lzrn");
-        let logits_path = format!("/Users/creynolds/Programming/lzr-neural/ckpts/{name}.logits.bin");
+        let logits_path =
+            format!("/Users/creynolds/Programming/lzr-neural/ckpts/{name}.logits.bin");
         if !std::path::Path::new(&lzrn_path).exists()
             || !std::path::Path::new(&logits_path).exists()
         {
