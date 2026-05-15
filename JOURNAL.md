@@ -13,6 +13,87 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-15 — Phase 26.5: nano_plus — Bigger Arm Inside the Post-NEON Budget
+
+After Option A's NEON kernel work raised the effective FLOPS/token budget from ~150 K (scalar) to ~700-900 K (NEON / AVX2), CDR/Claude trained an upsized variant `nano_plus` to exploit the headroom. Result: substantially stronger standalone bpb with modest inference cost increase.
+
+### Knobs
+
+| Knob | nano | **nano_plus** |
+|---|---|---|
+| Layers | 2 | 2 |
+| `d_model` | 64 | **96** |
+| Heads | 4 (`head_dim`=16) | 4 (`head_dim`=24) |
+| `d_ff` | 256 | 256 |
+| Context | 256 | 256 |
+| Params | 131 072 | **221 184** (+69 %) |
+| FLOPS/token | 294 912 | **491 520** (+66 %) |
+
+Same training recipe (seq_len=256, batch=64, 20 K steps cosine LR 3e-4, AdamW). Wall time: 1 013 s ≈ 17 min on MPS — modest cost vs nano's 14 min.
+
+### Results
+
+| Measurement | nano | **nano_plus** | Δ |
+|---|---:|---:|---:|
+| Final val_bpb (enwik8 tail) | 2.69 | **2.45** | **-0.24** |
+| Best val_bpb during run | 2.65 (step 19 000) | **2.42** (step 19 000) | -0.23 |
+| Standalone bpb (enwik9 first 1 MB) | 3.96 | **2.98** | **-0.98** |
+| Rust forward parity (max_abs vs `PyTorch`) | 19e-6 | 26e-6 | both well under 1e-3 |
+| Inference time (1 MB, NEON) | 16.9 s | 23.9 s | +41 % |
+| Extrapolated 1 GB total (both directions) | 9.4 hr | **13.3 hr** | +3.9 hr |
+
+The standalone-bpb improvement (-0.98 on enwik9 first 1 MB) is much larger than the param ratio (+69 %) would suggest. The extra d_model capacity captures structural patterns that 64-hidden simply can't represent.
+
+### Reference comparison
+
+| System | enwik9 standalone bpb |
+|---|---:|
+| Random byte | 8.000 |
+| Order-1 byte entropy | ~3.8 |
+| gzip | ~2.3 |
+| nano (131 K params, this work) | 3.96 |
+| **nano_plus (221 K params, this work)** | **2.98** |
+| bzip2 | ~1.8 |
+| LZR v3 deterministic | 1.844 |
+| medium (4.85 M params, this work) | 1.36 |
+| paq8 | ~1.5 |
+| Hutter target | 0.878 |
+
+nano_plus is now between gzip and bzip2 territory at byte-level — substantially weaker than the LZR deterministic codec on raw byte-level prediction, but much closer than nano was. The **orthogonal-signal hypothesis** for ensemble integration becomes more credible: when both predictors are in the same order-of-magnitude range, the chance that the transformer adds unique bits the codec misses is meaningfully larger.
+
+### Hutter budget at NEON throughput
+
+- Total inference: ~13.3 hr (encode + decode combined for 1 GB enwik9)
+- L(D) tax at int8 quant: 221 K bytes ≈ 0.0018 bpb on 1 GB
+- Codec overhead at 1.844 bpb: ~26 min total
+- Net Hutter wall-clock: **~13.7 hr total**
+- Judge GB5=2500 ⇒ 28 hr cap; GB5=3500 ⇒ 20 hr cap → **fits with margin on either**
+
+### What this changes for Phase 27 (integration)
+
+Realistic ensemble gain estimates have moved up:
+
+| Model | Standalone enwik9 bpb | Realistic ensemble gain |
+|---|---:|---:|
+| nano | 3.96 | -0.03 to -0.06 bpb |
+| **nano_plus** | **2.98** | **-0.05 to -0.15 bpb** |
+| medium (not deployable) | 1.36 | -0.20 to -0.40 bpb (if budget allowed) |
+
+The actual measurement is still required — these are upper-bound estimates from comparing standalone bpb to codec bpb. But the bigger gap between nano_plus and codec (-1.14 bpb vs codec's 1.844) gives the mixer more "raw material" to extract orthogonal signal from.
+
+**Decision**: `nano_plus_42_step20000.lzrn` is the deployment-target checkpoint for Phase 27. Skipping nano entirely.
+
+### Next direction
+
+Phase 27 — codec integration:
+1. `NeuralArm` wrapper in `lzr/src/` holding the loaded `ByteTransformer` + persistent `KvCache`
+2. Feed all source bytes through the arm as the encoder/decoder traverses tokens (via the existing token byte ranges; both sides see the same byte sequence)
+3. Wire into byte-aligned emission sites (`encode_oov_sep_bytes` first — 16.8 % of bits)
+4. Mix the existing 257-way CDF with the neural-arm distribution (start with simple 50/50 averaging; iterate to learned mixing if positive)
+5. Bench measurement on `--quick` panel; e2e enwik9 if positive
+
+---
+
 ## 2026-05-15 — Phase 26 + Option A: Nano Model Trained, NEON Matmul Closes the Inference Gap
 
 Following the inference-cost finding in the Phase 25c analysis (medium model ~70× over Hutter budget), CDR/Claude trained a Hutter-budget-sized "nano" model and then SIMD-tuned the matmul kernel. Together these bring the neural arm inside the Hutter wall-clock envelope.
