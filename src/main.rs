@@ -41,6 +41,7 @@ mod recon;
 mod survey;
 mod tok_lz;
 mod tokenizer;
+mod transformer;
 mod wiki_classifier;
 mod xml_codec;
 mod xml_lz_cp;
