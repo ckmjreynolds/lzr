@@ -34,6 +34,7 @@ mod mixer;
 mod models;
 mod mtf;
 mod neural;
+mod neural_arm;
 mod null;
 mod paq_codec;
 mod ppm;

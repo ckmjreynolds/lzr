@@ -598,6 +598,14 @@ struct Models {
     /// as the 4th arm. Mirrors `lz_flag_mlp` with independent weights
     /// (different target bit).
     token_oov_mlp: OnlineMLP<N_LR_FLAG_FEATS, FLAG_MLP_H>,
+
+    /// Phase 27: optional pretrained byte-level transformer arm,
+    /// loaded from the `LZR_NEURAL_WEIGHTS` env var if set. When
+    /// present, the codec feeds every source byte to it in order
+    /// and mixes its next-byte prediction into the OOV-separator
+    /// byte stream's emission CDF. Both encode and decode walk the
+    /// same byte sequence so the AC roundtrip is preserved.
+    pub(crate) neural_arm: Option<crate::neural_arm::NeuralArm>,
 }
 
 impl Models {
@@ -642,6 +650,36 @@ impl Models {
             token_id_mlp: OnlineMLP::new(ID_MLP_K, ID_MLP_LR),
             lz_flag_mlp: OnlineMLP::new(FLAG_MLP_K, FLAG_MLP_LR),
             token_oov_mlp: OnlineMLP::new(FLAG_MLP_K, FLAG_MLP_LR),
+            neural_arm: Self::load_neural_arm(),
+        }
+    }
+
+    /// Load the optional pretrained transformer arm from the
+    /// `LZR_NEURAL_WEIGHTS` env var. The codec runs identically with
+    /// or without it (the arm only modifies the OOV-separator byte
+    /// stream's emission CDF, which is encoded by both encode and
+    /// decode), so this is a "set the var to enable" gate.
+    fn load_neural_arm() -> Option<crate::neural_arm::NeuralArm> {
+        let path = std::env::var("LZR_NEURAL_WEIGHTS").ok()?;
+        let pb = std::path::PathBuf::from(&path);
+        match crate::neural_arm::NeuralArm::load(&pb) {
+            Ok(arm) => {
+                eprintln!(
+                    "xml-tok-route: loaded neural arm from {} (params={}, ctx={})",
+                    pb.display(),
+                    arm.cfg().vocab_size * arm.cfg().d_model * 2
+                        + arm.cfg().n_layer * (4 * arm.cfg().d_model * arm.cfg().d_model + 2 * arm.cfg().d_model * arm.cfg().d_ff),
+                    arm.cfg().context,
+                );
+                Some(arm)
+            }
+            Err(e) => {
+                eprintln!(
+                    "xml-tok-route: failed to load neural arm from {}: {e:#}",
+                    pb.display()
+                );
+                None
+            }
         }
     }
 }
@@ -682,6 +720,20 @@ impl Codec for XmlTokRouteCodec {
             &mut matcher,
             &mut wiki_class,
         );
+
+        // Phase 27: feed all warm bytes through the neural arm before
+        // measure-phase encoding starts. The arm needs to see the same
+        // byte stream the decoder will reconstruct so its pending
+        // predictions stay in sync across the AC roundtrip.
+        if let Some(arm) = models.neural_arm.as_mut() {
+            for &b in &buf[..warm_end] {
+                arm.feed(b);
+            }
+        }
+        let arm_baseline_fed = models
+            .neural_arm
+            .as_ref()
+            .map_or(0, crate::neural_arm::NeuralArm::fed_count);
 
         let mut writer = BitWriter::new();
         let mut comp = ComponentBits::default();
@@ -946,6 +998,22 @@ impl Codec for XmlTokRouteCodec {
                         }
                     }
                 }
+                // Phase 27: feed any source bytes the neural arm hasn't
+                // already consumed via in-place mixing inside
+                // `encode_oov_sep_bytes`. The OOV-sep path feeds
+                // interleaved with its emissions; every other path
+                // (dict-id hit, OOV-word, tag/attr) leaves source bytes
+                // unfed and we catch up here.
+                if let Some(arm) = models.neural_arm.as_mut() {
+                    let already_fed_in_measure = arm.fed_count() - arm_baseline_fed;
+                    let want_fed = i - warm_end;
+                    if already_fed_in_measure < want_fed {
+                        let start = warm_end + already_fed_in_measure;
+                        for &b in &buf[start..i] {
+                            arm.feed(b);
+                        }
+                    }
+                }
             }
             enc.finish();
         }
@@ -1011,6 +1079,18 @@ impl Codec for XmlTokRouteCodec {
             &mut matcher,
             &mut wiki_class,
         );
+
+        // Phase 27: feed warm bytes to the neural arm so its state
+        // matches the encoder's at the start of the measure window.
+        if let Some(arm) = models.neural_arm.as_mut() {
+            for &b in &buf[..warm_end] {
+                arm.feed(b);
+            }
+        }
+        let arm_baseline_fed = models
+            .neural_arm
+            .as_ref()
+            .map_or(0, crate::neural_arm::NeuralArm::fed_count);
 
         let mut reader = BitReader::new(&archive[4..]);
         let mut dec = AcDecoder::new(&mut reader);
@@ -1243,6 +1323,20 @@ impl Codec for XmlTokRouteCodec {
                     // the page-offset counter on every page start.
                     if idx == 0 {
                         page_token_offset = 0;
+                    }
+                }
+            }
+            // Phase 27: catch-up feed for the neural arm — same
+            // semantics as the encoder's catch-up: every iteration
+            // step that didn't push bytes through the OOV-sep mixer
+            // leaves them unfed, so we feed them here.
+            if let Some(arm) = models.neural_arm.as_mut() {
+                let already_fed_in_measure = arm.fed_count() - arm_baseline_fed;
+                let want_fed = buf.len() - warm_end;
+                if already_fed_in_measure < want_fed {
+                    let start = warm_end + already_fed_in_measure;
+                    for &b in &buf[start..] {
+                        arm.feed(b);
                     }
                 }
             }
@@ -2258,16 +2352,30 @@ fn encode_oov_sep_bytes(enc: &mut AcEncoder<'_>, models: &mut Models, bytes: &[u
     let mut prev_prev = BYTE_START;
     let mut prev = BYTE_START;
     let mut cdf = [0u32; 257];
+    let mut mixed = [0u32; 257];
     for &b in bytes {
         let idx = b as usize;
         let ctx = prev_prev * BYTE_NCTX + prev;
         models.oov_sep_byte.cdf_to(ctx, &mut cdf);
-        enc.encode(&cdf, idx);
+        let final_cdf = models.neural_arm.as_ref().map_or(&cdf, |arm| {
+            arm.mix_byte_cdf(&cdf, NEURAL_ARM_OOV_WEIGHT, &mut mixed);
+            &mixed
+        });
+        enc.encode(final_cdf, idx);
+        if let Some(arm) = models.neural_arm.as_mut() {
+            arm.feed(b);
+        }
         models.oov_sep_byte.observe(ctx, idx);
         prev_prev = prev;
         prev = idx;
     }
 }
+
+/// Phase 27: equal-weight blend of the existing Order-2 byte model
+/// and the neural arm's softmax-over-256 prediction. Start point
+/// for the first ensemble measurement; if positive, iterate to a
+/// learned per-context weight.
+const NEURAL_ARM_OOV_WEIGHT: f32 = 0.5;
 
 fn decode_oov_sep_bytes(
     dec: &mut AcDecoder<'_, '_>,
@@ -2277,13 +2385,21 @@ fn decode_oov_sep_bytes(
     let mut prev_prev = BYTE_START;
     let mut prev = BYTE_START;
     let mut cdf = [0u32; 257];
+    let mut mixed = [0u32; 257];
     let mut out = Vec::with_capacity(length);
     for _ in 0..length {
         let ctx = prev_prev * BYTE_NCTX + prev;
         models.oov_sep_byte.cdf_to(ctx, &mut cdf);
-        let idx = dec.decode(&cdf)?;
-        models.oov_sep_byte.observe(ctx, idx);
+        let final_cdf = models.neural_arm.as_ref().map_or(&cdf, |arm| {
+            arm.mix_byte_cdf(&cdf, NEURAL_ARM_OOV_WEIGHT, &mut mixed);
+            &mixed
+        });
+        let idx = dec.decode(final_cdf)?;
         let b = u8::try_from(idx).expect("byte symbol fits u8");
+        if let Some(arm) = models.neural_arm.as_mut() {
+            arm.feed(b);
+        }
+        models.oov_sep_byte.observe(ctx, idx);
         out.push(b);
         prev_prev = prev;
         prev = idx;
