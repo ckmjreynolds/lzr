@@ -486,7 +486,7 @@ fn read_header(buf: &[u8]) -> Result<TransformerConfig> {
     })
 }
 
-fn read_tensor(bytes: &[u8], cursor: &mut usize, n_floats: usize) -> Result<Vec<f32>> {
+pub(crate) fn read_tensor(bytes: &[u8], cursor: &mut usize, n_floats: usize) -> Result<Vec<f32>> {
     let n_bytes = n_floats * 4;
     if *cursor + n_bytes > bytes.len() {
         return Err(anyhow!(
@@ -525,7 +525,7 @@ fn read_tensor(bytes: &[u8], cursor: &mut usize, n_floats: usize) -> Result<Vec<
     clippy::similar_names,
     clippy::suboptimal_flops
 )]
-fn matmul_x_w_t(x: &[f32], w: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
+pub(crate) fn matmul_x_w_t(x: &[f32], w: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
     assert_eq!(x.len(), m * k);
     assert_eq!(w.len(), n * k);
     assert_eq!(out.len(), m * n);
@@ -712,7 +712,7 @@ unsafe fn dot_x86_avx2(x: &[f32], w: &[f32]) -> f32 {
     clippy::suboptimal_flops,
     clippy::items_after_statements
 )]
-fn rmsnorm_inplace(x: &mut [f32], weight: &[f32]) {
+pub(crate) fn rmsnorm_inplace(x: &mut [f32], weight: &[f32]) {
     assert_eq!(x.len(), weight.len());
     const EPS: f32 = 1e-5;
     let mut sum_sq = 0.0f32;
@@ -731,7 +731,7 @@ fn rmsnorm_inplace(x: &mut [f32], weight: &[f32]) {
 /// stable erf approximation (Abramowitz & Stegun 7.1.26, max abs error
 /// ~1.5e-7) — within `f32` precision.
 #[allow(clippy::suboptimal_flops)]
-fn gelu_inplace(x: &mut [f32]) {
+pub(crate) fn gelu_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
         let z = *v * std::f32::consts::FRAC_1_SQRT_2;
         *v = *v * 0.5 * (1.0 + erf_approx(z));
@@ -758,7 +758,7 @@ fn erf_approx(x: f32) -> f32 {
 /// In-place numerically-stable softmax over the slice. Treats
 /// `f32::NEG_INFINITY` entries as masked (their exp is 0, so they
 /// contribute nothing to the sum and end up with output 0).
-fn softmax_inplace(x: &mut [f32]) {
+pub(crate) fn softmax_inplace(x: &mut [f32]) {
     let mut max = f32::NEG_INFINITY;
     for &v in x.iter() {
         if v > max {

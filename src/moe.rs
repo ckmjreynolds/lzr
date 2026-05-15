@@ -1,0 +1,478 @@
+// Phase 29 WIP: the module is fully tested but no consumer in the codec
+// path wires it up yet (that lands as the v4 codec scaffold). The
+// module-level `dead_code` allow keeps the unused warnings out of
+// `-Dwarnings` until then.
+#![allow(dead_code)]
+
+//! Sparse top-1 `MoE` byte-level decoder transformer for v4.
+//!
+//! Inference-only port of the `MoEByteTransformer` in
+//! `lzr-neural/src/lzr_neural/moe.py`. Backbone identical to the
+//! dense [`crate::transformer::ByteTransformer`] except each block's
+//! FFN is replaced by a sparse top-1 routed `MoE` FFN: a per-block
+//! router projects `d_model → n_experts`, top-1 `argmax` selects
+//! exactly one expert per token, the chosen expert's FFN runs and
+//! its output is scaled by the router's softmax probability. Active
+//! per-token compute matches the dense baseline at the same backbone
+//! shape — the cost is total params (and `L(D)`), not active FLOPs.
+//!
+//! Weights come from the `.lzrm` binary written by
+//! `lzr-neural/scripts/export_moe_weights.py`. The format mirrors
+//! `.lzrn` exactly except for the header (one extra `n_experts`
+//! field) and the per-layer block layout (router weights followed
+//! by per-expert `(fc1, fc2)` pairs instead of the single dense
+//! `(fc1, fc2)`).
+//!
+//! See also `JOURNAL.md` 2026-05-15 Phase 29 for the standalone-bpb
+//! result that motivates this port.
+
+use anyhow::{Result, bail};
+
+use crate::transformer::{
+    gelu_inplace, matmul_x_w_t, read_tensor, rmsnorm_inplace, softmax_inplace,
+};
+
+/// Magic header bytes: `'LZRM'` little-endian. Distinct from `.lzrn`
+/// (`'LZRN'`) so a wrong-format load fails fast at the magic check
+/// instead of partway through tensor reads.
+const MAGIC: u32 = 0x4C5A_524D;
+const VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MoeConfig {
+    pub(crate) n_layer: usize,
+    pub(crate) n_head: usize,
+    pub(crate) d_model: usize,
+    pub(crate) d_ff: usize,
+    pub(crate) context: usize,
+    pub(crate) vocab_size: usize,
+    pub(crate) n_experts: usize,
+}
+
+impl MoeConfig {
+    pub(crate) const fn head_dim(&self) -> usize {
+        self.d_model / self.n_head
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpertWeights {
+    fc1_w: Vec<f32>, // [d_ff, d_model]
+    fc2_w: Vec<f32>, // [d_model, d_ff]
+}
+
+#[allow(clippy::struct_field_names)]
+#[derive(Debug)]
+pub(crate) struct MoeBlock {
+    norm1_w: Vec<f32>,           // [d_model]
+    qkv_w: Vec<f32>,             // [3 * d_model, d_model]
+    proj_w: Vec<f32>,            // [d_model, d_model]
+    norm2_w: Vec<f32>,           // [d_model]
+    router_w: Vec<f32>,          // [n_experts, d_model]
+    experts: Vec<ExpertWeights>, // len == n_experts
+}
+
+#[derive(Debug)]
+pub(crate) struct MoeByteTransformer {
+    pub(crate) cfg: MoeConfig,
+    tok_emb: Vec<f32>, // [vocab_size, d_model]
+    pos_emb: Vec<f32>, // [context, d_model]
+    blocks: Vec<MoeBlock>,
+    norm_f: Vec<f32>, // [d_model]
+}
+
+impl MoeByteTransformer {
+    /// Parse a `.lzrm` byte buffer. Layout, in declaration order:
+    ///
+    /// ```text
+    ///   header (36 bytes): magic, version, n_layer, n_head, d_model,
+    ///                      d_ff, context, vocab_size, n_experts (all u32 LE)
+    ///   tok_emb            [vocab_size, d_model]
+    ///   pos_emb            [context, d_model]
+    ///   for each layer:
+    ///     norm1            [d_model]
+    ///     qkv              [3*d_model, d_model]
+    ///     proj             [d_model, d_model]
+    ///     norm2            [d_model]
+    ///     router           [n_experts, d_model]
+    ///     for each expert:
+    ///       fc1            [d_ff, d_model]
+    ///       fc2            [d_model, d_ff]
+    ///   norm_f             [d_model]
+    /// ```
+    pub(crate) fn load_lzrm(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 36 {
+            bail!("lzrm buffer too short for header: {}", bytes.len());
+        }
+        let cfg = read_header(&bytes[..36])?;
+        let mut cursor = 36usize;
+
+        let tok_emb = read_tensor(bytes, &mut cursor, cfg.vocab_size * cfg.d_model)?;
+        let pos_emb = read_tensor(bytes, &mut cursor, cfg.context * cfg.d_model)?;
+
+        let mut blocks = Vec::with_capacity(cfg.n_layer);
+        for _ in 0..cfg.n_layer {
+            let norm1_w = read_tensor(bytes, &mut cursor, cfg.d_model)?;
+            let qkv_w = read_tensor(bytes, &mut cursor, 3 * cfg.d_model * cfg.d_model)?;
+            let proj_w = read_tensor(bytes, &mut cursor, cfg.d_model * cfg.d_model)?;
+            let norm2_w = read_tensor(bytes, &mut cursor, cfg.d_model)?;
+            let router_w = read_tensor(bytes, &mut cursor, cfg.n_experts * cfg.d_model)?;
+            let mut experts = Vec::with_capacity(cfg.n_experts);
+            for _ in 0..cfg.n_experts {
+                let fc1_w = read_tensor(bytes, &mut cursor, cfg.d_ff * cfg.d_model)?;
+                let fc2_w = read_tensor(bytes, &mut cursor, cfg.d_model * cfg.d_ff)?;
+                experts.push(ExpertWeights { fc1_w, fc2_w });
+            }
+            blocks.push(MoeBlock {
+                norm1_w,
+                qkv_w,
+                proj_w,
+                norm2_w,
+                router_w,
+                experts,
+            });
+        }
+
+        let norm_f = read_tensor(bytes, &mut cursor, cfg.d_model)?;
+        if cursor != bytes.len() {
+            bail!(
+                "lzrm buffer has {} trailing bytes after parse",
+                bytes.len() - cursor
+            );
+        }
+        Ok(Self {
+            cfg,
+            tok_emb,
+            pos_emb,
+            blocks,
+            norm_f,
+        })
+    }
+
+    /// Streaming forward step. One token in, `[vocab_size]` next-byte
+    /// logits out. Per-token cost is identical to the dense
+    /// transformer at the same backbone — only one expert FFN runs
+    /// (chosen by router `argmax`), at the dense FFN's exact shape.
+    /// The router itself is a single `[d_model → n_experts]` matvec
+    /// per layer, negligible vs the FFN cost (~0.3% at `d_ff=256`,
+    /// `n_experts=8`, `d_model=96`).
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::needless_range_loop,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        clippy::similar_names
+    )]
+    pub(crate) fn forward_step(&self, cache: &mut MoeKvCache, token: u8) -> Vec<f32> {
+        let cfg = &self.cfg;
+        assert_eq!(cache.layers.len(), cfg.n_layer);
+        assert!(
+            cache.pos < cfg.context,
+            "MoE KV cache full at pos={} (context={}); caller must reset between chunks",
+            cache.pos,
+            cfg.context
+        );
+        let d = cfg.d_model;
+        let h = cfg.n_head;
+        let hd = cfg.head_dim();
+        let p = cache.pos;
+
+        let mut x = vec![0f32; d];
+        let tok_row = &self.tok_emb[token as usize * d..(token as usize + 1) * d];
+        let pos_row = &self.pos_emb[p * d..(p + 1) * d];
+        for i in 0..d {
+            x[i] = tok_row[i] + pos_row[i];
+        }
+
+        for (l, block) in self.blocks.iter().enumerate() {
+            // Attention residual branch — identical to dense
+            // transformer's forward_step; the only difference is the
+            // FFN below uses MoE routing.
+            let mut x_norm = vec![0f32; d];
+            x_norm.copy_from_slice(&x);
+            rmsnorm_inplace(&mut x_norm, &block.norm1_w);
+
+            let mut qkv = vec![0f32; 3 * d];
+            matmul_x_w_t(&x_norm, &block.qkv_w, &mut qkv, 1, d, 3 * d);
+
+            let layer_cache = &mut cache.layers[l];
+            layer_cache.k[p * d..(p + 1) * d].copy_from_slice(&qkv[d..2 * d]);
+            layer_cache.v[p * d..(p + 1) * d].copy_from_slice(&qkv[2 * d..3 * d]);
+
+            let mut attn_out = vec![0f32; d];
+            for head in 0..h {
+                let q_h = &qkv[head * hd..head * hd + hd];
+                let scale = 1.0 / (hd as f32).sqrt();
+                let mut scores = vec![0f32; p + 1];
+                for j in 0..=p {
+                    let kj = &layer_cache.k[j * d + head * hd..j * d + head * hd + hd];
+                    let mut s = 0f32;
+                    for i in 0..hd {
+                        s += q_h[i] * kj[i];
+                    }
+                    scores[j] = s * scale;
+                }
+                softmax_inplace(&mut scores);
+
+                let out_h = &mut attn_out[head * hd..head * hd + hd];
+                for j in 0..=p {
+                    let vj = &layer_cache.v[j * d + head * hd..j * d + head * hd + hd];
+                    let s_j = scores[j];
+                    for i in 0..hd {
+                        out_h[i] += s_j * vj[i];
+                    }
+                }
+            }
+
+            let mut proj_out = vec![0f32; d];
+            matmul_x_w_t(&attn_out, &block.proj_w, &mut proj_out, 1, d, d);
+            for i in 0..d {
+                x[i] += proj_out[i];
+            }
+
+            // MoE FFN residual branch.
+            x_norm.copy_from_slice(&x);
+            rmsnorm_inplace(&mut x_norm, &block.norm2_w);
+
+            // Router: linear d_model → n_experts, then softmax → top-1.
+            let mut router_logits = vec![0f32; cfg.n_experts];
+            matmul_x_w_t(
+                &x_norm,
+                &block.router_w,
+                &mut router_logits,
+                1,
+                d,
+                cfg.n_experts,
+            );
+            let mut router_probs = router_logits.clone();
+            softmax_inplace(&mut router_probs);
+            let (expert_idx, gate_val) = argmax_with_value(&router_probs);
+
+            // One expert's FFN, weighted by its router probability.
+            let expert = &block.experts[expert_idx];
+            let mut ff_hidden = vec![0f32; cfg.d_ff];
+            matmul_x_w_t(&x_norm, &expert.fc1_w, &mut ff_hidden, 1, d, cfg.d_ff);
+            gelu_inplace(&mut ff_hidden);
+
+            let mut ff_out = vec![0f32; d];
+            matmul_x_w_t(&ff_hidden, &expert.fc2_w, &mut ff_out, 1, cfg.d_ff, d);
+            for i in 0..d {
+                x[i] += ff_out[i] * gate_val;
+            }
+        }
+
+        rmsnorm_inplace(&mut x, &self.norm_f);
+        let mut logits = vec![0f32; cfg.vocab_size];
+        matmul_x_w_t(&x, &self.tok_emb, &mut logits, 1, d, cfg.vocab_size);
+
+        cache.pos += 1;
+        logits
+    }
+
+    /// Batched full-sequence forward — same return shape as
+    /// [`crate::transformer::ByteTransformer::forward`]. Used only by
+    /// the parity test (which compares against `PyTorch` logits
+    /// dumped in batched mode); the codec path uses `forward_step`
+    /// for KV caching.
+    #[allow(clippy::many_single_char_names, clippy::needless_range_loop)]
+    pub(crate) fn forward(&self, tokens: &[u8]) -> Vec<f32> {
+        let t = tokens.len();
+        let vocab = self.cfg.vocab_size;
+        let mut all_logits = vec![0f32; t * vocab];
+        let mut cache = self.new_kv_cache();
+        for (i, &tok) in tokens.iter().enumerate() {
+            let step = self.forward_step(&mut cache, tok);
+            all_logits[i * vocab..(i + 1) * vocab].copy_from_slice(&step);
+        }
+        all_logits
+    }
+
+    pub(crate) fn new_kv_cache(&self) -> MoeKvCache {
+        MoeKvCache::new(&self.cfg)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MoeKvCache {
+    pub(crate) layers: Vec<MoeKvCacheLayer>,
+    pub(crate) pos: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct MoeKvCacheLayer {
+    pub(crate) k: Vec<f32>, // [context, d_model]
+    pub(crate) v: Vec<f32>, // [context, d_model]
+}
+
+impl MoeKvCache {
+    pub(crate) fn new(cfg: &MoeConfig) -> Self {
+        let layers = (0..cfg.n_layer)
+            .map(|_| MoeKvCacheLayer {
+                k: vec![0f32; cfg.context * cfg.d_model],
+                v: vec![0f32; cfg.context * cfg.d_model],
+            })
+            .collect();
+        Self { layers, pos: 0 }
+    }
+
+    pub(crate) const fn reset(&mut self) {
+        self.pos = 0;
+    }
+}
+
+fn read_header(buf: &[u8]) -> Result<MoeConfig> {
+    let read_u32 = |off: usize| -> u32 {
+        u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    };
+    let magic = read_u32(0);
+    if magic != MAGIC {
+        bail!("lzrm magic mismatch: got 0x{magic:08x}, expected 0x{MAGIC:08x}");
+    }
+    let version = read_u32(4);
+    if version != VERSION {
+        bail!("lzrm version mismatch: got {version}, expected {VERSION}");
+    }
+    Ok(MoeConfig {
+        n_layer: read_u32(8) as usize,
+        n_head: read_u32(12) as usize,
+        d_model: read_u32(16) as usize,
+        d_ff: read_u32(20) as usize,
+        context: read_u32(24) as usize,
+        vocab_size: read_u32(28) as usize,
+        n_experts: read_u32(32) as usize,
+    })
+}
+
+/// `argmax` over a probability slice, returning the index and the
+/// corresponding value. Equivalent to `PyTorch`'s `probs.max(dim=-1)`.
+fn argmax_with_value(probs: &[f32]) -> (usize, f32) {
+    let mut best_i = 0usize;
+    let mut best_v = probs[0];
+    for (i, &v) in probs.iter().enumerate().skip(1) {
+        if v > best_v {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    (best_i, best_v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parity check against the `PyTorch` `MoEByteTransformer`'s
+    /// batched forward. Reads `ckpt.lzrm` (weights) and
+    /// `ckpt.logits.bin` (reference logits for input `[0..seq_len)`)
+    /// from `lzr-neural/ckpts/`. Skips cleanly if artifacts aren't
+    /// present.
+    ///
+    /// Reference artifacts generated by:
+    /// ```text
+    ///   uv run scripts/export_moe_weights.py --ckpt ckpts/<name>.pt
+    ///   uv run scripts/dump_moe_logits_for_parity.py --ckpt ckpts/<name>.pt --seq-len 32
+    /// ```
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn run_moe_parity_check(name: &str) {
+        let lzrm_path = format!("/Users/creynolds/Programming/lzr-neural/ckpts/{name}.lzrm");
+        let logits_path =
+            format!("/Users/creynolds/Programming/lzr-neural/ckpts/{name}.logits.bin");
+        if !std::path::Path::new(&lzrm_path).exists()
+            || !std::path::Path::new(&logits_path).exists()
+        {
+            eprintln!("MoE parity artifacts for {name} missing — skipping");
+            return;
+        }
+        let lzrm = std::fs::read(&lzrm_path).unwrap();
+        let model = MoeByteTransformer::load_lzrm(&lzrm).unwrap();
+        let logits_bytes = std::fs::read(&logits_path).unwrap();
+        let t = u32::from_le_bytes([
+            logits_bytes[0],
+            logits_bytes[1],
+            logits_bytes[2],
+            logits_bytes[3],
+        ]) as usize;
+        let vocab = u32::from_le_bytes([
+            logits_bytes[4],
+            logits_bytes[5],
+            logits_bytes[6],
+            logits_bytes[7],
+        ]) as usize;
+        assert_eq!(vocab, model.cfg.vocab_size);
+        let mut reference = Vec::with_capacity(t * vocab);
+        for chunk in logits_bytes[8..].chunks_exact(4) {
+            reference.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        assert_eq!(reference.len(), t * vocab);
+
+        let input: Vec<u8> = (0..t as u8).collect();
+        let actual = model.forward(&input);
+        assert_eq!(actual.len(), reference.len());
+
+        let mut max_abs = 0f32;
+        let mut sum_abs = 0f32;
+        for (a, e) in actual.iter().zip(reference.iter()) {
+            let d = (a - e).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            sum_abs += d;
+        }
+        let mean_abs = sum_abs / actual.len() as f32;
+        eprintln!(
+            "MoE logit parity ({name}): t={t} vocab={vocab}  max_abs={max_abs:.6}  mean_abs={mean_abs:.6}"
+        );
+        assert!(
+            max_abs < 1e-3,
+            "MoE logit divergence too large for {name}: max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn moe_pytorch_logit_parity_nano_plus_equivalent() {
+        run_moe_parity_check("moe_nano_plus_equivalent_42_step20000");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn load_lzrm_round_trip_minimal() {
+        // Hand-crafted .lzrm for a minimal config (n_layer=1, d_model=2,
+        // n_head=1, d_ff=2, context=2, vocab=3, n_experts=2). Confirms
+        // header parsing and tensor stream consumption.
+        let cfg_bytes: Vec<u8> = [
+            MAGIC.to_le_bytes(),
+            VERSION.to_le_bytes(),
+            1u32.to_le_bytes(), // n_layer
+            1u32.to_le_bytes(), // n_head
+            2u32.to_le_bytes(), // d_model
+            2u32.to_le_bytes(), // d_ff
+            2u32.to_le_bytes(), // context
+            3u32.to_le_bytes(), // vocab_size
+            2u32.to_le_bytes(), // n_experts
+        ]
+        .concat();
+        let n_floats = 3 * 2 // tok_emb
+            + 2 * 2          // pos_emb
+            + 2              // norm1
+            + 6 * 2          // qkv (3*d_model x d_model = 6 x 2)
+            + 2 * 2          // proj
+            + 2              // norm2
+            + 2 * 2          // router (n_experts x d_model)
+            + 2 * (2 * 2     // expert fc1 (d_ff x d_model)
+                 + 2 * 2)    // expert fc2 (d_model x d_ff)
+            + 2; // norm_f
+        let mut bytes = cfg_bytes;
+        for i in 0..n_floats {
+            bytes.extend_from_slice(&f32::from(i as u16).to_le_bytes());
+        }
+        let model = MoeByteTransformer::load_lzrm(&bytes).expect("load");
+        assert_eq!(model.cfg.n_layer, 1);
+        assert_eq!(model.cfg.d_model, 2);
+        assert_eq!(model.cfg.vocab_size, 3);
+        assert_eq!(model.cfg.n_experts, 2);
+        assert_eq!(model.tok_emb.len(), 6);
+        assert_eq!(model.pos_emb.len(), 4);
+        assert_eq!(model.blocks.len(), 1);
+        assert_eq!(model.blocks[0].experts.len(), 2);
+    }
+}

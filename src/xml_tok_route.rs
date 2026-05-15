@@ -668,7 +668,9 @@ impl Models {
                     "xml-tok-route: loaded neural arm from {} (params={}, ctx={})",
                     pb.display(),
                     arm.cfg().vocab_size * arm.cfg().d_model * 2
-                        + arm.cfg().n_layer * (4 * arm.cfg().d_model * arm.cfg().d_model + 2 * arm.cfg().d_model * arm.cfg().d_ff),
+                        + arm.cfg().n_layer
+                            * (4 * arm.cfg().d_model * arm.cfg().d_model
+                                + 2 * arm.cfg().d_model * arm.cfg().d_ff),
                     arm.cfg().context,
                 );
                 Some(arm)

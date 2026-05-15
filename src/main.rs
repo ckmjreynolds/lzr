@@ -32,6 +32,7 @@ mod lz;
 mod match_model;
 mod mixer;
 mod models;
+mod moe;
 mod mtf;
 mod neural;
 mod neural_arm;
