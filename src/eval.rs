@@ -21,22 +21,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::bwt_codec::BwtCodec;
-use crate::classifier_stats::ClassifierStats;
 use crate::codec::{Codec, Decomposition};
+use crate::moe_codec::MoeCodec;
 use crate::null::NullCodec;
-use crate::paq_codec::PaqCodec;
-use crate::xml_codec::XmlCodec;
-use crate::xml_lz_cp::XmlLzCpCodec;
-use crate::xml_lz_ord3::XmlLzOrd3Codec;
-use crate::xml_lz_ppm::XmlLzPpmCodec;
-use crate::xml_lz_ppmc::XmlLzPpmcCodec;
-use crate::xml_lz_word::XmlLzWordCodec;
-use crate::xml_ppm::XmlPpmCodec;
-use crate::xml_tok::XmlTokCodec;
-use crate::xml_tok_pc::XmlTokPcCodec;
-use crate::xml_tok_route::XmlTokRouteCodec;
-use crate::xml_wiki_lz_cp::XmlWikiLzCpCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
 const SAMPLE_BYTES_QUICK: usize = 64 * 1024;
@@ -88,23 +75,8 @@ pub(crate) fn make_codec_public(name: &str) -> Result<Box<dyn Codec>> {
 fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
     match name {
         "null" => Ok(Box::new(NullCodec)),
-        "classifier-stats" => Ok(Box::new(ClassifierStats)),
-        "xml" => Ok(Box::new(XmlCodec)),
-        "xml-ppm" => Ok(Box::new(XmlPpmCodec)),
-        "xml-lz-ppm" => Ok(Box::new(XmlLzPpmCodec)),
-        "xml-lz-word" => Ok(Box::new(XmlLzWordCodec)),
-        "xml-lz-ord3" => Ok(Box::new(XmlLzOrd3Codec)),
-        "xml-lz-cp" => Ok(Box::new(XmlLzCpCodec)),
-        "xml-lz-ppmc" => Ok(Box::new(XmlLzPpmcCodec)),
-        "xml-wiki-lz-cp" => Ok(Box::new(XmlWikiLzCpCodec)),
-        "xml-tok" => Ok(Box::new(XmlTokCodec)),
-        "xml-tok-pc" => Ok(Box::new(XmlTokPcCodec)),
-        "xml-tok-route" => Ok(Box::new(XmlTokRouteCodec)),
-        "bwt" => Ok(Box::new(BwtCodec)),
-        "paq" => Ok(Box::new(PaqCodec)),
-        other => bail!(
-            "unknown codec '{other}' (known: null, classifier-stats, xml, xml-ppm, xml-lz-ppm, xml-lz-word, xml-lz-ord3, xml-lz-cp, xml-lz-ppmc, xml-wiki-lz-cp, xml-tok, xml-tok-pc, xml-tok-route, bwt, paq)"
-        ),
+        "moe" => Ok(Box::new(MoeCodec::new())),
+        other => bail!("unknown codec '{other}' (known: null, moe)"),
     }
 }
 

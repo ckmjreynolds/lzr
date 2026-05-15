@@ -328,40 +328,51 @@ mod tests {
     }
 
     #[test]
-    fn ac_stress_many_symbols_adaptive() {
-        // Long sequence through an adaptive Order-0 byte model — meant
-        // to exercise extreme renormalization paths (skewed CDFs,
-        // long runs of high-probability symbols) that the short
-        // synthetic tests don't reach.
-        use crate::models::Order0;
+    fn ac_stress_many_symbols_skewed_static() {
+        // Long sequence through a static, very-skewed CDF — exercises
+        // the renormalization paths that the short synthetic tests
+        // don't reach (long runs of high-prob symbols + occasional
+        // low-prob ones). Replaces the v3 Order-0 adaptive stress test
+        // which depended on the now-deleted `models` module.
         let input: Vec<u8> = (0..50_000u32)
-            .map(|i| u8::try_from((i.wrapping_mul(31)) % 256).unwrap())
+            .map(|i| {
+                // 90% byte 0, 9% byte 1, 1% byte 2 — extreme skew.
+                let r = (i.wrapping_mul(2_654_435_761)) % 100;
+                if r < 90 {
+                    0
+                } else if r < 99 {
+                    1
+                } else {
+                    2
+                }
+            })
             .collect();
 
-        let mut model = Order0::<256>::new();
-        let mut writer = BitWriter::new();
+        // CDF: byte 0 → 90%, byte 1 → 9%, byte 2 → 1%, all else → 0
+        // (but AC requires strictly-increasing, so floor at 1 unit).
         let mut cdf = vec![0u32; 257];
+        cdf[1] = (TOTAL * 90) / 100;
+        cdf[2] = (TOTAL * 99) / 100;
+        cdf[3] = TOTAL - 253; // floor remaining 253 entries at 1 unit each
+        for i in 4..257 {
+            cdf[i] = cdf[i - 1] + 1;
+        }
+        cdf[256] = TOTAL;
+
+        let mut writer = BitWriter::new();
         {
             let mut enc = AcEncoder::new(&mut writer);
             for &b in &input {
-                model.cdf_to(&mut cdf);
                 enc.encode(&cdf, b as usize);
-                model.observe(b as usize);
             }
             enc.finish();
         }
         let (buf, _pad) = writer.finish();
 
-        let mut model2 = Order0::<256>::new();
         let mut reader = BitReader::new(&buf);
         let mut dec = AcDecoder::new(&mut reader);
         let out: Vec<u8> = (0..input.len())
-            .map(|_| {
-                model2.cdf_to(&mut cdf);
-                let s = dec.decode(&cdf).unwrap();
-                model2.observe(s);
-                u8::try_from(s).unwrap()
-            })
+            .map(|_| u8::try_from(dec.decode(&cdf).unwrap()).unwrap())
             .collect();
         assert_eq!(out, input);
     }

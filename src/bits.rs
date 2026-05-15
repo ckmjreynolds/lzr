@@ -10,6 +10,11 @@
 //! The padding bit count (0-7) is returned so the codec can attribute
 //! it to a `"padding"` decomposition bucket.
 
+// `write_byte` / `read_byte` were used by v3 codecs we stripped from
+// v4. They stay here as part of the bit-IO API for the moment; future
+// v4 codecs (runtime n-gram framing, etc.) will exercise them again.
+#![allow(dead_code)]
+
 use anyhow::{Result, bail};
 
 #[derive(Debug)]
