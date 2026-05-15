@@ -13,6 +13,98 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-15 — Step C `medium` Pretraining Complete — 1.357 bpb Standalone on Enwik9
+
+The 5 M-param `medium` configuration trained to completion (20 K steps, 8.93 hours on MPS). Final val_bpb on the enwik8 tail held-out split was **1.4350**; standalone evaluation on the first 10 MB of enwik9 (the Hutter target corpus) lands at **1.3568 bpb** — paq8-class byte-level, substantially below the LZR v3 deterministic codec's 1.844 bpb (token-aligned, different measurement; still a striking comparison).
+
+### Training trajectory
+
+| Step | val_bpb (enwik8 tail) |
+|---:|---:|
+| 500 | 3.6475 |
+| 1 000 | 2.8422 |
+| 2 000 | 1.9869 |
+| 4 000 | 1.7046 |
+| 6 000 | 1.6095 |
+| 8 000 | 1.5573 |
+| 10 000 | 1.5294 |
+| 12 000 | 1.4769 |
+| 14 000 | 1.4664 |
+| 16 000 | 1.4299 |
+| 18 000 | 1.4490 |
+| **20 000** | **1.4350** |
+
+Cosine LR (3e-4 peak, warmup 500), AdamW, batch=32, seq_len=1024, context=1024. Train_bpb at termination was 1.40, val slightly above as expected. The model has seen ~655 M training tokens over the run — roughly 7.3 epochs on enwik8's 90 M-byte train split.
+
+### Architecture
+
+| Knob | Value | Note |
+|---|---|---|
+| `n_layer` | 6 | |
+| `d_model` | 256 | head_dim=32 with 8 heads |
+| `d_ff` | 1024 | 4× d_model |
+| `context` | 1024 | learned absolute pos embeddings |
+| total params | 4,849,664 | tied input/output embeddings included |
+| .lzrn size at f32 | 19.4 MiB | |
+| .lzrn size at int8 (projected) | 4.85 MiB | post-training quantization, not yet implemented |
+
+### Inference-budget reality check
+
+| Metric | Value vs target |
+|---|---|
+| FLOPS/token (full attention, no KV cache) | ~12.7 M — **over budget** by ~6-13× vs Hutter ~1-2 M |
+| FLOPS/token (with KV cache, seq=1024) | ~6 M — still over budget |
+| Solution path | KV cache + int8 quant + scalar-Rust kernel optimization. If still over, fall back to a smaller deployment model (4L × 128H "tiny" preset, ~1 M params, fits budget) — at the cost of standalone bpb. The medium-vs-tiny tradeoff is now a measurement question: tiny's standalone bpb on enwik9 needs to be measured before deciding. |
+
+### Rust forward-pass parity, second-checkpoint validation
+
+Re-ran the Phase 25a parity test against the medium checkpoint:
+
+```
+small_42_step2000  (886 K params): max_abs=7e-6
+medium_42_step20000 (4.85 M params): max_abs=17e-6
+```
+
+Both far below the 1e-3 threshold. The deeper model accumulates slightly more f32 ordering noise — expected — but the Rust port still produces logits indistinguishable from `PyTorch` (MPS) on a fixed input. The parity test is now parameterized via `run_parity_check(name)` so future checkpoints add cleanly with a 2-line test case.
+
+### Reference comparison
+
+| System | enwik9 bpb |
+|---|---:|
+| Random byte | 8.000 |
+| Order-1 byte entropy | ~3.8 |
+| gzip | ~2.3 |
+| bzip2 | ~1.8 |
+| **LZR v3 deterministic (Phase 24c)** | **1.844** (token-aligned, full corpus) |
+| **`medium_42_step20000` standalone** | **1.357** (byte-level, first 10 MB) |
+| paq8 (byte-level reference) | ~1.5 |
+| cmix-class | ~1.1 |
+| NNCP (Hutter byte-level SOTA) | 0.86 |
+| Hutter target | 0.878 |
+
+### Caveat: standalone-bpb vs ensemble-bpb is not the same metric
+
+The 1.357 standalone bpb is what the neural arm achieves *on its own* predicting the next byte given prior bytes. Inside the LZR codec, the neural arm would be one mixer arm among several deterministic arms (Order-N bit predictors, LR, MLP) that already capture most predictable patterns. Empirically (v1's online-trained 4 M RWKV) the ensemble gain was only -0.06 bpb. A pretrained model should do substantially better — but the realistic expectation is on the order of **-0.1 to -0.3 bpb at e2e**, not the standalone -0.5 bpb gap. The mixer doesn't get the neural arm's standalone capacity for free.
+
+### L(D) math for the medium model
+
+- 4.85 M params × 1 byte (int8) = **4.85 MB embedded weights** → L(D) tax on 1 GB corpus ≈ **0.039 bpb**
+- For the neural arm to be Hutter-positive: needs to deliver **> 0.04 bpb** improvement on archive content
+- For the neural arm to be Hutter-winning: would need to deliver **~0.97 bpb** improvement on archive content (from 1.844 → 0.878). Unrealistic from one ensemble arm; Hutter still likely requires the full cmix-style ensemble strategy.
+
+### Next direction
+
+1. **Phase 25a.5: KV cache.** Required for any practical codec integration. Current full-sequence forward is O(seq²) per token — would take days of inference time for 1 GB. KV cache reduces per-token cost to O(seq).
+2. **Phase 25c first-light: byte-aligned stream integration.** Wire the f32 medium checkpoint as an N+1-th arm on `token_oov_mixer` (the 16.8 % literal-byte stream — cleanest fit for byte-level neural predictions). Measure panel + e2e bpb impact. Decide whether to proceed with quantization.
+3. **Phase 25b: post-training int8 quantization** — only after 25c shows positive ensemble signal. Otherwise we're optimizing weight storage for an arm that's not earning its keep.
+4. **Architecture re-evaluation**: if medium's inference-FLOPS budget overrun is fatal (after kernel optimization), drop to a `tiny`-sized model and retrain. The right model size is the largest one that fits Hutter's wall-clock budget; we now have data points at both small (886 K params, easily under budget) and medium (4.85 M, over budget) to triangulate.
+
+### What's deferrable indefinitely
+
+The full-sequence forward is fine for offline analysis (eval_bpb on held-out windows). Don't optimize it for inference — the KV-cache variant in Phase 25a.5 is the inference path.
+
+---
+
 ## 2026-05-14 — Phase 25a: Rust Transformer Inference Port — Logit Parity Confirmed
 
 Following the Step C kickoff entry (below), CDR/Claude ported the byte-level decoder transformer to scalar Rust as `src/transformer.rs` and verified end-to-end forward-pass parity against the `PyTorch` reference at f32 precision.
