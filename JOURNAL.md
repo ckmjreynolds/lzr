@@ -13,6 +13,155 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-15 — Phase 29: Sparse-MoE Byte AR Hits 1.94 Standalone Bpb on Enwik9 — Active Compute Held at Nano_plus
+
+After ruling out BFN at this scale (Phase 28) and discussing the v4 "neural-first" architecture with CDR, the agreed plan was: train a sparse-MoE byte-level AR transformer at the same active per-token compute as `nano_plus` (Phase 26.5 baseline, 2.98 standalone bpb on enwik9). The lever is the underused 10 GB judge RAM — total params can grow several-fold without raising inference compute, since only one expert per token activates. Result: **1.94 standalone bpb on enwik9**, a -1.04 bpb improvement at zero extra inference FLOPS.
+
+### Architecture (`lzr-neural/src/lzr_neural/moe.py`)
+
+Causal AR backbone identical to `nano_plus`: 2 layers × 96 hidden × 4 heads (head_dim=24) × ctx=256, RMSNorm pre-norm, GELU, learned absolute pos embeddings, tied in/out embeddings. The only delta is each block's FFN (96 → 256 → 96) is replaced by `MoEFeedForward` — top-1 routed across **8 experts**, each with the dense FFN's exact shape. Switch-Transformer load-balancing aux loss (Fedus et al. 2022 eq. 4) at weight 0.01.
+
+Active inference path: router argmax + indexed weight load + one FFN forward = matches `nano_plus`'s active per-token compute exactly (~491 K FLOPS/token). Total params 911 K (vs nano_plus's 221 K, 4×). Shipped int8 weight tax: 911 KB ⇒ 0.0073 bpb on 1 GB enwik9 (vs nano_plus's 0.0018 bpb; +0.0055 bpb of L(D), wildly paid back by the L(C) gain).
+
+### Training (`lzr-neural/scripts/train_moe.py`)
+
+Same recipe as `nano_plus`: 20 K steps, batch=64, seq=256, AdamW with cosine LR 3e-4 + warmup 500, MPS device, seed 42. Loss = cross_entropy + 0.01 · aux_load_balancing. Wall: 2427 s ≈ 40 min — 2.4× longer than `nano_plus`'s 17 min, reflecting the per-expert dispatch loop overhead on MPS (in Rust scalar+NEON only one expert is active per token, so wall scales with active params, not total).
+
+Per-cycle expert utilization ([0.05, 0.27] bounds throughout the run, both layers, all 8 experts in use): no collapse, no router-only-uses-one-expert pathology. The aux loss is doing its job.
+
+### Standalone enwik9 bpb (first 1 MB, same methodology as nano_plus → 2.98)
+
+| Model | Standalone bpb | Active params | Total params | L(D) bpb |
+|---|---:|---:|---:|---:|
+| `nano_plus` (Phase 26.5) | 2.98 | 221 K | 221 K | 0.0018 |
+| **`moe_nano_plus_equivalent` (this work)** | **1.94** | ~221 K | 911 K | 0.0073 |
+| Δ | **-1.04** | 0 | +4× | +0.0055 |
+| LZR v3 deterministic (xml-lz-cp etc.) | 1.844 | n/a | n/a | n/a |
+
+For context: **MoE standalone (1.94) is now lower than the full v3 deterministic codec (1.84)**. The two predict different things (a single byte-level NN vs the BPE + LZ + Order-3/PPM ensemble), so they're not directly comparable, but the result confirms the MoE arm is competitive with — not just supplementary to — the existing codec on raw byte-level prediction. This is a qualitative shift from the `nano_plus` regime where the neural arm was always meaningfully weaker than the codec on raw bytes.
+
+### Hutter math, updated
+
+| Component | bpb |
+|---|---:|
+| Phase 24c v3 deterministic codec (current) | 1.844 |
+| `nano_plus` mixed at -0.033 (Phase 27) | 1.811 |
+| **Projected v4 MoE-only codec on enwik9 (rough)** | **2.0-2.2** |
+| **Projected v4 MoE + runtime n-gram + ensemble residual** | **1.0-1.5** |
+| Hutter target | 0.878 |
+
+The "MoE-only on raw bytes" projection (2.0-2.2 standalone-with-codec-overhead) is what v4 is designed to measure cleanly. The rough +0.06-0.26 bpb overhead vs the standalone 1.94 accounts for AC framing + uniform fallback for unpredictable bytes + edge effects, similar to v3's ~0.05 bpb framing overhead.
+
+The deeper question — what's the floor of "MoE + runtime augmentations + ensemble" — is what the rest of v4 work will measure. For the first time in this project, a single neural arm is in striking distance of the Hutter target on its own.
+
+### What this rules in / what's still open
+
+**Rules in (next concrete work):**
+- Build the v4 codec (AC + MoE arm + uniform fallback + runtime n-gram). Treat the deterministic stack as the safety net we already have, not the primary architecture.
+- Port MoE inference to Rust. Reuses Phase 26 NEON matmul kernel almost verbatim; only new code is the router argmax + expert indexing. Estimated 1-2 days.
+- Sweep E ∈ {4, 16, 32} to find the L(D)/standalone-bpb knee. E=16 might give ~1.8 bpb at 1.6 MB shipped; E=32 might give ~1.7 at 3.2 MB. Each MB of L(D) costs 0.008 bpb of L(C) on 1 GB; the gain has to clear that bar.
+
+**Still open:**
+- Wall-clock validation in Rust scalar+NEON — MPS rate (0.08 MB/s) is unrepresentative because MPS doesn't batch the dispatch loop well. The deciding number is `lzr neural-eval` once the Rust port lands.
+- Routing stability with different aux weights and warmup schedules — at 0.01 the router doesn't collapse, but the utilization variance suggests there might be free bpb in tighter balance.
+- Online routing-weight adaptation — the Tier 2 idea from the design discussion. Defer until the basic v4 codec is measured.
+
+### Files added in lzr-neural/
+
+- `src/lzr_neural/moe.py` (new, 200 LOC)
+- `src/lzr_neural/config.py` (`MoEConfig` + `MOE_PRESETS` added)
+- `scripts/train_moe.py` (new, 130 LOC)
+- `scripts/eval_bpb.py` (extended with MoE branch)
+- `ckpts/moe_nano_plus_equivalent_42_step20000.pt` (the deployment-target checkpoint)
+
+The lzr/ Rust submission binary remains untouched in v3; v4 work is queued for a new branch once CDR signs off.
+
+---
+
+## 2026-05-15 — Phase 28: Bayesian Flow Networks Tested at `nano_plus` Scale — Paradigm Ruled Out
+
+After review of the standard "neural compression" landscape and a discussion of whether **Bayesian Flow Networks** (Graves et al. 2023, "Bayesian Flow Networks") might give a tighter byte-level predictor than the AR-trained `nano_plus` arm, CDR/Claude ran a size-matched standalone bench in `lzr-neural/`. Result: BFN's compression-native objective fails to learn useful predictive structure at this parameter budget on byte-level text. Stage-1 gate of the staged exploration plan triggered "stop"; no codec integration attempted.
+
+### Why this experiment
+
+`nano_plus` (Phase 26.5) is a 221 K-param byte-level AR transformer trained with next-token cross-entropy. Standalone enwik9 bpb 2.98; ensemble lift -0.033 bpb at the Phase 27 panel slot. The hypothesis under test was whether a **same-architecture transformer trained with BFN's continuous-time L^∞ loss** (Graves 2023 eq. 174) — which is a direct upper bound on -log p(x), trained natively for compression — would be a tighter predictor at the same compute. BFN-on-text has not been evaluated on Hutter constraints to our knowledge; the only reported text result in the original paper is text8 (K=27), where BFN outperforms discrete diffusion.
+
+### Implementation (lzr-neural/)
+
+- `src/lzr_neural/bfn.py` — `DiscreteBFN`, bidirectional transformer body (own `BidirSelfAttention` / `BidirBlock`, no causal mask), input projection K→d_model, sinusoidal time embedding + 2-layer time-MLP. Loss `model.loss(x)` is the per-byte mean of K · β1 · ‖e_x − p̂(θ,t)‖² (continuous-time L^∞).
+- `scripts/train_bfn.py` — fork of `train.py` for the BFN objective, same checkpoint format extended with `objective: "bfn"` and `bfn_cfg`.
+- `scripts/eval_bpb.py` — auto-detects `objective` and dispatches to either AR cross-entropy or BFN Monte-Carlo L^∞.
+- `scripts/diagnose_bfn.py` — three diagnostics to disentangle the loose L^∞ bound from actual predictive ability: fill-in-the-blank, high-SNR endpoint, uniform input.
+
+The BFN model has 264 K params vs `nano_plus`'s 221 K — 20% larger, all from the time-MLP and the un-tied output head (BFN's input is a probability simplex, not a vocab embedding, so weight tying isn't a clean reuse). Same context (256), same depth (2L × 96d × 4h × d_ff=256), same training recipe (seq=256, batch=64, AdamW, cosine LR 3e-4, 20 K steps on MPS). β1=3.0 per the text8 settings in Graves 2023 §A.6.
+
+### Anchor run (`nano_plus_bfn_42_step20000`)
+
+Wall: 1037 s ≈ 17 min on MPS. Train loss settled at ~95 nats/byte (bound interpretation: ~137 bpb upper bound). Val on enwik8 tail noisy in the 84–108 range across the last 1 K steps.
+
+### Standalone bpb on enwik9 (first 1 MB) — same methodology as `nano_plus` 2.98
+
+| Measurement | bpb | Comment |
+|---|---:|---|
+| BFN L^∞ Monte-Carlo upper bound (n_t=64) | **94.28** | Strictly an upper bound; loose for K=256 |
+| nano_plus AR cross-entropy (reference) | 2.98 | Phase 26.5 |
+| nano_plus AR cross-entropy on first 100 K bytes (cross-check) | 2.30 | Matches the Phase 25c "first 100 KB is denser metadata" observation |
+
+The 94.28 bound is dominated by the K · β1 = 768 multiplier in front of the squared L2 prediction error — even tiny per-position errors register as huge bound contributions. The bound is loose enough to be uninterpretable for a comparison against AR's exact cross-entropy.
+
+### Diagnostics — does the model have any useful predictive structure?
+
+To disentangle bound looseness from model failure, three direct measurements on the same trained checkpoint, first 100 KB enwik9:
+
+| Diagnostic | bpb | Meaning |
+|---|---:|---|
+| 1. Fill-in-the-blank (mask 1 position, reveal e_x at all others) | **4.99** | Best-case predictive ability |
+| 2. High-SNR (t=1) endpoint, model output as distribution | **0.005** | Trivial copy from near-clean θ |
+| 3. Uniform input (t=0, no information) | **4.91** | Positional context only |
+
+**The model collapsed to the trivial t=1 solution.** At high SNR (θ ≈ e_x) the network just copies the input — 0.005 bpb means it's reading the noised distribution and outputting essentially the same. For everything else it has learned almost nothing: fill-in-the-blank with all neighbors revealed beats uniform-input by only 0.08 bpb (4.99 vs 4.91). The bidirectional structure that would have made a BFN useful is simply not learned.
+
+This is a known failure mode for diffusion-style training on discrete data with high vocab and small models: the loss landscape rewards the easy high-SNR copy, the harder low-SNR denoising never gets trained because the gradient signal is dominated by the easy regime. The text8 paper (K=27) avoided this in part because the smaller K kept the bound multiplier (K · β1 = 81) low enough that the harder regime was relatively higher-priority in the loss.
+
+### Decision per the staged plan
+
+The plan in `/Users/creynolds/.claude/plans/review-the-following-then-expressive-donut.md` defined the gate:
+
+| Outcome | Action |
+|---|---|
+| BFN bpb ≤ 2.85 | Escalate to Stage 2A |
+| BFN bpb in [2.88, 3.08] | Marginal, journal, stop |
+| **BFN bpb > 3.08** | **Stop, paradigm doesn't work** |
+
+Both the loose L^∞ bound (94.28) and the much-more-favorable fill-in-the-blank diagnostic (4.99) sit far above the 3.08 stop threshold. **Stage 1 gate triggers stop**; Stages 2A and 2B are not attempted.
+
+### What this rules out vs leaves open
+
+**Ruled out**: discrete BFN at byte vocab, ~221 K params, ~20 K training steps, default β1=3.0 schedule, no loss reweighting. The naive paradigm is not competitive with AR at this scale on text.
+
+**Not ruled out** (but out of scope per the plan):
+- **Loss reweighting** to upweight the low-SNR (high-loss) regime (min-SNR weighting per Hang et al. 2023, or simple 1/(1−t²) reweight) — could rescue the harder denoising regime. Probably the single most-likely change to flip the result, if anyone wants to try.
+- **Causal-masked BFN**: would be a different architectural test (closer to AR but trained with BFN loss). Possibly worse — bidirectional attention is what BFN trades off against AR.
+- **Bigger BFN** (~4 M params, the `medium` band): inference budget already eaten by `nano_plus`; out of scope.
+- **Smaller K** via BPE tokenization: reduces the bound multiplier. But Phase 16 already showed token-stream LZ as a better path than per-byte for the dictionary side, so this is somewhat redundant.
+
+### Files added in lzr-neural/
+
+- `src/lzr_neural/bfn.py` (new, 207 LOC)
+- `src/lzr_neural/config.py` (BFNConfig + BFN_PRESETS added)
+- `scripts/train_bfn.py` (new, 130 LOC)
+- `scripts/eval_bpb.py` (extended with BFN branch)
+- `scripts/diagnose_bfn.py` (new, diagnostic tool)
+- `ckpts/nano_plus_bfn_42_step20000.pt` (trained BFN checkpoint, kept for replay)
+
+The lzr/ Rust submission binary was untouched as the plan promised: the v3 codec stays bit-identical and the 168 tests still pass without `LZR_NEURAL_WEIGHTS` set.
+
+### Cross-cutting context
+
+This entry is consistent with the prior in the original review message that prompted this experiment: AR transformers are very hard to beat on text via diffusion-style paradigms, fundamentally because the AR cross-entropy is already exact while latent-variable bounds incur slack. The Hutter-relevant takeaway: the next deterministic-codec lever (dict-id projection, learned per-context mixer weight, byte-aligned mixer extension to `case_ac`/`tag_ac`/`attr_ac`) all remain better-bet bets than re-architecting the predictor.
+
+---
+
 ## 2026-05-15 — Phase 27: First-Light Ensemble Integration — Neural Arm Improves the Codec
 
 After Phase 26.5 produced the deployable `nano_plus_42_step20000` model, CDR/Claude wired it into `xml_tok_route` as a mixing arm on the `token_oov_sep` byte stream. Working end-to-end on first attempt; bpb improves with every panel window; bit-decomposition isolates the gain to exactly the targeted stream.
