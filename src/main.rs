@@ -168,6 +168,25 @@ enum Command {
         warm_bytes: usize,
     },
 
+    /// Phase 25c-prelim feasibility check: run the Step C transformer
+    /// over a corpus prefix using the streaming KV-cached forward, and
+    /// report standalone byte-level bpb. No codec involvement — this
+    /// validates the Rust inference path on real data and gives a
+    /// reference number to compare against the codec's per-stream bpb
+    /// for the ensemble-integration decision.
+    NeuralEval {
+        /// `.lzrn` weights produced by
+        /// `lzr-neural/scripts/export_weights.py`.
+        #[arg(long)]
+        weights: PathBuf,
+        /// Corpus file path.
+        #[arg(long, default_value = "assets/enwik9")]
+        corpus: PathBuf,
+        /// Bytes from the start to evaluate.
+        #[arg(long, default_value_t = 1_000_000)]
+        bytes: usize,
+    },
+
     /// Run the multi-offset codec eval panel against a chosen codec.
     /// Reports per-window bpb and the mean; optionally dumps a
     /// per-component bit decomposition to CSV.
@@ -274,6 +293,103 @@ fn run_compress(
     Ok(())
 }
 
+/// Streaming forward over a corpus prefix; report standalone bpb.
+///
+/// Resets the KV cache at every `context` boundary because the trained
+/// learned-absolute position embeddings are only valid for positions
+/// `0..context`. The first byte of each chunk has no context (the
+/// transformer's prediction is roughly uniform) so its contribution is
+/// genuinely uninformative — we still count it in the bpb so the
+/// number is directly comparable to other byte-level compressors.
+#[allow(clippy::cast_precision_loss)]
+fn run_neural_eval(weights: &PathBuf, corpus: &PathBuf, bytes_to_eval: usize) -> Result<()> {
+    let weights_bytes =
+        fs::read(weights).with_context(|| format!("reading weights {}", weights.display()))?;
+    let model = transformer::ByteTransformer::load_lzrn(&weights_bytes)
+        .with_context(|| "parsing .lzrn weights")?;
+    let cfg = model.cfg;
+    eprintln!(
+        "Loaded model: layers={} heads={} d_model={} d_ff={} context={} vocab={}",
+        cfg.n_layer, cfg.n_head, cfg.d_model, cfg.d_ff, cfg.context, cfg.vocab_size,
+    );
+
+    let corpus_bytes =
+        fs::read(corpus).with_context(|| format!("reading corpus {}", corpus.display()))?;
+    let n = bytes_to_eval.min(corpus_bytes.len());
+    eprintln!(
+        "Evaluating first {n} bytes of {} ({:.2} MiB)",
+        corpus.display(),
+        n as f64 / (1024.0 * 1024.0),
+    );
+
+    let mut cache = model.new_kv_cache();
+    let mut total_nats = 0f64;
+    let mut bytes_seen: usize = 0;
+    let mut chunks_processed: usize = 0;
+    let start = Instant::now();
+
+    // The transformer predicts byte_{p+1} from byte_p. The first byte
+    // of each chunk needs its own prediction — we get it by calling
+    // forward_step with a synthetic "start" byte (0). That position
+    // costs ~8 bits (~uniform) per chunk, but at context=1024 the
+    // overhead is < 0.01 bpb on a 1 GB stream.
+    for chunk in corpus_bytes[..n].chunks(cfg.context) {
+        cache.reset();
+        // Predict the FIRST byte of the chunk with no context — the
+        // model still emits some distribution (effectively from the
+        // embedding row of a "start" token). We use token 0 as that
+        // synthetic context.
+        let mut logits = model.forward_step(&mut cache, 0);
+        for &byte in chunk {
+            let log_p = log_softmax_at(&logits, byte as usize);
+            total_nats -= f64::from(log_p);
+            bytes_seen += 1;
+            if cache.pos < cfg.context {
+                logits = model.forward_step(&mut cache, byte);
+            }
+        }
+        chunks_processed += 1;
+        if chunks_processed % 16 == 0 {
+            let bpb_so_far = total_nats / (bytes_seen as f64) / std::f64::consts::LN_2;
+            let rate = (bytes_seen as f64) / start.elapsed().as_secs_f64() / (1024.0 * 1024.0);
+            eprintln!(
+                "  chunk {chunks_processed}  bytes={bytes_seen}  bpb={bpb_so_far:.4}  rate={rate:.2} MiB/s"
+            );
+        }
+    }
+
+    let bpb = total_nats / (bytes_seen as f64) / std::f64::consts::LN_2;
+    let elapsed = start.elapsed();
+    println!();
+    println!("Weights:        {}", weights.display());
+    println!("Corpus:         {}", corpus.display());
+    println!("Bytes evaluated: {bytes_seen}");
+    println!("Standalone bpb: {bpb:.4}");
+    println!("Inference time: {elapsed:?}");
+    println!(
+        "Throughput:     {:.2} MiB/s",
+        bytes_seen as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
+    );
+    Ok(())
+}
+
+/// Log-softmax projection at one index. Numerically stable via the
+/// max-subtract trick. Returns `ln P(idx)`.
+#[allow(clippy::cast_precision_loss)]
+fn log_softmax_at(logits: &[f32], idx: usize) -> f32 {
+    let mut max = f32::NEG_INFINITY;
+    for &v in logits {
+        if v > max {
+            max = v;
+        }
+    }
+    let mut sum_exp = 0f32;
+    for &v in logits {
+        sum_exp += (v - max).exp();
+    }
+    logits[idx] - max - sum_exp.ln()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -299,5 +415,10 @@ fn main() -> Result<()> {
             skip_verify,
         } => run_compress(&corpus, &codec, &out, skip_verify),
         Command::Recon { corpus, top } => recon::run_recon(&corpus, top),
+        Command::NeuralEval {
+            weights,
+            corpus,
+            bytes,
+        } => run_neural_eval(&weights, &corpus, bytes),
     }
 }
