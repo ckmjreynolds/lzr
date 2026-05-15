@@ -910,6 +910,11 @@ mod tests {
         run_parity_check("nano_42_step20000");
     }
 
+    #[test]
+    fn pytorch_logit_parity_nano_plus_42_step20000() {
+        run_parity_check("nano_plus_42_step20000");
+    }
+
     /// `forward` and `forward_step` must produce identical (within
     /// f32 noise) logits for the same input. This is the contract
     /// that makes the streaming KV-cache path safe to use in the
