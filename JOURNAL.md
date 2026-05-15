@@ -13,6 +13,68 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-14 — Phase 25a: Rust Transformer Inference Port — Logit Parity Confirmed
+
+Following the Step C kickoff entry (below), CDR/Claude ported the byte-level decoder transformer to scalar Rust as `src/transformer.rs` and verified end-to-end forward-pass parity against the `PyTorch` reference at f32 precision.
+
+### What landed
+
+- `src/transformer.rs` — `ByteTransformer` with `load_lzrn` and `forward` methods. Pure `Vec<f32>` storage, no new dependencies (per the CLAUDE.md zero-threading + minimal-dep submission-binary rules). Kernels: row-major `matmul_x_w_t`, `rmsnorm_inplace`, `gelu_inplace` (exact erf via Abramowitz & Stegun 7.1.26), `softmax_inplace` with `f32::NEG_INFINITY` masking for causal attention.
+- `lzr-neural/scripts/export_weights.py` — dumps a `PyTorch` checkpoint's weights in the canonical `.lzrn` binary layout. Header is 32 bytes (magic `'LZRN'`, version, six `u32` config fields); tensor stream is concatenated little-endian f32 in the declaration order documented at the top of `transformer.rs`'s `load_lzrn` parse loop.
+- `lzr-neural/scripts/dump_logits_for_parity.py` — runs a fixed input `[0..seq_len)` through the `PyTorch` model and writes the resulting `[t, vocab]` logits as little-endian f32 for the Rust parity test to compare against.
+
+### Parity result
+
+```
+ckpt    : small_42_step2000 (~886 K params, 4L × 128H, ctx=512)
+input   : bytes [0, 1, 2, ..., 31] (seq_len=32)
+metric  : abs diff in logits between Rust forward and PyTorch forward
+max_abs : 5e-6
+mean_abs: 1e-6
+```
+
+Below f32 accumulation-order noise. The Rust kernels match PyTorch numerically.
+
+### Architectural choices and why each one was deliberate
+
+| Decision | Reasoning |
+|---|---|
+| Pure `Vec<f32>` storage; no `ndarray` / `nalgebra` | Submission-binary deps stay minimal. Auto-vec'd index-based loops are clean to read and produce vectorized assembly at `RUSTFLAGS=-C target-cpu=native`. |
+| Row-major matmul as `out = x @ w^T` (not `w @ x`) | Matches `PyTorch`'s `nn.Linear` weight shape `[out, in]` exactly — no transpose needed at load time, and the export-script layout is direct. |
+| Exact erf-based GELU (not tanh approximation) | The trained `PyTorch` model uses `F.gelu` (exact). A tanh approximation would diverge in the high-curvature region near zero. A&S 7.1.26 has ~1.5e-7 max error in f32 — well below parity threshold. |
+| In-place RMSNorm | Single pass over the d_model vector; mean-of-squares + rsqrt + weight multiply. Quant-friendly (no variance-mean centering that complicates per-tensor scales). |
+| Full-sequence batched forward (no KV cache yet) | Simplest correctness-first port. KV-cache variant lands once the existing forward is validated — same kernels, just incremental. |
+| Hard-coded "PyTorch-shape" `out_dim, in_dim` weights | Zero ambiguity at the Rust ↔ Python boundary. The export script and the Rust loader are the single source of truth for the layout. |
+
+### Build invariants
+
+`./build.sh` clean: cargo fmt + nightly clippy with `clippy::pedantic`/`nursery` at `-Dwarnings` (default features and `--no-features`) + 164 release tests pass + nightly coverage runs. The transformer module's scoped `#[allow(...)]` attributes target the legitimately-needed lints on math kernels (single-char names, range loops, suboptimal_flops for mul_add-vs-parity tradeoffs, cast precision loss for f32 accumulation, struct field rename on `Block`'s `_w` suffix). The module-level `#![allow(dead_code)]` is the WIP signal — removed when Phase 25c wires the transformer into the codec.
+
+### Open dependencies
+
+- The `.lzrn` and `.logits.bin` parity artifacts are hardcoded as absolute paths in the parity test (`/Users/creynolds/Programming/lzr-neural/ckpts/small_42_step2000.{lzrn,logits.bin}`). The test cleanly skips on machines without those files. No CI dependency.
+- The Rust port has no KV cache. At codec integration time, each token's forward pass currently re-runs full attention over the whole context window — a `seq_len^2` cost that will be unsuitable for the actual encode/decode loop. KV cache is Phase 25a.5 (or 25b prerequisite).
+
+### What comes after 25a
+
+| Phase | Description | Status |
+|---|---|---|
+| 25a.5 | KV cache for streaming inference (one forward per emitted token, attention over `seq_len-1` cached K/V) | not started |
+| 25b | Int8 post-training quantization with calibration on held-out enwik8; verify ≤0.05 bpb degradation in forward output | not started |
+| 25c | Embed quantized weights as `const` via `include_bytes!`; wire as N+1-th arm on `token_id_mixer` (or `token_oov_mixer` for byte-aligned streams first) | not started |
+| Parallel | Continue medium-config training (5 M params, 6L × 256H, ctx=1024). At step 500: val_bpb 3.65 on enwik8. Expected to land around 2.0 by step 20 K | running |
+
+### Note on token-vs-byte arm integration
+
+A byte-level transformer like this one predicts the **next byte**. The codec emits at **dict-id** granularity. Direct integration with `token_id_mixer` requires either:
+1. Re-training the neural arm to predict dict-ids (couples training to the codec's vocab, breaks model portability)
+2. Projecting byte-level `P(byte)` into dict-id space (lossy, complex)
+3. **First integration target should be the byte-aligned streams** (`token_oov_ac` literal-byte stream, `case_ac`, `attr_ac`, `tag_ac`) — these emit at byte level, so the neural arm's predictions plug in directly. `token_oov_ac` is 16.8 % of total bits — a meaningful gain target on its own.
+
+Phase 25c will start with the `token_oov` mixer integration. Dict-id-aligned integration (the bigger 26.8 % stream) needs a separate trained model that predicts at the dict-id level — deferred.
+
+---
+
 ## 2026-05-14 — Step C Kickoff: lzr-neural Training Repo + First Pretraining Run
 
 Following the corrected Step C framing (pretrained + embedded, 1-10 M params at int8 quant, ~1 M FLOPS/token forward), CDR/Claude bootstrapped the training infrastructure as a sibling repo at `/Users/creynolds/Programming/lzr-neural/` — distinct from the retired `/Users/creynolds/Programming/lzr-train/` (MLX-based, Apple-only, abandoned per CLAUDE.md).
