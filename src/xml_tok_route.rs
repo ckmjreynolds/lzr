@@ -953,8 +953,16 @@ impl Codec for XmlTokRouteCodec {
                     Mode::AttrValue => {
                         let mut byte_cdf = [0u32; 257];
                         models.attr_byte.cdf_to(&mut byte_cdf);
+                        let mut mixed = [0u32; 257];
+                        let final_cdf = models.neural_arm.as_ref().map_or(&byte_cdf, |arm| {
+                            arm.mix_byte_cdf(&byte_cdf, NEURAL_ARM_OOV_WEIGHT, &mut mixed);
+                            &mixed
+                        });
                         let before = enc.bits_written();
-                        enc.encode(&byte_cdf, buf[i] as usize);
+                        enc.encode(final_cdf, buf[i] as usize);
+                        if let Some(arm) = models.neural_arm.as_mut() {
+                            arm.feed(buf[i]);
+                        }
                         comp.attr += enc.bits_written() - before;
                         models.attr_byte.observe(buf[i] as usize);
                         classifier.advance(buf[i]);
@@ -977,9 +985,22 @@ impl Codec for XmlTokRouteCodec {
                             enc.encode(&tag_cdf, TAG_ESCAPE);
                             models.tag_dict.observe(TAG_ESCAPE);
                             let mut byte_cdf = [0u32; 257];
+                            let mut mixed = [0u32; 257];
                             for &b in run {
                                 models.tag_byte.cdf_to(&mut byte_cdf);
-                                enc.encode(&byte_cdf, b as usize);
+                                let final_cdf =
+                                    models.neural_arm.as_ref().map_or(&byte_cdf, |arm| {
+                                        arm.mix_byte_cdf(
+                                            &byte_cdf,
+                                            NEURAL_ARM_OOV_WEIGHT,
+                                            &mut mixed,
+                                        );
+                                        &mixed
+                                    });
+                                enc.encode(final_cdf, b as usize);
+                                if let Some(arm) = models.neural_arm.as_mut() {
+                                    arm.feed(b);
+                                }
                                 models.tag_byte.observe(b as usize);
                             }
                         }
@@ -1279,8 +1300,16 @@ impl Codec for XmlTokRouteCodec {
                 Mode::AttrValue => {
                     let mut byte_cdf = [0u32; 257];
                     models.attr_byte.cdf_to(&mut byte_cdf);
-                    let sym = dec.decode(&byte_cdf)?;
+                    let mut mixed = [0u32; 257];
+                    let final_cdf = models.neural_arm.as_ref().map_or(&byte_cdf, |arm| {
+                        arm.mix_byte_cdf(&byte_cdf, NEURAL_ARM_OOV_WEIGHT, &mut mixed);
+                        &mixed
+                    });
+                    let sym = dec.decode(final_cdf)?;
                     let b = u8::try_from(sym).expect("byte symbol fits u8");
+                    if let Some(arm) = models.neural_arm.as_mut() {
+                        arm.feed(b);
+                    }
                     buf.push(b);
                     models.attr_byte.observe(sym);
                     classifier.advance(b);
@@ -1295,10 +1324,18 @@ impl Codec for XmlTokRouteCodec {
                     models.tag_dict.observe(idx);
                     if idx == TAG_ESCAPE {
                         let mut byte_cdf = [0u32; 257];
+                        let mut mixed = [0u32; 257];
                         loop {
                             models.tag_byte.cdf_to(&mut byte_cdf);
-                            let sym = dec.decode(&byte_cdf)?;
+                            let final_cdf = models.neural_arm.as_ref().map_or(&byte_cdf, |arm| {
+                                arm.mix_byte_cdf(&byte_cdf, NEURAL_ARM_OOV_WEIGHT, &mut mixed);
+                                &mixed
+                            });
+                            let sym = dec.decode(final_cdf)?;
                             let b = u8::try_from(sym).expect("byte symbol fits u8");
+                            if let Some(arm) = models.neural_arm.as_mut() {
+                                arm.feed(b);
+                            }
                             buf.push(b);
                             models.tag_byte.observe(sym);
                             classifier.advance(b);
