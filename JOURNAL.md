@@ -13,6 +13,66 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-16 — Phase 33: E=32 Doubled to 120 K Steps — Architecture Saturated, Pivot Required
+
+Phase 31's 60 K-step `moe_e32_long` was clearly training-bound (val 2.04 → 1.57 from doubling 20 K → 60 K). To test whether the curve still had headroom, CDR/Claude ran `moe_e32_xlong` at 120 K steps (2× longer training, same E=32 backbone, same enwik9 corpus, scaled cosine warmup). Result: **−0.036 bpb combined L+D from doubling training time**, vs the prior doubling's −0.22 — a ~6× drop in returns per training step. The E=32 / 2-layer / 96-hidden / 256-context backbone is now architecture-bound, not training-bound.
+
+### Training
+
+Wall: 21 230 s ≈ 5.9 hr on M3 Pro MPS. Same recipe as `moe_e32_long` except max_steps 60 K → 120 K and warmup 1500 → 3000.
+
+| Metric | E=32-long (60 K) | **E=32-xlong (120 K)** | Δ |
+|---|---:|---:|---:|
+| train_bpb (final smooth) | 1.46 | 1.43 | -0.03 |
+| val_bpb (enwik8 tail) | 1.57 | 1.54 | -0.03 |
+| Standalone bpb (1 MB enwik9) | 1.5417 | **1.5049** | **-0.037** |
+| Train wall | 178 min | 354 min | +2.0× |
+
+### V4 codec results on 1 MB enwik9 with E=32-xlong
+
+| Quant | `L(C)` bpb | `L(D)` bpb (2× rule) | Combined L+D |
+|---|---:|---:|---:|
+| f32 | 1.5659 | 0.2096 | 1.7755 |
+| **int8ch** | **1.5738** | **0.0524** | **1.6262** |
+
+Both at the int8ch quant the L(C) loss vs f32 is only +0.008 bpb (well below the L(D) saving). **The deployable v4 best is now 1.6262 combined L+D bpb** (was 1.6622 at E=32-long).
+
+### Diminishing-returns picture
+
+Plotting standalone bpb vs training steps for the E=32 backbone:
+
+| Steps | Standalone bpb | Δ per doubling |
+|---:|---:|---:|
+| 20 K | 1.78 | (baseline) |
+| 60 K | 1.5417 | -0.24 (over 3×) |
+| 120 K | 1.5049 | -0.037 (over 2×) |
+
+At ~6× drop in returns per step doubling, going to 240 K would buy roughly −0.02 bpb at 6 more hours of training — not worth it.
+
+### What this rules in / out
+
+**Rules in**: an architectural change is the next high-leverage move. Concrete candidates, in expected-impact order, all preserving the v4 codec API and the `apply_quantization` int8ch pathway:
+
+1. **Wider backbone** (`d_model=96 → 128`, `d_ff=256 → 512`): ~2.7× total params (8.7 M at E=32), ~1.78× active inference compute. L(D) at int8ch with 2× rule: 0.139 bpb (was 0.052), so the wider model needs to save >0.087 bpb of `L(C)` to be net-positive. Plausible based on standard scaling.
+2. **Deeper backbone** (`n_layer=2 → 4`): exactly 2× params, exactly 2× active compute. Better long-range capacity but L(D) doubles. Similar threshold (+0.05 L(D) → needs −0.05 L(C) to break even).
+3. **Longer context** (`ctx=256 → 512` or `1024`): 0 extra params (only `pos_emb` grows, +32K params per doubling). Attention compute scales linearly with ctx in the cached path. Likely the cheapest architectural lever — gains are limited only by how much long-range structure exists at byte level.
+4. **Smarter routing** (no-cost): top-2 instead of top-1 routing doubles active expert compute per token but might let the model use experts more cooperatively. Risky without careful aux-loss tuning.
+
+**Rules out (for now)**: more training at this backbone. 120 K steps is past the knee. Save the compute for the wider/deeper experiment.
+
+### Test-time compute headroom
+
+Both directions at int8ch on M3 Pro NEON: ~25-26 s per 1 MB → ~14 hr for 1 GB combined. Projected on the slower Hutter Ryzen 7: ~22-24 hr combined, or ~12 hr per direction — well inside the ~53 hr per-direction limit. A 2-3× compute increase from a wider/deeper backbone is fully absorbable.
+
+### Files / commits
+
+- `lzr-neural/ckpts/moe_e32_xlong_42_step120000.{pt,lzrm}` — the trained 120 K checkpoint.
+- `lzr-neural/src/lzr_neural/config.py` — `moe_e32_xlong` preset already committed in 4a992cb (added before the run started).
+
+CDR to choose between (1) wider backbone, (2) deeper backbone, (3) longer context as the next architectural step. My read: longer context first (cheapest, fastest to validate), then wider if context didn't suffice.
+
+---
+
 ## 2026-05-16 — Phase 32: Hutter Scoring Correction — `L(D)` Counted `2×`, Not `1×`
 
 CDR raised the suspicion that the Hutter scoring rule treats the decompressor more harshly than CLAUDE.md and prior journal entries have been assuming. Direct read of the verbatim rules at `prize.hutter1.net/hrules.htm` (followed up with the actual page text via curl) confirms it: **`L(D)` is paid `2×` even under the "same binary" relaxation, never `1×`.** The journal's combined-L+D numbers from Phases 27–31 are all underestimated by a factor of 2 in the `L(D)` term.
