@@ -45,8 +45,20 @@ const VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Quantization {
     F32,
+    /// Per-tensor symmetric int8. One scale per whole tensor; biased
+    /// by per-tensor max-abs outliers.
     Int8,
+    /// Per-tensor symmetric int4. As Int8 but 4-bit; near-broken on
+    /// our model at this scale.
     Int4,
+    /// Per-row (per-output-channel) symmetric int8. Each 2D weight
+    /// tensor gets one scale per output row, computed from that row's
+    /// max-abs. 1D tensors (norms) fall back to per-tensor since
+    /// per-channel on 1D is a no-op. Adds a tiny scales-overhead to
+    /// `L(D)` (~93 KB total for the current architecture, <0.001 bpb).
+    Int8Ch,
+    /// Per-row symmetric int4. Same shape handling as `Int8Ch`.
+    Int4Ch,
 }
 
 impl Quantization {
@@ -56,17 +68,22 @@ impl Quantization {
         match std::env::var(var).ok().as_deref() {
             Some("int8") => Self::Int8,
             Some("int4") => Self::Int4,
+            Some("int8ch") => Self::Int8Ch,
+            Some("int4ch") => Self::Int4Ch,
             _ => Self::F32,
         }
     }
 
     /// Bytes per parameter at this bit width — used to project the
-    /// `L(D)` tax that the shipped binary would actually pay.
+    /// `L(D)` tax that the shipped binary would actually pay. The
+    /// per-channel variants understate slightly (they ignore the
+    /// per-row scale overhead, ~3% on our architecture); the
+    /// `main.rs` reporter adds that overhead explicitly.
     pub(crate) const fn bytes_per_param(self) -> f64 {
         match self {
             Self::F32 => 4.0,
-            Self::Int8 => 1.0,
-            Self::Int4 => 0.5,
+            Self::Int8 | Self::Int8Ch => 1.0,
+            Self::Int4 | Self::Int4Ch => 0.5,
         }
     }
 
@@ -75,6 +92,8 @@ impl Quantization {
             Self::F32 => "f32",
             Self::Int8 => "int8",
             Self::Int4 => "int4",
+            Self::Int8Ch => "int8ch",
+            Self::Int4Ch => "int4ch",
         }
     }
 }
@@ -203,25 +222,43 @@ impl MoeByteTransformer {
     /// projections, router, every expert FFN, norms) gets its own
     /// per-tensor scale from its max-abs.
     pub(crate) fn apply_quantization(&mut self, q: Quantization) {
-        let bits = match q {
+        let (bits, per_channel) = match q {
             Quantization::F32 => return,
-            Quantization::Int8 => 8,
-            Quantization::Int4 => 4,
+            Quantization::Int8 => (8, false),
+            Quantization::Int4 => (4, false),
+            Quantization::Int8Ch => (8, true),
+            Quantization::Int4Ch => (4, true),
         };
-        quantize_dequantize_inplace(&mut self.tok_emb, bits);
-        quantize_dequantize_inplace(&mut self.pos_emb, bits);
+        let cfg = self.cfg;
+        let d = cfg.d_model;
+        // 2D tensor: [rows, cols], per-channel quant is per-row.
+        let q2d = |w: &mut Vec<f32>, rows: usize, cols: usize| {
+            if per_channel {
+                quantize_dequantize_per_channel(w, rows, cols, bits);
+            } else {
+                quantize_dequantize_inplace(w, bits);
+            }
+        };
+        // 1D tensor: always per-tensor (per-channel on 1D is a no-op
+        // since each element would be its own "channel").
+        let q1d = |w: &mut Vec<f32>| {
+            quantize_dequantize_inplace(w, bits);
+        };
+
+        q2d(&mut self.tok_emb, cfg.vocab_size, d);
+        q2d(&mut self.pos_emb, cfg.context, d);
         for block in &mut self.blocks {
-            quantize_dequantize_inplace(&mut block.norm1_w, bits);
-            quantize_dequantize_inplace(&mut block.qkv_w, bits);
-            quantize_dequantize_inplace(&mut block.proj_w, bits);
-            quantize_dequantize_inplace(&mut block.norm2_w, bits);
-            quantize_dequantize_inplace(&mut block.router_w, bits);
+            q1d(&mut block.norm1_w);
+            q2d(&mut block.qkv_w, 3 * d, d);
+            q2d(&mut block.proj_w, d, d);
+            q1d(&mut block.norm2_w);
+            q2d(&mut block.router_w, cfg.n_experts, d);
             for expert in &mut block.experts {
-                quantize_dequantize_inplace(&mut expert.fc1_w, bits);
-                quantize_dequantize_inplace(&mut expert.fc2_w, bits);
+                q2d(&mut expert.fc1_w, cfg.d_ff, d);
+                q2d(&mut expert.fc2_w, d, cfg.d_ff);
             }
         }
-        quantize_dequantize_inplace(&mut self.norm_f, bits);
+        q1d(&mut self.norm_f);
     }
 
     /// Total trainable parameter count — sum of every weight tensor's
@@ -478,6 +515,38 @@ fn quantize_dequantize_inplace(values: &mut [f32], bits: u32) {
     for v in values.iter_mut() {
         let q = (*v * inv_scale).round().clamp(-max_q, max_q);
         *v = q * scale;
+    }
+}
+
+/// Per-row symmetric quantize-then-dequantize for a row-major 2D
+/// tensor of shape `[rows, cols]` stored as a flat `Vec<f32>`. Each
+/// row gets its own scale from its own max-abs, so a row with mostly
+/// small weights doesn't have its precision wasted by an outlier in
+/// a different row.
+///
+/// Shipped `L(D)` per such tensor is `rows * cols * (bits/8) +
+/// rows * 4` (the per-row f32 scales) — the scale overhead is
+/// ~3% on our architecture, accounted for in `main.rs` reporting.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn quantize_dequantize_per_channel(values: &mut [f32], rows: usize, cols: usize, bits: u32) {
+    assert!((1..32).contains(&bits), "bits must be in 1..32");
+    assert_eq!(values.len(), rows * cols, "shape mismatch");
+    let max_q = ((1_u32 << (bits - 1)) - 1) as f32;
+    for row in values.chunks_exact_mut(cols) {
+        let max_abs = row.iter().fold(0_f32, |a, &v| a.max(v.abs()));
+        if max_abs == 0.0 {
+            continue;
+        }
+        let scale = max_abs / max_q;
+        let inv_scale = scale.recip();
+        for v in row.iter_mut() {
+            let q = (*v * inv_scale).round().clamp(-max_q, max_q);
+            *v = q * scale;
+        }
     }
 }
 
