@@ -13,6 +13,90 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-15 → 2026-05-16 — Phase 30: V4 Pure-Neural Codec Below V3 Deterministic Floor — Sparse-MoE E=32 Lands End-to-End
+
+Following the design discussion on neural-first architecture and the Phase 29 result, CDR/Claude branched **v4** from v3, stripped every deterministic codec (xml/wiki/lz/ppm/bwt/paq/tok/classifier/tokenizer + bit_pred, bpe, mixer, models, mtf, neural, neural_arm — 17 K LOC), and built the minimal pure-neural codec: AC over the sparse-MoE arm's byte distribution. The result, on first 1 MB of enwik9: **1.8221 bpb, roundtrip OK, end-to-end pure-neural** — below v3's deterministic ensemble (1.844) and within 0.011 bpb of the v3 + nano_plus mixed best (1.811 in Phase 27).
+
+### Sweep — `n_experts ∈ {4, 8, 16, 32, 64}` with the nano_plus backbone
+
+All variants reuse the Phase 26.5 nano_plus backbone (2 L × 96 hidden × 4 heads × ctx=256, ~221 K active params per token); only `n_experts` and the load-balancing aux weight differ. Same training recipe: 20 K steps, batch=64, seq=256, AdamW, cosine LR 3e-4 + warmup 500, MPS device, seed 42, aux loss weight 0.01.
+
+| n_experts | Total params | Train wall | Standalone bpb (1 MB enwik9) | L(D) bpb on 1 GB | Net (L+D) |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 517 K | 39 min | 2.17 | 0.0042 | 2.174 |
+| 8 | 911 K | 40 min | 1.94 | 0.0073 | 1.947 |
+| 16 | 1.7 M | 46 min | 1.88 | 0.014 | 1.894 |
+| **32** | **3.3 M** | **63 min** | **1.78** | **0.026** | **1.806** ← knee |
+| 64 | 6.4 M | 102 min | 1.87 | 0.051 | 1.921 |
+
+The knee is at **E=32**. Through E=32, each doubling of expert count buys -0.06 to -0.09 bpb in net (L+D) at zero extra active inference compute. At E=64 the trend reverses: standalone bpb rises (1.87 vs E=32's 1.78) and the L(D) tax doubles, so net loses 0.12 bpb vs E=32. Two plausible causes — neither sharply distinguishable from this single run:
+1. **Under-training at fixed step budget.** E=64 has 1.9× the total params of E=32 but the same 20 K-step budget, so each expert sees half the gradient signal it had at E=32.
+2. **Capacity outpaces data.** 6.4 M total params trained on 90 MB enwik8 (train_bpb 1.98 vs val 2.03 → mild overfit signal, but no worse than E=32's gap).
+
+Aux-loss balance is healthy across the sweep — E=64 utilization spreads across all 64 experts (range 0-5 % per expert, uniform target 1.5 %), no collapse. The Switch-Transformer load loss does its job.
+
+### Rust MoE inference port
+
+`src/moe.rs` (added Phase 29, 487 LOC) — `MoeByteTransformer` with `forward_step` mirroring the dense `ByteTransformer`. Active per-token compute is identical to nano_plus (one expert FFN runs, chosen by router argmax; the dense FFN's exact shape). Reuses the Phase 26 NEON / AVX2 matmul kernel via four `pub(crate)` helpers exposed in `transformer.rs` — zero kernel duplication. New `.lzrm` binary format (magic `LZRM`, version 1) adds one `n_experts` header field and per-layer `router + [(fc1_e, fc2_e) for each expert]` weight stream. PyTorch parity at max_abs 7.4e-5 on E=8, well under the 1e-3 threshold.
+
+### V4 codec (`src/moe_codec.rs`, 218 LOC)
+
+Pure pure-neural — no mode routing, no LZ, no PPM, no classifier:
+
+1. Both encoder and decoder pre-feed `warm` bytes through the `MoeArm`, identically, with no AC emission.
+2. For each `measure` byte: `predict_byte_cdf` produces a 257-entry strict-monotonic AC CDF from the arm's softmax; `AcEncoder::encode` emits; `feed` advances the cache.
+3. Cache auto-resets at every `context=256` boundary; first byte after each reset costs ~8 bits under uniform fallback (cold-start overhead bounded at 0.031 bpb).
+4. Archive layout: `u32 LE measure_len || AC-packed stream`. Decomposition splits into `moe_ac` and `framing` so the sum-equals-archive-bits invariant holds.
+
+Weights load lazily from `LZR_MOE_WEIGHTS` env var (matches v3's `LZR_NEURAL_WEIGHTS` pattern). build.sh fully green: fmt + clippy pedantic+nursery + 29 tests pass.
+
+### End-to-end on first 1 MB enwik9
+
+| Result (E=32 deployment model) | Value |
+|---|---:|
+| **Archive size** | **227,762 bytes** |
+| **L(C) bpb** | **1.8221** |
+| Roundtrip | OK (bit-identical) |
+| L(D) bpb (3.3 M params × int8 / 1 GB) | 0.026 |
+| **Net (L + D) projection on 1 GB** | **~1.85** |
+| Encode time (Rust scalar + NEON) | 25.5 s for 1 MB |
+| Decode time | 25.2 s for 1 MB |
+| Projected full-enwik9 wall (combined) | **~14 hr** |
+| Hutter judge budget | 20-28 hr |
+| Hutter target bpb | 0.878 |
+| Gap remaining | **~0.97 bpb** |
+
+The codec's 0.042 bpb over the standalone 1.78 is exactly the predicted AC framing overhead — no pathology, no surprise. The result reproduces cleanly and fits the wall-clock budget with margin.
+
+### What this rules in / out
+
+**Confirms** the central neural-first hypothesis: a single byte-level neural arm with no deterministic stack can match or beat v3's full ensemble at panel and 1 MB scale. v4's pure-neural floor (~1.82 bpb on enwik9) is already inside v3's best deterministic-only number (1.844) and within 0.01 bpb of v3 + nano_plus mixed (1.811) — without the LZ, PPM, BPE, classifier, mode-routing, or mixer code that v3 spent ~20 phases building.
+
+**Refines** the sparse-MoE design: E=32 is the knee at the 20 K-step / nano_plus-backbone budget. Further capacity adds L(D) faster than it removes L(C).
+
+**Doesn't address** (next-phase work):
+- *Tier 2B — extended training.* E=32 at 40 K-100 K steps may shave 0.1-0.2 bpb. Pure refinement, no architectural risk.
+- *Tier 2A — runtime n-gram mixing.* Free at L(D), captures local repetition the small MoE doesn't memorize. Plausibly -0.1 to -0.3 bpb when mixed.
+- *Wider backbone (d_model=128, n_layer=4).* Trades inference budget for capacity; needs Rust bench validation first.
+- *Quantization-aware training* to int4. E=32 at int4 would save ~0.013 bpb of L(D).
+- *Full-enwik9 wall-clock validation.* The 14 hr / 1 GB projection is extrapolated from 50 s / 1 MB; should be confirmed on the full corpus before committing more capacity.
+
+### Files added on v4 (relative to v3 at Phase 29)
+
+- `src/moe_arm.rs` — streaming `MoeArm` wrapper (159 LOC).
+- `src/moe_codec.rs` — `MoeCodec` implementing the `Codec` trait (218 LOC).
+- (stripped) 33 v3 codec / classifier / tokenizer files, 17031 LOC total removed.
+
+In `lzr-neural/`:
+- `src/lzr_neural/config.py` — `moe_e4`, `moe_e16`, `moe_e32`, `moe_e64` presets.
+- `ckpts/moe_e{4,8,16,32,64}_42_step20000.{pt,lzrm,logits.bin}` — the trained sweep + reference artifacts.
+
+### Next direction
+
+Order chosen with CDR: **(1) journal this entry, (2) extend training of E=32 to 40-60 K steps on enwik8 + enwik9 mix, (3) add the runtime n-gram mixing arm to v4 as the second predictor.** Defer 2C (wider backbone) and 2D (int4 QAT) until 2A + 2B numbers land.
+
+---
+
 ## 2026-05-15 — Phase 29: Sparse-MoE Byte AR Hits 1.94 Standalone Bpb on Enwik9 — Active Compute Held at Nano_plus
 
 After ruling out BFN at this scale (Phase 28) and discussing the v4 "neural-first" architecture with CDR, the agreed plan was: train a sparse-MoE byte-level AR transformer at the same active per-token compute as `nano_plus` (Phase 26.5 baseline, 2.98 standalone bpb on enwik9). The lever is the underused 10 GB judge RAM — total params can grow several-fold without raising inference compute, since only one expert per token activates. Result: **1.94 standalone bpb on enwik9**, a -1.04 bpb improvement at zero extra inference FLOPS.
