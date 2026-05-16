@@ -17,6 +17,7 @@ mod eval;
 mod moe;
 mod moe_arm;
 mod moe_codec;
+mod ngram_arm;
 mod null;
 mod transformer;
 

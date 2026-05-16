@@ -44,50 +44,118 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
-use crate::ac::{AcDecoder, AcEncoder};
+use crate::ac::{AcDecoder, AcEncoder, TOTAL};
 use crate::bits::{BitReader, BitWriter};
 use crate::codec::{Codec, Decomposition};
 use crate::moe_arm::MoeArm;
+use crate::ngram_arm::NgramArm;
 
 const WEIGHTS_ENV: &str = "LZR_MOE_WEIGHTS";
+/// Weight given to the runtime n-gram arm when mixing with the `MoE`
+/// arm in probability space. Default 0.0 means MoE-only (the
+/// Phase 30 baseline). Override via `LZR_NGRAM_WEIGHT` env var in
+/// `[0.0, 1.0]` to sweep without recompiling.
+const NGRAM_WEIGHT_ENV: &str = "LZR_NGRAM_WEIGHT";
 
 #[derive(Debug, Default)]
 pub(crate) struct MoeCodec {
-    /// Lazy-init the arm on first encode/decode call so the codec
+    /// Lazy-init the arms on first encode/decode call so the codec
     /// can be constructed without weights present (matches the v3
     /// pattern where `make_codec` is called eagerly during CLI
     /// dispatch but actual weight access can be deferred).
-    arm: Mutex<Option<MoeArm>>,
+    arms: Mutex<Option<Arms>>,
+}
+
+#[derive(Debug)]
+struct Arms {
+    moe: MoeArm,
+    ngram: NgramArm,
+    /// Mixing weight on the n-gram CDF; `1.0 - ngram_weight` goes
+    /// to the MoE. Set once at load time from `LZR_NGRAM_WEIGHT` env
+    /// var. At 0.0 the n-gram arm is still fed (deterministic state)
+    /// but contributes no mass to the AC distribution.
+    ngram_weight: f64,
 }
 
 impl MoeCodec {
     pub(crate) const fn new() -> Self {
         Self {
-            arm: Mutex::new(None),
+            arms: Mutex::new(None),
         }
     }
 
-    /// Run `op` against the (lazily-loaded) `MoeArm`. The mutex
-    /// guard is held for the entire encode/decode pass so no other
-    /// thread can touch the cache mid-emission. Single-threaded by
-    /// design (submission binary invariant), but the mutex is
-    /// required because [`Codec`] is `&self`.
+    /// Run `op` against the (lazily-loaded) arms. The mutex guard is
+    /// held for the entire encode/decode pass so no other thread can
+    /// touch the cache mid-emission. Single-threaded by design
+    /// (submission binary invariant), but the mutex is required
+    /// because [`Codec`] is `&self`.
     #[allow(clippy::significant_drop_tightening)]
-    fn with_arm<R>(&self, op: impl FnOnce(&mut MoeArm) -> Result<R>) -> Result<R> {
-        let mut guard = self.arm.lock().expect("MoE arm mutex poisoned");
+    fn with_arms<R>(&self, op: impl FnOnce(&mut Arms) -> Result<R>) -> Result<R> {
+        let mut guard = self.arms.lock().expect("MoE codec arms mutex poisoned");
         if guard.is_none() {
             let path: PathBuf = std::env::var_os(WEIGHTS_ENV)
                 .map(PathBuf::from)
                 .with_context(|| {
                     format!("v4 MoE codec requires {WEIGHTS_ENV} env var pointing at .lzrm weights")
                 })?;
-            let arm = MoeArm::load(&path)
+            let moe = MoeArm::load(&path)
                 .with_context(|| format!("loading MoE arm from {}", path.display()))?;
-            *guard = Some(arm);
+            let ngram_weight = std::env::var(NGRAM_WEIGHT_ENV)
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            *guard = Some(Arms {
+                moe,
+                ngram: NgramArm::new(),
+                ngram_weight,
+            });
         }
-        let arm = guard.as_mut().expect("loaded above");
-        arm.reset();
-        op(arm)
+        let arms = guard.as_mut().expect("loaded above");
+        arms.moe.reset();
+        arms.ngram.reset();
+        op(arms)
+    }
+}
+
+/// Mix `moe` and `ngram` 257-entry AC CDFs in probability space:
+/// `mixed_mass = (1-w) * moe_mass + w * ngram_mass`, then enforce
+/// strict monotonicity. Writes to `out`.
+#[allow(clippy::needless_range_loop, clippy::cast_possible_truncation)]
+fn mix_cdfs(moe: &[u32; 257], ngram: &[u32; 257], w_ngram: f64, out: &mut [u32; 257]) {
+    let total_f = f64::from(TOTAL);
+    let w_moe = 1.0 - w_ngram;
+    let mut acc = 0_f64;
+    out[0] = 0;
+    for i in 0..256 {
+        let moe_mass = f64::from(moe[i + 1] - moe[i]) / total_f;
+        let ng_mass = f64::from(ngram[i + 1] - ngram[i]) / total_f;
+        acc += w_moe * moe_mass + w_ngram * ng_mass;
+        out[i + 1] = (acc * total_f) as u32;
+    }
+    out[256] = TOTAL;
+
+    let mut prev = 0_u32;
+    for slot in out.iter_mut().take(257).skip(1) {
+        if *slot <= prev {
+            *slot = prev + 1;
+        }
+        prev = *slot;
+    }
+    if out[256] != TOTAL {
+        let last = out[256];
+        for slot in out.iter_mut().take(257).skip(1) {
+            let scaled = u64::from(*slot) * u64::from(TOTAL) / u64::from(last);
+            *slot = u32::try_from(scaled).unwrap_or(u32::MAX).max(1);
+        }
+        out[256] = TOTAL;
+        let mut prev = 0_u32;
+        for slot in out.iter_mut().take(257).skip(1) {
+            if *slot <= prev {
+                *slot = prev + 1;
+            }
+            prev = *slot;
+        }
     }
 }
 
@@ -106,22 +174,34 @@ impl Codec for MoeCodec {
         }
         let measure_len = u32::try_from(measure.len()).expect("checked above");
 
-        let (archive, ac_bits, total_bits) = self.with_arm(|arm| {
+        let (archive, ac_bits, total_bits) = self.with_arms(|arms| {
             for &b in warm {
-                arm.feed(b);
+                arms.moe.feed(b);
+                arms.ngram.feed(b);
             }
 
             let mut bw = BitWriter::new();
-            let mut cdf = [0_u32; 257];
+            let mut moe_cdf = [0_u32; 257];
+            let mut ngram_cdf = [0_u32; 257];
+            let mut mixed_cdf = [0_u32; 257];
             let bits_before;
             let bits_after;
             {
                 let mut enc = AcEncoder::new(&mut bw);
                 bits_before = enc.bits_written();
+                let w = arms.ngram_weight;
                 for &b in measure {
-                    arm.predict_byte_cdf(&mut cdf);
-                    enc.encode(&cdf, b as usize);
-                    arm.feed(b);
+                    arms.moe.predict_byte_cdf(&mut moe_cdf);
+                    let cdf_to_use: &[u32; 257] = if w == 0.0 {
+                        &moe_cdf
+                    } else {
+                        arms.ngram.predict_byte_cdf(&mut ngram_cdf);
+                        mix_cdfs(&moe_cdf, &ngram_cdf, w, &mut mixed_cdf);
+                        &mixed_cdf
+                    };
+                    enc.encode(cdf_to_use, b as usize);
+                    arms.moe.feed(b);
+                    arms.ngram.feed(b);
                 }
                 bits_after = enc.bits_written();
                 enc.finish();
@@ -129,7 +209,6 @@ impl Codec for MoeCodec {
             let (ac_bytes, _trailing) = bw.finish();
             let ac_bits = bits_after - bits_before;
 
-            // Archive = 4-byte LE length || AC bytes.
             let mut archive = Vec::with_capacity(4 + ac_bytes.len());
             archive.extend_from_slice(&measure_len.to_le_bytes());
             archive.extend_from_slice(&ac_bytes);
@@ -157,22 +236,34 @@ impl Codec for MoeCodec {
         let measure_len = measure_len as usize;
         let ac_bytes = &archive[4..];
 
-        self.with_arm(|arm| {
+        self.with_arms(|arms| {
             for &b in warm {
-                arm.feed(b);
+                arms.moe.feed(b);
+                arms.ngram.feed(b);
             }
 
             let mut br = BitReader::new(ac_bytes);
             let mut dec = AcDecoder::new(&mut br);
-            let mut cdf = [0_u32; 257];
+            let mut moe_cdf = [0_u32; 257];
+            let mut ngram_cdf = [0_u32; 257];
+            let mut mixed_cdf = [0_u32; 257];
             let mut out = Vec::with_capacity(measure_len);
+            let w = arms.ngram_weight;
             for _ in 0..measure_len {
-                arm.predict_byte_cdf(&mut cdf);
-                let b = dec.decode(&cdf)?;
+                arms.moe.predict_byte_cdf(&mut moe_cdf);
+                let cdf_to_use: &[u32; 257] = if w == 0.0 {
+                    &moe_cdf
+                } else {
+                    arms.ngram.predict_byte_cdf(&mut ngram_cdf);
+                    mix_cdfs(&moe_cdf, &ngram_cdf, w, &mut mixed_cdf);
+                    &mixed_cdf
+                };
+                let b = dec.decode(cdf_to_use)?;
                 let byte =
                     u8::try_from(b).with_context(|| format!("AC produced non-byte symbol {b}"))?;
                 out.push(byte);
-                arm.feed(byte);
+                arms.moe.feed(byte);
+                arms.ngram.feed(byte);
             }
             Ok(out)
         })
