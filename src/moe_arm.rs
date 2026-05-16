@@ -27,29 +27,48 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::ac::TOTAL;
-use crate::moe::{MoeByteTransformer, MoeConfig, MoeKvCache};
+use crate::moe::{MoeByteTransformer, MoeConfig, MoeKvCache, Quantization};
+
+/// Env var read at load time to choose a weight bit width. Values:
+/// `"int8"`, `"int4"`. Anything else (including unset) keeps `f32`.
+pub(crate) const QUANT_ENV: &str = "LZR_MOE_QUANT";
 
 #[derive(Debug)]
 pub(crate) struct MoeArm {
     model: MoeByteTransformer,
     cache: MoeKvCache,
+    quant: Quantization,
     pending_logits: Option<Vec<f32>>,
     fed_count: usize,
 }
 
 impl MoeArm {
     pub(crate) fn load(weights_path: &Path) -> Result<Self> {
+        Self::load_with_quantization(weights_path, Quantization::from_env(QUANT_ENV))
+    }
+
+    pub(crate) fn load_with_quantization(weights_path: &Path, q: Quantization) -> Result<Self> {
         let bytes = std::fs::read(weights_path)
             .with_context(|| format!("reading MoE arm weights {}", weights_path.display()))?;
-        let model = MoeByteTransformer::load_lzrm(&bytes)
+        let mut model = MoeByteTransformer::load_lzrm(&bytes)
             .with_context(|| "parsing .lzrm MoE-arm weights")?;
+        model.apply_quantization(q);
         let cache = model.new_kv_cache();
         Ok(Self {
             model,
             cache,
+            quant: q,
             pending_logits: None,
             fed_count: 0,
         })
+    }
+
+    pub(crate) const fn quantization(&self) -> Quantization {
+        self.quant
+    }
+
+    pub(crate) fn total_params(&self) -> usize {
+        self.model.total_params()
     }
 
     pub(crate) const fn cfg(&self) -> MoeConfig {

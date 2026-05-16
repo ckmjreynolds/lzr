@@ -38,6 +38,47 @@ use crate::transformer::{
 const MAGIC: u32 = 0x4C5A_524D;
 const VERSION: u32 = 1;
 
+/// Bit-width choice for weight storage in the shipped binary. The
+/// `.lzrm` file on disk is always `f32`; the bit width affects what
+/// gets committed to a future shipped binary (and the simulated
+/// precision applied at load time via [`MoeByteTransformer::apply_quantization`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Quantization {
+    F32,
+    Int8,
+    Int4,
+}
+
+impl Quantization {
+    /// Parse from a `LZR_MOE_QUANT` env-var value. Unset / unrecognized
+    /// returns `F32` so default behavior is unchanged.
+    pub(crate) fn from_env(var: &str) -> Self {
+        match std::env::var(var).ok().as_deref() {
+            Some("int8") => Self::Int8,
+            Some("int4") => Self::Int4,
+            _ => Self::F32,
+        }
+    }
+
+    /// Bytes per parameter at this bit width — used to project the
+    /// `L(D)` tax that the shipped binary would actually pay.
+    pub(crate) const fn bytes_per_param(self) -> f64 {
+        match self {
+            Self::F32 => 4.0,
+            Self::Int8 => 1.0,
+            Self::Int4 => 0.5,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Int8 => "int8",
+            Self::Int4 => "int4",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MoeConfig {
     pub(crate) n_layer: usize,
@@ -147,6 +188,58 @@ impl MoeByteTransformer {
             blocks,
             norm_f,
         })
+    }
+
+    /// Apply per-tensor symmetric quantize-then-dequantize in place to
+    /// every weight tensor. This is a dev-time stand-in for actually
+    /// shipping the binary at this bit width — the inference kernels
+    /// still see `f32`, but the values are restricted to the grid that
+    /// `bits`-bit quantization would produce. Lets us measure the
+    /// `L(C)` cost of any `L(D)`-saving quantization choice without
+    /// touching the `.lzrm` format or the matmul kernels.
+    ///
+    /// `Quantization::F32` is a no-op. `Int8` uses 8-bit symmetric,
+    /// `Int4` uses 4-bit symmetric. Each tensor (embeddings, attention
+    /// projections, router, every expert FFN, norms) gets its own
+    /// per-tensor scale from its max-abs.
+    pub(crate) fn apply_quantization(&mut self, q: Quantization) {
+        let bits = match q {
+            Quantization::F32 => return,
+            Quantization::Int8 => 8,
+            Quantization::Int4 => 4,
+        };
+        quantize_dequantize_inplace(&mut self.tok_emb, bits);
+        quantize_dequantize_inplace(&mut self.pos_emb, bits);
+        for block in &mut self.blocks {
+            quantize_dequantize_inplace(&mut block.norm1_w, bits);
+            quantize_dequantize_inplace(&mut block.qkv_w, bits);
+            quantize_dequantize_inplace(&mut block.proj_w, bits);
+            quantize_dequantize_inplace(&mut block.norm2_w, bits);
+            quantize_dequantize_inplace(&mut block.router_w, bits);
+            for expert in &mut block.experts {
+                quantize_dequantize_inplace(&mut expert.fc1_w, bits);
+                quantize_dequantize_inplace(&mut expert.fc2_w, bits);
+            }
+        }
+        quantize_dequantize_inplace(&mut self.norm_f, bits);
+    }
+
+    /// Total trainable parameter count — sum of every weight tensor's
+    /// length. Used by callers to project shipped weight size at any
+    /// bit width.
+    pub(crate) fn total_params(&self) -> usize {
+        let mut n = self.tok_emb.len() + self.pos_emb.len() + self.norm_f.len();
+        for block in &self.blocks {
+            n += block.norm1_w.len()
+                + block.qkv_w.len()
+                + block.proj_w.len()
+                + block.norm2_w.len()
+                + block.router_w.len();
+            for expert in &block.experts {
+                n += expert.fc1_w.len() + expert.fc2_w.len();
+            }
+        }
+        n
     }
 
     /// Streaming forward step. One token in, `[vocab_size]` next-byte
@@ -355,6 +448,37 @@ fn argmax_with_value(probs: &[f32]) -> (usize, f32) {
         }
     }
     (best_i, best_v)
+}
+
+/// Per-tensor symmetric quantize-then-dequantize in place. Picks a
+/// scale from the tensor's max-abs so the highest-magnitude weight
+/// maps to `+/- max_q`; everything in between rounds to the nearest
+/// quantization grid point. Zeros stay zero. A tensor of all-zero
+/// (or near-zero) values is left untouched.
+///
+/// `bits` is the signed bit width (e.g., 8 for int8, 4 for int4).
+/// The grid runs from `-(2^(bits-1) - 1)` to `+(2^(bits-1) - 1)`
+/// — symmetric, so the negative reserved slot (`-(2^(bits-1))`) is
+/// unused. This costs one grid point per tensor but keeps the scale
+/// computation trivially correct for both signs.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn quantize_dequantize_inplace(values: &mut [f32], bits: u32) {
+    assert!((1..32).contains(&bits), "bits must be in 1..32");
+    let max_abs = values.iter().fold(0_f32, |a, &v| a.max(v.abs()));
+    if max_abs == 0.0 {
+        return;
+    }
+    let max_q = ((1_u32 << (bits - 1)) - 1) as f32;
+    let scale = max_abs / max_q;
+    let inv_scale = scale.recip();
+    for v in values.iter_mut() {
+        let q = (*v * inv_scale).round().clamp(-max_q, max_q);
+        *v = q * scale;
+    }
 }
 
 #[cfg(test)]

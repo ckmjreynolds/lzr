@@ -122,6 +122,15 @@ fn run_compress(
         archive_bytes as f64 / (1024.0 * 1024.0),
     );
     println!("Compressed bpb:  {bpb:.4}");
+    if let Some((quant_name, shipped_bytes, ld_bpb_on_enwik9)) = projected_ld_on_enwik9() {
+        println!(
+            "L(D) projection: {shipped_bytes} bytes shipped at {quant_name} → {ld_bpb_on_enwik9:.4} bpb on 1 GB enwik9"
+        );
+        println!(
+            "Combined L+D bpb (this corpus's L(C) + 1 GB-amortized L(D)): {:.4}",
+            bpb + ld_bpb_on_enwik9
+        );
+    }
     println!("Encode time:     {encode_elapsed:?}");
     println!(
         "Encode rate:     {:.2} MiB/s",
@@ -233,6 +242,31 @@ fn run_neural_eval(weights: &PathBuf, corpus: &PathBuf, bytes_to_eval: usize) ->
         bytes_seen as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
     );
     Ok(())
+}
+
+/// Read `LZR_MOE_WEIGHTS` + `LZR_MOE_QUANT` and compute the projected
+/// `L(D)` tax (shipped weights bytes × 8 / 1 GB) the binary would pay
+/// at the chosen bit width. Returns `None` if the weights env var
+/// isn't set or the file can't be read — `L(D)` only meaningful when
+/// shipping is being simulated.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn projected_ld_on_enwik9() -> Option<(String, u64, f64)> {
+    let weights_path: PathBuf = std::env::var_os("LZR_MOE_WEIGHTS")?.into();
+    let f32_bytes = fs::metadata(&weights_path).ok()?.len();
+    // .lzrm header is 36 bytes; everything else is f32 tensors.
+    let param_bytes = f32_bytes.saturating_sub(36);
+    let n_params = param_bytes / 4;
+    let quant = moe::Quantization::from_env(moe_arm::QUANT_ENV);
+    // `n_params` peaks at a few million for the size of model we ship,
+    // well inside f64 mantissa precision — the cast lint is paranoia.
+    let shipped_bytes_f64 = (n_params as f64) * quant.bytes_per_param();
+    let shipped_bytes = shipped_bytes_f64 as u64;
+    let ld_bpb = 8.0 * shipped_bytes_f64 / 1e9;
+    Some((quant.name().to_string(), shipped_bytes, ld_bpb))
 }
 
 #[allow(clippy::cast_precision_loss)]
