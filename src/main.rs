@@ -124,7 +124,7 @@ fn run_compress(
     println!("Compressed bpb:  {bpb:.4}");
     if let Some((quant_name, shipped_bytes, ld_bpb_on_enwik9)) = projected_ld_on_enwik9() {
         println!(
-            "L(D) projection: {shipped_bytes} bytes shipped at {quant_name} → {ld_bpb_on_enwik9:.4} bpb on 1 GB enwik9"
+            "L(D) projection: {shipped_bytes} weight-bytes shipped at {quant_name} × Hutter 2× rule → {ld_bpb_on_enwik9:.4} bpb on 1 GB enwik9"
         );
         println!(
             "Combined L+D bpb (this corpus's L(C) + 1 GB-amortized L(D)): {:.4}",
@@ -245,10 +245,11 @@ fn run_neural_eval(weights: &PathBuf, corpus: &PathBuf, bytes_to_eval: usize) ->
 }
 
 /// Read `LZR_MOE_WEIGHTS` + `LZR_MOE_QUANT` and compute the projected
-/// `L(D)` tax (shipped weights bytes × 8 / 1 GB) the binary would pay
-/// at the chosen bit width. Returns `None` if the weights env var
-/// isn't set or the file can't be read — `L(D)` only meaningful when
-/// shipping is being simulated.
+/// `L(D)` tax the shipped binary would pay on 1 GB enwik9 — under
+/// the **`2×` Hutter rule** (the same binary appears in `S` as both
+/// `comp9a` and the reduced-multiplier `decomp9`, so every shipped
+/// byte counts twice). Returns `None` if the weights env var isn't
+/// set. See `JOURNAL.md` 2026-05-16 Phase 32 for the rule derivation.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -261,9 +262,13 @@ fn projected_ld_on_enwik9() -> Option<(String, u64, f64)> {
     let param_bytes = f32_bytes.saturating_sub(36);
     let n_params = param_bytes / 4;
     let quant = moe::Quantization::from_env(moe_arm::QUANT_ENV);
-    // `n_params` peaks at a few million for the size of model we ship,
-    // well inside f64 mantissa precision — the cast lint is paranoia.
-    let shipped_bytes_f64 = (n_params as f64) * quant.bytes_per_param();
+    // `n_params` peaks at a few million for the size of model we
+    // ship, well inside f64 mantissa precision.
+    let weights_bytes_f64 = (n_params as f64) * quant.bytes_per_param();
+    // 2× factor: the binary appears twice in S (once as comp9a, once
+    // as the reduced-multiplier decomp9). The Rust-runtime / code
+    // section also counts under this rule but is not measured here.
+    let shipped_bytes_f64 = 2.0 * weights_bytes_f64;
     let shipped_bytes = shipped_bytes_f64 as u64;
     let ld_bpb = 8.0 * shipped_bytes_f64 / 1e9;
     Some((quant.name().to_string(), shipped_bytes, ld_bpb))

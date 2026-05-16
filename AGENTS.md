@@ -4,11 +4,20 @@ Project-specific guidance for Claude Code working in this repo. Global Claude Co
 
 ## What this is
 
-A Hutter Prize attempt: a single Rust binary that compresses `enwik9` below **109,685,197 bytes** (99% of the 110,793,128-byte record = `L(C) + L(D) + L(A)`). The compressor and decompressor are the same executable, which triggers 1× scoring on `L(D)` rather than 2×.
+A Hutter Prize attempt: a single Rust binary that compresses `enwik9` below the current record (~116 MB ≈ 0.928 bpb combined).
+
+**Hutter scoring formula** (verbatim from `prize.hutter1.net/hrules.htm`):
+
+- *Default (self-extracting archive)*: `S = length(comp9.exe) + length(archive9.exe)`. The compressor and the self-extracting archive both contain a copy of the model weights, so weights are paid for `2×`.
+- *Relaxation (split compressor + bare archive)*: `S = length(comp9a.exe) + 2 × length(decomp9.exe) + length(archive9.bhm)`. **If `comp9a.exe == decomp9.exe`** (same binary used for both directions), the `2×` reduces to `1×`, giving `S = 2 × length(binary) + length(archive)`.
+
+The favorable shape for us is **one binary serving both directions**: the binary appears twice in `S` (once as the compressor, once as the reduced-multiplier decompressor), so its bytes count `2×`. There is no submission shape where `L(D)` is counted only `1×`. Split binaries (`comp9a != decomp9`) are strictly worse (`3×` the binary cost). When projecting `L(D)` bpb in code or journal entries, always multiply shipped-binary-bytes by 2 before dividing by 1 GB.
 
 Two branches:
 - **`hutter`** — v1, ensemble of LZ77 + cross-stream PPM-D + 4M-param RWKV byte-level neural arm. Best result: **1.985 bpb on enwik8** (249 MB extrapolated to enwik9). Architecture: byte-class-routed (Lower/Upper/NonLetter), monolithic codec, ad-hoc bit accounting. **Saturated** — see 2026-05-10 journal entry.
-- **`v2`** — clean-slate rewrite, mode-routed codec with eval-first discipline and per-component bit decomposition. Best deterministic result so far: **2.608 bpb on enwik8** (xml-lz-cp). No neural arm yet. Current development branch.
+- **`v2`** — clean-slate rewrite, mode-routed codec with eval-first discipline and per-component bit decomposition. Best deterministic result so far: **2.608 bpb on enwik8** (xml-lz-cp). No neural arm yet.
+- **`v3`** — adds neural-arm integration onto the v2 mode-routed codec. Best result: 1.811 bpb on enwik9 with `nano_plus` AR transformer mixed on `token_oov_sep` (Phase 27).
+- **`v4`** — neural-first pure-MoE codec. Sparse `n_experts=32` AR transformer + AC + uniform fallback; no LZ/PPM/classifier/tokenizer. Best result (E=32 at 60 K steps, int8ch-quantized at load): **L(C) 1.6098 + 2×L(D) 0.0524 = 1.6622 combined bpb on 1 MB enwik9.** Current development branch.
 
 Current history and rationale live in [JOURNAL.md](JOURNAL.md). The retired Python+MLX predecessor lives at `/Users/creynolds/Programming/lzr-train/`.
 
@@ -18,7 +27,7 @@ Always build via `./build.sh`, not a bare `cargo build`. The script runs fmt, cl
 
 ## Architecture constraints
 
-- **Single binary**, single `main.rs`, subcommands. Compressor and decompressor live in the same executable (Hutter scoring).
+- **Single binary**, single `main.rs`, subcommands. Compressor and decompressor are the same executable — this is the `comp9a == decomp9` relaxation that reduces the decompressor multiplier from `2×` to `1×`. The binary still counts `2×` in total (once as the compressor, once as the reduced decompressor), but that is `1×` better than the `3×` a split-binary submission would pay.
 - **Hutter judging machine limits** (the only hardware constraints actually guaranteed): single CPU core, no GPU, ≤ 10 GB RAM, ≤ 100 GB HDD, time ≤ `70,000 / Geekbench5` hours. The specific CPU model has changed before and may change again — do not hard-code assumptions.
 - **Submission binary is strictly single-threaded.** No `std::thread`, no rayon, no parallel iterators.
 - **Kernel strategy: architecture-neutral first.** Write clean scalar code and trust LLVM auto-vectorization with `RUSTFLAGS=-C target-cpu=native` (configured in `.cargo/config.toml`). v1's Python-side experiments showed clean scalar code reaching ~75 GOPS on Apple NEON where explicit `wide::i16x8` SIMD gave 2.9 GOPS — auto-vec is almost always the right tool. If a measurement justifies it, add an architecture-specific kernel behind a runtime dispatch (`is_x86_feature_detected!`) and keep the neutral path as the fallback.

@@ -13,6 +13,67 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-16 — Phase 32: Hutter Scoring Correction — `L(D)` Counted `2×`, Not `1×`
+
+CDR raised the suspicion that the Hutter scoring rule treats the decompressor more harshly than CLAUDE.md and prior journal entries have been assuming. Direct read of the verbatim rules at `prize.hutter1.net/hrules.htm` (followed up with the actual page text via curl) confirms it: **`L(D)` is paid `2×` even under the "same binary" relaxation, never `1×`.** The journal's combined-L+D numbers from Phases 27–31 are all underestimated by a factor of 2 in the `L(D)` term.
+
+### The actual formula
+
+Verbatim from the rules page:
+
+> Total size is measured as `S := length(comp9.exe/zip)+length(archive9.exe)`.
+
+That's the default (self-extracting archive) format. The relaxation for split compressor + bare archive:
+
+> In lieu of comp9.exe, a compressor comp9a.exe producing archive9.bhm from enwik9, and a decompressor decomp9.exe producing data9 from archive9.bhm may be submitted. In this case, total size is measured as `S := length(comp9a.exe/zip)+2×length(decomp9.exe/zip)+length(archive9.bhm)`. **If `comp9a.exe=decomp9.exe`, the `2×` can be reduced to `1×`.**
+
+| Submission shape | `S` expansion | Binary counted |
+|---|---|---|
+| Self-extracting archive (default) | `length(comp9) + length(archive9 = decomp + data)` | binary `2×` (in both files) |
+| Split, two binaries | `length(comp9a) + 2 × length(decomp9) + length(archive)` | `3×` total avg binary |
+| **Split, same binary (our case)** | `length(comp9a) + 1 × length(decomp9) + length(archive)` | **binary `2×`** |
+
+There is no submission shape where `L(D)` counts only `1×`. The previous CLAUDE.md text — "the same executable triggers `1×` scoring on `L(D)` rather than `2×`" — was wrong. The same-binary relaxation buys `2×` instead of `3×`; the binary still appears twice in `S` (once as `comp9a`, once as the reduced-multiplier `decomp9`), so every shipped byte is paid for twice. CLAUDE.md has been corrected in the same commit as this entry.
+
+### Practical-machine and time limits (also clarified from the same read)
+
+> Each program must run in less than `70'000/T` hours on a machine using at most 10GB RAM and 100GB HDD for temporary files, where `T` is the machine's Geekbench5 score.
+
+The `70'000/T` budget is **per program** (compressor and decompressor each get the full budget), not combined. As of 2021 the test machines were Lenovo 82HT (Intel i7-1165G7, `T≈1427` single-core, Windows) and an AMD Ryzen 7 box (`T=1310` single-core, Linux), giving per-program budgets of ~49 hr and ~53 hr respectively. Our v4 codec at ~7 hr per direction on M3 Pro NEON should land at ~12 hr per direction on the Hutter Ryzen 7 (rough M3-to-Zen2 throughput haircut), well inside either limit.
+
+### Corrected combined-L+D table (all numbers on 1 MB enwik9 except noted)
+
+| Phase / config | `L(C)` bpb | Reported `L(D)` bpb (1×, wrong) | **Corrected `L(D)` bpb (2×)** | **Corrected combined L+D** |
+|---|---:|---:|---:|---:|
+| Phase 27 v3 + nano_plus (enwik8 panel) | 2.149 | ~0.0018 | ~0.0036 | ~2.15 |
+| v3 deterministic best (xml-lz-cp) | 1.844 | 0 (no weights) | 0 | 1.844 |
+| v3 + nano_plus full projection | 1.811 | ~0.0018 | ~0.0036 | ~1.815 |
+| **Phase 29 — MoE E=8 standalone (enwik9)** | 1.94 | 0.0073 | 0.0146 | 1.955 |
+| **Phase 30 — MoE E=32 short** | 1.8221 | 0.026 | 0.052 | 1.874 |
+| **Phase 30 — MoE E=8 + v4 codec** | 1.9773 | 0.0073 | 0.0146 | 1.992 |
+| **Phase 31 — MoE E=32 long, f32 ship** | 1.6036 | 0.105 | 0.210 | 1.814 |
+| **Phase 31 — MoE E=32 long, int8 (per-tensor)** | 1.9468 | 0.026 | 0.052 | 1.999 |
+| **Phase 31 — MoE E=32 long, int8ch (per-channel)** ← **current best** | **1.6098** | 0.026 | **0.052** | **1.662** |
+| Phase 31 — MoE E=32 long, int4ch | 3.8445 | 0.013 | 0.026 | 3.871 |
+| Hutter target | — | — | — | **0.928** (1% improvement over 110.79 MB / 1 GB) |
+
+All entries above only count the **model weights** in `L(D)`. The actual shipped binary also contains the Rust runtime, decompress code, AC, etc. — probably another 1-3 MB stripped — which adds ~0.016-0.048 bpb on top under the `2×` rule. Treat the `L(D)` numbers above as a floor, not a ceiling.
+
+### What changes about our position
+
+- **v4 best is still 1.662 combined L+D, not 1.636** (a 0.026 bpb correction). Still meaningfully below v3 + nano_plus's ~1.815 corrected; still well above Hutter's 0.928 target; gap is now ~0.73 bpb instead of the 0.76 I quoted in Phase 31. Relative orderings (E sweep, training duration, quant modes) all stand — the correction is a uniform factor on the `L(D)` term.
+- **The int8ch advantage is bigger, not smaller, after correction.** f32 ship at the `2×` rule pays `0.210` bpb of `L(D)`, vs int8ch's `0.052` — the swing is `0.158` bpb, more than twice what I quoted (`0.079`). Quantization choice matters more than I said.
+- **Test-time compute is much more comfortable** than I implied. The `70'000/T` budget is per-program, so we have ~49 hr per direction on the slower Hutter judge, with ~12 hr per direction projected = ~4× headroom.
+- **CLAUDE.md updated** to spell out all three submission shapes and the `2×` floor. The `compress` subcommand's "L(D) projection" line still prints the `1×` figure; this should be doubled in the next pass through that code. The corrected numbers above use the doubled value.
+
+### Files / commits
+
+- `CLAUDE.md` — rewrite "What this is" section + the architecture-constraint line that mentioned Hutter scoring.
+- `JOURNAL.md` — this entry.
+- `src/main.rs` — `projected_ld_on_enwik9` should be updated to multiply by 2 (deferred; user-facing change, easy follow-up).
+
+---
+
 ## 2026-05-16 — Phase 31: Extended E=32 Training Buys -0.22 Bpb; Runtime N-gram Mixing Ruled Out
 
 Two follow-on experiments on the v4 codec scaffold from Phase 30. **Tier 2B (extended training): clear win, codec drops from 1.8221 → 1.6036 bpb on 1 MB enwik9.** **Tier 2A (runtime n-gram mixing): null result, MoE has already absorbed everything an Order-2 byte counter could add.**
