@@ -13,6 +13,56 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-16 — Phase 34: Longer-Context Pivot (ctx 256→512) Underperforms at Same Training Budget
+
+Phase 33 concluded the (E=32, 2L × 96d × 256d_ff × ctx=256) backbone is architecture-bound; CDR/Claude picked longer context as the first architectural pivot — cheapest in `L(D)` (only `pos_emb` grows) and the cleanest knob since the attention kernel and MoE FFN code paths don't change. Trained `moe_e32_ctx512` (ctx=512, seq_len=512, batch halved 64→32 to hold tokens-per-step constant) for the same 60 K steps as the `moe_e32_long` baseline. Result: **standalone bpb 1.806 vs ctx=256's 1.5417 — *worse* by 0.26 bpb under the same training budget.** Strong likelihood this is under-training rather than "context doesn't help," but the cost of confirming is another 5-10 hr run.
+
+### Run
+
+| Metric | ctx=256 (E=32-long, 60K) | **ctx=512 (E=32-ctx512, 60K)** | Δ |
+|---|---:|---:|---:|
+| Total params | 3.275 M | 3.300 M (+25 K pos_emb) | +0.8% |
+| Tokens / step | 16 384 (64 × 256) | 16 384 (32 × 512) | unchanged |
+| Train wall | 178 min | 204 min | +15% |
+| Final train_bpb (smooth) | 1.46 | 1.68 | +0.22 |
+| Final val_bpb (enwik8 tail) | 1.57 | 1.74 | +0.17 |
+| Standalone bpb (1 MB enwik9) | **1.5417** | **1.8060** | **+0.264** |
+
+### Why this is probably under-training, not "context is useless"
+
+Three pieces of evidence:
+
+1. **train_bpb stalled high**: 1.68 vs 1.46. The loss curve was still falling at step 60K (lr already in the 1e-8 range, cosine schedule closing); given more cosine warmup + LR decay headroom, train would have kept dropping.
+2. **Halved batch doubles gradient noise** per gradient step. Total *tokens* per step stayed at 16 384, but the number of *independent windows* went from 64 → 32. With per-window gradient variance held equal, the per-step gradient mean's variance doubles. Standard rule of thumb: needs ~2× more steps to reach the same loss as the larger-batch version.
+3. **Extra parameters to learn**: `pos_emb` positions 256-511 are initialized from `N(0, 0.02)` and have to learn from scratch. The network also has to learn to *use* the longer context — even after pos_emb is learned, the attention head's preferred patterns over positions 256-511 are different from 0-255 and need optimization.
+
+Together: a 60 K-step run at ctx=512/batch=32 is the under-training-equivalent of maybe 30 K steps at ctx=256/batch=64. Phase 31's data point at 20 K steps was standalone 1.78; this run's 1.806 lines up almost exactly.
+
+### What this rules in / out
+
+**Rules in (one of)**:
+
+A. **Train ctx=512 longer**, e.g., 120 K steps — direct test of the under-training hypothesis. Wall ~7-8 hr.
+
+B. **Train ctx=512 with batch=64** for 60 K steps (i.e., 32 768 tokens per step — 2× the original) — preserves window diversity, doubles per-step compute. Wall ~10 hr.
+
+C. **Skip context for now**, pivot to wider or deeper backbone — different lever, costlier in `L(D)` but well-studied.
+
+**Doesn't rule out** the possibility that byte-level Wikipedia just doesn't have much exploitable long-range structure beyond 256 bytes. The under-training hypothesis is more likely (Phase 31 trajectory + train-loss still falling), but the cleanest confirmation needs (A) or (B).
+
+### Updated v4 best
+
+Unchanged from Phase 33: **1.6262 combined L+D bpb on 1 MB enwik9** (E=32-xlong, int8ch). The ctx=512 model is not deployable — using it would *raise* combined L+D from 1.6262 to ~1.86. Sticking with `moe_e32_xlong_42_step120000.lzrm` as the deployment-target checkpoint.
+
+### Files / commits
+
+- `lzr-neural/src/lzr_neural/config.py` — `moe_e32_ctx512` preset (committed `b6f8dbd` on lzr-neural main).
+- `lzr-neural/ckpts/moe_e32_ctx512_42_step60000.{pt,lzrm}` — the under-trained ctx=512 checkpoint, retained for replay if (A) is chosen.
+
+CDR to choose between (A), (B), and (C) for the next architectural step.
+
+---
+
 ## 2026-05-16 — Phase 33: E=32 Doubled to 120 K Steps — Architecture Saturated, Pivot Required
 
 Phase 31's 60 K-step `moe_e32_long` was clearly training-bound (val 2.04 → 1.57 from doubling 20 K → 60 K). To test whether the curve still had headroom, CDR/Claude ran `moe_e32_xlong` at 120 K steps (2× longer training, same E=32 backbone, same enwik9 corpus, scaled cosine warmup). Result: **−0.036 bpb combined L+D from doubling training time**, vs the prior doubling's −0.22 — a ~6× drop in returns per training step. The E=32 / 2-layer / 96-hidden / 256-context backbone is now architecture-bound, not training-bound.
