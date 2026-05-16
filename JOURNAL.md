@@ -13,6 +13,102 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-16 — Phase 31: Extended E=32 Training Buys -0.22 Bpb; Runtime N-gram Mixing Ruled Out
+
+Two follow-on experiments on the v4 codec scaffold from Phase 30. **Tier 2B (extended training): clear win, codec drops from 1.8221 → 1.6036 bpb on 1 MB enwik9.** **Tier 2A (runtime n-gram mixing): null result, MoE has already absorbed everything an Order-2 byte counter could add.**
+
+### Tier 2B — `moe_e32_long`: 60 K steps on enwik9 (vs 20 K on enwik8)
+
+Same backbone (2 L × 96 hidden × 4 heads × ctx=256, E=32, n_experts=32) as Phase 30's deployment model. Only difference: max_steps 20 000 → 60 000, training data enwik8 → enwik9 (~10× more bytes), warmup 500 → 1500, eval cadence loosened to match. Wall: 10 679 s ≈ 2.97 hr on MPS.
+
+| Metric | E=32 (20 K, enwik8) | **E=32-long (60 K, enwik9)** | Δ |
+|---|---:|---:|---:|
+| train_bpb (final smooth) | 1.90 | **1.46** | -0.44 |
+| val_bpb (enwik8 tail) | 2.04 | **1.57** | -0.47 |
+| Standalone bpb (1 MB enwik9) | 1.78 | **1.5417** | -0.24 |
+| **v4 codec bpb (1 MB enwik9)** | 1.8221 | **1.6036** | **-0.22** |
+| Train wall | 63 min | 178 min | +2.8× |
+
+The improvement comes from both axes (more steps, more data) — separating them would need another run, deferred. Note that the val_bpb here is no longer truly held-out: training on enwik9 includes the enwik8 tail used as val. The standalone-on-1-MB-enwik9 number is the trustworthy reference.
+
+**Methodology footnote, recorded here once for all bpb numbers in v3 + v4 journal:** enwik8 = first 10^8 bytes of enwik9 (both prefixes of the same Wikipedia dump). So "standalone bpb on first 1 MB enwik9" is **in-distribution** for any model trained on enwik8 or enwik9 — the model has seen these bytes. For Hutter this is fine (the binary ships the trained weights against a fixed corpus; in-distribution memorization is exactly what we want, traded off against `L(D)`). For generalization claims it would not be — but we make no generalization claims. All bpb numbers below should be read as "compressor's actual per-byte bit cost on this fixed corpus," not "model's predictive entropy on unseen text."
+
+### Tier 2A — Runtime Order-2 n-gram mixing
+
+`src/ngram_arm.rs` (157 LOC): 65 536-context Order-2 byte counter with Laplace +1 smoothing, count cap with halving for non-stationarity, strict-monotonic AC CDF emit. Both sides build the same table from identical byte sequences (warm + measure), so zero `L(D)` cost. ~67 MB runtime, comfortably inside the 10 GB judge budget.
+
+`src/moe_codec.rs` now holds both `MoeArm` and `NgramArm` and mixes their CDFs in probability space at weight `LZR_NGRAM_WEIGHT` (default 0.0 = MoE-only, preserving the Phase 30 baseline). Both arms are fed identical bytes so encode and decode stay in lockstep.
+
+Sweep on 1 MB enwik9 with the E=32-long MoE:
+
+| `LZR_NGRAM_WEIGHT` | Codec bpb | Δ vs MoE-only |
+|---:|---:|---:|
+| **0.00 (MoE-only)** | **1.6036** | baseline |
+| 0.05 | 1.6327 | +0.029 |
+| 0.10 | 1.6695 | +0.066 |
+| 0.20 | 1.7548 | +0.151 |
+| 0.30 | 1.8538 | +0.250 |
+
+**Every non-zero weight hurts**, monotonically with the n-gram contribution. This is a cleaner null result than I expected — there's no interior optimum where the n-gram helps even slightly.
+
+### Why n-gram mixing failed at the byte-pair level
+
+The MoE at 1.54 standalone bpb is effectively Order-3+ in predictive power: at the byte level, an Order-2 count table can't represent information the MoE doesn't already encode in its weights or attention. Mixing two predictors only helps when they capture *orthogonal* signal — and in-distribution byte-pair statistics are entirely subsumed by a transformer that has been trained on the exact bytes being compressed.
+
+Three angles where runtime statistics might still help, in expected-payoff order:
+1. **Longer-range repetition the MoE cannot see** (LZ77-style match copying for bytes > 256 apart, the trained context limit). The MoE's attention is bounded; an explicit dictionary built at compression time over the prefix could catch repetitions the MoE provably can't see at this context.
+2. **Higher-order context** (Order-3 / Order-5 PPM with backoff). Memory budget exists (sparse hashing), but the MoE likely already captures much of this; expect a smaller-than-byte-pair win at best.
+3. **Per-context adaptive mixer weight** rather than fixed. The right weight might be 0 for typical bytes but 0.5 for "hard" positions where MoE uncertainty is high. Would need a small SGD mixer on confidence features.
+
+The runtime n-gram code stays in the tree (gated by `LZR_NGRAM_WEIGHT=0` default) since the negative result might flip for a less-trained MoE or out-of-distribution corpus; cheap to leave behind for replay.
+
+### Updated v4 bpb table
+
+| Setup | Standalone | Codec bpb (1 MB enwik9) | Notes |
+|---|---:|---:|---|
+| `nano_plus` AR (Phase 26.5) | 2.98 | n/a | byte-level AR baseline |
+| MoE E=8 (Phase 29) | 1.94 | 1.9773 | first v4 result, 20 K steps |
+| MoE E=32 short (Phase 30) | 1.78 | 1.8221 | sweep knee, 20 K steps |
+| **MoE E=32-long (this entry)** | **1.5417** | **1.6036** | **60 K steps on enwik9** |
+| MoE E=32-long + n-gram (sweep) | — | 1.63-1.85 | every mix weight worse |
+| v3 deterministic codec (xml-lz-cp) | 1.844 | — | best v3 deterministic only |
+| v3 + nano_plus mixed (Phase 27) | 1.811 | — | best v3 overall |
+| Hutter target | — | 0.878 | |
+| **Gap remaining** | — | **~0.73 bpb** | |
+
+For context, v4 has now improved by **-1.38 bpb** vs nano_plus's 2.98 standalone, at the same active per-token inference compute, and **-0.21 bpb** vs v3's best overall result.
+
+### What this rules in / out
+
+**Confirms** that more training + more data buys substantial bpb. The E=32 architecture is not training-saturated at 20 K steps. Worth exploring whether 120 K or 200 K steps continues to pay.
+
+**Rules out** simple Order-2 byte n-gram mixing as a useful additional arm in the small-context regime. The MoE subsumes byte-pair statistics.
+
+**Doesn't address** (next-direction candidates, no commitment yet):
+- *Even longer training* (120 K-200 K steps) — pure refinement.
+- *LZ-style dictionary arm* for long-range repetition beyond the 256-byte context.
+- *Higher-order PPM-style backoff arm.*
+- *Wider backbone* (d_model=128) with E=16 or E=24 to free `L(D)`.
+- *Quantization-aware training to int4.*
+- *Inference benchmark on full enwik9* to validate the 14 hr / 1 GB projection at scale.
+
+CDR to direct the next focus.
+
+### Files / commits
+
+v4 branch:
+- `src/ngram_arm.rs` (new, 157 LOC)
+- `src/moe_codec.rs` (modified: dual-arm with `mix_cdfs`, gated by `LZR_NGRAM_WEIGHT` env)
+- `src/main.rs` (added `mod ngram_arm;`)
+
+lzr-neural/:
+- `src/lzr_neural/config.py` (added `moe_e32_long` preset)
+- `ckpts/moe_e32_long_42_step60000.{pt,lzrm,logits.bin}` (the new deployment-target checkpoint)
+
+build.sh green: fmt + clippy pedantic+nursery + 33 tests pass (29 from Phase 30 + 4 new `ngram_arm` tests).
+
+---
+
 ## 2026-05-15 → 2026-05-16 — Phase 30: V4 Pure-Neural Codec Below V3 Deterministic Floor — Sparse-MoE E=32 Lands End-to-End
 
 Following the design discussion on neural-first architecture and the Phase 29 result, CDR/Claude branched **v4** from v3, stripped every deterministic codec (xml/wiki/lz/ppm/bwt/paq/tok/classifier/tokenizer + bit_pred, bpe, mixer, models, mtf, neural, neural_arm — 17 K LOC), and built the minimal pure-neural codec: AC over the sparse-MoE arm's byte distribution. The result, on first 1 MB of enwik9: **1.8221 bpb, roundtrip OK, end-to-end pure-neural** — below v3's deterministic ensemble (1.844) and within 0.011 bpb of the v3 + nano_plus mixed best (1.811 in Phase 27).

@@ -126,9 +126,11 @@ impl Default for NgramArm {
 
 impl std::fmt::Debug for NgramArm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `counts` is a 67 MB Vec — print its length, not contents.
         f.debug_struct("NgramArm")
             .field("order", &ORDER)
             .field("n_contexts", &N_CONTEXTS)
+            .field("counts_len", &self.counts.len())
             .field("fed_count", &self.fed_count)
             .field("context", &self.context)
             .finish()
@@ -140,7 +142,7 @@ fn uniform_cdf(out: &mut [u32; 257]) {
     let per = TOTAL / 256;
     let leftover = TOTAL - per * 256;
     for i in 0..256 {
-        let extra = if i < leftover as usize { 1 } else { 0 };
+        let extra = u32::from(i < leftover as usize);
         out[i + 1] = out[i] + per + extra;
     }
     debug_assert_eq!(out[256], TOTAL);
@@ -221,7 +223,12 @@ mod tests {
         assert_eq!(cdf[0], 0);
         assert_eq!(cdf[256], TOTAL);
         for i in 1..=256 {
-            assert!(cdf[i] > cdf[i - 1], "non-monotonic at {i}: {} vs {}", cdf[i - 1], cdf[i]);
+            assert!(
+                cdf[i] > cdf[i - 1],
+                "non-monotonic at {i}: {} vs {}",
+                cdf[i - 1],
+                cdf[i]
+            );
         }
     }
 

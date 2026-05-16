@@ -71,9 +71,9 @@ struct Arms {
     moe: MoeArm,
     ngram: NgramArm,
     /// Mixing weight on the n-gram CDF; `1.0 - ngram_weight` goes
-    /// to the MoE. Set once at load time from `LZR_NGRAM_WEIGHT` env
-    /// var. At 0.0 the n-gram arm is still fed (deterministic state)
-    /// but contributes no mass to the AC distribution.
+    /// to the `MoE`. Set once at load time from `LZR_NGRAM_WEIGHT`
+    /// env var. At 0.0 the n-gram arm is still fed (deterministic
+    /// state) but contributes no mass to the AC distribution.
     ngram_weight: f64,
 }
 
@@ -121,7 +121,11 @@ impl MoeCodec {
 /// Mix `moe` and `ngram` 257-entry AC CDFs in probability space:
 /// `mixed_mass = (1-w) * moe_mass + w * ngram_mass`, then enforce
 /// strict monotonicity. Writes to `out`.
-#[allow(clippy::needless_range_loop, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::needless_range_loop,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn mix_cdfs(moe: &[u32; 257], ngram: &[u32; 257], w_ngram: f64, out: &mut [u32; 257]) {
     let total_f = f64::from(TOTAL);
     let w_moe = 1.0 - w_ngram;
@@ -130,7 +134,7 @@ fn mix_cdfs(moe: &[u32; 257], ngram: &[u32; 257], w_ngram: f64, out: &mut [u32; 
     for i in 0..256 {
         let moe_mass = f64::from(moe[i + 1] - moe[i]) / total_f;
         let ng_mass = f64::from(ngram[i + 1] - ngram[i]) / total_f;
-        acc += w_moe * moe_mass + w_ngram * ng_mass;
+        acc += w_ngram.mul_add(ng_mass, w_moe * moe_mass);
         out[i + 1] = (acc * total_f) as u32;
     }
     out[256] = TOTAL;
