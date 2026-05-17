@@ -12,6 +12,7 @@
 
 mod ac;
 mod bits;
+mod bpe;
 mod codec;
 mod eval;
 mod moe;
