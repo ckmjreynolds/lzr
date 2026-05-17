@@ -13,6 +13,94 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-17 — Phase 38: Mixed-Precision Quantization (`mixed4`) Breaks the Combined-L+D Plateau
+
+Phase 37 confirmed that pure architectural scaling has hit a combined-L+D plateau (all three architectures within 0.014 bpb). Per CDR direction, the next move targets `L(D)` rather than `L(C)`: a **mixed-precision scheme** that quantizes the FFN expert weights (the bulk of params for all three architectures) at per-channel int4 while keeping the small precision-sensitive tensors (attention, router, embeddings) at per-channel int8, and the norms at f32. Result: **the wider model's combined L+D drops from 1.6424 → 1.6057, beating the prior best (narrow xlong int8ch, 1.6278) by 0.022 bpb.**
+
+### Why mixed precision should help
+
+Under the `2× Hutter rule` from Phase 32, `L(D)` is a direct linear function of shipped weight bytes. The compute-optimal frontier observed in Phase 37 (architectures tied on combined L+D) holds *for uniform precision*. Breaking the tie requires changing the per-byte trade-off — i.e., spending precision bits where they help most and shaving them where they don't.
+
+For the wider model (8.594 M total params):
+- FFN expert weights: 8.4 M params, **97% of total**
+- Attention (qkv+proj): 0.13 M, 1.5%
+- Router: 0.008 M, 0.1%
+- Embeddings (tok+pos): 0.066 M, 0.8%
+- Norms: 0.001 M, negligible
+
+Quantizing the 97% to int4 saves nearly half the shipped bytes while only the 3% of small tensors take the precision-sensitive load.
+
+### Implementation
+
+`src/moe.rs`:
+
+- New `Quantization::Mixed4` variant.
+- `bytes_per_param` returns `Option<f64>` (None for mixed — the legacy estimator can't represent it).
+- **New `MoeByteTransformer::shipped_bytes(q) -> u64`** — the authoritative `L(D)` projection. Walks every tensor in the model, applies per-tensor-class rules for the chosen quant scheme, and includes per-row scale overhead (relevant at int4 where a 4-byte scale shared across a 128-element row is 3% of the row's quant cost). Used by all schemes, not just Mixed4, so the per-row scale accounting we previously hand-waved is now exact.
+- `apply_quantization(Mixed4)`: dispatches per-tensor — FFN per-channel int4, attn/router/embeddings per-channel int8, norms left at f32.
+
+`src/main.rs`:
+
+- `projected_ld_on_enwik9` now loads the full `.lzrm` and calls `model.shipped_bytes(quant)`. Previously it estimated from `n_params × bytes_per_param` and missed the per-row scale overhead.
+
+### Sweep on 1 MB enwik9 across all three architectures
+
+| Config | L(C) bpb | L(D) bpb (2× rule) | Combined L+D | vs prior best |
+|---|---:|---:|---:|---:|
+| Narrow xlong int8ch (was best) | 1.5738 | 0.0539 | 1.6278 | baseline (was 1.6262, +0.0016 from exact accounting) |
+| Narrow xlong mixed4 | 1.6521 | 0.0288 | 1.6809 | +0.053 worse |
+| Deeper int8ch | 1.5315 | 0.1070 | 1.6385 | +0.011 worse |
+| Deeper mixed4 | 1.5768 | 0.0568 | 1.6336 | +0.006 worse |
+| Wider int8ch (Phase 35) | 1.5022 | 0.1402 | 1.6424 | +0.015 worse |
+| **Wider mixed4** | **1.5326** | **0.0732** | **1.6057** | **-0.022 better** ← new best |
+| Hutter target | — | — | 0.928 | gap 0.678 |
+
+### The pattern: mixed4 helps proportionally to FFN share
+
+| Architecture | FFN % of params | Mixed4 L(C) hit vs int8ch | Mixed4 L(D) saving vs int8ch | Net (combined) |
+|---|---:|---:|---:|---:|
+| Narrow xlong | ~49% | +0.078 | -0.025 | -0.053 (worse) |
+| Deeper | ~81% | +0.045 | -0.050 | +0.005 (slightly better) |
+| Wider | ~97% | +0.030 | -0.067 | **+0.037 (better)** |
+
+The wider architecture's FFN-heaviness was previously hurting it (more params → more L(D) at uniform precision). Under mixed4 it becomes the advantage: the easy-to-quantize bulk gets aggressive treatment while the harder tensors stay safe.
+
+### Exact accounting note
+
+The previous int8ch projection used `n_params × 1 byte` and reported L(D) 0.0524 for narrow xlong. The new `shipped_bytes` includes per-row f32 scales (4 bytes per row of every 2D tensor) and per-tensor f32 scales for 1D norms — totals 0.0539 for the same model. The 0.0015 bpb discrepancy is small but real; all numbers from this phase onward use the exact accounting.
+
+### Deployment best
+
+| Rank | Config | Combined L+D | Notes |
+|---:|---|---:|---|
+| 1 | **Wider + mixed4** | **1.6057** | new deployment target |
+| 2 | Narrow xlong + int8ch | 1.6278 | previous best |
+| 3 | Deeper + mixed4 | 1.6336 | best for deeper |
+| 4 | Deeper + int8ch | 1.6385 | |
+| 5 | Wider + int8ch | 1.6424 | |
+| 6 | Narrow xlong + mixed4 | 1.6809 | mixed4 is wrong for narrow |
+
+### What this rules in / out
+
+**Rules in (high-payoff follow-ups)**:
+
+A. **Train wider longer** — Phase 35 showed wider 60K cosine→60K hit val 1.4646; with mixed4 the new combined L+D ceiling is 1.6057. If wider has more L(C) room under proper training (e.g., longer cosine schedule matched to 120K, not the overshoot from Phase 36), every −0.01 bpb of L(C) translates directly into −0.01 combined since L(D) doesn't change with training.
+
+B. **Even more aggressive quant on FFN** — mixed3 or mixed-asymmetric. Each extra bit shaved from the FFN is ~0.035 bpb of L(D) saving on wider. Probably needs QAT or AWQ-style smart scales.
+
+C. **Wider at higher n_experts** (E=64 with the d=128 backbone) — would further inflate FFN share (already 97%, so room is limited), making mixed4 even more favorable. Need to retrain.
+
+**Rules out**: int8ch as the default ship choice. Mixed4 dominates for both wider and deeper; only narrow prefers int8ch (and narrow is no longer the leader).
+
+### Files / commits
+
+- `src/moe.rs` — Quantization::Mixed4 + shipped_bytes() (committed).
+- `src/main.rs` — projected_ld_on_enwik9 uses model.shipped_bytes (committed).
+
+build.sh green; 33 tests pass; verified roundtrip at mixed4 on 64 KB enwik8 prefix.
+
+---
+
 ## 2026-05-17 — Phase 37: Deeper Backbone (n_layer 2→4) — All Three Architectures Tie on Combined L+D
 
 Per CDR direction in Phase 36, the next architectural lever after wider hit its plateau was depth. Trained `moe_e32_deeper` (n_layer=4, otherwise identical to nano_plus: d_model=96, d_ff=256, n_head=4 head_dim=24, ctx=256, E=32). 60 K steps cosine→0 at 60 K (matching prior comparisons; Phase 36 showed overshooting `max_steps` with cosine hurts). Result: **combined L+D 1.6355 with int8ch** — within 0.014 bpb of both the narrow xlong (1.6262) and wider (1.6397) results. **Architectural scaling has hit a plateau on this data and training budget; the next move needs to be qualitative, not just bigger.**
