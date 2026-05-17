@@ -13,6 +13,72 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-16 — Phase 35: Wider Backbone (d_model 96→128, d_ff 256→512) — Wins on L(C), Loses on L(D) by a Hair
+
+Per CDR direction in Phase 34, the next architectural pivot is the wider backbone. Trained `moe_e32_wider` (E=32, n_layer=2, d_model=128, d_ff=512, n_head=4 → head_dim=32, ctx=256, batch=64, seq_len=256, 60 K steps) for direct comparison to `moe_e32_long`. Result: **wider buys -0.072 bpb in L(C) but costs +0.085 bpb in L(D)** at int8ch with the 2× Hutter rule. Combined L+D essentially flat at 1.6397 vs current best 1.6262 (+0.014 worse) — but the wider model is clearly under-trained at 60 K and the trajectory suggests 120 K could land it well below the narrower best.
+
+### Run
+
+| Metric | E=32-long (narrow, 60K) | **E=32-wider (60K)** | Δ |
+|---|---:|---:|---:|
+| n_layer × d_model × d_ff | 2 × 96 × 256 | 2 × 128 × 512 | wider 2.1× FFN dim |
+| Total params | 3.275 M | 8.594 M | +163% |
+| Active per-token compute | ~491 K FLOPs | ~1.23 M FLOPs | +151% |
+| Train wall (M3 Pro MPS) | 178 min | 225 min | +27% (less than compute ratio — MPS dispatch dominates) |
+| Final train_bpb (smooth) | 1.46 | 1.353 | -0.107 |
+| Final val_bpb (enwik8 tail) | 1.57 | 1.465 | -0.105 |
+| Standalone bpb (1 MB enwik9) | 1.5417 | **1.4349** | **-0.107** |
+
+### V4 codec results on 1 MB enwik9
+
+| Quant | L(C) bpb | L(D) bpb (2× rule) | Combined L+D | Encode wall (1 MB) |
+|---|---:|---:|---:|---:|
+| f32 | 1.4993 | 0.5500 | 2.0493 | 41.5 s |
+| **int8ch** | **1.5022** | **0.1375** | **1.6397** | 41.3 s |
+
+### vs current best (E=32-xlong narrow, 120K + int8ch = 1.6262)
+
+| | Narrow xlong (120K) | **Wider (60K)** | Δ |
+|---|---:|---:|---:|
+| L(C) bpb | 1.5738 | **1.5022** | **-0.072** (wider wins L(C)) |
+| L(D) bpb (2× int8ch) | 0.0524 | 0.1375 | **+0.085** (wider loses L(D)) |
+| Combined L+D | 1.6262 | 1.6397 | **+0.014** (essentially flat, narrow xlong marginally ahead) |
+| Train wall | 5.9 hr | 3.7 hr | wider 1.6× faster per wall-hour |
+
+The wider model wins L(C) by 0.072, just short of the L(D) break-even threshold (needed >0.085 to be net-positive). It's roughly tied with the long-trained narrow model, but at substantially less training compute.
+
+### Strong evidence wider is under-trained at 60K
+
+1. **Same train/val gap as the narrow model had at 60K**: wider 1.35 / 1.46 (gap 0.11) vs narrow at 60K 1.46 / 1.57 (gap 0.11). The narrow model closed val from 1.57 → 1.50 when doubled to 120K. By analogy, wider at 120K should land around val 1.40, standalone ~1.36.
+2. **More capacity to absorb**: 8.6M params trained on 60K × 16K tokens = 983M tokens means each param has been touched fewer times than in the narrow run. Bigger models converge slower per step.
+3. **Train_bpb still falling**: at step 60K with LR essentially 0, train_bpb is 1.353 and was 1.4 at step 50K. Loss curve still has meaningful slope.
+
+If wider-at-120K follows that trajectory, projected:
+
+| Hypothetical | L(C) | L(D) | Combined L+D |
+|---|---:|---:|---:|
+| Wider 60K int8ch (measured) | 1.502 | 0.137 | 1.640 |
+| Wider 120K int8ch (projected) | ~1.36 | 0.137 | **~1.50** |
+| Hutter target | — | — | 0.928 |
+| Projected gap remaining | — | — | **0.57 bpb** |
+
+That would be the first projection inside the 0.6 bpb gap territory, and a -0.13 bpb improvement over today's best.
+
+### Test-time wall update
+
+Encoder + decoder at int8ch on M3 Pro: ~41 s/MB combined → ~22.8 hr for 1 GB combined → ~11.4 hr per direction. Projected onto the slower Hutter Ryzen 7 (~2.4× slowdown): ~27 hr per direction, comfortably inside the 53 hr per-direction limit.
+
+### Decision
+
+Next step (pending CDR sign-off): train `moe_e32_wider_long` for 120 K steps on enwik9, same config as `moe_e32_wider` otherwise. ETA ~7.5 hr on M3 Pro. If it lands below combined L+D 1.55, deeper / longer-context / int4-with-AWQ all become much harder lifts to justify; we lock in wider-long as the v4 deployment target and turn to integration polish (Rust runtime size, framing overhead).
+
+### Files / commits
+
+- `lzr-neural/src/lzr_neural/config.py` — `moe_e32_wider` preset (committed in lzr-neural).
+- `lzr-neural/ckpts/moe_e32_wider_42_step60000.{pt,lzrm}` — the under-trained wider checkpoint, retained.
+
+---
+
 ## 2026-05-16 — Phase 34: Longer-Context Pivot (ctx 256→512) Underperforms at Same Training Budget
 
 Phase 33 concluded the (E=32, 2L × 96d × 256d_ff × ctx=256) backbone is architecture-bound; CDR/Claude picked longer context as the first architectural pivot — cheapest in `L(D)` (only `pos_emb` grows) and the cleanest knob since the attention kernel and MoE FFN code paths don't change. Trained `moe_e32_ctx512` (ctx=512, seq_len=512, batch halved 64→32 to hold tokens-per-step constant) for the same 60 K steps as the `moe_e32_long` baseline. Result: **standalone bpb 1.806 vs ctx=256's 1.5417 — *worse* by 0.26 bpb under the same training budget.** Strong likelihood this is under-training rather than "context doesn't help," but the cost of confirming is another 5-10 hr run.
