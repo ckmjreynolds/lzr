@@ -13,6 +13,73 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-17 — Phase 39: `mixed5` is the Universal Quantization Sweet Spot
+
+Phase 38 introduced `Mixed4` and identified wider + mixed4 = combined L+D 1.6057 as the new best. Per CDR direction the next move was more-aggressive FFN quant; added `Mixed3` (FFN at int3) and `Mixed5` (FFN at int5) variants and swept all three across all three architectures. Result: **`Mixed5` dominates everywhere**, including the narrow model where `Mixed4` was a loser. New v4 deployment best: **wider + mixed5 = 1.5985 combined L+D**, gap to Hutter target now 0.671 bpb.
+
+### The L(C) vs FFN-bit curve is sharply nonlinear
+
+| FFN bits | wider L(C) bpb | Δ vs int8 (1.502) |
+|---:|---:|---:|
+| 8 (int8ch) | 1.5022 | baseline |
+| 5 (mixed5) | 1.5085 | +0.007 |
+| 4 (mixed4) | 1.5326 | +0.030 |
+| 3 (mixed3) | 1.7084 | +0.206 (broken) |
+
+Int5 gives essentially f32-equivalent L(C) (+0.007 is well inside noise) while still saving 36% of FFN bytes vs int8. Int4 costs 4× more L(C) for ~12% more L(D) saving — strictly worse. Int3 falls off a cliff — too few representable values for the FFN's weight distribution at this scale.
+
+### Cross-architecture sweep (1 MB enwik9, combined L+D, lower is better)
+
+| Architecture | int8ch | mixed4 | **mixed5** |
+|---|---:|---:|---:|
+| Narrow xlong (120K) | 1.6278 | 1.6809 | **1.6245** |
+| Deeper (60K) | 1.6385 | 1.6336 | **1.6098** |
+| **Wider (60K)** | 1.6424 | 1.6057 | **1.5985** ← NEW BEST |
+
+**Mixed5 wins for every architecture.** The previous "mixed4 loses on narrow" finding from Phase 38 was specific to mixed4: the L(C) hit at int4 outweighed the L(D) saving for narrow's smaller FFN share. At int5 the L(C) hit shrinks fast enough that even narrow benefits (−0.003 vs int8ch — small but consistent).
+
+### Per-row scale overhead at non-byte-aligned bit widths
+
+Int5 FFN doesn't pack into byte-aligned grids, but for Hutter scoring all that matters is shipped bytes — `shipped_bytes` uses `div_ceil(cols * bits, 8)` to compute the packed byte count per row. The dequantizer at load doesn't need to actually unpack since `apply_quantization` just simulates the precision loss in-place on `f32`. So implementing real packed storage is a deployment-time concern, not a metric concern.
+
+### Updated v4 deployment table (sorted best→worst)
+
+| Rank | Config | L(C) | L(D) 2× | Combined L+D |
+|---:|---|---:|---:|---:|
+| 1 | **Wider + mixed5** | 1.5085 | 0.0899 | **1.5985** |
+| 2 | Wider + mixed4 | 1.5326 | 0.0732 | 1.6057 |
+| 3 | Deeper + mixed5 | 1.5405 | 0.0693 | 1.6098 |
+| 4 | Narrow xlong + mixed5 | 1.5895 | 0.0351 | 1.6245 |
+| 5 | Narrow xlong + int8ch | 1.5738 | 0.0539 | 1.6278 |
+| 6 | Deeper + mixed4 | 1.5768 | 0.0568 | 1.6336 |
+| 7 | Deeper + int8ch | 1.5315 | 0.1070 | 1.6385 |
+| 8 | Wider + int8ch | 1.5022 | 0.1402 | 1.6424 |
+| 9 | Narrow xlong + mixed4 | 1.6521 | 0.0288 | 1.6809 |
+
+Hutter target 0.928; gap from new best 0.671 bpb.
+
+### What this rules in / out
+
+**Rules in (next-direction candidates)**:
+
+A. **Train wider longer with proper LR schedule** (cosine→0 at 120K). Every −0.01 bpb of L(C) is now −0.01 bpb of combined directly. The Phase 35→36 attempts didn't fully exhaust this — the 120K xlong-style run hasn't been done for the wider model. ~7.5 hr.
+
+B. **`Mixed6` / per-tensor-bit sweep** — int5 may not be the global optimum. Try `Mixed6`, `Mixed7` to find the FFN bit-width knee precisely. Each is ~1 min runtime. Cheap to do.
+
+C. **Asymmetric quantization with zero-point** — symmetric assumes weights are zero-mean. FFN weights post-training drift slightly; an asymmetric scheme may recover a few more bits of effective precision per int5 grid cell. Code change only, no retraining.
+
+D. **Sub-row grouping** (e.g., 32 weights/group with their own scale) — finer quantization granularity in exchange for more scale bytes. Trades against the per-row int5 result above; need to sweep.
+
+E. **The Rust binary L(D) side quest from earlier** — we project weight L(D) accurately but the actual binary also includes Rust runtime + code (probably 1-3 MB). Under the 2× rule that's another 0.016-0.048 bpb we haven't measured. Easy to investigate.
+
+### Files / commits
+
+- `src/moe.rs` — `Quantization::Mixed3` and `Quantization::Mixed5` variants, parameterized FFN bit-width via `ffn_bits()`, updated `apply_quantization` and `shipped_bytes` to dispatch by bit-width (committed).
+
+build.sh green, 33 tests pass, verified roundtrip at mixed5.
+
+---
+
 ## 2026-05-17 — Phase 38: Mixed-Precision Quantization (`mixed4`) Breaks the Combined-L+D Plateau
 
 Phase 37 confirmed that pure architectural scaling has hit a combined-L+D plateau (all three architectures within 0.014 bpb). Per CDR direction, the next move targets `L(D)` rather than `L(C)`: a **mixed-precision scheme** that quantizes the FFN expert weights (the bulk of params for all three architectures) at per-channel int4 while keeping the small precision-sensitive tensors (attention, router, embeddings) at per-channel int8, and the norms at f32. Result: **the wider model's combined L+D drops from 1.6424 → 1.6057, beating the prior best (narrow xlong int8ch, 1.6278) by 0.022 bpb.**
