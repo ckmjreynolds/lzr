@@ -13,6 +13,76 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-17 — Phase 36: Early-Stop Infrastructure Works; Long-`max_steps`+Cosine LR Hurts Convergence
+
+CDR asked for arbitrary-length training with periodic checkpoints and auto-termination. Added CLI overrides (`--max-steps`, `--eval-every`, `--ckpt-every`, `--warmup-steps`, `--early-stop-patience`, `--early-stop-min-delta`) to `train_moe.py`, plus a "save final checkpoint on termination even if not at cadence" guard. CDR's specific concern — "don't stop at 120K if we really needed 150K" — surfaced a subtler trap: with the existing cosine LR schedule, setting `max_steps` generously high keeps the LR high throughout the run and *hurts* final convergence.
+
+### Infrastructure
+
+`scripts/train_moe.py` now exposes:
+
+```text
+--max-steps N            override preset's max_steps
+--eval-every K           override preset's eval cadence
+--ckpt-every K           override preset's checkpoint cadence
+--warmup-steps K         override preset's warmup
+--early-stop-patience N  stop after N eval cycles without >=min-delta improvement
+--early-stop-min-delta D minimum val_bpb drop to reset the patience counter
+```
+
+Tracks best val_bpb seen and its step. On termination (whether by max_steps or early stop), saves a final checkpoint if one wasn't just written at the cadence boundary, and prints a summary line `done in <s>s (<reason>, final step N, best val_bpb V@step S)`. Backward compatible — all flags default to the preset's values.
+
+### Test run: `moe_e32_wider_es`
+
+Launched at `max_steps=300000`, `eval_every=2000`, `ckpt_every=10000`, `warmup_steps=3000`, `early-stop-patience=8`, `min_delta=0.005`. The intent was "give the cosine LR plenty of headroom, let early stop decide when we're done." Result: clean early-stop termination, but a worse model than the Phase 35 wider run at the same step count.
+
+| Snapshot | Wall | Final / best val_bpb | Standalone bpb (1 MB enwik9) |
+|---|---:|---:|---:|
+| **Phase 35 wider 60K, cosine→0 at 60K** | 225 min | val 1.4646 final | **1.4349** ← still best |
+| Wider_es @ step 60K, cosine→0 at 300K | ~135 min in | val ~1.55 mid-run | 1.4920 |
+| Wider_es @ step 78K, cosine→0 at 300K (early-stop fired) | 288 min | val 1.4714 best @ step 62K | 1.4656 |
+| Wider_es @ step 78K — final ckpt | — | val 1.4722 | 1.4656 |
+
+Early stop fired correctly: 8 consecutive eval cycles (16 K steps) with no >0.005 bpb improvement after the best at step 62 K. Saved 222 K steps of unnecessary compute — that part of the design worked as intended.
+
+### The LR-schedule trap
+
+At step 60 K, the original wider run had LR `≈ 0` (cosine decayed to 0 at step 60 K). The early-stop run had LR `≈ 2.8e-4` (cosine still near peak, decaying toward 0 at step 300 K). The end-of-training low-LR phase in the original gave it ~0.06 bpb of annealing benefit at the same step count.
+
+Implication: **with cosine LR, `max_steps` isn't just an upper bound — it directly controls how aggressive the late-stage LR decay is.** Setting it 5× higher than the actual convergence point keeps the model in a noisier optimization regime throughout. The early-stop guard can save wall-time but cannot recover the missing LR cool-down.
+
+Two clean fixes for next time:
+
+1. **Match `max_steps` to expected convergence** rather than overshooting (so cosine decay lands where it should). Drawback: if the model actually needs more steps than estimated, we cut off LR too early — the original concern.
+2. **Add a constant-LR (or constant-with-final-decay) schedule**, decoupling LR from `max_steps`. Then `max_steps` becomes a pure upper bound and early stop is the real termination mechanism. Recommended; deferred to a follow-up commit.
+
+### Wider architecture verdict
+
+The wider 60 K result (val 1.4646, standalone 1.4349) was already at or near the architecture's capacity. The 78 K early-stop run, despite training 30 % longer, did not beat it on val (1.4714 vs 1.4646) and was worse on standalone (1.4656 vs 1.4349) — but the LR comparison isn't apples-to-apples. To know whether the wider model has any more headroom we'd need a properly-annealed longer run (e.g., 120 K with cosine→0 at 120 K). Given the Phase 35 projection ("wider at 120 K should land combined L+D ~1.50") rested on the narrow model's curve and that curve flattened sharply at 60→120 K (Phase 33), the upside is bounded.
+
+### Deployment best unchanged
+
+Best v4 combined L+D still **1.6262** (Phase 33: `moe_e32_xlong_42_step120000.lzrm` + int8ch). Phase 35's wider 60 K is at 1.6397 — essentially tied but on the wrong side. The early-stop run produces nothing deployable: best wider_es L(C) at step 60 K is 1.493 vs the original wider 60 K's 1.499, but L(D) is the same, so combined L+D at int8ch ≈ 1.63 vs the deployment 1.626 — slightly worse, not deployable.
+
+### What to do next
+
+Three options, in increasing scope:
+
+A. **Add constant-LR schedule** to `train_moe.py` (1-day code change), then re-test wider at 120 K with constant-LR + early stop. Clean separation between "duration" and "schedule." If wider improves beyond 1.43 standalone, doubling further might be worth it.
+
+B. **Run wider 120 K with cosine→0 at 120 K** (no code change, 7.5 hr). Direct test of whether wider has more room with proper LR annealing.
+
+C. **Architectural pivot: deeper backbone** (`n_layer=2→4`) at the original 96×256 width. 2× params (so similar `L(D)` to wider), different inductive bias (depth instead of width). Phase 35 estimated similar break-even threshold. ~6-8 hr.
+
+CDR to choose.
+
+### Files / commits
+
+- `lzr-neural/scripts/train_moe.py` (committed): CLI overrides + early stop.
+- `lzr-neural/ckpts/moe_e32_wider_es_step*.pt` (10 K, 20 K, ..., 78 K): nine checkpoints retained, the step-62 K best deserves a separate `_step62000.pt` save if we want it (10 K cadence missed it, only step-60 K and step-70 K were saved); the existing step-60 K is the closest proxy and was evaluated above.
+
+---
+
 ## 2026-05-16 — Phase 35: Wider Backbone (d_model 96→128, d_ff 256→512) — Wins on L(C), Loses on L(D) by a Hair
 
 Per CDR direction in Phase 34, the next architectural pivot is the wider backbone. Trained `moe_e32_wider` (E=32, n_layer=2, d_model=128, d_ff=512, n_head=4 → head_dim=32, ctx=256, batch=64, seq_len=256, 60 K steps) for direct comparison to `moe_e32_long`. Result: **wider buys -0.072 bpb in L(C) but costs +0.085 bpb in L(D)** at int8ch with the 2× Hutter rule. Combined L+D essentially flat at 1.6397 vs current best 1.6262 (+0.014 worse) — but the wider model is clearly under-trained at 60 K and the trajectory suggests 120 K could land it well below the narrower best.
