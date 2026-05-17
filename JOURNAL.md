@@ -13,6 +13,74 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-17 — Phase 37: Deeper Backbone (n_layer 2→4) — All Three Architectures Tie on Combined L+D
+
+Per CDR direction in Phase 36, the next architectural lever after wider hit its plateau was depth. Trained `moe_e32_deeper` (n_layer=4, otherwise identical to nano_plus: d_model=96, d_ff=256, n_head=4 head_dim=24, ctx=256, E=32). 60 K steps cosine→0 at 60 K (matching prior comparisons; Phase 36 showed overshooting `max_steps` with cosine hurts). Result: **combined L+D 1.6355 with int8ch** — within 0.014 bpb of both the narrow xlong (1.6262) and wider (1.6397) results. **Architectural scaling has hit a plateau on this data and training budget; the next move needs to be qualitative, not just bigger.**
+
+### Run
+
+| Metric | E=32-long narrow (60K) | E=32-wider (60K) | **E=32-deeper (60K)** |
+|---|---:|---:|---:|
+| n_layer × d_model × d_ff | 2 × 96 × 256 | 2 × 128 × 512 | **4 × 96 × 256** |
+| Total params | 3.275 M | 8.594 M | **6.501 M** |
+| Active per-token compute | 1× nano_plus | 2.5× nano_plus | **2× nano_plus** |
+| Train wall (M3 Pro MPS) | 178 min | 225 min | **350 min** |
+| Final train_bpb (smooth) | 1.46 | 1.353 | **1.38** |
+| Best val_bpb | 1.57 | 1.4646 | **1.4719 @ step 58K** |
+| Aux loss (sum across layers) | ~2.0 | ~2.0 | ~4.0 (~1.0 per layer) |
+
+Aux at deeper is ~4.0 (vs ~2.0 for the 2-layer models) — that's the per-layer aux summed across 4 layers, so per-layer is healthy at ~1.0. No routing collapse; utilization at all 32 experts in all 4 layers stays in the 2-5% range.
+
+### V4 codec results on 1 MB enwik9
+
+| Quant | L(C) bpb | L(D) bpb (2× rule) | Combined L+D | Encode wall (1 MB) |
+|---|---:|---:|---:|---:|
+| f32 | 1.5305 | 0.4161 | 1.9465 | 47.8 s |
+| **int8ch** | **1.5315** | **0.1040** | **1.6355** | 48.5 s |
+
+Encode wall on M3 Pro NEON: ~48 s / MB combined → ~13.3 hr per direction projected for 1 GB. On the slower Hutter Ryzen 7: ~32 hr per direction — still inside the 49 hr per-direction limit but the margin is now ~50%, not the 4× we had with narrow.
+
+### The combined-L+D plateau
+
+| Architecture | Total params | L(C) bpb | L(D) bpb (2× int8ch) | **Combined L+D** | vs Hutter target gap |
+|---|---:|---:|---:|---:|---:|
+| Narrow xlong (120K steps) | 3.275 M | 1.5738 | 0.0524 | **1.6262** | 0.698 |
+| **Deeper (60K)** | 6.501 M | 1.5315 | 0.1040 | **1.6355** | 0.708 |
+| Wider (60K) | 8.594 M | 1.5022 | 0.1375 | **1.6397** | 0.712 |
+
+The three architectures span 2.6× in total params and 2.5× in active compute, yet they land within **0.014 bpb** of each other on combined L+D. Each step up in capacity buys roughly enough L(C) reduction to pay its own L(D) cost.
+
+This is the well-known "compute-optimal frontier" phenomenon at fixed training-data budget: doubling params buys roughly proportional L(C) gains until the data is exhausted, at which point gains diminish to match the L(D) tax. We are on that frontier.
+
+### What this rules in / out
+
+**Rules out**: more parameters of the same shape will not break the plateau at this training-data budget. Deeper and wider both got there from different directions. Going further (n_layer=6, d_model=160) would extend the param count without changing the basic trade-off.
+
+**Rules in (next-direction candidates)**:
+
+A. **Smarter quantization** (mixed-precision, AWQ-style optimal scales, learned 4-bit). The 2× rule makes L(D) the binding cost; the wider model is L(D)-bound (0.137 bpb), the deeper model is too (0.104 bpb). If we can ship those at int4 without breaking L(C), wider becomes the clear winner at ~1.5 combined L+D. Code-only experiment, no retraining.
+
+B. **Retrieval-augmented small model** (the original v4 Tier 3 idea from the design discussion). Use the past bytes as a runtime-built lookup, condition the small NN's prediction on retrieval hits. Free at L(D) (no shipped state), unbounded effective context. Untested; complex.
+
+C. **Token-level model** with BPE (8K-16K vocab). Trades a shipped BPE table for shorter sequences and richer per-token info. The Phase 16 result on v2 (`xml-tok` at 2.412 bpb) suggests token-level helps; an MoE-on-tokens could plausibly land below the byte-level plateau.
+
+D. **Better training data**: only ~10% of `enwik9` is structural (XML, infoboxes); the rest is text. Training on text-only might give a tighter model for prose, with a separate small model for structure. Mode-routing is back, but on the training side.
+
+E. **Constant-LR + early-stop loop** (Phase 36 follow-up): rerun deeper/wider with truly arbitrary training duration. Architectural plateau may be partly under-training even at 60 K cosine→60 K.
+
+CDR to direct. My recommendation: **A first** (cheapest, biggest expected payoff under the 2× rule), then **C or E** depending on appetite for code vs more compute.
+
+### Deployment best
+
+Unchanged: **1.6262 combined L+D** (Phase 33 narrow xlong, int8ch). Deeper is 0.009 worse, wider is 0.014 worse. All three are good candidates depending on the next-direction choice — if (A) lands int4 for either bigger model, the ranking flips.
+
+### Files / commits
+
+- `lzr-neural/src/lzr_neural/config.py` — `moe_e32_deeper` preset (committed).
+- `lzr-neural/ckpts/moe_e32_deeper_42_step60000.{pt,lzrm}` — the deeper checkpoint.
+
+---
+
 ## 2026-05-17 — Phase 36: Early-Stop Infrastructure Works; Long-`max_steps`+Cosine LR Hurts Convergence
 
 CDR asked for arbitrary-length training with periodic checkpoints and auto-termination. Added CLI overrides (`--max-steps`, `--eval-every`, `--ckpt-every`, `--warmup-steps`, `--early-stop-patience`, `--early-stop-min-delta`) to `train_moe.py`, plus a "save final checkpoint on termination even if not at cadence" guard. CDR's specific concern — "don't stop at 120K if we really needed 150K" — surfaced a subtler trap: with the existing cosine LR schedule, setting `max_steps` generously high keeps the LR high throughout the run and *hurts* final convergence.
