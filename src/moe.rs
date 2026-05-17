@@ -59,6 +59,14 @@ pub(crate) enum Quantization {
     Int8Ch,
     /// Per-row symmetric int4. Same shape handling as `Int8Ch`.
     Int4Ch,
+    /// **Mixed precision**: FFN expert weights at per-channel int4,
+    /// attention / router / embedding weights at per-channel int8,
+    /// norms left at f32. Targets the `L(D)` sweet spot where the
+    /// bulk of params (FFN) get aggressive quant but precision-
+    /// sensitive small tensors stay safe. Per-row scale overhead is
+    /// real for int4 (~6% on small rows) and tracked exactly by
+    /// [`MoeByteTransformer::shipped_bytes`].
+    Mixed4,
 }
 
 impl Quantization {
@@ -70,20 +78,23 @@ impl Quantization {
             Some("int4") => Self::Int4,
             Some("int8ch") => Self::Int8Ch,
             Some("int4ch") => Self::Int4Ch,
+            Some("mixed4") => Self::Mixed4,
             _ => Self::F32,
         }
     }
 
-    /// Bytes per parameter at this bit width — used to project the
-    /// `L(D)` tax that the shipped binary would actually pay. The
-    /// per-channel variants understate slightly (they ignore the
-    /// per-row scale overhead, ~3% on our architecture); the
-    /// `main.rs` reporter adds that overhead explicitly.
-    pub(crate) const fn bytes_per_param(self) -> f64 {
+    /// Bytes per parameter at this bit width — used by the legacy
+    /// `L(D)` estimator. Per-channel variants understate slightly
+    /// (ignore per-row scale overhead, ~3% on our architecture).
+    /// Returns `None` for mixed-precision schemes whose bytes-per-
+    /// param isn't uniform — callers should use
+    /// [`MoeByteTransformer::shipped_bytes`] for those.
+    pub(crate) const fn bytes_per_param(self) -> Option<f64> {
         match self {
-            Self::F32 => 4.0,
-            Self::Int8 | Self::Int8Ch => 1.0,
-            Self::Int4 | Self::Int4Ch => 0.5,
+            Self::F32 => Some(4.0),
+            Self::Int8 | Self::Int8Ch => Some(1.0),
+            Self::Int4 | Self::Int4Ch => Some(0.5),
+            Self::Mixed4 => None,
         }
     }
 
@@ -94,6 +105,7 @@ impl Quantization {
             Self::Int4 => "int4",
             Self::Int8Ch => "int8ch",
             Self::Int4Ch => "int4ch",
+            Self::Mixed4 => "mixed4",
         }
     }
 }
@@ -222,15 +234,38 @@ impl MoeByteTransformer {
     /// projections, router, every expert FFN, norms) gets its own
     /// per-tensor scale from its max-abs.
     pub(crate) fn apply_quantization(&mut self, q: Quantization) {
+        if matches!(q, Quantization::F32) {
+            return;
+        }
+        let cfg = self.cfg;
+        let d = cfg.d_model;
+
+        if matches!(q, Quantization::Mixed4) {
+            // FFN expert weights → per-channel int4; everything else
+            // (attn / router / embeddings) → per-channel int8; norms
+            // stay at f32 since they're tiny and high-precision
+            // matters for the rescaling step.
+            quantize_dequantize_per_channel(&mut self.tok_emb, cfg.vocab_size, d, 8);
+            quantize_dequantize_per_channel(&mut self.pos_emb, cfg.context, d, 8);
+            for block in &mut self.blocks {
+                quantize_dequantize_per_channel(&mut block.qkv_w, 3 * d, d, 8);
+                quantize_dequantize_per_channel(&mut block.proj_w, d, d, 8);
+                quantize_dequantize_per_channel(&mut block.router_w, cfg.n_experts, d, 8);
+                for expert in &mut block.experts {
+                    quantize_dequantize_per_channel(&mut expert.fc1_w, cfg.d_ff, d, 4);
+                    quantize_dequantize_per_channel(&mut expert.fc2_w, d, cfg.d_ff, 4);
+                }
+            }
+            return;
+        }
+
         let (bits, per_channel) = match q {
-            Quantization::F32 => return,
+            Quantization::F32 | Quantization::Mixed4 => unreachable!("handled above"),
             Quantization::Int8 => (8, false),
             Quantization::Int4 => (4, false),
             Quantization::Int8Ch => (8, true),
             Quantization::Int4Ch => (4, true),
         };
-        let cfg = self.cfg;
-        let d = cfg.d_model;
         // 2D tensor: [rows, cols], per-channel quant is per-row.
         let q2d = |w: &mut Vec<f32>, rows: usize, cols: usize| {
             if per_channel {
@@ -259,6 +294,90 @@ impl MoeByteTransformer {
             }
         }
         q1d(&mut self.norm_f);
+    }
+
+    /// Compute the exact shipped-weight byte count this model would
+    /// pay under the given `Quantization`, including per-row scale
+    /// overhead for per-channel and mixed schemes. Authoritative
+    /// source for `L(D)` projection — callers should use this rather
+    /// than `n_params × Quantization::bytes_per_param`.
+    ///
+    /// 1D tensors (norms): always per-tensor — one f32 scale per
+    /// tensor (or f32 storage in `Mixed4`).
+    /// 2D tensors at per-channel: `rows × (cols × bits/8 + 4)` bytes.
+    /// 2D tensors at per-tensor: `rows × cols × bits/8 + 4` bytes.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub(crate) fn shipped_bytes(&self, q: Quantization) -> u64 {
+        // Helper: bytes for a 2D tensor of shape [rows, cols] at bits-bit
+        // per-channel (one f32 scale per row).
+        let per_channel_2d = |rows: usize, cols: usize, bits: u32| -> u64 {
+            let weight_bytes = (rows as u64) * ((cols as u64) * u64::from(bits)).div_ceil(8);
+            let scale_bytes = (rows as u64) * 4;
+            weight_bytes + scale_bytes
+        };
+        // Helper: bytes for a flat tensor of `n` elements at bits-bit
+        // per-tensor (single f32 scale shared).
+        let per_tensor = |n: usize, bits: u32| -> u64 {
+            let weight_bytes = ((n as u64) * u64::from(bits)).div_ceil(8);
+            weight_bytes + 4
+        };
+        // Helper: bytes for a flat tensor stored as f32 (no quant).
+        let f32_bytes = |n: usize| -> u64 { (n as u64) * 4 };
+
+        let cfg = self.cfg;
+        let d = cfg.d_model;
+        match q {
+            Quantization::F32 => f32_bytes(self.total_params()),
+            Quantization::Int8 => per_tensor(self.total_params(), 8),
+            Quantization::Int4 => per_tensor(self.total_params(), 4),
+            Quantization::Int8Ch | Quantization::Int4Ch => {
+                let bits = if matches!(q, Quantization::Int8Ch) {
+                    8
+                } else {
+                    4
+                };
+                let mut b = 0_u64;
+                b += per_channel_2d(cfg.vocab_size, d, bits);
+                b += per_channel_2d(cfg.context, d, bits);
+                for block in &self.blocks {
+                    b += per_tensor(block.norm1_w.len(), bits);
+                    b += per_channel_2d(3 * d, d, bits);
+                    b += per_channel_2d(d, d, bits);
+                    b += per_tensor(block.norm2_w.len(), bits);
+                    b += per_channel_2d(cfg.n_experts, d, bits);
+                    for _ in &block.experts {
+                        b += per_channel_2d(cfg.d_ff, d, bits);
+                        b += per_channel_2d(d, cfg.d_ff, bits);
+                    }
+                }
+                b += per_tensor(self.norm_f.len(), bits);
+                b
+            }
+            Quantization::Mixed4 => {
+                // FFN per-channel int4, attn/router/emb per-channel int8,
+                // norms f32 (no quant).
+                let mut b = 0_u64;
+                b += per_channel_2d(cfg.vocab_size, d, 8);
+                b += per_channel_2d(cfg.context, d, 8);
+                for block in &self.blocks {
+                    b += f32_bytes(block.norm1_w.len());
+                    b += per_channel_2d(3 * d, d, 8);
+                    b += per_channel_2d(d, d, 8);
+                    b += f32_bytes(block.norm2_w.len());
+                    b += per_channel_2d(cfg.n_experts, d, 8);
+                    for _ in &block.experts {
+                        b += per_channel_2d(cfg.d_ff, d, 4);
+                        b += per_channel_2d(d, cfg.d_ff, 4);
+                    }
+                }
+                b += f32_bytes(self.norm_f.len());
+                b
+            }
+        }
     }
 
     /// Total trainable parameter count — sum of every weight tensor's

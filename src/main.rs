@@ -248,29 +248,22 @@ fn run_neural_eval(weights: &PathBuf, corpus: &PathBuf, bytes_to_eval: usize) ->
 /// `L(D)` tax the shipped binary would pay on 1 GB enwik9 — under
 /// the **`2×` Hutter rule** (the same binary appears in `S` as both
 /// `comp9a` and the reduced-multiplier `decomp9`, so every shipped
-/// byte counts twice). Returns `None` if the weights env var isn't
-/// set. See `JOURNAL.md` 2026-05-16 Phase 32 for the rule derivation.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
+/// byte counts twice). Loads the model so per-tensor accounting
+/// (per-channel scales, mixed-precision schemes) is exact, not
+/// estimated. Returns `None` if the weights env var isn't set or
+/// loading fails. See `JOURNAL.md` 2026-05-16 Phase 32.
+#[allow(clippy::cast_precision_loss)]
 fn projected_ld_on_enwik9() -> Option<(String, u64, f64)> {
     let weights_path: PathBuf = std::env::var_os("LZR_MOE_WEIGHTS")?.into();
-    let f32_bytes = fs::metadata(&weights_path).ok()?.len();
-    // .lzrm header is 36 bytes; everything else is f32 tensors.
-    let param_bytes = f32_bytes.saturating_sub(36);
-    let n_params = param_bytes / 4;
+    let bytes = fs::read(&weights_path).ok()?;
+    let model = moe::MoeByteTransformer::load_lzrm(&bytes).ok()?;
     let quant = moe::Quantization::from_env(moe_arm::QUANT_ENV);
-    // `n_params` peaks at a few million for the size of model we
-    // ship, well inside f64 mantissa precision.
-    let weights_bytes_f64 = (n_params as f64) * quant.bytes_per_param();
+    let weights_bytes = model.shipped_bytes(quant);
     // 2× factor: the binary appears twice in S (once as comp9a, once
     // as the reduced-multiplier decomp9). The Rust-runtime / code
     // section also counts under this rule but is not measured here.
-    let shipped_bytes_f64 = 2.0 * weights_bytes_f64;
-    let shipped_bytes = shipped_bytes_f64 as u64;
-    let ld_bpb = 8.0 * shipped_bytes_f64 / 1e9;
+    let shipped_bytes = 2 * weights_bytes;
+    let ld_bpb = 8.0 * (shipped_bytes as f64) / 1e9;
     Some((quant.name().to_string(), shipped_bytes, ld_bpb))
 }
 
