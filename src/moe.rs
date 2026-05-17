@@ -67,6 +67,16 @@ pub(crate) enum Quantization {
     /// real for int4 (~6% on small rows) and tracked exactly by
     /// [`MoeByteTransformer::shipped_bytes`].
     Mixed4,
+    /// Mixed3: same scheme as `Mixed4` but FFN at per-channel int3.
+    /// Maximum aggressive L(D) saving (saves ~0.017 bpb vs Mixed4 on
+    /// the wider model); risks larger L(C) hit since 3 bits is at
+    /// the edge of what naive symmetric quant can represent.
+    Mixed3,
+    /// Mixed5: same scheme as `Mixed4` but FFN at per-channel int5.
+    /// Less aggressive L(D) saving than Mixed4; safer L(C). Use as a
+    /// fallback point if Mixed3 / Mixed4 both lose L(C) more than
+    /// they save L(D).
+    Mixed5,
 }
 
 impl Quantization {
@@ -79,6 +89,8 @@ impl Quantization {
             Some("int8ch") => Self::Int8Ch,
             Some("int4ch") => Self::Int4Ch,
             Some("mixed4") => Self::Mixed4,
+            Some("mixed3") => Self::Mixed3,
+            Some("mixed5") => Self::Mixed5,
             _ => Self::F32,
         }
     }
@@ -94,7 +106,7 @@ impl Quantization {
             Self::F32 => Some(4.0),
             Self::Int8 | Self::Int8Ch => Some(1.0),
             Self::Int4 | Self::Int4Ch => Some(0.5),
-            Self::Mixed4 => None,
+            Self::Mixed4 | Self::Mixed3 | Self::Mixed5 => None,
         }
     }
 
@@ -106,6 +118,18 @@ impl Quantization {
             Self::Int8Ch => "int8ch",
             Self::Int4Ch => "int4ch",
             Self::Mixed4 => "mixed4",
+            Self::Mixed3 => "mixed3",
+            Self::Mixed5 => "mixed5",
+        }
+    }
+
+    /// FFN bit-width for the mixed schemes (panics for non-mixed).
+    const fn ffn_bits(self) -> u32 {
+        match self {
+            Self::Mixed3 => 3,
+            Self::Mixed4 => 4,
+            Self::Mixed5 => 5,
+            _ => panic!("ffn_bits called on non-mixed variant"),
         }
     }
 }
@@ -240,11 +264,15 @@ impl MoeByteTransformer {
         let cfg = self.cfg;
         let d = cfg.d_model;
 
-        if matches!(q, Quantization::Mixed4) {
-            // FFN expert weights → per-channel int4; everything else
-            // (attn / router / embeddings) → per-channel int8; norms
-            // stay at f32 since they're tiny and high-precision
-            // matters for the rescaling step.
+        if matches!(
+            q,
+            Quantization::Mixed4 | Quantization::Mixed3 | Quantization::Mixed5
+        ) {
+            // FFN expert weights → per-channel at `ffn_bits` bits;
+            // everything else (attn / router / embeddings) →
+            // per-channel int8; norms stay at f32 since they're tiny
+            // and high-precision matters for the rescaling step.
+            let ffn_bits = q.ffn_bits();
             quantize_dequantize_per_channel(&mut self.tok_emb, cfg.vocab_size, d, 8);
             quantize_dequantize_per_channel(&mut self.pos_emb, cfg.context, d, 8);
             for block in &mut self.blocks {
@@ -252,15 +280,20 @@ impl MoeByteTransformer {
                 quantize_dequantize_per_channel(&mut block.proj_w, d, d, 8);
                 quantize_dequantize_per_channel(&mut block.router_w, cfg.n_experts, d, 8);
                 for expert in &mut block.experts {
-                    quantize_dequantize_per_channel(&mut expert.fc1_w, cfg.d_ff, d, 4);
-                    quantize_dequantize_per_channel(&mut expert.fc2_w, d, cfg.d_ff, 4);
+                    quantize_dequantize_per_channel(&mut expert.fc1_w, cfg.d_ff, d, ffn_bits);
+                    quantize_dequantize_per_channel(&mut expert.fc2_w, d, cfg.d_ff, ffn_bits);
                 }
             }
             return;
         }
 
         let (bits, per_channel) = match q {
-            Quantization::F32 | Quantization::Mixed4 => unreachable!("handled above"),
+            Quantization::F32
+            | Quantization::Mixed4
+            | Quantization::Mixed3
+            | Quantization::Mixed5 => {
+                unreachable!("handled above")
+            }
             Quantization::Int8 => (8, false),
             Quantization::Int4 => (4, false),
             Quantization::Int8Ch => (8, true),
@@ -357,9 +390,10 @@ impl MoeByteTransformer {
                 b += per_tensor(self.norm_f.len(), bits);
                 b
             }
-            Quantization::Mixed4 => {
-                // FFN per-channel int4, attn/router/emb per-channel int8,
-                // norms f32 (no quant).
+            Quantization::Mixed4 | Quantization::Mixed3 | Quantization::Mixed5 => {
+                // FFN per-channel int{3,4,5}, attn/router/emb per-channel
+                // int8, norms f32 (no quant).
+                let ffn_bits = q.ffn_bits();
                 let mut b = 0_u64;
                 b += per_channel_2d(cfg.vocab_size, d, 8);
                 b += per_channel_2d(cfg.context, d, 8);
@@ -370,8 +404,8 @@ impl MoeByteTransformer {
                     b += f32_bytes(block.norm2_w.len());
                     b += per_channel_2d(cfg.n_experts, d, 8);
                     for _ in &block.experts {
-                        b += per_channel_2d(cfg.d_ff, d, 4);
-                        b += per_channel_2d(d, cfg.d_ff, 4);
+                        b += per_channel_2d(cfg.d_ff, d, ffn_bits);
+                        b += per_channel_2d(d, cfg.d_ff, ffn_bits);
                     }
                 }
                 b += f32_bytes(self.norm_f.len());
