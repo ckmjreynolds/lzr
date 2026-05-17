@@ -77,6 +77,14 @@ pub(crate) enum Quantization {
     /// fallback point if Mixed3 / Mixed4 both lose L(C) more than
     /// they save L(D).
     Mixed5,
+    /// Same scheme as `Mixed5` but with **asymmetric** per-channel
+    /// int5 on the FFN — each row gets both a f32 scale and a u8
+    /// zero-point. Recovers precision when a row's weight
+    /// distribution isn't centered at zero (post-training FFN
+    /// weights often have a small bias). Per-row overhead +1 byte vs
+    /// symmetric (the u8 zero-point), <1% of the row's quant cost
+    /// on our architectures.
+    Mixed5Asym,
 }
 
 impl Quantization {
@@ -91,6 +99,7 @@ impl Quantization {
             Some("mixed4") => Self::Mixed4,
             Some("mixed3") => Self::Mixed3,
             Some("mixed5") => Self::Mixed5,
+            Some("mixed5asym") => Self::Mixed5Asym,
             _ => Self::F32,
         }
     }
@@ -106,7 +115,7 @@ impl Quantization {
             Self::F32 => Some(4.0),
             Self::Int8 | Self::Int8Ch => Some(1.0),
             Self::Int4 | Self::Int4Ch => Some(0.5),
-            Self::Mixed4 | Self::Mixed3 | Self::Mixed5 => None,
+            Self::Mixed4 | Self::Mixed3 | Self::Mixed5 | Self::Mixed5Asym => None,
         }
     }
 
@@ -120,6 +129,7 @@ impl Quantization {
             Self::Mixed4 => "mixed4",
             Self::Mixed3 => "mixed3",
             Self::Mixed5 => "mixed5",
+            Self::Mixed5Asym => "mixed5asym",
         }
     }
 
@@ -128,9 +138,15 @@ impl Quantization {
         match self {
             Self::Mixed3 => 3,
             Self::Mixed4 => 4,
-            Self::Mixed5 => 5,
+            Self::Mixed5 | Self::Mixed5Asym => 5,
             _ => panic!("ffn_bits called on non-mixed variant"),
         }
+    }
+
+    /// Whether the FFN uses asymmetric (range-based scale + zero-point)
+    /// quantization. Currently only `Mixed5Asym`.
+    const fn ffn_asymmetric(self) -> bool {
+        matches!(self, Self::Mixed5Asym)
     }
 }
 
@@ -266,13 +282,25 @@ impl MoeByteTransformer {
 
         if matches!(
             q,
-            Quantization::Mixed4 | Quantization::Mixed3 | Quantization::Mixed5
+            Quantization::Mixed4
+                | Quantization::Mixed3
+                | Quantization::Mixed5
+                | Quantization::Mixed5Asym
         ) {
-            // FFN expert weights → per-channel at `ffn_bits` bits;
+            // FFN expert weights → per-channel at `ffn_bits` bits
+            // (symmetric or asymmetric depending on variant);
             // everything else (attn / router / embeddings) →
-            // per-channel int8; norms stay at f32 since they're tiny
-            // and high-precision matters for the rescaling step.
+            // per-channel int8 symmetric; norms stay at f32 since
+            // they're tiny and high-precision matters.
             let ffn_bits = q.ffn_bits();
+            let ffn_asym = q.ffn_asymmetric();
+            let q_ffn = |w: &mut Vec<f32>, rows: usize, cols: usize| {
+                if ffn_asym {
+                    quantize_dequantize_per_channel_asym(w, rows, cols, ffn_bits);
+                } else {
+                    quantize_dequantize_per_channel(w, rows, cols, ffn_bits);
+                }
+            };
             quantize_dequantize_per_channel(&mut self.tok_emb, cfg.vocab_size, d, 8);
             quantize_dequantize_per_channel(&mut self.pos_emb, cfg.context, d, 8);
             for block in &mut self.blocks {
@@ -280,8 +308,8 @@ impl MoeByteTransformer {
                 quantize_dequantize_per_channel(&mut block.proj_w, d, d, 8);
                 quantize_dequantize_per_channel(&mut block.router_w, cfg.n_experts, d, 8);
                 for expert in &mut block.experts {
-                    quantize_dequantize_per_channel(&mut expert.fc1_w, cfg.d_ff, d, ffn_bits);
-                    quantize_dequantize_per_channel(&mut expert.fc2_w, d, cfg.d_ff, ffn_bits);
+                    q_ffn(&mut expert.fc1_w, cfg.d_ff, d);
+                    q_ffn(&mut expert.fc2_w, d, cfg.d_ff);
                 }
             }
             return;
@@ -291,7 +319,8 @@ impl MoeByteTransformer {
             Quantization::F32
             | Quantization::Mixed4
             | Quantization::Mixed3
-            | Quantization::Mixed5 => {
+            | Quantization::Mixed5
+            | Quantization::Mixed5Asym => {
                 unreachable!("handled above")
             }
             Quantization::Int8 => (8, false),
@@ -390,10 +419,24 @@ impl MoeByteTransformer {
                 b += per_tensor(self.norm_f.len(), bits);
                 b
             }
-            Quantization::Mixed4 | Quantization::Mixed3 | Quantization::Mixed5 => {
-                // FFN per-channel int{3,4,5}, attn/router/emb per-channel
-                // int8, norms f32 (no quant).
+            Quantization::Mixed4
+            | Quantization::Mixed3
+            | Quantization::Mixed5
+            | Quantization::Mixed5Asym => {
+                // FFN per-channel int{3,4,5} (symmetric or
+                // asymmetric); attn/router/emb per-channel int8;
+                // norms f32.
+                // Asymmetric adds 1 u8 zero-point per row on top of
+                // the 4-byte f32 scale, so per-channel rows cost
+                // `cols × bits / 8 + 5` instead of `+ 4`.
                 let ffn_bits = q.ffn_bits();
+                let ffn_per_row_overhead = if q.ffn_asymmetric() { 5_u64 } else { 4_u64 };
+                let ffn_per_channel_2d = |rows: usize, cols: usize| -> u64 {
+                    let weight_bytes =
+                        (rows as u64) * ((cols as u64) * u64::from(ffn_bits)).div_ceil(8);
+                    let scale_bytes = (rows as u64) * ffn_per_row_overhead;
+                    weight_bytes + scale_bytes
+                };
                 let mut b = 0_u64;
                 b += per_channel_2d(cfg.vocab_size, d, 8);
                 b += per_channel_2d(cfg.context, d, 8);
@@ -404,8 +447,8 @@ impl MoeByteTransformer {
                     b += f32_bytes(block.norm2_w.len());
                     b += per_channel_2d(cfg.n_experts, d, 8);
                     for _ in &block.experts {
-                        b += per_channel_2d(cfg.d_ff, d, ffn_bits);
-                        b += per_channel_2d(d, cfg.d_ff, ffn_bits);
+                        b += ffn_per_channel_2d(cfg.d_ff, d);
+                        b += ffn_per_channel_2d(d, cfg.d_ff);
                     }
                 }
                 b += f32_bytes(self.norm_f.len());
@@ -699,6 +742,51 @@ fn quantize_dequantize_per_channel(values: &mut [f32], rows: usize, cols: usize,
         for v in row.iter_mut() {
             let q = (*v * inv_scale).round().clamp(-max_q, max_q);
             *v = q * scale;
+        }
+    }
+}
+
+/// Asymmetric per-channel quantize-then-dequantize: each row of the
+/// `[rows, cols]` 2D tensor gets a `(scale, zero_point)` pair derived
+/// from its `(min, max)` so the full quant grid covers the row's
+/// actual range — useful when a row's weights aren't centered at
+/// zero (post-training FFN weights often acquire a small bias).
+///
+/// Quant: `q = round((w - w_min) / scale)` clamped to `[0, n_levels-1]`.
+/// Dequant: `w' = q * scale + w_min`.
+///
+/// Shipped storage per row is `cols * bits / 8` weight bytes + 4
+/// (f32 scale) + 1 (u8 zero-point) — the per-row overhead vs
+/// symmetric is +1 byte, accounted for in [`MoeByteTransformer::shipped_bytes`].
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn quantize_dequantize_per_channel_asym(values: &mut [f32], rows: usize, cols: usize, bits: u32) {
+    assert!((2..32).contains(&bits), "asym needs at least 2 bits");
+    assert_eq!(values.len(), rows * cols, "shape mismatch");
+    let n_levels = (1_u32 << bits) - 1; // e.g., 31 for int5 (0..=31)
+    let n_levels_f = n_levels as f32;
+    for row in values.chunks_exact_mut(cols) {
+        let (mut w_min, mut w_max) = (row[0], row[0]);
+        for &v in row.iter() {
+            if v < w_min {
+                w_min = v;
+            }
+            if v > w_max {
+                w_max = v;
+            }
+        }
+        let range = w_max - w_min;
+        if range == 0.0 {
+            continue;
+        }
+        let scale = range / n_levels_f;
+        let inv_scale = scale.recip();
+        for v in row.iter_mut() {
+            let q = ((*v - w_min) * inv_scale).round().clamp(0.0, n_levels_f);
+            *v = q * scale + w_min;
         }
     }
 }
