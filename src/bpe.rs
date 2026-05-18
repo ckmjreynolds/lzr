@@ -57,8 +57,8 @@ pub(crate) struct Bpe {
 impl Bpe {
     /// Load a `.bin` tokenizer file produced by `train_bpe.py`.
     pub(crate) fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("reading BPE table {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading BPE table {}", path.display()))?;
         Self::parse(&bytes)
     }
 
@@ -97,9 +97,7 @@ impl Bpe {
             }
             let byte_len = read_u16(bytes, &mut cursor) as usize;
             if cursor + byte_len > bytes.len() {
-                bail!(
-                    "BPE table truncated at token {tok_id} body (need {byte_len} bytes)"
-                );
+                bail!("BPE table truncated at token {tok_id} body (need {byte_len} bytes)");
             }
             id_to_bytes.push(bytes[cursor..cursor + byte_len].to_vec());
             cursor += byte_len;
@@ -216,9 +214,8 @@ mod tests {
 
     #[test]
     fn bpe_round_trips_real_enwik8_prefix() {
-        let bpe_path = std::path::PathBuf::from(
-            "/Users/creynolds/Programming/lzr-neural/ckpts/bpe_8k_v2.bin",
-        );
+        let bpe_path =
+            std::path::PathBuf::from("/Users/creynolds/Programming/lzr-neural/ckpts/bpe_8k_v2.bin");
         if !bpe_path.exists() {
             eprintln!("BPE table missing — skipping round-trip test");
             return;
@@ -249,6 +246,33 @@ mod tests {
             tokens.len(),
             bytes_per_token,
         );
+    }
+
+    /// Round-trip the first 1 MB of enwik9 directly through the
+    /// Rust BPE (no AC, no codec). Catches any encode/decode issue
+    /// that's specific to the larger input size.
+    #[test]
+    fn bpe_round_trips_first_1mb_enwik9() {
+        let bpe_path =
+            std::path::PathBuf::from("/Users/creynolds/Programming/lzr-neural/ckpts/bpe_8k_v2.bin");
+        let corpus = std::path::PathBuf::from("/Users/creynolds/Programming/lzr/assets/enwik9");
+        if !bpe_path.exists() || !corpus.exists() {
+            eprintln!("artifacts missing — skipping");
+            return;
+        }
+        let bpe = Bpe::load(&bpe_path).expect("load BPE");
+        let mut all = std::fs::read(&corpus).expect("read corpus");
+        all.truncate(1_000_000);
+        let tokens = bpe.encode(&all);
+        let decoded = bpe.decode(&tokens);
+        eprintln!(
+            "bpe 1MB roundtrip: in={} tokens={} out={}",
+            all.len(),
+            tokens.len(),
+            decoded.len()
+        );
+        assert_eq!(decoded.len(), all.len(), "byte length mismatch");
+        assert_eq!(decoded, all, "byte content mismatch");
     }
 
     #[test]
@@ -290,9 +314,8 @@ mod tests {
     /// Rust BPE algorithm and HF tokenizers' BPE.
     #[test]
     fn bpe_python_parity() {
-        let bpe_path = std::path::PathBuf::from(
-            "/Users/creynolds/Programming/lzr-neural/ckpts/bpe_8k_v2.bin",
-        );
+        let bpe_path =
+            std::path::PathBuf::from("/Users/creynolds/Programming/lzr-neural/ckpts/bpe_8k_v2.bin");
         let ref_path = std::path::PathBuf::from(
             "/Users/creynolds/Programming/lzr-neural/ckpts/bpe_8k_v2.parity.bin",
         );
@@ -333,15 +356,14 @@ mod tests {
         );
         for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
             assert_eq!(
-                a, e,
+                a,
+                e,
                 "mismatch at position {i}: rust={a} python={e}\n  rust first 8: {:?}\n  py   first 8: {:?}",
                 &actual[..8.min(actual.len())],
                 &expected[..8.min(expected.len())],
             );
         }
-        eprintln!(
-            "bpe parity OK: {n_bytes} bytes → {n_tokens} tokens, exact match"
-        );
+        eprintln!("bpe parity OK: {n_bytes} bytes → {n_tokens} tokens, exact match");
     }
 
     #[test]

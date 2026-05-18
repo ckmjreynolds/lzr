@@ -182,12 +182,17 @@ mod tests {
         let arm = NgramArm::new();
         let mut cdf = [0_u32; 257];
         arm.predict_byte_cdf(&mut cdf);
-        // Uniform: per-symbol mass ≈ TOTAL/256 = 256.
+        // Uniform: per-symbol mass ≈ TOTAL/256.
         assert_eq!(cdf[0], 0);
         assert_eq!(cdf[256], TOTAL);
+        let per = TOTAL / 256;
         for i in 0..256 {
             let mass = cdf[i + 1] - cdf[i];
-            assert!((255..=257).contains(&mass), "uniform mass at {i}: {mass}");
+            // Allow ±1 for the leftover distribution.
+            assert!(
+                (per - 1..=per + 1).contains(&mass),
+                "uniform mass at {i}: {mass} (expected ~{per})"
+            );
         }
     }
 

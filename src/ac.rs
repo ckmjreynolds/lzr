@@ -17,9 +17,13 @@ use anyhow::{Result, bail};
 use crate::bits::{BitReader, BitWriter};
 
 /// Sum of probability mass across all symbols in any CDF the AC sees.
-/// 16-bit precision keeps the `range * mass / TOTAL` multiplies inside
-/// u64 with headroom.
-pub(crate) const TOTAL: u32 = 1 << 16;
+/// 20-bit precision keeps `range * mass / TOTAL` multiplies inside
+/// `u64` with comfortable headroom (`2^32 * 2^20 = 2^52`) and gives
+/// per-symbol mass resolution that survives large vocabs — at 16-bit
+/// precision an 8192-vocab CDF had many symbols at the 1-unit floor,
+/// causing AC encode/decode to disagree on adjacent IDs (see Phase 41
+/// diagnostic).
+pub(crate) const TOTAL: u32 = 1 << 20;
 
 const PRECISION_BITS: u32 = 32;
 const HALF: u32 = 1u32 << (PRECISION_BITS - 1);

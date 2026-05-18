@@ -489,7 +489,7 @@ impl MoeByteTransformer {
         clippy::suboptimal_flops,
         clippy::similar_names
     )]
-    pub(crate) fn forward_step(&self, cache: &mut MoeKvCache, token: u8) -> Vec<f32> {
+    pub(crate) fn forward_step(&self, cache: &mut MoeKvCache, token: u32) -> Vec<f32> {
         let cfg = &self.cfg;
         assert_eq!(cache.layers.len(), cfg.n_layer);
         assert!(
@@ -497,6 +497,11 @@ impl MoeByteTransformer {
             "MoE KV cache full at pos={} (context={}); caller must reset between chunks",
             cache.pos,
             cfg.context
+        );
+        assert!(
+            (token as usize) < cfg.vocab_size,
+            "token {token} out of vocab (size {})",
+            cfg.vocab_size
         );
         let d = cfg.d_model;
         let h = cfg.n_head;
@@ -601,7 +606,7 @@ impl MoeByteTransformer {
     /// dumped in batched mode); the codec path uses `forward_step`
     /// for KV caching.
     #[allow(clippy::many_single_char_names, clippy::needless_range_loop)]
-    pub(crate) fn forward(&self, tokens: &[u8]) -> Vec<f32> {
+    pub(crate) fn forward(&self, tokens: &[u32]) -> Vec<f32> {
         let t = tokens.len();
         let vocab = self.cfg.vocab_size;
         let mut all_logits = vec![0f32; t * vocab];
@@ -839,7 +844,7 @@ mod tests {
         }
         assert_eq!(reference.len(), t * vocab);
 
-        let input: Vec<u8> = (0..t as u8).collect();
+        let input: Vec<u32> = (0..t).map(|i| i as u32).collect();
         let actual = model.forward(&input);
         assert_eq!(actual.len(), reference.len());
 

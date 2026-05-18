@@ -23,6 +23,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::codec::{Codec, Decomposition};
 use crate::moe_codec::MoeCodec;
+use crate::moe_tok_codec::MoeTokCodec;
 use crate::null::NullCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
@@ -76,7 +77,8 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
     match name {
         "null" => Ok(Box::new(NullCodec)),
         "moe" => Ok(Box::new(MoeCodec::new())),
-        other => bail!("unknown codec '{other}' (known: null, moe)"),
+        "moe-tok" => Ok(Box::new(MoeTokCodec::new())),
+        other => bail!("unknown codec '{other}' (known: null, moe, moe-tok)"),
     }
 }
 

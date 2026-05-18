@@ -18,6 +18,7 @@ mod eval;
 mod moe;
 mod moe_arm;
 mod moe_codec;
+mod moe_tok_codec;
 mod ngram_arm;
 mod null;
 mod transformer;
@@ -211,13 +212,13 @@ fn run_neural_eval(weights: &PathBuf, corpus: &PathBuf, bytes_to_eval: usize) ->
 
     for chunk in corpus_bytes[..n].chunks(cfg.context) {
         cache.reset();
-        let mut logits = model.forward_step(&mut cache, 0);
+        let mut logits = model.forward_step(&mut cache, 0_u32);
         for &byte in chunk {
             let log_p = log_softmax_at(&logits, byte as usize);
             total_nats -= f64::from(log_p);
             bytes_seen += 1;
             if cache.pos < cfg.context {
-                logits = model.forward_step(&mut cache, byte);
+                logits = model.forward_step(&mut cache, u32::from(byte));
             }
         }
         chunks_processed += 1;
@@ -245,27 +246,35 @@ fn run_neural_eval(weights: &PathBuf, corpus: &PathBuf, bytes_to_eval: usize) ->
     Ok(())
 }
 
-/// Read `LZR_MOE_WEIGHTS` + `LZR_MOE_QUANT` and compute the projected
-/// `L(D)` tax the shipped binary would pay on 1 GB enwik9 — under
-/// the **`2×` Hutter rule** (the same binary appears in `S` as both
-/// `comp9a` and the reduced-multiplier `decomp9`, so every shipped
-/// byte counts twice). Loads the model so per-tensor accounting
-/// (per-channel scales, mixed-precision schemes) is exact, not
-/// estimated. Returns `None` if the weights env var isn't set or
-/// loading fails. See `JOURNAL.md` 2026-05-16 Phase 32.
+/// Read `LZR_MOE_WEIGHTS` + `LZR_MOE_QUANT` (+ optionally
+/// `LZR_BPE_TABLE`) and compute the projected `L(D)` tax the shipped
+/// binary would pay on 1 GB enwik9 — under the **`2×` Hutter rule**
+/// (the same binary appears in `S` as both `comp9a` and the
+/// reduced-multiplier `decomp9`, so every shipped byte counts
+/// twice). Loads the model so per-tensor accounting (per-channel
+/// scales, mixed-precision schemes) is exact, not estimated. If
+/// `LZR_BPE_TABLE` is set, its file size is included in the shipped
+/// bytes (the BPE table must ship for the token codec to decode).
+/// Returns `None` if the weights env var isn't set or loading fails.
+/// See `JOURNAL.md` 2026-05-16 Phase 32.
 #[allow(clippy::cast_precision_loss)]
 fn projected_ld_on_enwik9() -> Option<(String, u64, f64)> {
     let weights_path: PathBuf = std::env::var_os("LZR_MOE_WEIGHTS")?.into();
     let bytes = fs::read(&weights_path).ok()?;
     let model = moe::MoeByteTransformer::load_lzrm(&bytes).ok()?;
     let quant = moe::Quantization::from_env(moe_arm::QUANT_ENV);
-    let weights_bytes = model.shipped_bytes(quant);
-    // 2× factor: the binary appears twice in S (once as comp9a, once
-    // as the reduced-multiplier decomp9). The Rust-runtime / code
-    // section also counts under this rule but is not measured here.
+    let mut weights_bytes = model.shipped_bytes(quant);
+    let mut name = quant.name().to_string();
+    if let Some(bpe_path) = std::env::var_os("LZR_BPE_TABLE") {
+        if let Ok(meta) = fs::metadata(PathBuf::from(&bpe_path)) {
+            weights_bytes += meta.len();
+            name.push_str("+bpe");
+        }
+    }
+    // 2× factor: the binary appears twice in S.
     let shipped_bytes = 2 * weights_bytes;
     let ld_bpb = 8.0 * (shipped_bytes as f64) / 1e9;
-    Some((quant.name().to_string(), shipped_bytes, ld_bpb))
+    Some((name, shipped_bytes, ld_bpb))
 }
 
 #[allow(clippy::cast_precision_loss)]

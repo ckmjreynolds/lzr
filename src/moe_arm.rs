@@ -85,7 +85,17 @@ impl MoeArm {
         if self.cache.pos >= self.model.cfg.context {
             self.cache.reset();
         }
-        self.pending_logits = Some(self.model.forward_step(&mut self.cache, byte));
+        self.pending_logits = Some(self.model.forward_step(&mut self.cache, u32::from(byte)));
+        self.fed_count += 1;
+    }
+
+    /// Same as [`feed`] but accepts a token id directly (for non-byte
+    /// vocabs, where the token id may exceed `u8` range).
+    pub(crate) fn feed_token(&mut self, token: u32) {
+        if self.cache.pos >= self.model.cfg.context {
+            self.cache.reset();
+        }
+        self.pending_logits = Some(self.model.forward_step(&mut self.cache, token));
         self.fed_count += 1;
     }
 
@@ -94,6 +104,40 @@ impl MoeArm {
     pub(crate) fn reset(&mut self) {
         self.cache.reset();
         self.pending_logits = None;
+    }
+
+    /// Build a CDF over the model's full vocab for the next emission.
+    /// `out.len()` must equal `vocab_size + 1`. At cold start
+    /// (no logits pending) returns a uniform CDF. Strict monotonicity
+    /// is enforced so the AC encoder/decoder never see zero-prob
+    /// symbols.
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub(crate) fn predict_cdf(&self, out: &mut [u32]) {
+        let vocab = self.model.cfg.vocab_size;
+        assert_eq!(
+            out.len(),
+            vocab + 1,
+            "predict_cdf: out must have vocab+1 entries"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let mut probs = vec![1.0_f32 / vocab as f32; vocab];
+        if let Some(logits) = self.pending_logits.as_ref() {
+            softmax_into(logits, &mut probs);
+        }
+        let total_f = f64::from(TOTAL);
+        out[0] = 0;
+        let mut acc = 0_f64;
+        for i in 0..vocab {
+            acc += f64::from(probs[i]);
+            let scaled = (acc * total_f) as u32;
+            out[i + 1] = scaled;
+        }
+        out[vocab] = TOTAL;
+        enforce_monotonic(out, vocab);
     }
 
     /// Build a 257-entry AC CDF over bytes for the next emission
@@ -153,6 +197,37 @@ impl MoeArm {
     }
 }
 
+/// Enforce strict monotonicity on a length-`(vocab+1)` CDF in place,
+/// ending with `out[vocab] == TOTAL`. Used by [`MoeArm::predict_cdf`]
+/// and shared with [`MoeArm::predict_byte_cdf`].
+fn enforce_monotonic(out: &mut [u32], vocab: usize) {
+    debug_assert_eq!(out.len(), vocab + 1);
+    let mut prev = 0_u32;
+    for slot in out.iter_mut().take(vocab + 1).skip(1) {
+        if *slot <= prev {
+            *slot = prev + 1;
+        }
+        prev = *slot;
+    }
+    if out[vocab] != TOTAL {
+        let last = out[vocab];
+        for slot in out.iter_mut().take(vocab + 1).skip(1) {
+            let scaled = u64::from(*slot) * u64::from(TOTAL) / u64::from(last);
+            #[allow(clippy::cast_possible_truncation)]
+            let s = scaled as u32;
+            *slot = s.max(1);
+        }
+        out[vocab] = TOTAL;
+        let mut prev = 0_u32;
+        for slot in out.iter_mut().take(vocab + 1).skip(1) {
+            if *slot <= prev {
+                *slot = prev + 1;
+            }
+            prev = *slot;
+        }
+    }
+}
+
 /// Numerically-stable softmax over the first 256 entries of `logits`.
 /// (The model's vocab is exactly 256.)
 #[allow(clippy::cast_possible_truncation)]
@@ -175,4 +250,27 @@ fn softmax_256(logits: &[f32]) -> [f32; 256] {
         *v *= inv;
     }
     out
+}
+
+/// Variable-length numerically-stable softmax — writes into `out`,
+/// reading `out.len()` entries from `logits`. Used for token vocabs
+/// where the size isn't known at compile time.
+fn softmax_into(logits: &[f32], out: &mut [f32]) {
+    debug_assert!(logits.len() >= out.len());
+    let mut max = f32::NEG_INFINITY;
+    for &v in logits.iter().take(out.len()) {
+        if v > max {
+            max = v;
+        }
+    }
+    let mut sum = 0_f32;
+    for (i, &v) in logits.iter().take(out.len()).enumerate() {
+        let e = (v - max).exp();
+        out[i] = e;
+        sum += e;
+    }
+    let inv = sum.recip();
+    for v in out.iter_mut() {
+        *v *= inv;
+    }
 }
