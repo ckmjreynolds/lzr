@@ -13,6 +13,79 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-18 — Phase 42: 16K BPE Vocab + Bigger AC TOTAL — Combined L+D 1.5038 bpb
+
+CDR directed: larger BPE vocab, then train longer. Retrained BPE on full enwik9 at `vocab_size=16384` (vs 8192 in Phase 41), pretokenized to 218 M tokens at 4.58 bytes/token (vs 251 M at 3.98 — 15% denser), trained `moe_tok_wider_16k` (E=32, 2L × 128d × 512d_ff × ctx=512, vocab=16384) for 60 K steps. Result: **combined L+D 1.5038 bpb**, a **-0.018 bpb** improvement over Phase 41's best (1.5217).
+
+The win required a second AC precision bump.
+
+### Run
+
+| Metric | 8K (Phase 41) | **16K (this entry)** | Δ |
+|---|---:|---:|---:|
+| BPE vocab | 8 192 | 16 384 | 2× |
+| Bytes/token (full enwik9) | 3.98 | 4.58 | +15% denser |
+| BPE table size | 129 KB | 273 KB | +144 KB |
+| MoE total params | 9.64 M | 10.69 M | +1.05 M (embed+head) |
+| Train wall (60 K steps) | 320 min | 402 min | +25% |
+| Standalone bpb (1 MB enwik9) | 1.3873 | 1.3531 | **-0.034** |
+
+### AC precision bump (TOTAL 2^20 → 2^24)
+
+The 8K codec's TOTAL = 2^20 (Phase 41 fix) wasn't enough for 16K: every 0.75 MB of input mid-stream the AC encode/decode disagreed on some token id by ±1, producing the same "decoded > expected" symptom from Phase 41. At 16K vocab the per-symbol floor (1 unit / 2^20) is 0.0001%, so adjacent low-prob symbols quantize indistinguishably after enough range-narrowing.
+
+Fix: `TOTAL = 1 << 24`. Per-symbol floor mass is now ≥1024 distinguishable AC range units even at 16K vocab; `range * mass / TOTAL` peaks at 2^56, well inside u64. `ac_roundtrips_skewed_distribution` tolerance widened from `< n/2` to `< n/2 + 32` to absorb the small per-symbol overhead increase (~0.01 byte/symbol at the 1-unit-mass floor).
+
+Side benefit: byte codec L(C) on wider mixed5asym dropped further from 1.5029 → ~1.5025 — small but consistent.
+
+Diagnosis took some thrashing because the first failure was due to a stale binary, not the precision bump. Added two new tests to catch state issues earlier:
+- `bpe_round_trips_first_1mb_enwik9_16k` — confirms 16K BPE alone roundtrips 1 MB.
+- `moe_tok_codec_roundtrips_1mb` — full codec roundtrip at realistic scale.
+
+### Updated v4 deployment table (1 MB enwik9, mixed5asym, TOTAL=2^24)
+
+| Rank | Config | L(C) | L(D) (2× rule) | Combined L+D |
+|---:|---|---:|---:|---:|
+| 1 | **moe-tok 16K wider** | **1.3743** | **0.1296** | **1.5038** |
+| 2 | moe-tok 8K wider | 1.4111 | 0.1100 | 1.5211 |
+| 3 | byte wider | ~1.5025 | 0.0906 | ~1.5931 |
+| Hutter target | — | — | — | 0.928 |
+| **Gap remaining** | — | — | — | **0.576** |
+
+### Wall-clock
+
+| Codec | Wall/MB (M3 Pro NEON, encode+decode) | Projected /1GB /direction on Hutter Ryzen 7 |
+|---|---:|---:|
+| byte wider | ~50 s | ~17 hr |
+| moe-tok 8K | ~80 s | ~27 hr |
+| **moe-tok 16K** | **~111 s** | **~37 hr** |
+| Hutter per-program limit | — | 49–53 hr |
+
+The 16K codec's bigger output head (vocab × d_model = 16384 × 128 = 2.1 M ops/token vs 8K's 1.05 M) drives the wall-clock up. Margin is now ~12-16 hr instead of 8K's ~22 hr. Further architectural growth (24K vocab, wider d_model, deeper) needs to be weighed against this.
+
+### What this rules in / out
+
+**Rules in (next moves CDR has chosen)**:
+
+A. **Train 16K MoE longer** (60K → 120K, `moe_tok_wider_16k_long` preset). Phase 31's analogous byte-level doubling bought -0.22 standalone bpb; if the token trajectory tracks even half of that, combined L+D should land ~1.47. ETA ~13 hr training. **Launched as `b8s4ad14n`**.
+
+**Rules out (for now)**:
+
+- 32K vocab — would push wall to ~50 hr per direction on Hutter Ryzen 7, at the limit. Not worth the marginal L(C) gain without optimization elsewhere.
+- Wider d_model with token vocabs — same wall-clock pressure.
+
+### Files / commits
+
+- `src/ac.rs`: TOTAL bump + tolerance widen.
+- `src/bpe.rs`: 16K BPE roundtrip test added.
+- `src/moe_tok_codec.rs`: 1 MB codec roundtrip test added.
+- `lzr-neural/scripts/train_bpe.py` (no code change): used at `--vocab-size 16384`.
+- `lzr-neural/src/lzr_neural/config.py`: `moe_tok_wider_16k` and `moe_tok_wider_16k_long` presets.
+
+build.sh green; 41 tests pass.
+
+---
+
 ## 2026-05-17 — Phase 41: Token-Level v4 Codec Lands — Combined L+D 1.5217 bpb (BPE+MoE+AC)
 
 After Phase 39 landed `mixed5` as the best quantization (combined 1.5985) and Phase 40 (asymmetric int5) added a marginal further win (1.5978), the next leap required moving off byte-level prediction. CDR directed the BPE + token-MoE pivot. Result: **wider + mixed5asym + 8 K BPE → combined L+D 1.5217 bpb on 1 MB enwik9**, a clean **-0.076 bpb** over the byte-level best, with bit-exact roundtrip.
