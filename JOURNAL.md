@@ -13,6 +13,90 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-17 — Phase 41: Token-Level v4 Codec Lands — Combined L+D 1.5217 bpb (BPE+MoE+AC)
+
+After Phase 39 landed `mixed5` as the best quantization (combined 1.5985) and Phase 40 (asymmetric int5) added a marginal further win (1.5978), the next leap required moving off byte-level prediction. CDR directed the BPE + token-MoE pivot. Result: **wider + mixed5asym + 8 K BPE → combined L+D 1.5217 bpb on 1 MB enwik9**, a clean **-0.076 bpb** over the byte-level best, with bit-exact roundtrip.
+
+### The pipeline
+
+- **BPE trained on full enwik9**: byte-level (raw latin-1), `Split("\n")` pre-tokenizer, 8192 vocab → 251 M tokens, 3.98 bytes/token avg, 129 KB shipped binary. The Rust-friendly scheme (no GPT-2 byte_to_unicode reshuffle, no Unicode regex) makes the Rust encoder ~330 LOC.
+- **Token MoE retrained**: same wider backbone (E=32, n_layer=2, d_model=128, d_ff=512) but `vocab_size=8192` and `context=512` (to compensate for tokens being ~4× denser than bytes). 60 K steps cosine→60 K on the new token stream. Standalone byte-equivalent bpb = 1.3873 (vs byte-level wider's 1.5072, -0.12).
+- **Rust BPE module** (`src/bpe.rs`): loads `.bin` format, encode = split on 0x0A then per-line greedy lowest-rank merge, decode = concat token byte sequences. **Bit-exact parity with HF tokenizers** verified by a fixed-corpus test (1019 tokens matched on 4 KB enwik8).
+- **Rust token codec** (`src/moe_tok_codec.rs`): BPE-encode warm + measure; AC-encode each token over a `vocab+1`-entry CDF from the MoE arm; reverse on decode. Archive layout: `(u32 LE measure_byte_len)(u32 LE n_tokens)(AC bytes)`.
+
+### The AC precision bug
+
+First end-to-end run failed roundtrip: 1 MB enwik9 encoded → AC-decoded 1,041,389 bytes vs the expected 1,000,000. Token-level diagnostic localized the first mismatch to position 3279, where decoded=1995 vs expected=1994 (adjacent IDs differing by 1).
+
+Root cause: AC's `TOTAL = 2^16` divided over an 8192-vocab CDF leaves many low-probability symbols at the 1-unit min-mass floor. With `range × mass / TOTAL` arithmetic in u64, range narrowing eventually loses the resolution needed to distinguish adjacent symbols. Encode and decode disagree on the symbol.
+
+Fix: `TOTAL = 1 << 20`. `range × mass / TOTAL` peaks at `2^32 × 2^20 = 2^52`, well inside u64. Per-symbol mass for an 8 K vocab is now ≥128 units even after the floor — plenty for unambiguous AC encode/decode. Side effect: the byte codec slightly improves too (per-byte CDF granularity is finer), so `wider+mixed5asym` byte codec dropped from 1.5072 → 1.5029 L(C).
+
+The pre-existing tests still pass; the `ngram_arm` uniform-mass check was rewritten to compute its expected value from `TOTAL` instead of the previous hard-coded 256.
+
+### Updated v4 deployment table (1 MB enwik9, sorted best→worst, all at `mixed5asym`)
+
+| Rank | Config | L(C) | L(D) (2× rule) | Combined L+D |
+|---:|---|---:|---:|---:|
+| 1 | **moe-tok wider + BPE 8K** | **1.4118** | **0.1100** | **1.5217** ← new best |
+| 2 | byte wider | 1.5029 | 0.0906 | 1.5934 |
+| 3 | byte deeper | 1.5380 | 0.0701 | 1.6081 |
+| 4 | byte narrow xlong | 1.5855 | 0.0354 | 1.6209 |
+| Hutter target | — | — | — | 0.928 |
+| **Gap remaining** | — | — | — | **0.594 bpb** |
+
+### Why the win is real but smaller than the standalone delta suggested
+
+- Standalone token L(C) on 1 MB enwik9: **1.3873** byte-equivalent.
+- Codec L(C) (with framing): **1.4118** — adds 0.024 of overhead (AC tail + header).
+- L(D) goes from byte 0.0906 → token 0.1100 (+0.019): bigger embedding (256 → 8192 vocab) + 129 KB BPE table.
+- Combined: 1.5217 vs byte best 1.5934 → -0.076 net.
+
+vs my Phase 38 projection of -0.110 with the old GPT-2-regex tokenizer (1.3383 standalone): the simpler per-line tokenizer is ~0.05 bpb less efficient at the standalone level, and the new MoE retrain costs +0.005 bpb at L(C). The net win held up but is smaller than the optimistic projection.
+
+### Wall-clock
+
+Token codec encode + decode each ~40 s / MB (~80 s / MB combined) → ~22 hr per direction projected on M3 Pro NEON for 1 GB enwik9. On the slower Hutter Ryzen 7 (~2.4× slowdown): ~52 hr per direction. That's **at the edge of the 49-53 hr per-program limit** depending on which judge machine. Worse than the byte codec's ~11 hr per direction.
+
+The token codec is roughly 1.5-2× slower per byte than the byte codec because:
+- Each token forward pass is the same compute, but tokens cover 4× the bytes — so per-byte compute is ¼.
+- BUT the model has 4× more total params (bigger vocab → bigger emb+head), so per-token compute is higher.
+- Plus AC with TOTAL=2^20 emits slightly more bits per renorm cycle than TOTAL=2^16.
+
+Net is just barely inside the budget. Optimization will matter if we want to push token-MoE further (bigger models or longer contexts).
+
+### What this rules in / out
+
+**Rules in (next-direction candidates)**:
+
+A. **Wall-clock optimization**: AC kernel tuning (TOTAL=2^20 added 5-10% overhead), BPE encode efficiency (current is O(n²) per line, fine on average but worst-case slow on long lines). Each ~10-20% wall improvement directly unlocks larger token models.
+
+B. **Bigger token model**: with the BPE table fixed at 129 KB, all the win goes to L(C) — every 0.01 bpb reduction in token standalone bpb = 0.01 bpb of combined-L+D. Train wider token-MoE longer, or try `moe_tok_wider_long` at 120 K steps.
+
+C. **Larger BPE vocab** (16 K or 32 K): more tokens means shorter sequences (fewer tokens to predict) but bigger embeddings. Sweet spot probably ~16 K based on standard LM scaling.
+
+D. **Online ngram mixing** at the token level: built-from-prefix token n-gram CDF mixed with MoE CDF. Phase 31's byte n-gram was a null result, but token n-grams capture long-range structure the MoE may miss.
+
+E. **Bigger context** (token ctx 512 → 1024): given 3.98 bytes/token, ctx=512 already gives ~2 KB of byte-context. ctx=1024 doubles attention compute per token; might or might not help given enwik9's locally repetitive structure.
+
+CDR to direct.
+
+### Files / commits
+
+- `src/bpe.rs` (new, ~330 LOC + 5 tests including Python parity)
+- `src/moe_tok_codec.rs` (new, ~250 LOC + 2 tests)
+- `src/moe_arm.rs`: `predict_cdf` for arbitrary vocab, `feed_token`, shared `enforce_monotonic`.
+- `src/moe.rs`: `forward_step` takes `u32` (was `u8`).
+- `src/ac.rs`: `TOTAL = 1 << 20`.
+- `src/main.rs`: `LZR_BPE_TABLE` env var size folded into the L(D) projection.
+- `src/eval.rs`: `--codec moe-tok` registered.
+- `src/ngram_arm.rs`: test updated for new TOTAL.
+- `lzr-neural/scripts/train_bpe.py`, `pretokenize.py`, `dump_bpe_tokens_for_parity.py`, `eval_bpb_tokens.py` (new).
+
+build.sh green; 40 tests pass.
+
+---
+
 ## 2026-05-17 — Phase 39: `mixed5` is the Universal Quantization Sweet Spot
 
 Phase 38 introduced `Mixed4` and identified wider + mixed4 = combined L+D 1.6057 as the new best. Per CDR direction the next move was more-aggressive FFN quant; added `Mixed3` (FFN at int3) and `Mixed5` (FFN at int5) variants and swept all three across all three architectures. Result: **`Mixed5` dominates everywhere**, including the narrow model where `Mixed4` was a loser. New v4 deployment best: **wider + mixed5 = 1.5985 combined L+D**, gap to Hutter target now 0.671 bpb.
