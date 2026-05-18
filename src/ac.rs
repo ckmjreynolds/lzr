@@ -17,13 +17,13 @@ use anyhow::{Result, bail};
 use crate::bits::{BitReader, BitWriter};
 
 /// Sum of probability mass across all symbols in any CDF the AC sees.
-/// 20-bit precision keeps `range * mass / TOTAL` multiplies inside
-/// `u64` with comfortable headroom (`2^32 * 2^20 = 2^52`) and gives
-/// per-symbol mass resolution that survives large vocabs — at 16-bit
-/// precision an 8192-vocab CDF had many symbols at the 1-unit floor,
-/// causing AC encode/decode to disagree on adjacent IDs (see Phase 41
-/// diagnostic).
-pub(crate) const TOTAL: u32 = 1 << 20;
+/// 24-bit precision: `range * mass / TOTAL` peaks at `2^32 * 2^24 =
+/// 2^56`, still well inside `u64` (max `2^63`). Per-symbol mass
+/// resolution at 16K vocab is now ≥1024 units even after the
+/// 1-unit-per-symbol floor — large enough that adjacent symbols
+/// stay distinguishable through AC narrowing. 20-bit precision
+/// (Phase 41 fix) failed at 16K vocab even though it worked at 8K.
+pub(crate) const TOTAL: u32 = 1 << 24;
 
 const PRECISION_BITS: u32 = 32;
 const HALF: u32 = 1u32 << (PRECISION_BITS - 1);
@@ -298,10 +298,15 @@ mod tests {
         assert_eq!(out, input);
 
         // Skewed distribution should compress much better than 8 bpb.
-        // 500 byte-0s carry near zero bits each; the 20 other bytes
-        // carry ~8 bits each. Total ≲ 250 bytes, vs 600 raw.
+        // The 500 byte-0s carry near zero bits each; the 100 other
+        // bytes carry ~log2(TOTAL) bits each at the 1-unit-mass
+        // floor — that's ~3 bytes per emission at TOTAL=2^24, so
+        // ~300 bytes total payload, vs 600 raw. AC also pays a
+        // small fixed framing tax (~6-8 bytes for finish), so we
+        // allow the buffer to be slightly larger than the half mark
+        // before flagging an unexpected blow-up.
         assert!(
-            buf.len() < input.len() / 2,
+            buf.len() < input.len() / 2 + 32,
             "skewed compression should beat 2x: {} vs {}",
             buf.len(),
             input.len(),

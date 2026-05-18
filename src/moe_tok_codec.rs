@@ -279,6 +279,36 @@ mod tests {
         eprintln!("all {n_tokens_in_archive} tokens round-trip OK");
     }
 
+    /// Full codec round-trip on a substantial 1 MB enwik9 sample —
+    /// the same scale as the `compress` CLI exercises. Catches any
+    /// state-leak between `encode_window` and `decode_window` calls
+    /// on the same codec instance.
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn moe_tok_codec_roundtrips_1mb() {
+        if std::env::var_os(WEIGHTS_ENV).is_none()
+            || std::env::var_os(BPE_TABLE_ENV).is_none()
+        {
+            eprintln!("env unset — skipping");
+            return;
+        }
+        let corpus_path = "/Users/creynolds/Programming/lzr/assets/enwik9";
+        if !std::path::Path::new(corpus_path).exists() {
+            eprintln!("corpus missing — skipping");
+            return;
+        }
+        let mut data = std::fs::read(corpus_path).unwrap();
+        data.truncate(1_000_000);
+
+        let codec = MoeTokCodec::new();
+        let (archive, _) = codec.encode_window(b"", &data).unwrap();
+        eprintln!("encoded {} bytes into {}-byte archive", data.len(), archive.len());
+        let decoded = codec.decode_window(b"", &archive).unwrap();
+        assert_eq!(decoded.len(), data.len(), "byte count mismatch");
+        assert_eq!(decoded, data, "byte content mismatch");
+        eprintln!("1MB round-trip OK");
+    }
+
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn moe_tok_codec_roundtrips() {

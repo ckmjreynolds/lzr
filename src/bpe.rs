@@ -248,6 +248,32 @@ mod tests {
         );
     }
 
+    /// Same round-trip but with the 16K vocab tokenizer.
+    #[test]
+    fn bpe_round_trips_first_1mb_enwik9_16k() {
+        let bpe_path = std::path::PathBuf::from(
+            "/Users/creynolds/Programming/lzr-neural/ckpts/bpe_16k.bin",
+        );
+        let corpus = std::path::PathBuf::from("/Users/creynolds/Programming/lzr/assets/enwik9");
+        if !bpe_path.exists() || !corpus.exists() {
+            eprintln!("artifacts missing — skipping");
+            return;
+        }
+        let bpe = Bpe::load(&bpe_path).expect("load 16K BPE");
+        let mut all = std::fs::read(&corpus).expect("read corpus");
+        all.truncate(1_000_000);
+        let tokens = bpe.encode(&all);
+        let decoded = bpe.decode(&tokens);
+        eprintln!(
+            "bpe 16K 1MB roundtrip: in={} tokens={} out={}",
+            all.len(),
+            tokens.len(),
+            decoded.len()
+        );
+        assert_eq!(decoded.len(), all.len(), "byte length mismatch");
+        assert_eq!(decoded, all, "byte content mismatch");
+    }
+
     /// Round-trip the first 1 MB of enwik9 directly through the
     /// Rust BPE (no AC, no codec). Catches any encode/decode issue
     /// that's specific to the larger input size.
