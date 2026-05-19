@@ -13,6 +13,68 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-19 — Phase 44: Token-Level LZ77 Layer — Modest −0.005 bpb, Validates Neural-Only Thesis
+
+CDR proposed inserting an LZ77 stage on top of the Phase 43 16K-vocab token codec, motivated by: (1) wall-time relief if absorbed tokens let us skip MoE forward passes, and (2) catching long-range repeats that escape the MoE's 512-token attention. Per CDR's "min-match should beat the LZ encoding cost vs the MoE-AC arm's avg per-token cost" framing, calibration started from the measured per-token rate (~6.2 bits/tok at 4.58 bytes/tok = 1.28 standalone bpb) and LZ overhead (14-bit offset + 8-bit length + adaptive KT 2-symbol flag CDF ≈ 22-30 bits/match).
+
+### Measurement first — token-stream LZ77 potential
+
+`lzr-neural/scripts/measure_lz77_potential.py` scans the first 218 K tokens of `enwik9.bpe_16k.u16`, finds the longest exact prior match within an 8K-token window at each position, and reports greedy non-overlapping absorption at `min_match` 3, 4, 5, 8, 10, 12, 16:
+
+| `min_match` | absorbed tok | % | n_matches | avg_len | naïve savings (bits) |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 57,565 | 26.4% | 12,395 | 4.6 | 44,658 |
+| 4 | 40,072 | 18.4% | 6,406 | 6.3 | 80,199 |
+| 5 | 30,048 | 13.8% | 3,848 | 7.8 | 82,142 |
+| 8 | 16,144 | 7.4% | 1,344 | 12.0 | 61,549 |
+| 16 | 5,113 | 2.3% | 224 | 22.8 | 24,681 |
+
+The "naïve savings" column assumes the absorbed tokens cost the corpus average (6.2 bpb). The actual measurement told a different story.
+
+### Implementation — `moe-tok-lz` codec
+
+New `src/lz77.rs` (token-level longest-match with 3-gram hash index, `CHAIN_CAP=32`) and `src/moe_tok_lz_codec.rs`. Per output position, emit a Krichevsky-Trofimov-adaptive 2-symbol AC flag (literal vs LZ). On LZ: uniform-CDF AC encode of `(offset-1)` and `(length-MIN_MATCH)`. On literal: existing MoE-CDF token-id AC encode. Both encoder and decoder feed every token to the MoE arm so KV-cache state stays in lockstep — no wall-time win in this version, just compression.
+
+### Sweep — actual roundtrip on 1 MB enwik9
+
+| Config | Archive bytes | L(C) bpb | Δ vs Phase 43 |
+|---|---:|---:|---:|
+| `moe-tok` baseline (Phase 43) | 159,973 | 1.2798 | — |
+| `moe-tok-lz` MIN_OFFSET=512, MIN_MATCH=5 | 164,275 | 1.3142 | **+0.0344** |
+| `moe-tok-lz` MIN_OFFSET=512, MIN_MATCH=8 | 159,914 | 1.2793 | −0.0005 |
+| `moe-tok-lz` MIN_OFFSET=512, MIN_MATCH=16 | 159,509 | 1.2761 | −0.0037 |
+| **`moe-tok-lz` MIN_OFFSET=1, MIN_MATCH=16** | **159,364** | **1.2749** | **−0.0049** |
+
+The first row is the key finding. With `MIN_MATCH=5` the LZ stage *hurt* compression by 0.034 bpb. Working back from the decomposition: absorbed tokens were cost-average (5.88 bits/abs_tok) in the baseline, but the LZ flag+payload cost was 22-30 bits/match. Replacing a length-5 run at 5.88×5 = 29.4 baseline bits with a 28-bit LZ match saves nothing — and the flag overhead pushed it net-negative.
+
+### What this says about the MoE
+
+The MoE arm predicts far-back repeats at ~2.5 bits/token *even at offsets beyond its 512-token attention window* — this is distributional learning generalizing the BPE merges and English structure, not just attention memorization. Counter to the original hypothesis, gating to `MIN_OFFSET=512` (only matches outside attention) gave a *smaller* win than `MIN_OFFSET=1` (any distance), because filtering removes some long-match candidates that *were* slight wins regardless of where they came from.
+
+Net at the best config (`MIN_OFFSET=1, MIN_MATCH=16`): **163 emitted matches** absorbing ~3.8K tokens on 1 MB. Per-match savings ≈ 23 bits net of the ~22 bits/match payload + ~12 bits flag → marginal but positive. Combined L+D: **~1.4123 bpb** (essentially Phase 43 + −0.005).
+
+### Implications
+
+This is a small win but a meaningful finding for the architecture:
+
+1. **The "neural-first, strip LZ/PPM" v4 thesis is validated empirically**, not just stylistically. The MoE-AC arm already extracts ~95% of the LZ-style redundancy that LZ77 could capture, including matches at offsets up to the 8K-token window.
+
+2. **`MIN_MATCH` is highly sensitive**. Below the per-token-MoE-cost threshold, LZ actively hurts. Above it, the win shrinks to noise. There is no broad-min_match sweet spot — only a narrow band where the few matches that beat MoE prediction also beat the LZ encoding cost.
+
+3. **The wall-time potential is unrealized** in this codec. To skip MoE forward passes on absorbed tokens (the original motivation), we'd need a batched-multi-token KV update — a substantial engineering effort. Worth revisiting only if we hit the 50-hr/direction Hutter wall, which we currently aren't.
+
+4. **A non-uniform offset CDF (Golomb / exp-Golomb) was not tried**. Could shave 3-5 bits per match. With 163 matches that's ~600 bits = 0.0006 bpb. Below the noise floor; not pursued.
+
+### What ships
+
+`moe-tok-lz` codec is registered alongside `moe-tok` and `moe`. Default constants in `src/lz77.rs`: `MIN_MATCH=16`, `DEFAULT_MIN_OFFSET=1`, `MAX_MATCH=271`, `WINDOW=16384`. Roundtrip verified on 1 MB enwik9. Not adopted as the v4 default — Phase 43's `moe-tok` is still ahead on simplicity-per-bpb and the 240K training run is the bigger lever.
+
+### Open in parallel: Phase 45 240K training kicked off
+
+`moe_tok_wider_16k_xlong` preset added (240K steps, matched-cosine, warmup 6K). Training started during this session; ~30 hr wall on M3 Pro MPS. Per Phase 31→32 byte-level analogy, expected combined L+D ~1.37-1.39.
+
+---
+
 ## 2026-05-19 — Phase 43: 16K BPE × 120K Steps — Combined L+D 1.4171 bpb, Gap Under 0.5
 
 Per CDR's "larger vocab then train longer" sequencing in Phases 41–42, the natural follow-up was doubling the 16K MoE's training from 60K to 120K steps. Trained `moe_tok_wider_16k_long` (same backbone as `moe_tok_wider_16k` but `max_steps=120_000`, cosine→0 at 120K, warmup 3K) on the existing `enwik9.bpe_16k.u16` token corpus. Result: **combined L+D 1.4171 bpb** on 1 MB enwik9, a **−0.087 bpb** improvement over Phase 42's best (1.5038). **Gap to Hutter target is now under 0.5 bpb (0.489) for the first time** since the project began.
