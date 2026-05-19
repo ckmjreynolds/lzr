@@ -286,9 +286,7 @@ mod tests {
     #[test]
     #[allow(clippy::cast_precision_loss)]
     fn moe_tok_codec_roundtrips_1mb() {
-        if std::env::var_os(WEIGHTS_ENV).is_none()
-            || std::env::var_os(BPE_TABLE_ENV).is_none()
-        {
+        if std::env::var_os(WEIGHTS_ENV).is_none() || std::env::var_os(BPE_TABLE_ENV).is_none() {
             eprintln!("env unset — skipping");
             return;
         }
@@ -302,7 +300,11 @@ mod tests {
 
         let codec = MoeTokCodec::new();
         let (archive, _) = codec.encode_window(b"", &data).unwrap();
-        eprintln!("encoded {} bytes into {}-byte archive", data.len(), archive.len());
+        eprintln!(
+            "encoded {} bytes into {}-byte archive",
+            data.len(),
+            archive.len()
+        );
         let decoded = codec.decode_window(b"", &archive).unwrap();
         assert_eq!(decoded.len(), data.len(), "byte count mismatch");
         assert_eq!(decoded, data, "byte content mismatch");

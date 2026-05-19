@@ -251,9 +251,8 @@ mod tests {
     /// Same round-trip but with the 16K vocab tokenizer.
     #[test]
     fn bpe_round_trips_first_1mb_enwik9_16k() {
-        let bpe_path = std::path::PathBuf::from(
-            "/Users/creynolds/Programming/lzr-neural/ckpts/bpe_16k.bin",
-        );
+        let bpe_path =
+            std::path::PathBuf::from("/Users/creynolds/Programming/lzr-neural/ckpts/bpe_16k.bin");
         let corpus = std::path::PathBuf::from("/Users/creynolds/Programming/lzr/assets/enwik9");
         if !bpe_path.exists() || !corpus.exists() {
             eprintln!("artifacts missing — skipping");
