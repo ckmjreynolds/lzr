@@ -13,6 +13,85 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-19 — Phase 43: 16K BPE × 120K Steps — Combined L+D 1.4171 bpb, Gap Under 0.5
+
+Per CDR's "larger vocab then train longer" sequencing in Phases 41–42, the natural follow-up was doubling the 16K MoE's training from 60K to 120K steps. Trained `moe_tok_wider_16k_long` (same backbone as `moe_tok_wider_16k` but `max_steps=120_000`, cosine→0 at 120K, warmup 3K) on the existing `enwik9.bpe_16k.u16` token corpus. Result: **combined L+D 1.4171 bpb** on 1 MB enwik9, a **−0.087 bpb** improvement over Phase 42's best (1.5038). **Gap to Hutter target is now under 0.5 bpb (0.489) for the first time** since the project began.
+
+### Run
+
+| Metric | 16K @ 60K (Phase 42) | **16K @ 120K (this entry)** | Δ |
+|---|---:|---:|---:|
+| Train wall (M3 Pro MPS) | 402 min | 802 min (13.4 hr) | +2× |
+| Final train_bpb (bits/token) | 5.58 | 5.26 | −0.32 |
+| Best val_bpb (bits/token) | 5.83 @ step 56K | 5.41 @ step 114K | −0.42 |
+| Standalone bpb (byte-equiv, 1 MB enwik9) | 1.3531 | 1.2590 | −0.094 |
+| **Combined L+D bpb** | **1.5038** | **1.4171** | **−0.087** |
+
+The training improvement (val −0.42 bits/token / 4.58 = −0.092 byte-equiv) maps almost 1:1 to the L(C) win, confirming the trajectory wasn't training-saturated at 60K. L(D) is unchanged because the model architecture and vocab are identical — same 10.69 M params, same 273 KB BPE table.
+
+### vs Phase 31's analogous doubling on the byte-level model
+
+| Doubling | byte L(C) drop | token L(C) drop |
+|---|---:|---:|
+| 20K → 60K (Phase 30 → 31) | −0.24 | — |
+| 60K → 120K (Phase 31 → 32) | −0.04 | — |
+| **60K → 120K (Phase 42 → 43, this)** | — | **−0.087** |
+
+The token-level 60→120K curve is more like the byte-level 20→60K than the byte 60→120K — the token MoE has more headroom to absorb training, presumably because the token-prediction task is inherently more entropy-rich per step (predicting 1 of 16384 vs 1 of 256).
+
+### Wall-clock
+
+Codec wall is identical to Phase 42's 16K@60K: ~111 s / MB combined → **~37 hr per direction projected on the Hutter Ryzen 7 judge** (Phase 32's per-program 49-53 hr limit), unchanged because we trained longer, not bigger. Comfortable margin.
+
+### Updated v4 deployment table (1 MB enwik9, all `mixed5asym` + `TOTAL=2^24`)
+
+| Rank | Config | L(C) | L(D) (2× rule) | Combined L+D |
+|---:|---|---:|---:|---:|
+| 1 | **moe-tok 16K wider @ 120K** | **1.2876** | **0.1296** | **1.4171** |
+| 2 | moe-tok 16K wider @ 60K | 1.3743 | 0.1296 | 1.5038 |
+| 3 | moe-tok 8K wider @ 60K | 1.4111 | 0.1100 | 1.5211 |
+| 4 | byte wider | ~1.5025 | 0.0906 | ~1.5931 |
+| Hutter target | — | — | — | 0.928 |
+| **Gap remaining** | — | — | — | **0.489** |
+
+### Progress since the start of v4 (Phase 30)
+
+| Phase | Codec | Combined L+D | Gap to Hutter |
+|---:|---|---:|---:|
+| 30 | byte wider 60K f32 ship | ~1.81 | 0.88 |
+| 31 | byte narrow xlong int8ch | 1.6262 | 0.70 |
+| 38 | byte wider mixed4 | 1.6057 | 0.68 |
+| 39 | byte wider mixed5 | 1.5985 | 0.67 |
+| 40 | byte wider mixed5asym | 1.5978 | 0.67 |
+| 41 | moe-tok 8K wider | 1.5217 | 0.59 |
+| 42 | moe-tok 16K wider | 1.5038 | 0.58 |
+| **43** | **moe-tok 16K wider × 120K** | **1.4171** | **0.49** |
+
+**Net v4 improvement: −0.39 bpb** since Phase 30's first end-to-end pure-neural codec, all on the M3 Pro training budget.
+
+### What this rules in / out
+
+**Rules in (candidates for the next leap)**:
+
+A. **Train 16K MoE even longer** (e.g., 240K). Phase 31→32 showed sharply diminishing returns past 60K on byte-level; token-level may still have gas. ETA ~26 hr training. If standalone drops by another 0.05+ this is the cheapest available lever.
+
+B. **Bigger token MoE** (more experts at 16K vocab, or n_layer=4). L(D) tax rises but if L(C) drops faster... worth a focused experiment.
+
+C. **24K or 32K BPE vocab** with the long-training recipe. Hits the wall-clock limit at ~50 hr/direction; only viable if we also optimize the kernel.
+
+D. **Wall-clock optimization** (AC kernel, BPE encode O(n²) → O(n log n), int4 expert FFN at smarter scales). Each ~10% saved opens room for a bigger model.
+
+E. **Online token n-gram mixing** (Phase 31's byte n-gram was null because the byte MoE was too good; a 16K-vocab token n-gram built from prefix bytes might catch long-range patterns the model misses in its 512-token ctx).
+
+### Files / commits
+
+- `lzr-neural/src/lzr_neural/config.py` — `moe_tok_wider_16k_long` preset (committed before launch).
+- `lzr-neural/ckpts/moe_tok_wider_16k_long_42_step120000.{pt,lzrm}` — new deployment-target checkpoint.
+
+build.sh unchanged; same 41 tests pass.
+
+---
+
 ## 2026-05-18 — Phase 42: 16K BPE Vocab + Bigger AC TOTAL — Combined L+D 1.5038 bpb
 
 CDR directed: larger BPE vocab, then train longer. Retrained BPE on full enwik9 at `vocab_size=16384` (vs 8192 in Phase 41), pretokenized to 218 M tokens at 4.58 bytes/token (vs 251 M at 3.98 — 15% denser), trained `moe_tok_wider_16k` (E=32, 2L × 128d × 512d_ff × ctx=512, vocab=16384) for 60 K steps. Result: **combined L+D 1.5038 bpb**, a **-0.018 bpb** improvement over Phase 41's best (1.5217).
