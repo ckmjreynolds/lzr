@@ -13,6 +13,56 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-20 → 2026-05-21 — Phase 45: 240K Steps with Lower LR — Combined L+D 1.408, Beats Phase 43 by 0.009 bpb
+
+Per the Phase 44 plan, CDR kicked off the 240K-step extension of Phase 43's `moe_tok_wider_16k_long` recipe on 2026-05-19. The first attempt (`moe_tok_wider_16k_xlong`, peak LR 3e-4 same as Phase 43) ran into MoE router instability at step ~28K — val_aux climbed from 2.10 to 3.0, val_bpb spiked from a then-best 7.00 → 9.86 over four eval cycles, train_bpb continued descending while val plateaued. The 240K cosine kept LR near peak for ~60K steps versus Phase 43's 120K-cosine which decayed LR by half over the same span; the prolonged high LR was the proximate cause.
+
+After 24K val-no-improvement steps and CDR's standing authorization to "kill and restart with appropriate changes," v1 was terminated at step ~64K. The restart (`moe_tok_wider_16k_xlong_lowlr`) kept the 240K schedule but halved peak LR to 1.5e-4 — same effective LR-time integral as Phase 43's 3e-4 over 120K, just stretched. This held the router stable through the full schedule.
+
+### Run timeline
+
+| Run | Peak LR | Wall | Best val_bpb | Final ckpt | Outcome |
+|---|---:|---:|---:|---|---|
+| v1 (`xlong`) | 3e-4 | ~3 hr | 6.22 @ step 40K | step 60K (manual kill) | Router collapse @ step ~28K, never recovered |
+| v2 (`xlong_lowlr`) | **1.5e-4** | 26.6 hr | **5.4312 @ step 224K** | step 240K | Clean trajectory, single brief val_aux spike at step 156K that self-recovered |
+
+v2's val_aux stayed in [2.09, 2.17] across the entire 240K, never approaching v1's 3.0 collapse zone. The hypothesis (lower LR → stable router under the long cosine) was confirmed.
+
+### Codec measurements — actual L(C) on 1 MB enwik9
+
+Exported the step-240K checkpoint to `.lzrm` and ran the `moe_tok_codec_roundtrips_1mb` and `moe_tok_lz_codec_roundtrips_1mb` tests against both the Phase 43 (`moe_tok_wider_16k_long`) and Phase 45 (`moe_tok_wider_16k_xlong_lowlr`) weights:
+
+| Codec | Phase 43 bytes | Phase 45 bytes | Δ bytes | Δ L(C) bpb |
+|---|---:|---:|---:|---:|
+| `moe-tok` | 159,973 | **158,738** | −1,235 | **−0.0099** |
+| `moe-tok-lz` | 159,364 | **158,135** | −1,229 | **−0.0098** |
+
+L(D) is unchanged (same architecture, same vocab, same BPE table). Combined L+D extrapolation:
+
+| Config | L(C) bpb | L(D) bpb (2×) | Combined L+D | Gap to Hutter |
+|---|---:|---:|---:|---:|
+| moe-tok 16K wider × 120K (Phase 43) | 1.2876 | 0.1296 | 1.4171 | 0.489 |
+| moe-tok 16K wider × 240K low-LR (Phase 45) | **~1.278** | 0.1296 | **~1.408** | **0.480** |
+| moe-tok-lz Phase 45 | ~1.273 | ~0.1297 | **~1.403** | **0.475** |
+
+### What the val/codec discrepancy tells us
+
+v2's best val_bpb (5.4312) was 0.02 above Phase 43's best (5.41) — but the codec measurement on 1 MB enwik9 shows Phase 45 ahead by 0.0099 bpb. The 16-batch / 512-seq val sample (~256 KB of token windows) reports noisier and slightly different statistics than the codec's actual encode pass with cold-start KV cache priming. The codec measurement is the authoritative number for Hutter scoring; val_bpb is a proxy.
+
+### Cost-benefit on the longer schedule
+
+- Phase 43: 13.4 hr training → 1.4171 combined
+- Phase 45 v2: 26.6 hr training → 1.408 combined
+- **−0.009 bpb per +13.2 hr of additional training** — diminishing returns are stark. A doubled training budget bought roughly an order of magnitude less L(C) drop than the 60K→120K doubling did.
+
+The dominant remaining lever is no longer training-time on this backbone; it's architectural (deeper, more experts, bigger vocab) or kernel-level (skip MoE forward passes for LZ-absorbed tokens to free wall-time for bigger models).
+
+### What ships
+
+`moe_tok_wider_16k_xlong_lowlr` preset added to `lzr-neural/src/lzr_neural/config.py`. Final ckpt at `ckpts/moe_tok_wider_16k_xlong_lowlr_42_step240000.{pt,lzrm}`. Phase 45 is now the deterministic floor for v4; the Phase 43 weights are superseded.
+
+---
+
 ## 2026-05-19 — Phase 44: Token-Level LZ77 Layer — Modest −0.005 bpb, Validates Neural-Only Thesis
 
 CDR proposed inserting an LZ77 stage on top of the Phase 43 16K-vocab token codec, motivated by: (1) wall-time relief if absorbed tokens let us skip MoE forward passes, and (2) catching long-range repeats that escape the MoE's 512-token attention. Per CDR's "min-match should beat the LZ encoding cost vs the MoE-AC arm's avg per-token cost" framing, calibration started from the measured per-token rate (~6.2 bits/tok at 4.58 bytes/tok = 1.28 standalone bpb) and LZ overhead (14-bit offset + 8-bit length + adaptive KT 2-symbol flag CDF ≈ 22-30 bits/match).
