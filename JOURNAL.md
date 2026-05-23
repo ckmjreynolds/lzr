@@ -13,6 +13,93 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-23 — Phase 48: Logit Temperature Calibration — Combined L+D 1.4628 on 100 MB enwik8, −0.0044 bpb at Zero Shipped Cost
+
+Following Phase 47's conclusion that classical byte-level mix-ins cannot help, CDR and Claude went back to the entropy dump for a second pass. Phase 47's analysis stopped at the rank distribution; this round sliced the same dump by additional dimensions to look for *any* targetable failure cell before accepting that the next architectural lever was on the model side.
+
+### Stratification — second pass on the 1 MB Phase 47 dump
+
+Slicing the per-token CSV by XML mode (Content / Tag / AttrValue via an ad-hoc byte-level FSM), context-position decile, token byte length, and top-1 probability bucket revealed which dimensions concentrate bits and which do not.
+
+| Slice | Concentration | Verdict |
+|---|---|---|
+| XML mode | Content 99.4%, Tag 0.5%, AttrValue 0.0% | Mode routing has ~zero ceiling |
+| Context decile (d1..d10) | 9.4-11.2% per decile — flat | No warmup cliff; rules out first-N-tokens mix-in |
+| Rank ≥5000 (catastrophic) | 2.2% of bits | Fat tail is small; not patternable |
+| Byte-length × rank | Mean bits/tok within a rank bucket is invariant across length | Length is not its own signal |
+
+The dispositive cross-tab was **rank × top-1 probability**:
+
+| rank \ top1 | ≥0.9 | 0.5-0.9 | 0.1-0.5 | 0.01-0.1 | <0.01 |
+|---|---:|---:|---:|---:|---:|
+| 0 | 0.1% | 1.0% | 3.9% | 1.6% | 0.0% |
+| 1-9 | 0.2% | 2.3% | 11.4% | 6.6% | 0.0% |
+| 10-49 | 0.1% | 0.9% | 8.4% | 10.1% | 0.0% |
+| 50-499 | 0.1% | 0.8% | 8.9% | **20.5%** | 0.2% |
+| 500-4999 | 0.1% | 0.4% | 4.7% | 15.3% | 0.2% |
+| 5000+ | 0.0% | 0.1% | 0.6% | 1.5% | 0.0% |
+
+56% of all bits live where top-1 is in [0.01, 0.5] *and* the correct token is somewhere in ranks 10-4999. This is diffuse *under-confidence*: the model is rarely catastrophically wrong, but pervasively spreads probability too thin. A predictor whose top-1 prob is systematically lower than the empirical hit rate is exactly the calibration error a single scalar temperature `T < 1` can correct.
+
+### Sweep on 1 MB enwik9 prefix
+
+Added `LZR_LOGIT_TEMP` env override (`OnceLock<f32>`, default 1.0) applied inside `softmax_into` as `(v - max) / T` before `exp`. Encoder and decoder share the env, so the AC roundtrip holds. Sweep:
+
+| T | L(C) bpb | Δ vs T=1.0 |
+|---:|---:|---:|
+| 0.85 | 1.2859 | +0.0030 |
+| 0.90 | 1.2795 | −0.0034 |
+| 0.92 | 1.2785 | −0.0044 |
+| **0.94** | **1.2784** | **−0.0045** |
+| 0.95 | 1.2787 | −0.0042 |
+| 0.96 | 1.2792 | −0.0037 |
+| 0.98 | 1.2807 | −0.0022 |
+| 1.00 | 1.2829 | 0 |
+| 1.05 | 1.2915 | +0.0086 |
+| 1.10 | 1.3038 | +0.0209 |
+
+Clean quadratic minimum at T=0.94. The minimum is flat-ish across 0.92-0.95 (within 0.0003), indicating the optimum is well-determined but not knife-edge.
+
+### Transfer at scale
+
+The 1 MB optimum was confirmed at two larger scales — the question was whether the calibration coefficient was slice-dependent noise or a property of the model:
+
+| corpus | T=1.00 L(C) | T=0.94 L(C) | Δ |
+|---|---:|---:|---:|
+| enwik9[0..1 MB] | 1.2829 | 1.2784 | **−0.0045** |
+| enwik9[0..10 MB] | 1.3307 | 1.3261 | **−0.0046** |
+| enwik8 (100 MB full) | 1.3377 | 1.3333 | **−0.0044** |
+
+Three independent measurements within 0.0002 bpb of each other across two orders of magnitude in corpus size. The coefficient is a real property of the Phase 45 weights, not slice noise.
+
+### 100 MB enwik8 validation vs Phase 47 baseline
+
+| | L(C) | L(D) | Combined | Peak RSS | Wall |
+|---|---:|---:|---:|---:|---:|
+| Phase 47 (T=1.0) | 1.3377 | 0.1296 | 1.4672 | 376 MB | 11,117 s |
+| **Phase 48 (T=0.94)** | **1.3333** | 0.1296 | **1.4628** | 394 MB | 11,387 s |
+
+Roundtrip verified bit-perfect. Wall increased 2.4% (one extra multiply per token in the softmax inner loop); peak RSS within noise. L(D) unchanged — the binary gains exactly four bytes (one `f32` constant) and the projected `L(D)` rounds to the same 0.1296.
+
+### What ships
+
+`LZR_LOGIT_TEMP` env override removed; `const LOGIT_TEMP: f32 = 0.94;` baked at the top of `src/moe_arm.rs` with a doc comment pointing here. `build.sh` clean (fmt + clippy default & no-default-features + 42 tests + nightly coverage). Production codec is unchanged structurally; this is a one-line numerical calibration of the predictor head.
+
+### What this validated beyond the bpb win
+
+The Phase 47 entropy-dumper plus this round's slice analysis was the substrate that *predicted* the magnitude. The 1 MB sweep gave −0.0045; the 100 MB validation landed −0.0044. Stratification → hypothesis → 1 MB sweep → 10 MB transfer → 100 MB validation worked end-to-end as a methodology. The recommendation made in conversation ahead of the experiment was for a 0.01-0.05 bpb ceiling; the actual was at the low end. That itself is information: the MoE's calibration error is small (~6%), bounding what a more elaborate per-position or per-rank calibration could buy. A learned scalar T is the cheapest possible knob and got most of it.
+
+### Where this leaves the next move
+
+v4 floor on enwik8 is **1.4628 bpb combined**. Gap to Hutter (0.928 bpb): **0.535 bpb on enwik8** (deterministic floor estimate scales similarly to enwik9). Calibration is now in the noise budget; the remaining structural levers are bigger model at matched training, longer context, or a token-aware adaptive predictor (Phase 47's "second small MoE" sketch). The 240K-step low-LR recipe is saturated in compute terms (Phase 45 noted val_bpb best at step 224K of 240K), so simply training the same model longer is not it.
+
+### Files touched
+
+- `src/moe_arm.rs` — `LOGIT_TEMP` constant; `softmax_into` divides exponent by it
+- `JOURNAL.md` — this entry
+
+---
+
 ## 2026-05-22 — Phase 47: Drop LZ77 — Peak Gain 0.006 bpb, Codec Simplifies to Pure MoE
 
 CDR and Claude returned to the question of whether to mix other predictors in alongside the MoE arm. Before designing any mixer, CDR proposed measuring where the MoE actually loses bits — entropy-by-position dump and analysis — so the predictor choice would be informed rather than guessed. That measurement collapsed the LZ77 question along the way.

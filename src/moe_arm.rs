@@ -33,6 +33,12 @@ use crate::moe::{MoeByteTransformer, MoeConfig, MoeKvCache, Quantization};
 /// `"int8"`, `"int4"`. Anything else (including unset) keeps `f32`.
 pub(crate) const QUANT_ENV: &str = "LZR_MOE_QUANT";
 
+/// Scalar temperature applied to logits before softmax. `T < 1`
+/// sharpens. Fit on 1 MB and 10 MB sweeps in Phase 48 — see journal
+/// entry; the `MoE` was systematically ~6% under-confident and `T=0.94`
+/// recovers ~0.0046 bpb at zero shipped-binary cost.
+const LOGIT_TEMP: f32 = 0.94;
+
 #[derive(Debug)]
 pub(crate) struct MoeArm {
     model: MoeByteTransformer,
@@ -257,6 +263,7 @@ fn softmax_256(logits: &[f32]) -> [f32; 256] {
 /// where the size isn't known at compile time.
 fn softmax_into(logits: &[f32], out: &mut [f32]) {
     debug_assert!(logits.len() >= out.len());
+    let inv_t = LOGIT_TEMP.recip();
     let mut max = f32::NEG_INFINITY;
     for &v in logits.iter().take(out.len()) {
         if v > max {
@@ -265,7 +272,7 @@ fn softmax_into(logits: &[f32], out: &mut [f32]) {
     }
     let mut sum = 0_f32;
     for (i, &v) in logits.iter().take(out.len()).enumerate() {
-        let e = (v - max).exp();
+        let e = ((v - max) * inv_t).exp();
         out[i] = e;
         sum += e;
     }
