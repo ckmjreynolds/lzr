@@ -13,6 +13,80 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-22 — Phase 47: Drop LZ77 — Peak Gain 0.006 bpb, Codec Simplifies to Pure MoE
+
+CDR and Claude returned to the question of whether to mix other predictors in alongside the MoE arm. Before designing any mixer, CDR proposed measuring where the MoE actually loses bits — entropy-by-position dump and analysis — so the predictor choice would be informed rather than guessed. That measurement collapsed the LZ77 question along the way.
+
+### Per-token entropy dumper
+
+Added `LZR_ENTROPY_DUMP=path` to `moe-tok-lz` (and later ported to `moe-tok`). One CSV row per emitted unit: source position, token id, byte length, ideal bits (`-log2 p_actual`), MoE distribution entropy, top-1 probability, rank of the actual token. Diagnostic-only — does not alter the archive.
+
+Ran on three 1 MB slices: `enwik9[0..1MB]` (in-training, first 1 MB), `enwik9[950MB..951MB]` (out-of-training, last 5% of corpus), and `enwik8[0..1MB]` (byte-identical to the first slice). The third confirms that prior session framing of "enwik8 is honest, enwik9 is memorized" was wrong: `enwik8` is the first 100 MB of `enwik9` and the entire corpus is in training. The held-out slice gave 1.2412 bpb L(C) — *better* than the in-training first-MB at 1.2761. Per-slice variability dominates; there is no detectable memorization advantage at this model scale.
+
+### Where MoE loses bits — rank distribution (in-training 1 MB)
+
+| MoE rank of actual token | % literals | % literal bits | mean bits/tok |
+|---|---:|---:|---:|
+| top-1 | 32.9% | 6.5% | 1.12 |
+| top-5 | 19.1% | 13.2% | 3.89 |
+| top-50 | 21.8% | 26.7% | 6.93 |
+| **top-500** | **16.9%** | **30.6%** | 10.21 |
+| top-5K | 8.6% | 20.8% | 13.59 |
+| tail (>5K) | 0.7% | 2.2% | 18.12 |
+
+The pain is not fat-tailed: top 1% of tokens hold 3.2% of bits, top 10% hold 25%, top 20% hold 44%. Failure mode is **"right region, wrong token"** — 51% of bits live in the rank-50-to-rank-5K bucket where MoE has correctly narrowed to ~few-hundred candidates but cannot pick. A byte-level Markov or PPM cannot help here: they don't know about BPE tokens and cannot disambiguate inside a ~500-token region. This effectively rules out the classical-predictor mix-in family on this codec architecture.
+
+### Surprise finding — LZ77 contributes 0.6% of bits
+
+The dump aggregated by emission type showed LZ77 absorbing only 0.6% of bits (238 matches, 27 KB) on the in-training 1 MB. Phase 44 had reported −0.005 bpb at landing, which was tiny but not nothing; CDR asked to investigate before designing the next predictor mix-in.
+
+Made `MIN_MATCH` and `MIN_OFFSET` runtime-configurable via `LZR_LZ_MIN_MATCH` and `LZR_LZ_MIN_OFFSET` env vars (Lz77 gained a `with_min_match` constructor and a `min_match` field; codec computes length CDF from runtime value; defaults bit-identical to Phase 44).
+
+### Sweep — `MIN_MATCH` (`MIN_OFFSET=1`)
+
+| MIN_MATCH | bpb L(C) | LZ matches | LZ % of bits |
+|---:|---:|---:|---:|
+| 4 | 1.3575 | 7,019 | 13.9% |
+| 6 | 1.2956 | 2,657 | 5.8% |
+| 8 | 1.2814 | 1,417 | 3.2% |
+| 10 | 1.2771 | 832 | 2.0% |
+| **12** | **1.2754** | 506 | 1.2% |
+| 16 (Phase 44 default) | 1.2761 | 238 | 0.6% |
+
+### Sweep — `MIN_OFFSET` (`MIN_MATCH=12`)
+
+| MIN_OFFSET | bpb L(C) |
+|---:|---:|
+| **1** | **1.2754** |
+| 128 | 1.2757 |
+| 512 | 1.2763 |
+| 1024 | 1.2788 |
+
+### Baseline — pure `moe-tok` (no LZ at all)
+
+`moe-tok` on the same 1 MB: **1.2812 bpb L(C)**. Peak LZ savings (MM=12, MO=1): 0.006 bpb. Phase 44's MM=16 default saved 0.005 — consistent.
+
+### Decision and what ships
+
+0.006 bpb is below the per-slice variability of the larger experiments (Phase 45's 1 MB-vs-100 MB had a 0.05 gap from slice selection alone). Carrying 718 lines of LZ code (`src/lz77.rs` + `src/moe_tok_lz_codec.rs`) for that savings — plus the memory bug we shipped in Phase 46 (ring-buffer fix, commit `240bbc4`, no journal entry written for the fix itself) — is a bad trade.
+
+Phase 47 deletes:
+- `src/lz77.rs` (340 lines)
+- `src/moe_tok_lz_codec.rs` (378 lines)
+- All references in `main.rs` and `eval.rs`
+
+Phase 47 ports:
+- `LZR_ENTROPY_DUMP` plumbing from the LZ codec into `moe_tok_codec.rs`
+- `bpe.rs` gains `token_byte_len` accessor
+
+Net diff: −639 lines. `build.sh` clean (fmt + clippy default & no-default-features + 42 tests + nightly coverage). Production codec is now `moe-tok` (pure MoE + BPE + AC). Projected honest enwik8 100 MB combined: ~1.467 (Phase 46's 1.4615 + 0.006 LZ removed). Phase 44 entry should be read as a measurement-validated negative result superseded here.
+
+### Implications for the mix-in question
+
+The entropy analysis was the substrate. Classical byte-level predictors (Markov, PPM) cannot help when 51% of bits live in BPE-token disambiguation. A useful secondary predictor must operate at the same granularity as MoE (token-level, with BPE awareness), which means it is structurally similar to a second small MoE — exactly the "more MoE" path we paused. The next architectural lever is therefore back on the model side (deeper / wider / longer context), or a token-aware adaptive predictor we have not yet sketched, not a classical-DSP mix-in.
+
+---
+
 ## 2026-05-20 → 2026-05-21 — Phase 45: 240K Steps with Lower LR — Combined L+D 1.408, Beats Phase 43 by 0.009 bpb
 
 Per the Phase 44 plan, CDR kicked off the 240K-step extension of Phase 43's `moe_tok_wider_16k_long` recipe on 2026-05-19. The first attempt (`moe_tok_wider_16k_xlong`, peak LR 3e-4 same as Phase 43) ran into MoE router instability at step ~28K — val_aux climbed from 2.10 to 3.0, val_bpb spiked from a then-best 7.00 → 9.86 over four eval cycles, train_bpb continued descending while val plateaued. The 240K cosine kept LR near peak for ~60K steps versus Phase 43's 120K-cosine which decayed LR by half over the same span; the prolonged high LR was the proximate cause.
