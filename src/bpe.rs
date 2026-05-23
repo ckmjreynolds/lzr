@@ -133,6 +133,12 @@ impl Bpe {
         })
     }
 
+    /// Byte length of a token's expansion. Returns 0 for ids beyond
+    /// `vocab_size` (which shouldn't occur in practice).
+    pub(crate) fn token_byte_len(&self, id: u32) -> usize {
+        self.id_to_bytes.get(id as usize).map_or(0, Vec::len)
+    }
+
     /// Encode a byte slice into a token sequence.
     pub(crate) fn encode(&self, input: &[u8]) -> Vec<u32> {
         let mut out = Vec::with_capacity(input.len() / 3);

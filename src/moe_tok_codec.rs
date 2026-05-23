@@ -27,12 +27,14 @@
 
 #![allow(dead_code)]
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
-use crate::ac::{AcDecoder, AcEncoder};
+use crate::ac::{AcDecoder, AcEncoder, TOTAL};
 use crate::bits::{BitReader, BitWriter};
 use crate::bpe::Bpe;
 use crate::codec::{Codec, Decomposition};
@@ -40,6 +42,66 @@ use crate::moe_arm::MoeArm;
 
 const WEIGHTS_ENV: &str = "LZR_MOE_WEIGHTS";
 const BPE_TABLE_ENV: &str = "LZR_BPE_TABLE";
+/// When set to a writable path, the encode loop dumps one CSV row per
+/// emitted token so we can analyze where the predictor loses bits.
+/// Diagnostic only — does not affect bits emitted to the archive.
+const ENTROPY_DUMP_ENV: &str = "LZR_ENTROPY_DUMP";
+
+/// Diagnostic stats for one literal token: ideal bits paid, `MoE`
+/// distribution entropy, top-1 probability, rank of the actual token.
+struct LitStats {
+    ideal_bits: f64,
+    entropy_bits: f64,
+    top1_prob: f64,
+    rank: u32,
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn lit_stats(cdf: &[u32], t: u32) -> LitStats {
+    let vocab = cdf.len() - 1;
+    let total_f = f64::from(TOTAL);
+    let span_t = u64::from(cdf[t as usize + 1] - cdf[t as usize]);
+    let p_t = span_t as f64 / total_f;
+    let ideal_bits = if p_t > 0.0 { -p_t.log2() } else { 0.0 };
+
+    let mut entropy = 0.0_f64;
+    let mut top1 = 0.0_f64;
+    let mut rank = 0_u32;
+    for i in 0..vocab {
+        let span = u64::from(cdf[i + 1] - cdf[i]);
+        let p = span as f64 / total_f;
+        if p > 0.0 {
+            entropy = p.mul_add(-p.log2(), entropy);
+        }
+        if p > top1 {
+            top1 = p;
+        }
+        if p > p_t {
+            rank += 1;
+        }
+    }
+    LitStats {
+        ideal_bits,
+        entropy_bits: entropy,
+        top1_prob: top1,
+        rank,
+    }
+}
+
+fn open_entropy_dump() -> Result<Option<BufWriter<File>>> {
+    let Some(path) = std::env::var_os(ENTROPY_DUMP_ENV) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let f = File::create(&path)
+        .with_context(|| format!("creating entropy dump at {}", path.display()))?;
+    let mut w = BufWriter::new(f);
+    writeln!(
+        w,
+        "src_pos,tok_id,tok_bytes,ideal_bits,entropy,top1_prob,rank"
+    )?;
+    Ok(Some(w))
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct MoeTokCodec {
@@ -119,18 +181,33 @@ impl Codec for MoeTokCodec {
 
             let mut bw = BitWriter::new();
             let mut cdf = vec![0_u32; vocab + 1];
+            let mut dump = open_entropy_dump()?;
             let bits_before;
             let bits_after;
             {
                 let mut enc = AcEncoder::new(&mut bw);
                 bits_before = enc.bits_written();
+                let mut src_pos: usize = 0;
                 for &tok in &measure_tokens {
                     arms.moe.predict_cdf(&mut cdf);
+                    let tok_bytes = arms.bpe.token_byte_len(tok);
+                    if let Some(w) = dump.as_mut() {
+                        let s = lit_stats(&cdf, tok);
+                        writeln!(
+                            w,
+                            "{src_pos},{tok},{tok_bytes},{:.6},{:.6},{:.6},{}",
+                            s.ideal_bits, s.entropy_bits, s.top1_prob, s.rank
+                        )?;
+                    }
+                    src_pos += tok_bytes;
                     enc.encode(&cdf, tok as usize);
                     arms.moe.feed_token(tok);
                 }
                 bits_after = enc.bits_written();
                 enc.finish();
+            }
+            if let Some(mut w) = dump {
+                w.flush()?;
             }
             let (ac_bytes, _trailing) = bw.finish();
             let ac_bits = bits_after - bits_before;
