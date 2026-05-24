@@ -875,18 +875,22 @@ impl MoeByteTransformer {
                 rmsnorm_inplace(&mut x_norm[i * d..(i + 1) * d], &block.norm1_w);
             }
 
-            // qkv matmul: per-token act-quant + int8 GEMM, batched over positions.
-            let mut qkv = vec![0f32; n * 3 * d];
+            // qkv matmul: per-token act-quant + batched int8 GEMM (CPU or GPU).
+            let mut qkv_x_i8 = vec![0i8; n * d];
+            let mut qkv_x_scales = vec![0f32; n];
             for i in 0..n {
-                let x_scale =
+                qkv_x_scales[i] =
                     crate::int_inference::quantize_act_i8(&x_norm[i * d..(i + 1) * d], &mut act_i8);
-                crate::int_inference::matmul_i8_i8_per_channel(
-                    &act_i8,
-                    x_scale,
-                    &int_block.qkv,
-                    &mut qkv[i * 3 * d..(i + 1) * 3 * d],
-                );
+                qkv_x_i8[i * d..(i + 1) * d].copy_from_slice(&act_i8);
             }
+            let mut qkv = vec![0f32; n * 3 * d];
+            crate::int_inference::batched_matmul_dispatch(
+                &qkv_x_i8,
+                &qkv_x_scales,
+                &int_block.qkv,
+                n,
+                &mut qkv,
+            );
 
             // Write K/V for this layer (used by attention below).
             for i in 0..n {
@@ -923,22 +927,26 @@ impl MoeByteTransformer {
                 }
             }
 
-            // proj matmul + residual add, per-position.
+            // proj matmul: batched int8 GEMM, then residual add.
+            let mut proj_x_i8 = vec![0i8; n * d];
+            let mut proj_x_scales = vec![0f32; n];
             for i in 0..n {
-                let proj_scale = crate::int_inference::quantize_act_i8(
+                proj_x_scales[i] = crate::int_inference::quantize_act_i8(
                     &attn_out[i * d..(i + 1) * d],
                     &mut act_i8,
                 );
-                let mut proj_out = vec![0f32; d];
-                crate::int_inference::matmul_i8_i8_per_channel(
-                    &act_i8,
-                    proj_scale,
-                    &int_block.proj,
-                    &mut proj_out,
-                );
-                for c in 0..d {
-                    x[i * d + c] += proj_out[c];
-                }
+                proj_x_i8[i * d..(i + 1) * d].copy_from_slice(&act_i8);
+            }
+            let mut proj_out = vec![0f32; n * d];
+            crate::int_inference::batched_matmul_dispatch(
+                &proj_x_i8,
+                &proj_x_scales,
+                &int_block.proj,
+                n,
+                &mut proj_out,
+            );
+            for i in 0..n * d {
+                x[i] += proj_out[i];
             }
 
             // Pre-FFN rmsnorm.
@@ -947,20 +955,24 @@ impl MoeByteTransformer {
                 rmsnorm_inplace(&mut x_norm2[i * d..(i + 1) * d], &block.norm2_w);
             }
 
-            // Router: int matmul → softmax → argmax, per-position.
-            let mut router_logits = vec![0f32; n * n_experts];
+            // Router: batched int8 GEMM, then per-token softmax+argmax.
+            let mut router_x_i8 = vec![0i8; n * d];
+            let mut router_x_scales = vec![0f32; n];
             for i in 0..n {
-                let r_scale = crate::int_inference::quantize_act_i8(
+                router_x_scales[i] = crate::int_inference::quantize_act_i8(
                     &x_norm2[i * d..(i + 1) * d],
                     &mut act_i8,
                 );
-                crate::int_inference::matmul_i8_i8_per_channel(
-                    &act_i8,
-                    r_scale,
-                    &int_block.router,
-                    &mut router_logits[i * n_experts..(i + 1) * n_experts],
-                );
+                router_x_i8[i * d..(i + 1) * d].copy_from_slice(&act_i8);
             }
+            let mut router_logits = vec![0f32; n * n_experts];
+            crate::int_inference::batched_matmul_dispatch(
+                &router_x_i8,
+                &router_x_scales,
+                &int_block.router,
+                n,
+                &mut router_logits,
+            );
 
             // Per-token MoE FFN: argmax expert, fc1 + GELU + fc2, gate.
             for i in 0..n {
@@ -996,19 +1008,23 @@ impl MoeByteTransformer {
             }
         }
 
-        // Final rmsnorm + vocab projection, per-position.
-        let mut logits = vec![0f32; n * vocab];
+        // Final rmsnorm + batched vocab projection.
+        let mut final_x_i8 = vec![0i8; n * d];
+        let mut final_x_scales = vec![0f32; n];
         for i in 0..n {
             rmsnorm_inplace(&mut x[i * d..(i + 1) * d], &self.norm_f);
-            let final_scale =
+            final_x_scales[i] =
                 crate::int_inference::quantize_act_i8(&x[i * d..(i + 1) * d], &mut act_i8);
-            crate::int_inference::matmul_i8_i8_per_channel(
-                &act_i8,
-                final_scale,
-                &ic.tok_emb,
-                &mut logits[i * vocab..(i + 1) * vocab],
-            );
+            final_x_i8[i * d..(i + 1) * d].copy_from_slice(&act_i8);
         }
+        let mut logits = vec![0f32; n * vocab];
+        crate::int_inference::batched_matmul_dispatch(
+            &final_x_i8,
+            &final_x_scales,
+            &ic.tok_emb,
+            n,
+            &mut logits,
+        );
         logits
     }
 
@@ -1307,8 +1323,7 @@ mod tests {
         model.apply_quantization(Quantization::Mixed5Asym);
         model.prepare_int_cache();
         let vocab_u32 = u32::try_from(model.cfg.vocab_size).expect("vocab fits u32");
-        let tokens: Vec<u32> =
-            (0..256u32).map(|i| (i * 37 + 11) % vocab_u32).collect();
+        let tokens: Vec<u32> = (0..256u32).map(|i| (i * 37 + 11) % vocab_u32).collect();
 
         // per-step
         let t0 = std::time::Instant::now();

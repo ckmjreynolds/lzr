@@ -166,6 +166,49 @@ fn gpu_backend_enabled() -> bool {
     })
 }
 
+/// Day-4 Phase 2b: batched int8 matmul dispatcher.
+///
+/// Processes M rows of activation through the same weight tensor in
+/// one GPU dispatch (or M CPU dispatches in the CPU path). Same
+/// bit-equivalence contract as `matmul_dispatch`: every output
+/// element is identical to what M sequential `matmul_dispatch` calls
+/// would produce.
+///
+/// `x_i8` is `[M, K]` row-major. `x_scales[m]` is the per-row
+/// activation scale (one per token). `out` is `[M, N]` row-major.
+/// On the GPU path, the weight tensor's `OnceLock<GpuTensor>` is
+/// uploaded lazily on first use just like the single-row path.
+pub(crate) fn batched_matmul_dispatch(
+    x_i8: &[i8],
+    x_scales: &[f32],
+    w: &IntTensor,
+    m: usize,
+    out: &mut [f32],
+) {
+    let n = w.rows;
+    let k = w.cols;
+    debug_assert_eq!(x_i8.len(), m * k);
+    debug_assert_eq!(x_scales.len(), m);
+    debug_assert_eq!(out.len(), m * n);
+    #[cfg(feature = "gpu-inference")]
+    if gpu_backend_enabled() {
+        let gpu = crate::gpu::gpu().expect("GPU init");
+        let w_gpu = w.gpu.get_or_init(|| gpu.upload_tensor(&w.data, &w.scales));
+        gpu.batched_matmul_i8(x_i8, x_scales, w_gpu, m, n, k, out)
+            .expect("GPU batched matmul");
+        return;
+    }
+    // CPU fallback: loop the per-row kernel.
+    for r in 0..m {
+        matmul_i8_i8_per_channel(
+            &x_i8[r * k..(r + 1) * k],
+            x_scales[r],
+            w,
+            &mut out[r * n..(r + 1) * n],
+        );
+    }
+}
+
 /// Dispatcher that picks the CPU or GPU backend for one int8 matmul.
 /// Always CPU when the `gpu-inference` feature is off (i.e., the
 /// submission build).

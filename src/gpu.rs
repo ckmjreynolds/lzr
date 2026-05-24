@@ -71,6 +71,40 @@ kernel void matmul_i8_per_channel(
     }
     out[gid] = float(acc) * p.x_scale * w_scales[gid];
 }
+
+// Day-4 Phase 2a: batched per-token int8 matmul.
+//   x_i8 [M, K], x_scales [M] (one per token row)
+//   w_i8 [N, K] row-major, w_scales [N] (one per output channel)
+//   out  [M, N]
+// One thread per (m, n) output. Same i32 accumulator + same f32
+// multiply order as the per-token kernel, so out[m, n] is bit-for-bit
+// identical to the per-token kernel called M times.
+struct BatchedParams {
+    uint m;
+    uint k;
+    uint n;
+};
+
+kernel void batched_matmul_i8_per_channel(
+    device const char*  x_i8     [[buffer(0)]],
+    device const float* x_scales [[buffer(1)]],
+    device const char*  w_i8     [[buffer(2)]],
+    device const float* w_scales [[buffer(3)]],
+    device float*       out      [[buffer(4)]],
+    constant BatchedParams& p    [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.x;  // m
+    uint col = gid.y;  // n
+    if (row >= p.m || col >= p.n) return;
+    int acc = 0;
+    device const char* x_row = x_i8 + row * p.k;
+    device const char* w_row = w_i8 + col * p.k;
+    for (uint c = 0; c < p.k; c++) {
+        acc += int(x_row[c]) * int(w_row[c]);
+    }
+    out[row * p.n + col] = float(acc) * x_scales[row] * w_scales[col];
+}
 ";
 
 #[repr(C)]
@@ -81,11 +115,20 @@ struct Params {
     x_scale: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct BatchedParams {
+    m: u32,
+    k: u32,
+    n: u32,
+}
+
 #[derive(Debug)]
 pub(crate) struct Gpu {
     device: Device,
     queue: CommandQueue,
     matmul_pipeline: ComputePipelineState,
+    batched_matmul_pipeline: ComputePipelineState,
 }
 
 // `Device`, `CommandQueue`, etc. wrap Objective-C pointers that the
@@ -138,6 +181,12 @@ impl Gpu {
         let matmul_pipeline = device
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|e| anyhow!("pipeline creation failed: {e}"))?;
+        let batched_function = library
+            .get_function("batched_matmul_i8_per_channel", None)
+            .map_err(|e| anyhow!("missing batched kernel function: {e}"))?;
+        let batched_matmul_pipeline = device
+            .new_compute_pipeline_state_with_function(&batched_function)
+            .map_err(|e| anyhow!("batched pipeline creation failed: {e}"))?;
         eprintln!(
             "[gpu] init OK: device={} max_threads_per_threadgroup={}",
             device.name(),
@@ -147,6 +196,7 @@ impl Gpu {
             device,
             queue,
             matmul_pipeline,
+            batched_matmul_pipeline,
         })
     }
 
@@ -301,6 +351,86 @@ impl Gpu {
         out.copy_from_slice(slice);
         Ok(())
     }
+
+    /// Day-4 Phase 2a: batched int8 matmul. Processes M rows of
+    /// activation against the same `n × k` weight tensor in a single
+    /// 2D-dispatch.
+    ///
+    /// Inputs:
+    /// - `x_i8`: `[M, K]` int8 activation, row-major. Length `M * K`.
+    /// - `x_scales`: `[M]` per-row activation scales (one per token).
+    /// - `w_gpu`: pre-uploaded weight tensor `(rows = N, cols = K)`.
+    /// - `m`, `n`, `k`: dimensions.
+    /// - `out`: `[M, N]` f32 output, row-major. Length `M * N`. Overwritten.
+    ///
+    /// Same i32 accumulator and same `acc * x_scale * w_scale` triple
+    /// product as `matmul_with_buffers`, so every output element is
+    /// bit-for-bit identical to a per-row call of the single-row
+    /// kernel on the same inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batched_matmul_i8(
+        &self,
+        x_i8: &[i8],
+        x_scales: &[f32],
+        w_gpu: &GpuTensor,
+        m: usize,
+        n: usize,
+        k: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        if x_i8.len() != m.saturating_mul(k) {
+            return Err(anyhow!("x_i8 len {} != m*k = {}*{}", x_i8.len(), m, k));
+        }
+        if x_scales.len() != m {
+            return Err(anyhow!("x_scales len {} != m {m}", x_scales.len()));
+        }
+        if out.len() != m.saturating_mul(n) {
+            return Err(anyhow!("out len {} != m*n = {}*{}", out.len(), m, n));
+        }
+        let x_buf = self.buffer_from_slice(x_i8);
+        let x_scales_buf = self.buffer_from_slice(x_scales);
+        let out_buf = self.empty_buffer(size_of::<f32>().saturating_mul(m * n));
+        let params = BatchedParams {
+            m: u32::try_from(m).context("m overflow")?,
+            k: u32::try_from(k).context("k overflow")?,
+            n: u32::try_from(n).context("n overflow")?,
+        };
+        let params_buf = self.buffer_from_slice(&[params]);
+
+        let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.batched_matmul_pipeline);
+        enc.set_buffer(0, Some(&x_buf), 0);
+        enc.set_buffer(1, Some(&x_scales_buf), 0);
+        enc.set_buffer(2, Some(&w_gpu.data_buf), 0);
+        enc.set_buffer(3, Some(&w_gpu.scales_buf), 0);
+        enc.set_buffer(4, Some(&out_buf), 0);
+        enc.set_buffer(5, Some(&params_buf), 0);
+
+        let grid = MTLSize::new(m as u64, n as u64, 1);
+        // 2D threadgroup: pick a reasonable rectangle. Apple GPUs run
+        // 32-thread SIMD groups; (16 × 16) gives 256 threads which
+        // is well within max_total_threads_per_threadgroup (1024 on
+        // M3 Pro) and keeps occupancy high.
+        let max_tg = self
+            .batched_matmul_pipeline
+            .max_total_threads_per_threadgroup();
+        let tg_x = 16u64.min(m as u64).max(1);
+        let tg_y = 16u64.min(n as u64).max(1);
+        let tg_x = tg_x.min(max_tg);
+        let tg_y = (max_tg / tg_x).min(tg_y).max(1);
+        let tg = MTLSize::new(tg_x, tg_y, 1);
+        enc.dispatch_threads(grid, tg);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // SAFETY: shared-storage Metal buffer is host-readable.
+        let out_ptr = out_buf.contents().cast::<f32>();
+        let slice = unsafe { std::slice::from_raw_parts(out_ptr, m * n) };
+        out.copy_from_slice(slice);
+        Ok(())
+    }
 }
 
 /// Public accessor for the lazily-initialized singleton.
@@ -418,13 +548,166 @@ mod tests {
             }
             let cpu_max = out_cpu.iter().fold(0_f32, |a, &b| a.max(b.abs()));
             let ratio = gpu_us / cpu_us;
-            let ok = if max_d <= 1e-3 * cpu_max { "OK" } else { "DRIFT" };
+            let ok = if max_d <= 1e-3 * cpu_max {
+                "OK"
+            } else {
+                "DRIFT"
+            };
             eprintln!(
                 "{name:>8}  {n:>5}  {k:>5}  {cpu_us:>10.1}  {gpu_us:>10.1}  {ratio:>9.2}x  {ok}"
             );
         }
         eprintln!(
             "\nIf gpu (µs) >> cpu (µs), per-dispatch sync dominates — Day-4 batched encode needed.\nIf gpu (µs) <  cpu (µs), kernel itself wins — sync model is the bottleneck."
+        );
+    }
+
+    /// Day-4 Phase 2a diagnostic: wall comparison of the batched
+    /// kernel vs M sequential per-row dispatches at production matmul
+    /// shapes for varying M. Confirms the kernel actually wins the
+    /// dispatch-amortization battle.
+    /// ```text
+    /// cargo test --features gpu-inference --release \
+    ///   gpu::tests::batched_matmul_wall_bench -- --nocapture --ignored
+    /// ```
+    #[test]
+    #[ignore = "diagnostic — run on demand"]
+    fn batched_matmul_wall_bench() {
+        use std::time::Instant;
+        let shapes: &[(&str, usize, usize)] = &[
+            ("qkv", 3 * 128, 128),
+            ("proj", 128, 128),
+            ("router", 32, 128),
+            ("fc1", 512, 128),
+            ("fc2", 128, 512),
+            ("vocab", 16384, 128),
+        ];
+        let ms: &[usize] = &[16, 64, 256];
+        let g = gpu().expect("metal init");
+        let header = format!(
+            "\n{:>8}  {:>5}  {:>5}  {:>4}  {:>12}  {:>12}  {:>10}",
+            "shape", "n", "k", "M", "per-row (ms)", "batched (ms)", "speedup"
+        );
+        eprintln!("{header}");
+        eprintln!("{}", "-".repeat(75));
+        for (name, n, k) in shapes {
+            let n = *n;
+            let k = *k;
+            let w_f: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32) * 0.013 - 0.2).sin())
+                .collect();
+            let w = IntTensor::pack_per_channel_sym(&w_f, n, k, 8);
+            let w_gpu = g.upload_tensor(&w.data, &w.scales);
+            for &m in ms {
+                let x_f: Vec<f32> = (0..m * k)
+                    .map(|i| ((i as f32) * 0.027 + 0.4).cos())
+                    .collect();
+                let mut x_i8 = vec![0i8; m * k];
+                let mut x_scales = vec![0f32; m];
+                let mut tmp = Vec::new();
+                for r in 0..m {
+                    x_scales[r] = quantize_act_i8(&x_f[r * k..(r + 1) * k], &mut tmp);
+                    x_i8[r * k..(r + 1) * k].copy_from_slice(&tmp);
+                }
+                let mut out_seq = vec![0f32; m * n];
+                let mut out_bat = vec![0f32; m * n];
+                let iters: u32 = 30;
+                // warmup
+                g.matmul_with_buffers(&x_i8[..k], x_scales[0], &w_gpu, n, k, &mut out_seq[..n])
+                    .expect("warm");
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    for r in 0..m {
+                        g.matmul_with_buffers(
+                            &x_i8[r * k..(r + 1) * k],
+                            x_scales[r],
+                            &w_gpu,
+                            n,
+                            k,
+                            &mut out_seq[r * n..(r + 1) * n],
+                        )
+                        .expect("seq");
+                    }
+                }
+                let per_row_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(iters);
+                g.batched_matmul_i8(&x_i8, &x_scales, &w_gpu, m, n, k, &mut out_bat)
+                    .expect("warm batched");
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    g.batched_matmul_i8(&x_i8, &x_scales, &w_gpu, m, n, k, &mut out_bat)
+                        .expect("bat");
+                }
+                let batched_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(iters);
+                let speedup = per_row_ms / batched_ms;
+                eprintln!(
+                    "{name:>8}  {n:>5}  {k:>5}  {m:>4}  {per_row_ms:>12.2}  {batched_ms:>12.2}  {speedup:>9.2}x"
+                );
+            }
+        }
+    }
+
+    /// Day-4 Phase 2a acceptance: batched int8 matmul on M rows of
+    /// activation must produce the same `[M, N]` output that M
+    /// per-row calls of `matmul_with_buffers` would.
+    #[test]
+    fn batched_matmul_i8_matches_per_row() {
+        let m = 31; // odd to expose row-handling bugs
+        let k = 96;
+        let n = 256;
+        let x_f: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32) * 0.0173 - 0.7).sin())
+            .collect();
+        let w_f: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32) * 0.011 + 0.4).cos())
+            .collect();
+        let w = IntTensor::pack_per_channel_sym(&w_f, n, k, 8);
+
+        // Per-row quantize.
+        let mut x_i8 = vec![0i8; m * k];
+        let mut x_scales = vec![0f32; m];
+        let mut tmp = Vec::new();
+        for r in 0..m {
+            x_scales[r] = quantize_act_i8(&x_f[r * k..(r + 1) * k], &mut tmp);
+            x_i8[r * k..(r + 1) * k].copy_from_slice(&tmp);
+        }
+
+        let g = gpu().expect("metal init");
+        let w_gpu = g.upload_tensor(&w.data, &w.scales);
+
+        // Reference: M per-row dispatches.
+        let mut ref_out = vec![0f32; m * n];
+        for r in 0..m {
+            g.matmul_with_buffers(
+                &x_i8[r * k..(r + 1) * k],
+                x_scales[r],
+                &w_gpu,
+                n,
+                k,
+                &mut ref_out[r * n..(r + 1) * n],
+            )
+            .expect("per-row matmul");
+        }
+
+        // Batched: one dispatch over (M × N) outputs.
+        let mut batched = vec![0f32; m * n];
+        g.batched_matmul_i8(&x_i8, &x_scales, &w_gpu, m, n, k, &mut batched)
+            .expect("batched matmul");
+
+        let mut exact = 0usize;
+        let mut max_d = 0_f32;
+        for i in 0..m * n {
+            if batched[i].to_bits() == ref_out[i].to_bits() {
+                exact += 1;
+            }
+            max_d = max_d.max((batched[i] - ref_out[i]).abs());
+        }
+        let total = m * n;
+        eprintln!(
+            "[batched matmul test] {exact}/{total} bit-exact vs per-row, max_abs_diff={max_d:e}"
+        );
+        assert_eq!(
+            exact, total,
+            "batched kernel must bit-match per-row kernel — max_abs_diff={max_d:e}"
         );
     }
 
