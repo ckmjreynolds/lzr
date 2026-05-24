@@ -21,10 +21,16 @@ default     = ["submission"]
 # what ships. Training-related code is gated behind `training` and will be
 # added later when (and if) the bit-budget audit calls for a neural arm.
 submission  = []
+# Apple Silicon Metal GPU acceleration for the int8 forward path.
+# Dev-only — pulls in objc bindings + Metal framework. Never enabled in
+# the submission build. The submission CI gate in `build.sh` verifies
+# this stays out of the default feature set.
+gpu-inference = ["dep:metal"]
 
 [dependencies]
 anyhow      = "=1.0.102"
 clap        = { version = "=4.6.1", features = ["derive"] }
+metal       = { version = "=0.33.0", optional = true }
 
 [dev-dependencies]
 assert_cmd        = "=2.2.1"

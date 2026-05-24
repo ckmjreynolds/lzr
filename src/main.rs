@@ -15,6 +15,8 @@ mod bits;
 mod bpe;
 mod codec;
 mod eval;
+#[cfg(feature = "gpu-inference")]
+mod gpu;
 mod int_inference;
 mod moe;
 mod moe_arm;
