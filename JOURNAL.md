@@ -13,6 +13,76 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-24 — Phase 50C Day 1+2: Metal GPU Backend Behind Feature Flag — Bit-Exact Archives vs CPU on 4 KB and 1 MB
+
+Per the Phase 50 recommendation that ranked Phase 50C as the highest-value next step (turns every future codec experiment from a 3-hour CPU commitment into a sub-hour test), CDR directed implementing the Metal GPU backend with enwik8 validation. The acceptance contract for the GPU path is **bit-identical archives to the CPU int8 path**, which lets a GPU-encoded archive round-trip through a CPU decoder unchanged. That contract is the entire reason for choosing int8: the i32 accumulator is reduction-order-independent, so GPU's parallel reduction tree and CPU's linear sum produce the same integer, and the trailing `(acc as f32) * x_scale * w_scales[row]` dequant uses the same three-multiply expression on both backends.
+
+### Day 1 — Standalone Metal int8 GEMM with bit-exactness test
+
+`src/gpu.rs` (Phase 50C Day 1 commit `1527591`) adds:
+- A `gpu-inference` cargo feature pulling `metal = 0.33.0` (transitively `objc`, `core-foundation`, `foreign-types`).
+- A `Gpu` singleton (`OnceLock`) owning a Metal device, command queue, and pre-compiled `matmul_i8_per_channel` pipeline state.
+- `Gpu::matmul_i8_per_channel(x_i8, x_scale, w_i8, w_scales, out)` mirroring the CPU API in `int_inference.rs`.
+- An MSL kernel: one thread per output row, `int` accumulator, `float(acc) * x_scale * w_scales[gid]` at the end.
+
+The acceptance test compares CPU and GPU outputs on `n=384, k=128` synthetic data:
+
+```
+[gpu] init OK: device=Apple M3 Pro max_threads_per_threadgroup=1024
+[gpu test] max_abs_diff=0e0  y_max=4.6657627e1  exact_match=384/384
+```
+
+**384/384 exact f32 bit matches, max absolute difference = 0e0.** The bit-exactness contract holds.
+
+The submission binary is unaffected — `cargo build --no-default-features --features submission` still produces a Metal-free binary. `build.sh` CI gate passes.
+
+### Day 2 — Wire into MoE forward path via `LZR_GPU_BACKEND=1`
+
+`src/int_inference.rs` (Phase 50C Day 2 commit `81bf45c`) adds a `matmul_dispatch()` that routes each int8 matmul to either the CPU or the GPU backend. `LZR_GPU_BACKEND=1` (requires the `gpu-inference` feature) opts in. All six matmul call sites in `MoeByteTransformer::forward_step_int` now go through the dispatcher.
+
+End-to-end correctness validation on `enwik9[0..4KB]` and `enwik9[0..1MB]`:
+
+| corpus | CPU int8 archive bytes | GPU int8 archive bytes | `cmp` |
+|---|---:|---:|:---:|
+| 4 KB | 767 | 767 | **byte-identical** |
+| 1 MB | 167,475 | 167,475 | **byte-identical** |
+
+Bit-exactness holds across 242 000 tokens and ~3 million matmuls, end-to-end through embeddings, attention, softmax, gelu, structural mask, and AC.
+
+| corpus | CPU int8 wall | GPU per-token wall | Δ |
+|---|---:|---:|---:|
+| 1 MB | 42.0 s | 41.3 s | flat |
+
+GPU per-token wall is essentially identical to CPU int8 at 1 MB scale — the per-matmul GPU compute win is cancelled by per-call buffer allocation overhead (each forward step allocates fresh Metal buffers for the activation and the masked weight rows). The real wall-time win requires Day 3 (pre-upload weight buffers in `IntCache` so only the activation buffer is allocated per step) and Day 4 (batched encode that runs the whole token sequence in one shader dispatch).
+
+### Day 3 — Pre-upload weights (in progress)
+
+Deferred to a follow-up session to keep the enwik8 validation as the next milestone of *this* session. The plumbing path is: extend `IntTensor` with an optional `metal::Buffer`, populate it during `prepare_int_cache()` when GPU is enabled, and have `Gpu::matmul_with_buffers()` consume the pre-allocated buffer instead of uploading per call.
+
+### Day 4 — 100 MB enwik8 GPU roundtrip (in progress)
+
+Launched in background. Expected outcome: byte-identical archive to Phase 50D's CPU int8 archive (`/tmp/phase50d_qat_int_enwik8.archive`, 16 660 096 bytes), same L+D of 1.4629, similar wall (~2 h 17 m at current per-token GPU speed). Result and `cmp` verdict pending; will be filled in when the run completes.
+
+### What this enables for the future
+
+With bit-exact GPU↔CPU established at the single-matmul, full-forward-step, 4 KB roundtrip, AND 1 MB roundtrip levels, the GPU backend can substitute for the CPU backend in any codec experiment without changing the archive. That means:
+
+- A future enwik9 (1 GB) roundtrip can run on GPU and produce the same archive a CPU decode would accept.
+- Iteration on the codec (calibration, masks, AC variants) can use GPU for fast turnaround, then ship via CPU-only submission binary.
+- Once Day 3 weight pre-upload + Day 4 batched encode land, the 10-50× speedup that motivates this whole effort becomes the daily-driver throughput.
+
+### What ships from this Day 1+2
+
+Branch `v4`:
+- `Cargo.toml` — `gpu-inference` feature + optional `metal` dep.
+- `src/gpu.rs` — Metal device, MSL int8 GEMM kernel, `Gpu::matmul_i8_per_channel`.
+- `src/int_inference.rs` — `matmul_dispatch()` + `LZR_GPU_BACKEND` env reader.
+- `src/moe.rs` — six matmul call sites in `forward_step_int` routed through `matmul_dispatch`.
+
+The submission binary continues to ship without any Metal linkage.
+
+---
+
 ## 2026-05-23 → 2026-05-24 — Phase 50A/B/D: Integer-Only Rust Inference + QAT in PyTorch — Pipeline Working, +0.003 bpb int8/f32 Gap is Intrinsic at This Quant Scheme
 
 After Phase 49 exhausted the single-scalar/single-FSM calibration track, CDR directed building the integer-only inference + QAT + GPU pipeline that would make the same predictor reproducible across CPU and GPU backends and unlock practical enwik9-scale validation. The audit showed the existing "quantization" was actually quantize-dequantize (q-dq) on f32 weights — the matmul itself stayed f32 — so an integer-only forward path was a from-scratch addition, not a tweak. Phases 50A (Rust int8 inference), 50B (PyTorch QAT to recover regression), 50C (Metal GPU backend), 50D (enwik8 + enwik9) were scoped as the arc. This entry covers 50A, 50B, and the 50D enwik8 leg from a single autonomous 10-hour session; 50C and the enwik9 leg are deferred.
