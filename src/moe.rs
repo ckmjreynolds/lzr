@@ -191,6 +191,34 @@ pub(crate) struct MoeByteTransformer {
     pos_emb: Vec<f32>, // [context, d_model]
     blocks: Vec<MoeBlock>,
     norm_f: Vec<f32>, // [d_model]
+    /// Optional int8 packed cache of all matmul-side weights (Phase
+    /// 50A). When `Some(...)`, [`MoeByteTransformer::forward_step`]
+    /// dispatches to the integer path. Built by
+    /// [`MoeByteTransformer::prepare_int_cache`] after q-dq.
+    int_cache: Option<IntCache>,
+}
+
+#[derive(Debug)]
+struct IntExpertCache {
+    fc1: crate::int_inference::IntTensor,
+    fc2: crate::int_inference::IntTensor,
+}
+
+#[derive(Debug)]
+struct IntBlockCache {
+    qkv: crate::int_inference::IntTensor,
+    proj: crate::int_inference::IntTensor,
+    router: crate::int_inference::IntTensor,
+    experts: Vec<IntExpertCache>,
+}
+
+#[derive(Debug)]
+struct IntCache {
+    /// `tok_emb` packed as a single tensor (rows = vocab, cols = `d_model`).
+    /// Used both for the final vocab projection (matmul) and the
+    /// embedding lookup (dequant a row on demand).
+    tok_emb: crate::int_inference::IntTensor,
+    blocks: Vec<IntBlockCache>,
 }
 
 impl MoeByteTransformer {
@@ -258,6 +286,7 @@ impl MoeByteTransformer {
             pos_emb,
             blocks,
             norm_f,
+            int_cache: None,
         })
     }
 
@@ -595,6 +624,192 @@ impl MoeByteTransformer {
         rmsnorm_inplace(&mut x, &self.norm_f);
         let mut logits = vec![0f32; cfg.vocab_size];
         matmul_x_w_t(&x, &self.tok_emb, &mut logits, 1, d, cfg.vocab_size);
+
+        cache.pos += 1;
+        logits
+    }
+
+    /// Pack every matmul-side weight tensor into per-channel-int8.
+    /// Idempotent. After this call `int_cache.is_some()` and
+    /// [`MoeByteTransformer::forward_step`] will dispatch to the
+    /// integer path.
+    pub(crate) fn prepare_int_cache(&mut self) {
+        use crate::int_inference::IntTensor;
+        if self.int_cache.is_some() {
+            return;
+        }
+        let cfg = self.cfg;
+        let d = cfg.d_model;
+        let tok_emb = IntTensor::pack_per_channel_sym(&self.tok_emb, cfg.vocab_size, d, 8);
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|b| IntBlockCache {
+                qkv: IntTensor::pack_per_channel_sym(&b.qkv_w, 3 * d, d, 8),
+                proj: IntTensor::pack_per_channel_sym(&b.proj_w, d, d, 8),
+                router: IntTensor::pack_per_channel_sym(&b.router_w, cfg.n_experts, d, 8),
+                experts: b
+                    .experts
+                    .iter()
+                    .map(|e| IntExpertCache {
+                        fc1: IntTensor::pack_per_channel_sym(&e.fc1_w, cfg.d_ff, d, 8),
+                        fc2: IntTensor::pack_per_channel_sym(&e.fc2_w, d, cfg.d_ff, 8),
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.int_cache = Some(IntCache { tok_emb, blocks });
+    }
+
+    /// Integer-path forward step (Phase 50A). Same API as
+    /// [`MoeByteTransformer::forward_step`] but every matmul runs
+    /// through int8 × int8 → int32 → f32 with dynamic per-token
+    /// activation quantization. Element-wise ops (rmsnorm, softmax,
+    /// gelu) and the attention dot-products stay in f32 because they
+    /// are precision-sensitive or too small to benefit. Requires
+    /// [`MoeByteTransformer::prepare_int_cache`] to have been called.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::similar_names,
+        clippy::needless_range_loop,
+        clippy::too_many_lines,
+        clippy::suboptimal_flops,
+        clippy::cast_precision_loss
+    )]
+    pub(crate) fn forward_step_int(&self, cache: &mut MoeKvCache, token: u32) -> Vec<f32> {
+        let ic = self
+            .int_cache
+            .as_ref()
+            .expect("prepare_int_cache() must be called before forward_step_int");
+        let cfg = &self.cfg;
+        assert!(cache.pos < cfg.context);
+        assert!((token as usize) < cfg.vocab_size);
+        let d = cfg.d_model;
+        let h = cfg.n_head;
+        let hd = cfg.head_dim();
+        let p = cache.pos;
+
+        // Embedding: dequant a row of tok_emb on the fly + add pos_emb.
+        let mut x = vec![0f32; d];
+        let row = token as usize;
+        let scale = ic.tok_emb.scales[row];
+        let row_i8 = &ic.tok_emb.data[row * d..(row + 1) * d];
+        let pos_row = &self.pos_emb[p * d..(p + 1) * d];
+        for i in 0..d {
+            x[i] = f32::from(row_i8[i]) * scale + pos_row[i];
+        }
+
+        let mut act_i8 = Vec::with_capacity(d.max(cfg.d_ff));
+        for (l, block) in self.blocks.iter().enumerate() {
+            let int_block = &ic.blocks[l];
+
+            // Attention path.
+            let mut x_norm = x.clone();
+            rmsnorm_inplace(&mut x_norm, &block.norm1_w);
+
+            // qkv: int matmul.
+            let x_scale = crate::int_inference::quantize_act_i8(&x_norm, &mut act_i8);
+            let mut qkv = vec![0f32; 3 * d];
+            crate::int_inference::matmul_i8_i8_per_channel(
+                &act_i8,
+                x_scale,
+                &int_block.qkv,
+                &mut qkv,
+            );
+
+            let layer_cache = &mut cache.layers[l];
+            layer_cache.k[p * d..(p + 1) * d].copy_from_slice(&qkv[d..2 * d]);
+            layer_cache.v[p * d..(p + 1) * d].copy_from_slice(&qkv[2 * d..3 * d]);
+
+            // Attention dot products: stay f32 (tiny, precision-sensitive).
+            let mut attn_out = vec![0f32; d];
+            for head in 0..h {
+                let q_h = &qkv[head * hd..head * hd + hd];
+                let scale_attn = 1.0 / (hd as f32).sqrt();
+                let mut scores = vec![0f32; p + 1];
+                for j in 0..=p {
+                    let kj = &layer_cache.k[j * d + head * hd..j * d + head * hd + hd];
+                    let mut s = 0f32;
+                    for i in 0..hd {
+                        s += q_h[i] * kj[i];
+                    }
+                    scores[j] = s * scale_attn;
+                }
+                softmax_inplace(&mut scores);
+                let out_h = &mut attn_out[head * hd..head * hd + hd];
+                for j in 0..=p {
+                    let vj = &layer_cache.v[j * d + head * hd..j * d + head * hd + hd];
+                    let s_j = scores[j];
+                    for i in 0..hd {
+                        out_h[i] += s_j * vj[i];
+                    }
+                }
+            }
+
+            // proj: int matmul.
+            let proj_scale = crate::int_inference::quantize_act_i8(&attn_out, &mut act_i8);
+            let mut proj_out = vec![0f32; d];
+            crate::int_inference::matmul_i8_i8_per_channel(
+                &act_i8,
+                proj_scale,
+                &int_block.proj,
+                &mut proj_out,
+            );
+            for i in 0..d {
+                x[i] += proj_out[i];
+            }
+
+            // MoE FFN.
+            x_norm.copy_from_slice(&x);
+            rmsnorm_inplace(&mut x_norm, &block.norm2_w);
+
+            // Router: int matmul.
+            let r_scale = crate::int_inference::quantize_act_i8(&x_norm, &mut act_i8);
+            let mut router_logits = vec![0f32; cfg.n_experts];
+            crate::int_inference::matmul_i8_i8_per_channel(
+                &act_i8,
+                r_scale,
+                &int_block.router,
+                &mut router_logits,
+            );
+            let mut router_probs = router_logits.clone();
+            softmax_inplace(&mut router_probs);
+            let (expert_idx, gate_val) = argmax_with_value(&router_probs);
+
+            // Expert FFN: two int matmuls, GELU between.
+            let int_expert = &int_block.experts[expert_idx];
+            let fc1_scale = crate::int_inference::quantize_act_i8(&x_norm, &mut act_i8);
+            let mut ff_hidden = vec![0f32; cfg.d_ff];
+            crate::int_inference::matmul_i8_i8_per_channel(
+                &act_i8,
+                fc1_scale,
+                &int_expert.fc1,
+                &mut ff_hidden,
+            );
+            gelu_inplace(&mut ff_hidden);
+
+            let fc2_scale = crate::int_inference::quantize_act_i8(&ff_hidden, &mut act_i8);
+            let mut ff_out = vec![0f32; d];
+            crate::int_inference::matmul_i8_i8_per_channel(
+                &act_i8,
+                fc2_scale,
+                &int_expert.fc2,
+                &mut ff_out,
+            );
+            for i in 0..d {
+                x[i] += ff_out[i] * gate_val;
+            }
+        }
+
+        rmsnorm_inplace(&mut x, &self.norm_f);
+        let final_scale = crate::int_inference::quantize_act_i8(&x, &mut act_i8);
+        let mut logits = vec![0f32; cfg.vocab_size];
+        crate::int_inference::matmul_i8_i8_per_channel(
+            &act_i8,
+            final_scale,
+            &ic.tok_emb,
+            &mut logits,
+        );
 
         cache.pos += 1;
         logits

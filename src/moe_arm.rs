@@ -39,6 +39,21 @@ pub(crate) const QUANT_ENV: &str = "LZR_MOE_QUANT";
 /// recovers ~0.0046 bpb at zero shipped-binary cost.
 const LOGIT_TEMP: f32 = 0.94;
 
+/// When set to "1", `MoeArm::feed_token` and `feed` route through the
+/// integer-only forward path (Phase 50A). Read once at load.
+const INT_KERNELS_ENV: &str = "LZR_INT_KERNELS";
+
+fn int_kernels_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var(INT_KERNELS_ENV)
+            .ok()
+            .as_deref()
+            .is_some_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct MoeArm {
     model: MoeByteTransformer,
@@ -59,6 +74,9 @@ impl MoeArm {
         let mut model = MoeByteTransformer::load_lzrm(&bytes)
             .with_context(|| "parsing .lzrm MoE-arm weights")?;
         model.apply_quantization(q);
+        if int_kernels_enabled() {
+            model.prepare_int_cache();
+        }
         let cache = model.new_kv_cache();
         Ok(Self {
             model,
@@ -91,8 +109,16 @@ impl MoeArm {
         if self.cache.pos >= self.model.cfg.context {
             self.cache.reset();
         }
-        self.pending_logits = Some(self.model.forward_step(&mut self.cache, u32::from(byte)));
+        self.pending_logits = Some(self.run_forward(u32::from(byte)));
         self.fed_count += 1;
+    }
+
+    fn run_forward(&mut self, token: u32) -> Vec<f32> {
+        if int_kernels_enabled() {
+            self.model.forward_step_int(&mut self.cache, token)
+        } else {
+            self.model.forward_step(&mut self.cache, token)
+        }
     }
 
     /// Same as [`feed`] but accepts a token id directly (for non-byte
@@ -101,7 +127,7 @@ impl MoeArm {
         if self.cache.pos >= self.model.cfg.context {
             self.cache.reset();
         }
-        self.pending_logits = Some(self.model.forward_step(&mut self.cache, token));
+        self.pending_logits = Some(self.run_forward(token));
         self.fed_count += 1;
     }
 

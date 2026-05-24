@@ -15,6 +15,7 @@ mod bits;
 mod bpe;
 mod codec;
 mod eval;
+mod int_inference;
 mod moe;
 mod moe_arm;
 mod moe_codec;

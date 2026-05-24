@@ -1,0 +1,204 @@
+//! Integer-only inference primitives — Phase 50A.
+//!
+//! Builds on top of the existing f32 q-dq scheme by keeping a packed
+//! int8 representation alongside the f32 weights and providing a
+//! dynamic per-token activation quantizer plus an int8 × int8 → int32
+//! → f32 GEMM. The motivation is twofold:
+//!
+//! - **Reproducibility across backends**: an integer GEMM with an
+//!   integer accumulator produces the same result regardless of
+//!   reduction order, which is the prerequisite for a GPU/CPU
+//!   backend swap that ships interoperable archives (Phase 50C).
+//! - **Smaller activations on GPU**: int8 activations halve memory
+//!   bandwidth vs f32, which is the throughput-binding term on
+//!   Apple-Silicon Metal for our tiny per-step matmul sizes.
+//!
+//! The CPU path here is intentionally simple scalar code that LLVM
+//! can auto-vectorize; matches the project's "trust the compiler
+//! first" policy. SIMD intrinsics may be added later if profiling
+//! warrants it.
+
+#![allow(dead_code)]
+
+/// Per-output-channel packed int8 weight tensor stored row-major
+/// (rows = output channels, cols = input dim). One f32 scale per row.
+/// Reconstruction: `w_f32[r, c] ≈ w_i8[r, c] * scales[r]`.
+#[derive(Debug, Clone)]
+pub(crate) struct IntTensor {
+    pub(crate) data: Vec<i8>,
+    pub(crate) scales: Vec<f32>,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+}
+
+impl IntTensor {
+    /// Pack an f32 row-major weight matrix `[rows, cols]` into int8
+    /// using per-output-channel (per-row) symmetric quantization.
+    /// `cap_bits` is the number of significant bits to use (e.g. 8 for
+    /// full int8, 5 for an int5-stored-in-int8 cell). The packed
+    /// values still occupy a full `i8` cell each; `cap_bits < 8`
+    /// merely matches the Phase-49 `mixed*` precision envelope so
+    /// L(C) parity is achievable.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    pub(crate) fn pack_per_channel_sym(
+        weights: &[f32],
+        rows: usize,
+        cols: usize,
+        cap_bits: u32,
+    ) -> Self {
+        assert_eq!(weights.len(), rows * cols, "shape mismatch");
+        assert!((1..=8).contains(&cap_bits), "cap_bits must be 1..=8");
+        let qmax = (1i32 << (cap_bits - 1)) - 1; // e.g. 127 for 8 bits
+        let mut data = vec![0i8; rows * cols];
+        let mut scales = vec![0f32; rows];
+        for r in 0..rows {
+            let row = &weights[r * cols..(r + 1) * cols];
+            let mut max_abs = 0f32;
+            for &v in row {
+                let a = v.abs();
+                if a > max_abs {
+                    max_abs = a;
+                }
+            }
+            let scale = if max_abs > 0.0 {
+                max_abs / qmax as f32
+            } else {
+                1.0
+            };
+            scales[r] = scale;
+            let inv = 1.0 / scale;
+            let out_row = &mut data[r * cols..(r + 1) * cols];
+            for c in 0..cols {
+                let q = (row[c] * inv).round().clamp(-qmax as f32, qmax as f32) as i32;
+                out_row[c] = q as i8;
+            }
+        }
+        Self {
+            data,
+            scales,
+            rows,
+            cols,
+        }
+    }
+}
+
+/// Per-token activation quantizer: max-abs symmetric, scale-only.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+pub(crate) fn quantize_act_i8(x: &[f32], out: &mut Vec<i8>) -> f32 {
+    out.clear();
+    out.reserve(x.len());
+    let mut max_abs = 0f32;
+    for &v in x {
+        let a = v.abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+    }
+    let qmax = 127i32;
+    let scale = if max_abs > 0.0 {
+        max_abs / qmax as f32
+    } else {
+        1.0
+    };
+    let inv = 1.0 / scale;
+    for &v in x {
+        let q = (v * inv).round().clamp(-127.0, 127.0) as i32;
+        out.push(q as i8);
+    }
+    scale
+}
+
+/// `y[n] = sum_k x_i8[k] * w_i8[n, k]`   (i32 accumulator)
+/// `y_f32[n] = y_i32[n] * x_scale * w.scales[n]`
+///
+/// Shapes:
+/// - `x_i8`: \[k\]
+/// - `w`: rows = n, cols = k
+/// - `out`: \[n\], **overwritten**
+#[allow(clippy::cast_precision_loss, clippy::needless_range_loop)]
+pub(crate) fn matmul_i8_i8_per_channel(x_i8: &[i8], x_scale: f32, w: &IntTensor, out: &mut [f32]) {
+    let k = w.cols;
+    let n = w.rows;
+    assert_eq!(x_i8.len(), k, "activation length mismatch");
+    assert_eq!(out.len(), n, "out length mismatch");
+    for row in 0..n {
+        let w_row = &w.data[row * k..(row + 1) * k];
+        let mut acc: i32 = 0;
+        for c in 0..k {
+            acc += i32::from(x_i8[c]) * i32::from(w_row[c]);
+        }
+        out[row] = (acc as f32) * x_scale * w.scales[row];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(clippy::many_single_char_names, clippy::suboptimal_flops)]
+    fn matmul_f32_ref(x: &[f32], w: &[f32], out: &mut [f32], k: usize, n: usize) {
+        for row in 0..n {
+            let mut s = 0f32;
+            for c in 0..k {
+                s += x[c] * w[row * k + c];
+            }
+            out[row] = s;
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn int_matmul_matches_f32_within_tolerance() {
+        let k = 128;
+        let n = 256;
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.03).sin()).collect();
+        let w: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.013).cos()).collect();
+
+        let mut y_ref = vec![0f32; n];
+        matmul_f32_ref(&x, &w, &mut y_ref, k, n);
+
+        let w_pack = IntTensor::pack_per_channel_sym(&w, n, k, 8);
+        let mut x_i8 = Vec::new();
+        let x_scale = quantize_act_i8(&x, &mut x_i8);
+        let mut y_int = vec![0f32; n];
+        matmul_i8_i8_per_channel(&x_i8, x_scale, &w_pack, &mut y_int);
+
+        // Mixed criterion: per-output we accept either small absolute
+        // error (relative to the output scale) or small relative error.
+        // This is the standard way to bench int8 inference because tiny
+        // outputs near zero blow up the relative metric.
+        let y_max = y_ref.iter().map(|v| v.abs()).fold(0f32, f32::max);
+        let abs_floor = 0.01 * y_max;
+        let mut max_rel_large = 0f32;
+        for i in 0..n {
+            let abs = (y_int[i] - y_ref[i]).abs();
+            if y_ref[i].abs() > abs_floor {
+                let rel = abs / y_ref[i].abs();
+                if rel > max_rel_large {
+                    max_rel_large = rel;
+                }
+            }
+        }
+        assert!(
+            max_rel_large < 0.05,
+            "max relative error on non-tiny outputs {max_rel_large:.4}"
+        );
+    }
+
+    #[test]
+    fn pack_zero_row_handled() {
+        let w = vec![0.0f32; 64];
+        let p = IntTensor::pack_per_channel_sym(&w, 4, 16, 8);
+        for &s in &p.scales {
+            assert!(s.is_finite());
+        }
+    }
+}
