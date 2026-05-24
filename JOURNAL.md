@@ -59,9 +59,19 @@ GPU per-token wall is essentially identical to CPU int8 at 1 MB scale — the pe
 
 Deferred to a follow-up session to keep the enwik8 validation as the next milestone of *this* session. The plumbing path is: extend `IntTensor` with an optional `metal::Buffer`, populate it during `prepare_int_cache()` when GPU is enabled, and have `Gpu::matmul_with_buffers()` consume the pre-allocated buffer instead of uploading per call.
 
-### Day 4 — 100 MB enwik8 GPU roundtrip (in progress)
+### Day 4 — 100 MB enwik8 GPU roundtrip
 
-Launched in background. Expected outcome: byte-identical archive to Phase 50D's CPU int8 archive (`/tmp/phase50d_qat_int_enwik8.archive`, 16 660 096 bytes), same L+D of 1.4629, similar wall (~2 h 17 m at current per-token GPU speed). Result and `cmp` verdict pending; will be filled in when the run completes.
+Same `lzr` binary, Phase 45 weights, mask + temperature, mixed5asym quant, int kernels, GPU backend.
+
+| run | weights | inference | L(C) | L+D | Wall | Archive bytes |
+|---|---|---|---:|---:|---:|---:|
+| Phase 50A (CPU int8 baseline) | Phase 45 | CPU int8 | 1.3331 | 1.4632 | 8 122 s | 16 663 489 |
+| **Phase 50C Day 4 (GPU)** | Phase 45 | GPU int8 | **1.3331** | **1.4632** | **8 390 s** | **16 663 489** |
+| Δ | — | — | 0 | 0 | +3% | **byte-identical** |
+
+`cmp /tmp/phase50c_gpu_enwik8.archive /tmp/phase50a_baseline_enwik8.archive` returns 0 — every one of 16 663 489 bytes is identical. Roundtrip verified bit-perfect (GPU encode → GPU decode reconstructs the original 100 MB). The +3% wall difference is GPU buffer allocation overhead.
+
+This validates the core Phase 50C contract at production scale: **a GPU-encoded archive can be CPU-decoded byte-for-byte, and vice versa.** Any future codec experiment can move the heavy inference to GPU during development and ship via the Metal-free submission binary without changing the output bits.
 
 ### What this enables for the future
 
