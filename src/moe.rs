@@ -633,6 +633,13 @@ impl MoeByteTransformer {
     /// Idempotent. After this call `int_cache.is_some()` and
     /// [`MoeByteTransformer::forward_step`] will dispatch to the
     /// integer path.
+    /// True once `prepare_int_cache` has been called and the integer
+    /// inference path is ready. Used by `MoeArm::precompute_for_encode`
+    /// to gate batched-encode mode entry.
+    pub(crate) const fn int_cache_ready(&self) -> bool {
+        self.int_cache.is_some()
+    }
+
     pub(crate) fn prepare_int_cache(&mut self) {
         use crate::int_inference::IntTensor;
         if self.int_cache.is_some() {
@@ -974,36 +981,80 @@ impl MoeByteTransformer {
                 &mut router_logits,
             );
 
-            // Per-token MoE FFN: argmax expert, fc1 + GELU + fc2, gate.
+            // Per-token expert selection (argmax of softmax router).
+            let mut expert_assignment = vec![0usize; n];
+            let mut gate_vals = vec![0f32; n];
             for i in 0..n {
                 let mut probs = router_logits[i * n_experts..(i + 1) * n_experts].to_vec();
                 softmax_inplace(&mut probs);
                 let (expert_idx, gate_val) = argmax_with_value(&probs);
-                let int_expert = &int_block.experts[expert_idx];
+                expert_assignment[i] = expert_idx;
+                gate_vals[i] = gate_val;
+            }
 
-                let fc1_scale = crate::int_inference::quantize_act_i8(
-                    &x_norm2[i * d..(i + 1) * d],
-                    &mut act_i8,
-                );
-                let mut ff_hidden = vec![0f32; d_ff];
-                crate::int_inference::matmul_i8_i8_per_channel(
-                    &act_i8,
-                    fc1_scale,
+            // Per-expert gather → batched fc1 → gelu → batched fc2 → scatter.
+            // Same per-token int sums as the per-token loop: each row of
+            // the batched per-expert matmul is the same input × the same
+            // weight rows as the original per-token call.
+            let mut tokens_for_expert: Vec<Vec<usize>> = vec![Vec::new(); n_experts];
+            for (i, &e) in expert_assignment.iter().enumerate() {
+                tokens_for_expert[e].push(i);
+            }
+            for e in 0..n_experts {
+                let toks = &tokens_for_expert[e];
+                if toks.is_empty() {
+                    continue;
+                }
+                let m_e = toks.len();
+                let int_expert = &int_block.experts[e];
+
+                // fc1: per-row quantize x_norm2 for the assigned tokens, then batched matmul.
+                let mut fc1_x_i8 = vec![0i8; m_e * d];
+                let mut fc1_x_scales = vec![0f32; m_e];
+                for (k, &i) in toks.iter().enumerate() {
+                    fc1_x_scales[k] = crate::int_inference::quantize_act_i8(
+                        &x_norm2[i * d..(i + 1) * d],
+                        &mut act_i8,
+                    );
+                    fc1_x_i8[k * d..(k + 1) * d].copy_from_slice(&act_i8);
+                }
+                let mut ff_hidden = vec![0f32; m_e * d_ff];
+                crate::int_inference::batched_matmul_dispatch(
+                    &fc1_x_i8,
+                    &fc1_x_scales,
                     &int_expert.fc1,
+                    m_e,
                     &mut ff_hidden,
                 );
-                gelu_inplace(&mut ff_hidden);
 
-                let fc2_scale = crate::int_inference::quantize_act_i8(&ff_hidden, &mut act_i8);
-                let mut ff_out = vec![0f32; d];
-                crate::int_inference::matmul_i8_i8_per_channel(
-                    &act_i8,
-                    fc2_scale,
+                // gelu per row (same as per-token path).
+                for k in 0..m_e {
+                    gelu_inplace(&mut ff_hidden[k * d_ff..(k + 1) * d_ff]);
+                }
+
+                // fc2: per-row quantize ff_hidden, batched matmul, scatter back to x.
+                let mut fc2_x_i8 = vec![0i8; m_e * d_ff];
+                let mut fc2_x_scales = vec![0f32; m_e];
+                for k in 0..m_e {
+                    fc2_x_scales[k] = crate::int_inference::quantize_act_i8(
+                        &ff_hidden[k * d_ff..(k + 1) * d_ff],
+                        &mut act_i8,
+                    );
+                    fc2_x_i8[k * d_ff..(k + 1) * d_ff].copy_from_slice(&act_i8);
+                }
+                let mut ff_out = vec![0f32; m_e * d];
+                crate::int_inference::batched_matmul_dispatch(
+                    &fc2_x_i8,
+                    &fc2_x_scales,
                     &int_expert.fc2,
+                    m_e,
                     &mut ff_out,
                 );
-                for c in 0..d {
-                    x[i * d + c] += ff_out[c] * gate_val;
+                for (k, &i) in toks.iter().enumerate() {
+                    let gate = gate_vals[i];
+                    for c in 0..d {
+                        x[i * d + c] += ff_out[k * d + c] * gate;
+                    }
                 }
             }
         }

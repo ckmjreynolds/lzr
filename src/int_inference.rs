@@ -178,6 +178,13 @@ fn gpu_backend_enabled() -> bool {
 /// activation scale (one per token). `out` is `[M, N]` row-major.
 /// On the GPU path, the weight tensor's `OnceLock<GpuTensor>` is
 /// uploaded lazily on first use just like the single-row path.
+///
+/// **Small-M fast path:** below `GPU_BATCH_MIN_M`, even on the GPU
+/// backend we fall back to the per-row CPU kernel. Apple Metal's
+/// ~250 µs dispatch floor dominates a tiny GEMM, while CPU NEON int8
+/// finishes the same work in 1 µs. The threshold is set so the
+/// per-expert `MoE` FFN path (~8 tokens/expert on average) stays on
+/// CPU until Phase 3 introduces a proper expert-batched kernel.
 pub(crate) fn batched_matmul_dispatch(
     x_i8: &[i8],
     x_scales: &[f32],
@@ -191,7 +198,7 @@ pub(crate) fn batched_matmul_dispatch(
     debug_assert_eq!(x_scales.len(), m);
     debug_assert_eq!(out.len(), m * n);
     #[cfg(feature = "gpu-inference")]
-    if gpu_backend_enabled() {
+    if gpu_backend_enabled() && m >= GPU_BATCH_MIN_M {
         let gpu = crate::gpu::gpu().expect("GPU init");
         let w_gpu = w.gpu.get_or_init(|| gpu.upload_tensor(&w.data, &w.scales));
         gpu.batched_matmul_i8(x_i8, x_scales, w_gpu, m, n, k, out)
@@ -208,6 +215,18 @@ pub(crate) fn batched_matmul_dispatch(
         );
     }
 }
+
+/// Minimum batch size for the GPU batched matmul to win.  Below this,
+/// CPU NEON int8 GEMM is faster than the Metal dispatch overhead. See
+/// the `gpu::tests::batched_matmul_wall_bench` numbers — at M=16 the
+/// GPU batched kernel is ~15× per-row but the absolute wall is
+/// dominated by command-buffer overhead until M is large enough that
+/// the kernel compute can amortize it.
+#[cfg(feature = "gpu-inference")]
+const GPU_BATCH_MIN_M: usize = 32;
+#[cfg(not(feature = "gpu-inference"))]
+#[allow(dead_code)]
+const GPU_BATCH_MIN_M: usize = 32;
 
 /// Dispatcher that picks the CPU or GPU backend for one int8 matmul.
 /// Always CPU when the `gpu-inference` feature is off (i.e., the

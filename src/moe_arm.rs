@@ -61,6 +61,16 @@ pub(crate) struct MoeArm {
     quant: Quantization,
     pending_logits: Option<Vec<f32>>,
     fed_count: usize,
+    /// Phase 50C Day-4 Phase-4 batched-encode mode. When `Some`, the
+    /// codec encoder has precomputed all per-position prediction
+    /// logits via `precompute_for_encode` and is consuming them in
+    /// order through `predict_cdf_with_bias`. While set, `predict_cdf`
+    /// reads `precomputed_logits[next_pos*vocab..(next_pos+1)*vocab]`
+    /// instead of `pending_logits`, and `next_pos` is advanced.
+    /// `feed_token` is a no-op in this mode (the precomputed logits
+    /// already account for every token).
+    precomputed_logits: Option<Vec<f32>>,
+    next_pos: usize,
 }
 
 impl MoeArm {
@@ -84,11 +94,21 @@ impl MoeArm {
             quant: q,
             pending_logits: None,
             fed_count: 0,
+            precomputed_logits: None,
+            next_pos: 0,
         })
     }
 
     pub(crate) const fn quantization(&self) -> Quantization {
         self.quant
+    }
+
+    /// True if the arm can run the Phase 50C Day-4 batched-encode
+    /// path (`precompute_for_encode`). Requires the integer
+    /// inference kernels (`LZR_INT_KERNELS=1`) and a populated int
+    /// cache. Falls back to the per-step path when false.
+    pub(crate) fn can_batched_encode(&self) -> bool {
+        int_kernels_enabled() && self.model.int_cache_ready()
     }
 
     pub(crate) fn total_params(&self) -> usize {
@@ -123,7 +143,14 @@ impl MoeArm {
 
     /// Same as [`feed`] but accepts a token id directly (for non-byte
     /// vocabs, where the token id may exceed `u8` range).
+    ///
+    /// No-op when batched-encode mode is active (precomputed logits
+    /// already account for every token, no need to advance the cache).
     pub(crate) fn feed_token(&mut self, token: u32) {
+        if self.precomputed_logits.is_some() {
+            self.fed_count += 1;
+            return;
+        }
         if self.cache.pos >= self.model.cfg.context {
             self.cache.reset();
         }
@@ -133,9 +160,107 @@ impl MoeArm {
 
     /// Reset both KV cache and pending logits. Called by the codec
     /// at window boundaries where prior-window context is irrelevant.
+    /// Also exits batched-encode mode.
     pub(crate) fn reset(&mut self) {
         self.cache.reset();
         self.pending_logits = None;
+        self.precomputed_logits = None;
+        self.next_pos = 0;
+        self.fed_count = 0;
+    }
+
+    /// Phase 50C Day-4 Phase-4 — batched-encode entry point.
+    ///
+    /// Precomputes the per-position prediction logits for an entire
+    /// `warm + measure` token sequence in one (chunked) batched
+    /// forward pass, then puts the arm into batched-encode mode. The
+    /// codec encoder thereafter calls `predict_cdf_with_bias` in a
+    /// pure loop with no per-token forward dispatch: each call reads
+    /// the next precomputed logits row.
+    ///
+    /// The chunking matches the per-step path's KV-cache reset
+    /// boundary (`cfg.context` tokens per chunk), so the produced
+    /// predictions are bit-identical to what the per-step
+    /// `feed_token` + `predict_cdf_with_bias` loop would produce
+    /// over the same `warm + measure` sequence.
+    ///
+    /// After this call:
+    /// - `predict_cdf_with_bias` consumes precomputed logits in
+    ///   sequence (one row per call, starting from the first
+    ///   measure token).
+    /// - `feed_token` is a no-op except for `fed_count` accounting.
+    /// - `reset()` exits batched mode.
+    ///
+    /// Requires `int_kernels_enabled()`. Panics if `warm` was
+    /// previously fed via `feed_token` (caller must `reset()` first
+    /// — see usage in `moe_tok_codec`).
+    pub(crate) fn precompute_for_encode(&mut self, warm: &[u32], measure: &[u32]) {
+        assert!(
+            int_kernels_enabled(),
+            "precompute_for_encode requires LZR_INT_KERNELS=1"
+        );
+        assert!(
+            self.model.int_cache_ready(),
+            "precompute_for_encode requires prepare_int_cache()"
+        );
+        let vocab = self.model.cfg.vocab_size;
+        let context = self.model.cfg.context;
+
+        // Output: one row per measure token, holding the logits the
+        // codec needs to predict that token before AC-encoding it.
+        let mut precomputed = vec![0_f32; measure.len() * vocab];
+
+        if measure.is_empty() {
+            self.precomputed_logits = Some(precomputed);
+            self.next_pos = 0;
+            return;
+        }
+
+        // Chunking: combined[0..W+M] is the conceptual token stream the
+        // per-step path feeds. The per-step path resets the cache every
+        // `context` tokens, so chunk c covers combined[c*context..min(L, (c+1)*context)].
+        // For position p in the combined stream, the logits the codec
+        // needs to predict combined[p] (when p > 0) is the output of
+        // the model after feeding combined[p-1]. That feed is at
+        // chunk c' = (p-1) / context, position-in-chunk pp' = (p-1) % context.
+        let w = warm.len();
+        let total = w + measure.len();
+        let mut chunk_start = 0;
+        while chunk_start < total {
+            let chunk_end = (chunk_start + context).min(total);
+            let mut chunk_tokens: Vec<u32> = Vec::with_capacity(chunk_end - chunk_start);
+            for g in chunk_start..chunk_end {
+                chunk_tokens.push(if g < w { warm[g] } else { measure[g - w] });
+            }
+            let chunk_logits = self.model.batched_forward_int(&chunk_tokens);
+
+            // Copy out predictions for measure tokens in this chunk.
+            // Measure token m (global pos g = w + m) needs logits from
+            // feeding the token at global pos g - 1, which is in the
+            // chunk iff chunk_start <= g - 1 < chunk_end.
+            for m in 0..measure.len() {
+                let g = w + m;
+                if g == 0 {
+                    // Truly cold start (w=0 and m=0). The codec's
+                    // `predict_cdf` with no pending logits returns
+                    // uniform. We leave this row at zero — the codec
+                    // detects it via a marker.
+                    continue;
+                }
+                let g_logits = g - 1;
+                if g_logits >= chunk_start && g_logits < chunk_end {
+                    let pp = g_logits - chunk_start;
+                    let src = pp * vocab;
+                    let dst = m * vocab;
+                    precomputed[dst..dst + vocab].copy_from_slice(&chunk_logits[src..src + vocab]);
+                }
+            }
+            chunk_start += context;
+        }
+
+        self.precomputed_logits = Some(precomputed);
+        self.next_pos = 0;
+        self.fed_count = 0;
     }
 
     /// Build a CDF over the model's full vocab for the next emission.
@@ -148,7 +273,7 @@ impl MoeArm {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    pub(crate) fn predict_cdf(&self, out: &mut [u32]) {
+    pub(crate) fn predict_cdf(&mut self, out: &mut [u32]) {
         self.predict_cdf_with_bias(out, &[]);
     }
 
@@ -161,7 +286,7 @@ impl MoeArm {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    pub(crate) fn predict_cdf_with_bias(&self, out: &mut [u32], bias: &[f32]) {
+    pub(crate) fn predict_cdf_with_bias(&mut self, out: &mut [u32], bias: &[f32]) {
         let vocab = self.model.cfg.vocab_size;
         assert_eq!(
             out.len(),
@@ -174,7 +299,23 @@ impl MoeArm {
         );
         #[allow(clippy::cast_precision_loss)]
         let mut probs = vec![1.0_f32 / vocab as f32; vocab];
-        if let Some(logits) = self.pending_logits.as_ref() {
+
+        // Batched-encode mode: read the next row of precomputed
+        // logits. A row of all-zero f32s is the marker for the
+        // truly-cold-start (w=0, m=0) case and falls back to uniform.
+        let logits_from_precomputed: Option<Vec<f32>> = self
+            .precomputed_logits
+            .as_ref()
+            .filter(|p| (self.next_pos + 1) * vocab <= p.len())
+            .map(|p| p[self.next_pos * vocab..(self.next_pos + 1) * vocab].to_vec());
+        if let Some(logits) = logits_from_precomputed.as_ref() {
+            // Cold-start marker: all zeros means use uniform.
+            let any_nonzero = logits.iter().any(|&v| v != 0.0);
+            if any_nonzero {
+                softmax_into_with_bias(logits, bias, &mut probs);
+            }
+            self.next_pos += 1;
+        } else if let Some(logits) = self.pending_logits.as_ref() {
             softmax_into_with_bias(logits, bias, &mut probs);
         }
         let total_f = f64::from(TOTAL);

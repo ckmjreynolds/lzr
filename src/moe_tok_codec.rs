@@ -170,6 +170,7 @@ impl Codec for MoeTokCodec {
         "moe-tok"
     }
 
+    #[allow(clippy::too_many_lines)]
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
         if measure.len() > u32::MAX as usize {
             bail!(
@@ -181,15 +182,50 @@ impl Codec for MoeTokCodec {
         let measure_len = u32::try_from(measure.len()).expect("checked above");
 
         let (archive, ac_bits, total_bits) = self.with_arms(|arms| {
-            // Prime the arm with BPE-encoded warm bytes (no AC emit).
+            let timing = std::env::var("LZR_TIMING").is_ok();
+            let t_bpe_start = std::time::Instant::now();
+            // BPE-encode warm + measure up-front.
             let warm_tokens = arms.bpe.encode(warm);
-            for &tok in &warm_tokens {
-                arms.moe.feed_token(tok);
-            }
-
             // BPE-encode measure once; we AC-encode the resulting
             // token sequence in order.
             let measure_tokens = arms.bpe.encode(measure);
+            if timing {
+                eprintln!(
+                    "[timing] BPE encode: {:.2}s",
+                    t_bpe_start.elapsed().as_secs_f64()
+                );
+            }
+
+            let t_forward_start = std::time::Instant::now();
+            // Phase 50C Day-4 Phase-4: if the int batched-encode path
+            // is available, precompute every prediction in one
+            // (chunked) batched forward instead of feeding warm
+            // tokens one-by-one through the per-step path. The codec
+            // loop below then becomes pure CDF/AC work with no
+            // per-token forward dispatch. Bit-identical archive.
+            if arms.moe.can_batched_encode() {
+                arms.moe
+                    .precompute_for_encode(&warm_tokens, &measure_tokens);
+                if timing {
+                    eprintln!(
+                        "[timing] batched precompute_for_encode ({} measure tokens): {:.2}s",
+                        measure_tokens.len(),
+                        t_forward_start.elapsed().as_secs_f64()
+                    );
+                }
+            } else {
+                // Legacy per-step path: prime arm with warm tokens
+                // through one-by-one feed.
+                for &tok in &warm_tokens {
+                    arms.moe.feed_token(tok);
+                }
+                if timing {
+                    eprintln!(
+                        "[timing] per-step warm feed: {:.2}s",
+                        t_forward_start.elapsed().as_secs_f64()
+                    );
+                }
+            }
             let n_tokens =
                 u32::try_from(measure_tokens.len()).context("token count exceeds u32 capacity")?;
             let vocab = arms.moe.cfg().vocab_size;
@@ -210,6 +246,7 @@ impl Codec for MoeTokCodec {
                 } else {
                     warm[warm.len() - 1]
                 };
+                let t_ac_start = std::time::Instant::now();
                 for &tok in &measure_tokens {
                     let class = struct_mask::byte_class(last_byte);
                     fill_bias(&mut bias, class);
@@ -232,6 +269,13 @@ impl Codec for MoeTokCodec {
                     arms.moe.feed_token(tok);
                 }
                 bits_after = enc.bits_written();
+                if timing {
+                    eprintln!(
+                        "[timing] AC encode loop ({} tokens): {:.2}s",
+                        measure_tokens.len(),
+                        t_ac_start.elapsed().as_secs_f64()
+                    );
+                }
                 enc.finish();
             }
             if let Some(mut w) = dump {
