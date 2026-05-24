@@ -21,6 +21,7 @@ mod moe_codec;
 mod moe_tok_codec;
 mod ngram_arm;
 mod null;
+mod struct_mask;
 mod transformer;
 
 use std::fs;
@@ -81,6 +82,22 @@ enum Command {
         /// Bytes to evaluate from the start of the corpus.
         #[arg(long, default_value_t = 1_000_000)]
         bytes: usize,
+    },
+
+    /// Generate a per-byte-class allowed-token bitmask by BPE-encoding
+    /// a training corpus and recording which token ids appear after
+    /// bytes of each class. Output is a 32 KB file consumable via
+    /// `LZR_STRUCT_MASK`.
+    GenMask {
+        #[arg(long, default_value = "assets/enwik9")]
+        corpus: PathBuf,
+        #[arg(long)]
+        bpe: PathBuf,
+        /// Limit corpus bytes (default: full corpus).
+        #[arg(long)]
+        bytes: Option<usize>,
+        #[arg(long, default_value = "/tmp/struct_mask.bin")]
+        out: PathBuf,
     },
 }
 
@@ -271,6 +288,9 @@ fn projected_ld_on_enwik9() -> Option<(String, u64, f64)> {
             name.push_str("+bpe");
         }
     }
+    // Structural mask is embedded in the binary via include_bytes!.
+    weights_bytes += struct_mask::FILE_BYTES as u64;
+    name.push_str("+mask");
     // 2× factor: the binary appears twice in S.
     let shipped_bytes = 2 * weights_bytes;
     let ld_bpb = 8.0 * (shipped_bytes as f64) / 1e9;
@@ -312,5 +332,89 @@ fn main() -> Result<()> {
             corpus,
             bytes,
         } => run_neural_eval(&weights, &corpus, bytes),
+        Command::GenMask {
+            corpus,
+            bpe,
+            bytes,
+            out,
+        } => run_gen_mask(&corpus, &bpe, bytes, &out),
     }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn run_gen_mask(
+    corpus: &std::path::Path,
+    bpe_path: &std::path::Path,
+    bytes: Option<usize>,
+    out: &std::path::Path,
+) -> Result<()> {
+    let bpe = bpe::Bpe::load(bpe_path).context("loading BPE table")?;
+    if bpe.vocab_size != struct_mask::VOCAB {
+        bail!(
+            "struct mask expects vocab {}, BPE has {}",
+            struct_mask::VOCAB,
+            bpe.vocab_size
+        );
+    }
+    let raw = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
+    let take = bytes.map_or(raw.len(), |n| n.min(raw.len()));
+    let src = &raw[..take];
+    eprintln!(
+        "GenMask: BPE-encoding {take} bytes ({:.2} MiB) ...",
+        take as f64 / (1024.0 * 1024.0)
+    );
+    let t0 = Instant::now();
+    let tokens = bpe.encode(src);
+    eprintln!(
+        "  {} tokens ({:.2} bytes/tok) in {:?}",
+        tokens.len(),
+        take as f64 / tokens.len() as f64,
+        t0.elapsed()
+    );
+
+    let mut mask = struct_mask::StructMask::zeros();
+    let mut byte_pos = 0_usize;
+    for &tok in &tokens {
+        let prev_byte = if byte_pos == 0 {
+            b'\n'
+        } else {
+            src[byte_pos - 1]
+        };
+        let class = struct_mask::byte_class(prev_byte);
+        mask.set(class, tok);
+        byte_pos += bpe.token_byte_len(tok);
+    }
+
+    let mut populations = [0_u32; struct_mask::N_CLASSES];
+    for (class, pop) in populations.iter_mut().enumerate() {
+        let mut count = 0_u32;
+        for tok in 0..u32::try_from(struct_mask::VOCAB).unwrap() {
+            if mask.get(class, tok) {
+                count += 1;
+            }
+        }
+        *pop = count;
+    }
+    eprintln!("  per-class allowed-token populations:");
+    let class_labels = [
+        "lower", "UPPER", "digit", "space", "\\n", "ws", "<", ">", "\"", "&", ";", "=", "/", ".",
+        "punct", "nonASCII",
+    ];
+    for (i, label) in class_labels.iter().enumerate() {
+        eprintln!(
+            "    [{:>2}] {:<8} {:>6} tokens ({:.1}%)",
+            i,
+            label,
+            populations[i],
+            100.0 * f64::from(populations[i]) / struct_mask::VOCAB as f64
+        );
+    }
+
+    mask.save(out)?;
+    eprintln!(
+        "Wrote mask: {} ({} bytes)",
+        out.display(),
+        struct_mask::FILE_BYTES
+    );
+    Ok(())
 }

@@ -123,16 +123,33 @@ impl MoeArm {
         clippy::cast_sign_loss
     )]
     pub(crate) fn predict_cdf(&self, out: &mut [u32]) {
+        self.predict_cdf_with_bias(out, &[]);
+    }
+
+    /// Same as [`MoeArm::predict_cdf`] but adds `bias[i]` to each
+    /// logit before the (temperature-scaled) softmax. `bias` may be
+    /// empty, in which case it is treated as all zeros. Used by the
+    /// `moe-tok` codec to apply a structural mask (Phase 49).
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub(crate) fn predict_cdf_with_bias(&self, out: &mut [u32], bias: &[f32]) {
         let vocab = self.model.cfg.vocab_size;
         assert_eq!(
             out.len(),
             vocab + 1,
             "predict_cdf: out must have vocab+1 entries"
         );
+        assert!(
+            bias.is_empty() || bias.len() == vocab,
+            "bias must be empty or vocab-sized"
+        );
         #[allow(clippy::cast_precision_loss)]
         let mut probs = vec![1.0_f32 / vocab as f32; vocab];
         if let Some(logits) = self.pending_logits.as_ref() {
-            softmax_into(logits, &mut probs);
+            softmax_into_with_bias(logits, bias, &mut probs);
         }
         let total_f = f64::from(TOTAL);
         out[0] = 0;
@@ -262,16 +279,32 @@ fn softmax_256(logits: &[f32]) -> [f32; 256] {
 /// reading `out.len()` entries from `logits`. Used for token vocabs
 /// where the size isn't known at compile time.
 fn softmax_into(logits: &[f32], out: &mut [f32]) {
+    softmax_into_with_bias(logits, &[], out);
+}
+
+fn softmax_into_with_bias(logits: &[f32], bias: &[f32], out: &mut [f32]) {
     debug_assert!(logits.len() >= out.len());
+    debug_assert!(bias.is_empty() || bias.len() >= out.len());
     let inv_t = LOGIT_TEMP.recip();
+    let use_bias = !bias.is_empty();
     let mut max = f32::NEG_INFINITY;
-    for &v in logits.iter().take(out.len()) {
+    for i in 0..out.len() {
+        let v = if use_bias {
+            logits[i] + bias[i]
+        } else {
+            logits[i]
+        };
         if v > max {
             max = v;
         }
     }
     let mut sum = 0_f32;
-    for (i, &v) in logits.iter().take(out.len()).enumerate() {
+    for i in 0..out.len() {
+        let v = if use_bias {
+            logits[i] + bias[i]
+        } else {
+            logits[i]
+        };
         let e = ((v - max) * inv_t).exp();
         out[i] = e;
         sum += e;

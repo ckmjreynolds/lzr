@@ -139,6 +139,12 @@ impl Bpe {
         self.id_to_bytes.get(id as usize).map_or(0, Vec::len)
     }
 
+    /// Borrowed byte expansion for a token id. Empty for out-of-range
+    /// ids (which shouldn't occur in practice).
+    pub(crate) fn token_bytes(&self, id: u32) -> &[u8] {
+        self.id_to_bytes.get(id as usize).map_or(&[], Vec::as_slice)
+    }
+
     /// Encode a byte slice into a token sequence.
     pub(crate) fn encode(&self, input: &[u8]) -> Vec<u32> {
         let mut out = Vec::with_capacity(input.len() / 3);

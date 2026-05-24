@@ -13,6 +13,100 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-23 — Phase 49: Structural Mask — Combined L+D 1.4599 on 100 MB enwik8, −0.0029 bpb via Deterministic Anti-Model
+
+After Phase 48 baked the calibration scalar, CDR pushed on the "anti-model" idea — if we can independently know certain `MoE` predictions are structurally implausible, overrule them. The constraint is that any overrule must be deterministically computable from state both encoder and decoder already see, so it costs no signaling bits. Discussion narrowed to structural state derived from the source byte history: at every token boundary the *previous source byte* is in a known class on both sides. A per-class bitmask of "which BPE tokens ever follow this class in training" is the cheapest test of the anti-model hypothesis.
+
+### Mask design
+
+A new `lzr gen-mask` subcommand reads a training corpus, BPE-encodes it, and at each token boundary records `(class(prev_byte), token_id)`. Bytes are classified into 16 categories: lowercase, uppercase, digit, space, newline, other-whitespace, `<`, `>`, `"`, `&`, `;`, `=`, `/`, `.`, other-ASCII-printable, non-ASCII. The output is `N_CLASSES × VOCAB / 8 = 16 × 16384 / 8 = 32_768` bytes — one bit per `(class, token)` pair. The mask is generated from the first 100 MB of enwik9 (23.6 M tokens) and embedded via `include_bytes!("../assets/struct_mask.bin")`. Both encoder and decoder reference the same bytes, so the mask is part of `L(D)` (counted at the Hutter 2× rule) but never signaled.
+
+At inference the codec maintains the previous source byte across the token loop (initialized to `\n` for cold start, advanced from token bytes after each step), classifies it, and applies a constant additive logit bias `ln(0.01) ≈ −4.605` to tokens flagged "never seen after this class." Soft masking ensures every token retains non-zero AC mass; a wrong call costs at most `−ln(0.01) / ln(2) ≈ 6.6` bits.
+
+### Per-class populations from the 100 MB enwik9 fit
+
+| Class | Allowed tokens | % of vocab | Note |
+|---|---:|---:|---|
+| lower | 11,369 | 69.4% | Loose — most tokens can follow a letter |
+| UPPER | 6,339 | 38.7% | Modestly tight |
+| digit | 4,032 | 24.6% | Tight; mostly more digits, units, separators |
+| space | 12,592 | 76.9% | Loose |
+| `\n` | 7,210 | 44.0% | Mid; line-start subset |
+| `<` | 9 | 0.1% | Very tight — XML tag names only |
+| `>` | 2,767 | 16.9% | Mid; content-start tokens |
+| `"` | 23 | 0.1% | Very tight — attribute-value starts |
+| `&` | 0 | 0.0% | Never observed at a token boundary (entities pre-merge into single tokens) |
+| `;` | 9,335 | 57.0% | Loose; end of entity → content |
+| `=` | 4,323 | 26.4% | Tight; mostly `"...` |
+| `/` | 6,697 | 40.9% | Mid; URL / closing-tag context |
+| `.` | 4,665 | 28.5% | Tight; sentence boundaries, numbers |
+| punct | 12,942 | 79.0% | Loose |
+| nonASCII | 4,204 | 25.7% | Tight; non-ASCII continuations |
+
+Classes with zero populated tokens are degenerate: the additive bias becomes a constant added to every logit and cancels out at softmax. The `&` class is therefore a no-op — entities like `&amp;` are themselves single BPE tokens so the byte `&` never appears at a boundary in the training data.
+
+### Sweep on 1 MB enwik9 prefix
+
+The mask file is loaded via `LZR_STRUCT_MASK` and `LZR_MASK_PENALTY` (both env-driven during the sweep; baked as `const` after validation).
+
+| Penalty | L(C) bpb | Δ vs Phase 48 (no mask) |
+|---:|---:|---:|
+| 1.00 (mask off / identity) | 1.2784 | 0 |
+| 0.90 | 1.2780 | −0.0004 |
+| 0.70 | 1.2773 | −0.0011 |
+| 0.50 | 1.2766 | −0.0018 |
+| 0.30 | 1.2758 | −0.0026 |
+| 0.10 | 1.2751 | −0.0033 |
+| 0.05 | 1.2749 | −0.0035 |
+| **0.01** | **1.2747** | **−0.0037** |
+| 0.001 | 1.2746 | −0.0038 |
+| 0.0001 | 1.2746 | −0.0038 |
+
+Monotonic with saturation at penalty ≤ 0.01. The plateau confirms the soft mask is converging to a near-hard mask in practice — actual-source tokens hit "allowed" cells reliably enough that further pushing penalty toward zero only marginally helps.
+
+### Transfer at scale
+
+| corpus | Δ L(C) (P=0.01 vs no mask) |
+|---|---:|
+| enwik9[0..1 MB] | −0.0038 |
+| enwik9[0..10 MB] | −0.0035 |
+| enwik8 (100 MB full) | −0.0035 |
+
+Same pattern as Phase 48: the small-scale optimum transfers within 0.0003 across two orders of magnitude.
+
+### 100 MB enwik8 validation vs Phase 48 baseline
+
+| | L(C) | L(D) | Combined | Peak RSS | Wall |
+|---|---:|---:|---:|---:|---:|
+| Phase 48 (no mask) | 1.3333 | 0.1296 | 1.4628 | 394 MB | 11,387 s |
+| **Phase 49 (mask, P=0.01)** | **1.3298** | **0.1301** | **1.4599** | 394 MB | 12,514 s |
+
+Δ combined: **−0.0029 bpb** (L(C) gain of −0.0035 net of +0.0005 L(D) for the embedded 32 KB mask). Roundtrip verified bit-perfect. Wall +9.9% from the per-token bias-fill (16,384 boolean lookups × one `f32` write per token).
+
+### What ships
+
+- `src/struct_mask.rs` — new module: byte-class FSM, `StructMask` builder for `gen-mask`, embedded `MASK: &[u8; 32_768]` via `include_bytes!`, `mask_bit(class, token)` inline accessor.
+- `assets/struct_mask.bin` — 32 KB checked into the repo, generated by `lzr gen-mask --bpe ckpts/bpe_16k.bin --bytes 100000000`.
+- `src/moe_arm.rs` — new `predict_cdf_with_bias(out, bias)` method that adds `bias[i]` to each logit before the temperature-scaled softmax. `predict_cdf` becomes a thin wrapper passing empty bias.
+- `src/moe_tok_codec.rs` — `MASK_PENALTY_LOG: f32 = ln(0.01)` baked as `const`; encode and decode loops track `last_byte`, fill the bias vector per step, and call `predict_cdf_with_bias`. Env-driven mask path removed; the mask is always on.
+- `src/main.rs` — `gen-mask` subcommand; `projected_ld_on_enwik9` always adds `struct_mask::FILE_BYTES` to shipped bytes.
+
+`build.sh` clean (fmt + clippy default & no-default-features + 42 tests + nightly coverage). Production codec is unchanged structurally; this is a one-extra-vector-operation addition to the prediction path.
+
+### What this validated about the anti-model framing
+
+CDR's initial framing was lexical (misspellings, bad grammar). Analysis showed that path is asymmetric — suppressing typos *costs* bits when the source genuinely contains them — and that Wikipedia's structural noise pushes the asymmetry the wrong way for lexical filters. The right generalization was structural state, not lexical correctness: the strongest deterministic side-channel we have is "what byte just came," which is a coarse FSM. The 100 MB result confirms it: structural masking is real but small (~0.003 bpb), and the headroom inside this design (more classes, joint two-byte state, frequency thresholds) is plausibly another 0.002-0.005 bpb if pursued — diminishing returns territory.
+
+### Cumulative progress
+
+- Phase 47 (T=1.0, no mask): 1.4672 combined on 100 MB enwik8
+- Phase 48 (T=0.94, no mask): 1.4628 (−0.0044)
+- **Phase 49 (T=0.94, mask P=0.01): 1.4599** (−0.0029 more, **−0.0073** cumulative)
+
+Gap to Hutter target on enwik8: **0.532 bpb** (was 0.535 at Phase 48). The remaining lever menu — bigger model + QAT, longer context, cascaded multi-scale, paradigm bets like BFN/SSM — is unchanged from the Phase 48 takeaway; the calibration/mask track is essentially exhausted at the single-scalar / single-FSM granularity.
+
+---
+
 ## 2026-05-23 — Phase 48: Logit Temperature Calibration — Combined L+D 1.4628 on 100 MB enwik8, −0.0044 bpb at Zero Shipped Cost
 
 Following Phase 47's conclusion that classical byte-level mix-ins cannot help, CDR and Claude went back to the entropy dump for a second pass. Phase 47's analysis stopped at the rank distribution; this round sliced the same dump by additional dimensions to look for *any* targetable failure cell before accepting that the next architectural lever was on the model side.

@@ -39,6 +39,7 @@ use crate::bits::{BitReader, BitWriter};
 use crate::bpe::Bpe;
 use crate::codec::{Codec, Decomposition};
 use crate::moe_arm::MoeArm;
+use crate::struct_mask;
 
 const WEIGHTS_ENV: &str = "LZR_MOE_WEIGHTS";
 const BPE_TABLE_ENV: &str = "LZR_BPE_TABLE";
@@ -46,6 +47,20 @@ const BPE_TABLE_ENV: &str = "LZR_BPE_TABLE";
 /// emitted token so we can analyze where the predictor loses bits.
 /// Diagnostic only — does not affect bits emitted to the archive.
 const ENTROPY_DUMP_ENV: &str = "LZR_ENTROPY_DUMP";
+
+/// Soft mask penalty as additive logit bias = ln(0.01). Applied to
+/// tokens flagged "never seen after this byte class" in the embedded
+/// `struct_mask::MASK`. Fit on 1 MB / 10 MB / 100 MB sweeps in Phase
+/// 49; the gain saturates at penalty ≤ 0.01.
+const MASK_PENALTY_LOG: f32 = -4.605_17;
+
+#[inline]
+fn fill_bias(bias: &mut [f32], class: usize) {
+    for (i, slot) in bias.iter_mut().enumerate() {
+        let allowed = struct_mask::mask_bit(class, u32::try_from(i).expect("vocab fits u32"));
+        *slot = if allowed { 0.0 } else { MASK_PENALTY_LOG };
+    }
+}
 
 /// Diagnostic stats for one literal token: ideal bits paid, `MoE`
 /// distribution entropy, top-1 probability, rank of the actual token.
@@ -179,6 +194,8 @@ impl Codec for MoeTokCodec {
                 u32::try_from(measure_tokens.len()).context("token count exceeds u32 capacity")?;
             let vocab = arms.moe.cfg().vocab_size;
 
+            let mut bias = vec![0_f32; vocab];
+
             let mut bw = BitWriter::new();
             let mut cdf = vec![0_u32; vocab + 1];
             let mut dump = open_entropy_dump()?;
@@ -188,9 +205,17 @@ impl Codec for MoeTokCodec {
                 let mut enc = AcEncoder::new(&mut bw);
                 bits_before = enc.bits_written();
                 let mut src_pos: usize = 0;
+                let mut last_byte = if warm.is_empty() {
+                    b'\n'
+                } else {
+                    warm[warm.len() - 1]
+                };
                 for &tok in &measure_tokens {
-                    arms.moe.predict_cdf(&mut cdf);
-                    let tok_bytes = arms.bpe.token_byte_len(tok);
+                    let class = struct_mask::byte_class(last_byte);
+                    fill_bias(&mut bias, class);
+                    arms.moe.predict_cdf_with_bias(&mut cdf, &bias);
+                    let tok_bytes_view = arms.bpe.token_bytes(tok);
+                    let tok_bytes = tok_bytes_view.len();
                     if let Some(w) = dump.as_mut() {
                         let s = lit_stats(&cdf, tok);
                         writeln!(
@@ -198,6 +223,9 @@ impl Codec for MoeTokCodec {
                             "{src_pos},{tok},{tok_bytes},{:.6},{:.6},{:.6},{}",
                             s.ideal_bits, s.entropy_bits, s.top1_prob, s.rank
                         )?;
+                    }
+                    if let Some(&b) = tok_bytes_view.last() {
+                        last_byte = b;
                     }
                     src_pos += tok_bytes;
                     enc.encode(&cdf, tok as usize);
@@ -245,15 +273,28 @@ impl Codec for MoeTokCodec {
             }
 
             let vocab = arms.moe.cfg().vocab_size;
+            let mut bias = vec![0_f32; vocab];
+
             let mut br = BitReader::new(ac_bytes);
             let mut dec = AcDecoder::new(&mut br);
             let mut cdf = vec![0_u32; vocab + 1];
             let mut tokens = Vec::with_capacity(n_tokens);
+            let mut last_byte = if warm.is_empty() {
+                b'\n'
+            } else {
+                warm[warm.len() - 1]
+            };
             for _ in 0..n_tokens {
-                arms.moe.predict_cdf(&mut cdf);
+                let class = struct_mask::byte_class(last_byte);
+                fill_bias(&mut bias, class);
+                arms.moe.predict_cdf_with_bias(&mut cdf, &bias);
                 let sym = dec.decode(&cdf)?;
                 let tok = u32::try_from(sym)
                     .with_context(|| format!("AC produced non-vocab symbol {sym}"))?;
+                let tok_bytes_view = arms.bpe.token_bytes(tok);
+                if let Some(&b) = tok_bytes_view.last() {
+                    last_byte = b;
+                }
                 tokens.push(tok);
                 arms.moe.feed_token(tok);
             }

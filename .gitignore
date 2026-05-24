@@ -2,7 +2,8 @@
 rustc-ice-*.txt
 target/
 .DS_Store
-assets/
+assets/*
+!assets/struct_mask.bin
 checkpoints/
 lcov.info
 src/.DS_Store
