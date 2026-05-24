@@ -76,17 +76,23 @@ The high-LR run **shrank the int8/f32 gap to 0.0016** but at the cost of much wo
 
 The interpretation: **the +0.003 gap is an intrinsic limit of the per-token max-abs activation quant scheme at int8 precision.** Per-token max-abs has a hard precision floor that scales as `1 / (127 × dynamic_range)` per channel, and the model is already at that floor. Shrinking the gap further requires a different quant scheme (per-token + per-channel hybrid, learned scales, percentile-based clip-then-quant), not more QAT at the existing scheme.
 
-### Phase 50D — 100 MB enwik8 validation through QAT'd weights
+### Phase 50D — 100 MB enwik8: three-way comparison
 
-Full 100 MB enwik8 roundtrip with the Phase 50B step-20000 QAT'd ckpt and the int8 inference path. Same binary as Phase 49 (mask + temperature still applied), only the weights and inference path differ.
+Three 100 MB enwik8 roundtrips against the same Phase 49 binary (mask + temperature still applied), differing only in (a) inference path and (b) which weights ship:
 
-| | L(C) | L(D) | Combined | Peak RSS | Wall |
-|---|---:|---:|---:|---:|---:|
-| Phase 49 (Phase 45 wts, f32 inference) | 1.3333 | 0.1301 | 1.4599 | 394 MB | 11 387 s |
-| **Phase 50D (QAT step 20000 wts, int8 inference)** | **1.3328** | **0.1301** | **1.4629** | **405 MB** | **8 257 s** |
-| Δ | **−0.0005** | 0 | **+0.0030** | +3% | **−28%** |
+| run | weights | inference | L(C) | L(D) | Combined | Peak RSS | Wall |
+|---|---|---|---:|---:|---:|---:|---:|
+| Phase 49 baseline | Phase 45 (240K f32) | **f32** | **1.3298** | 0.1301 | **1.4599** | 394 MB | 11 387 s |
+| **Phase 50A at scale** | Phase 45 (240K f32) | **int8** | 1.3331 | 0.1301 | 1.4632 | 405 MB | 8 122 s |
+| **Phase 50D** | **QAT 20K @ lr×0.1** | **int8** | 1.3328 | 0.1301 | **1.4629** | 405 MB | 8 257 s |
 
-Roundtrip verified bit-perfect. The +0.0030 combined L+D matches the 1 MB prediction to four decimal places. The 28% wall speedup at full scale confirms the 1 MB measurement holds — the int8 kernels are SIMD-friendly enough that they cleanly beat f32 even without intrinsics. The slight L(C) improvement (−0.0005) is within slice-to-slice variance noise; QAT'd weights and Phase 45 weights are statistically indistinguishable at 100 MB.
+All three roundtrips verified bit-perfect. Reading the deltas:
+
+- **Inference-path cost** (50A vs 49 — same weights, change inference): L(C) +0.0033, combined +0.0033, wall −29%.
+- **Weight-set effect** (50D vs 50A — same inference, change weights): L(C) −0.0003, combined −0.0003, within slice-to-slice noise.
+- **Combined effect** (50D vs 49): L(C) +0.0030, combined +0.0030, wall −28%.
+
+The 28% wall speedup at full scale confirms the 1 MB measurement (35% on encode-only). The +0.0030 combined matches the 1 MB prediction to four decimal places. **QAT contributed essentially zero L(C) improvement at 100 MB** — Phase 45 weights and QAT'd weights are statistically indistinguishable through the int8 path at this scale. All the cost of moving to int8 is in the inference-path, not the weights.
 
 ### Phase 50C — Deferred
 
@@ -94,12 +100,21 @@ Metal GPU backend behind `gpu-inference` feature flag was scoped but not impleme
 
 ### Recommendation for the enwik9 retrain
 
-Empirical conclusion across two QAT recipes (lr×0.1 / 20 K, lr×1.0 / 5 K):
+Empirical conclusion across two QAT recipes (lr×0.1 / 20 K, lr×1.0 / 5 K) plus the 100 MB three-way comparison:
 
-- **Do not include QAT at the existing fake-quant scheme.** The lr×0.1 recipe is essentially a no-op (recovers to Phase 45 baseline) and the lr×1.0 recipe regresses absolute quality. The 4.5 GPU-hours each costs is not earning bpb.
-- **Use Phase 45's recipe directly** for the enwik9 retrain: `moe_tok_wider_16k_xlong_lowlr`, 240 K steps, peak LR 1.5e-4. The resulting weights work as well or marginally better than the QAT'd weights in int8 inference.
-- **Accept the +0.003 bpb int8 regression** as the cost of bit-reproducible inference, which is the prerequisite for Phase 50C. The win — 35% faster CPU inference today, future GPU/CPU interoperability — far exceeds 0.003 bpb at our current scale.
+- **Do not include QAT at the existing fake-quant scheme.** The lr×0.1 recipe is essentially a no-op at 100 MB (50D vs 50A: −0.0003 bpb, in noise) and the lr×1.0 recipe regresses absolute quality. The 4.5 GPU-hours each costs is not earning bpb at this point.
+- **Use Phase 45's recipe directly** for the enwik9 retrain: `moe_tok_wider_16k_xlong_lowlr`, 240 K steps, peak LR 1.5e-4. The resulting f32 weights work statistically identically to QAT'd weights when run through the int8 inference path at 100 MB.
+- **Accept the +0.003 bpb int8 regression** as the cost of bit-reproducible inference, which is the prerequisite for Phase 50C. The win — 28% faster CPU inference today, future GPU/CPU interoperability — far exceeds 0.003 bpb at our current scale.
 - If a future session wants to attack the +0.003 gap directly, the cheapest experiment is lower-bit fake-quant during training (int7 or int6 STE) to over-correct, or learned per-tensor activation scales — not more QAT at int8.
+
+### Cumulative progress on enwik8
+
+- Phase 47 (T=1.0, no mask, f32): 1.4672 combined
+- Phase 48 (T=0.94, no mask, f32): 1.4628 (−0.0044)
+- Phase 49 (T=0.94, mask, f32): 1.4599 (−0.0029)
+- **Phase 50D (T=0.94, mask, int8 + QAT wts): 1.4629** (+0.0030, traded for −28% wall and GPU readiness)
+
+Gap to Hutter target on enwik8: **0.535 bpb** (back to roughly the Phase 48 mark, with int8 in the budget). The structural levers (bigger model + QAT, longer context, cascaded multi-scale, paradigm bets like BFN/SSM) remain the only paths to materially close the remaining gap; this session was infrastructure work to enable them on GPU rather than direct bpb-shrinking.
 
 ### What ships from this session
 
