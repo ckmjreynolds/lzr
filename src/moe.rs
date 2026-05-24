@@ -800,6 +800,218 @@ impl MoeByteTransformer {
         logits
     }
 
+    /// Phase 50C Day-4 Phase-1 — CPU batched forward over a full
+    /// token sequence, integer-inference path. Produces the same
+    /// `[N * vocab_size]` logits a loop of
+    /// [`MoeByteTransformer::forward_step_int`] would, but with the
+    /// per-position work laid out so the heavy inner loops can be
+    /// progressively replaced by batched GPU kernels in Day-4 Phase 2+.
+    ///
+    /// Bit-equivalence to the per-step path is the acceptance contract
+    /// — every f32 reduction is computed with the same scalar
+    /// summation order as `forward_step_int`, every per-token int8
+    /// activation quant is identical, and the int8 GEMMs reuse
+    /// `matmul_i8_i8_per_channel` (one call per position for now —
+    /// the future GPU batched-GEMM kernel will produce the same i32
+    /// accumulators so bit-exactness is preserved).
+    ///
+    /// Constraints: `tokens.len() <= cfg.context` (mirrors the
+    /// per-step path's `cache.pos < cfg.context` assert). Callers
+    /// chunk longer sequences themselves.
+    #[allow(
+        clippy::many_single_char_names,
+        clippy::similar_names,
+        clippy::needless_range_loop,
+        clippy::too_many_lines,
+        clippy::suboptimal_flops,
+        clippy::cast_precision_loss
+    )]
+    pub(crate) fn batched_forward_int(&self, tokens: &[u32]) -> Vec<f32> {
+        let ic = self
+            .int_cache
+            .as_ref()
+            .expect("prepare_int_cache() must be called before batched_forward_int");
+        let cfg = &self.cfg;
+        let n = tokens.len();
+        let d = cfg.d_model;
+        let h = cfg.n_head;
+        let hd = cfg.head_dim();
+        let vocab = cfg.vocab_size;
+        let n_experts = cfg.n_experts;
+        let d_ff = cfg.d_ff;
+        assert!(
+            n <= cfg.context,
+            "batched_forward_int: tokens.len()={n} exceeds context {} — caller must chunk",
+            cfg.context
+        );
+        for &t in tokens {
+            assert!((t as usize) < vocab, "token id {t} >= vocab_size {vocab}");
+        }
+
+        // Embedding: dequant tok_emb rows + add pos_emb, batched [N, d].
+        let mut x = vec![0f32; n * d];
+        for (i, &tok) in tokens.iter().enumerate() {
+            let row = tok as usize;
+            let scale = ic.tok_emb.scales[row];
+            let row_i8 = &ic.tok_emb.data[row * d..(row + 1) * d];
+            let pos_row = &self.pos_emb[i * d..(i + 1) * d];
+            for c in 0..d {
+                x[i * d + c] = f32::from(row_i8[c]) * scale + pos_row[c];
+            }
+        }
+
+        // Per-layer K/V scratch, sized for one layer at a time (we
+        // overwrite each layer's K/V into the same buffers).
+        let mut k_buf = vec![0f32; n * d];
+        let mut v_buf = vec![0f32; n * d];
+        let mut act_i8 = Vec::with_capacity(d.max(d_ff));
+
+        for (l, block) in self.blocks.iter().enumerate() {
+            let int_block = &ic.blocks[l];
+
+            // Pre-attention rmsnorm: per-position, same scalar reduction.
+            let mut x_norm = x.clone();
+            for i in 0..n {
+                rmsnorm_inplace(&mut x_norm[i * d..(i + 1) * d], &block.norm1_w);
+            }
+
+            // qkv matmul: per-token act-quant + int8 GEMM, batched over positions.
+            let mut qkv = vec![0f32; n * 3 * d];
+            for i in 0..n {
+                let x_scale =
+                    crate::int_inference::quantize_act_i8(&x_norm[i * d..(i + 1) * d], &mut act_i8);
+                crate::int_inference::matmul_i8_i8_per_channel(
+                    &act_i8,
+                    x_scale,
+                    &int_block.qkv,
+                    &mut qkv[i * 3 * d..(i + 1) * 3 * d],
+                );
+            }
+
+            // Write K/V for this layer (used by attention below).
+            for i in 0..n {
+                k_buf[i * d..(i + 1) * d].copy_from_slice(&qkv[i * 3 * d + d..i * 3 * d + 2 * d]);
+                v_buf[i * d..(i + 1) * d]
+                    .copy_from_slice(&qkv[i * 3 * d + 2 * d..i * 3 * d + 3 * d]);
+            }
+
+            // Causal multi-head attention, per-position, same scalar
+            // reductions as forward_step_int.
+            let mut attn_out = vec![0f32; n * d];
+            let scale_attn = 1.0 / (hd as f32).sqrt();
+            for i in 0..n {
+                for head in 0..h {
+                    let q_h = &qkv[i * 3 * d + head * hd..i * 3 * d + head * hd + hd];
+                    let mut scores = vec![0f32; i + 1];
+                    for j in 0..=i {
+                        let kj = &k_buf[j * d + head * hd..j * d + head * hd + hd];
+                        let mut s = 0f32;
+                        for c in 0..hd {
+                            s += q_h[c] * kj[c];
+                        }
+                        scores[j] = s * scale_attn;
+                    }
+                    softmax_inplace(&mut scores);
+                    let out_h = &mut attn_out[i * d + head * hd..i * d + head * hd + hd];
+                    for j in 0..=i {
+                        let vj = &v_buf[j * d + head * hd..j * d + head * hd + hd];
+                        let s_j = scores[j];
+                        for c in 0..hd {
+                            out_h[c] += s_j * vj[c];
+                        }
+                    }
+                }
+            }
+
+            // proj matmul + residual add, per-position.
+            for i in 0..n {
+                let proj_scale = crate::int_inference::quantize_act_i8(
+                    &attn_out[i * d..(i + 1) * d],
+                    &mut act_i8,
+                );
+                let mut proj_out = vec![0f32; d];
+                crate::int_inference::matmul_i8_i8_per_channel(
+                    &act_i8,
+                    proj_scale,
+                    &int_block.proj,
+                    &mut proj_out,
+                );
+                for c in 0..d {
+                    x[i * d + c] += proj_out[c];
+                }
+            }
+
+            // Pre-FFN rmsnorm.
+            let mut x_norm2 = x.clone();
+            for i in 0..n {
+                rmsnorm_inplace(&mut x_norm2[i * d..(i + 1) * d], &block.norm2_w);
+            }
+
+            // Router: int matmul → softmax → argmax, per-position.
+            let mut router_logits = vec![0f32; n * n_experts];
+            for i in 0..n {
+                let r_scale = crate::int_inference::quantize_act_i8(
+                    &x_norm2[i * d..(i + 1) * d],
+                    &mut act_i8,
+                );
+                crate::int_inference::matmul_i8_i8_per_channel(
+                    &act_i8,
+                    r_scale,
+                    &int_block.router,
+                    &mut router_logits[i * n_experts..(i + 1) * n_experts],
+                );
+            }
+
+            // Per-token MoE FFN: argmax expert, fc1 + GELU + fc2, gate.
+            for i in 0..n {
+                let mut probs = router_logits[i * n_experts..(i + 1) * n_experts].to_vec();
+                softmax_inplace(&mut probs);
+                let (expert_idx, gate_val) = argmax_with_value(&probs);
+                let int_expert = &int_block.experts[expert_idx];
+
+                let fc1_scale = crate::int_inference::quantize_act_i8(
+                    &x_norm2[i * d..(i + 1) * d],
+                    &mut act_i8,
+                );
+                let mut ff_hidden = vec![0f32; d_ff];
+                crate::int_inference::matmul_i8_i8_per_channel(
+                    &act_i8,
+                    fc1_scale,
+                    &int_expert.fc1,
+                    &mut ff_hidden,
+                );
+                gelu_inplace(&mut ff_hidden);
+
+                let fc2_scale = crate::int_inference::quantize_act_i8(&ff_hidden, &mut act_i8);
+                let mut ff_out = vec![0f32; d];
+                crate::int_inference::matmul_i8_i8_per_channel(
+                    &act_i8,
+                    fc2_scale,
+                    &int_expert.fc2,
+                    &mut ff_out,
+                );
+                for c in 0..d {
+                    x[i * d + c] += ff_out[c] * gate_val;
+                }
+            }
+        }
+
+        // Final rmsnorm + vocab projection, per-position.
+        let mut logits = vec![0f32; n * vocab];
+        for i in 0..n {
+            rmsnorm_inplace(&mut x[i * d..(i + 1) * d], &self.norm_f);
+            let final_scale =
+                crate::int_inference::quantize_act_i8(&x[i * d..(i + 1) * d], &mut act_i8);
+            crate::int_inference::matmul_i8_i8_per_channel(
+                &act_i8,
+                final_scale,
+                &ic.tok_emb,
+                &mut logits[i * vocab..(i + 1) * vocab],
+            );
+        }
+        logits
+    }
+
     /// Batched full-sequence forward — same return shape as
     /// [`crate::transformer::ByteTransformer::forward`]. Used only by
     /// the parity test (which compares against `PyTorch` logits
@@ -1070,6 +1282,115 @@ mod tests {
     #[test]
     fn moe_pytorch_logit_parity_nano_plus_equivalent() {
         run_moe_parity_check("moe_nano_plus_equivalent_42_step20000");
+    }
+
+    /// Phase 50C Day-4 Phase-1 diagnostic: wall comparison of the
+    /// new batched CPU path vs the per-step loop on a small sequence
+    /// from the Phase-45 checkpoint. Both paths run identical work;
+    /// the difference, if any, comes from fewer per-call `Vec` allocs
+    /// in the batched path. Run on demand:
+    /// ```text
+    /// cargo test --release moe::tests::batched_vs_per_step_cpu_wall \
+    ///   -- --nocapture --ignored
+    /// ```
+    #[test]
+    #[ignore = "diagnostic — run on demand"]
+    fn batched_vs_per_step_cpu_wall() {
+        let lzrm_path = "/Users/creynolds/Programming/lzr-neural/ckpts/\
+                         moe_tok_wider_16k_xlong_lowlr_42_step240000.lzrm";
+        if !std::path::Path::new(lzrm_path).exists() {
+            eprintln!("Phase-45 .lzrm missing — skipping bench");
+            return;
+        }
+        let lzrm = std::fs::read(lzrm_path).expect("read .lzrm");
+        let mut model = MoeByteTransformer::load_lzrm(&lzrm).expect("load");
+        model.apply_quantization(Quantization::Mixed5Asym);
+        model.prepare_int_cache();
+        let vocab_u32 = u32::try_from(model.cfg.vocab_size).expect("vocab fits u32");
+        let tokens: Vec<u32> =
+            (0..256u32).map(|i| (i * 37 + 11) % vocab_u32).collect();
+
+        // per-step
+        let t0 = std::time::Instant::now();
+        let iters = 3u32;
+        for _ in 0..iters {
+            let mut cache = model.new_kv_cache();
+            for &t in &tokens {
+                std::hint::black_box(model.forward_step_int(&mut cache, t));
+            }
+        }
+        let per_step_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(iters);
+
+        // batched
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(model.batched_forward_int(&tokens));
+        }
+        let batched_ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(iters);
+
+        eprintln!(
+            "wall on {tokens_len} tokens × {iters} iters:\n  per-step CPU: {per_step_ms:>8.1} ms / iter\n  batched  CPU: {batched_ms:>8.1} ms / iter  ({ratio:.2}× per-step)",
+            tokens_len = tokens.len(),
+            ratio = batched_ms / per_step_ms,
+        );
+    }
+
+    /// Phase 50C Day-4 Phase-1 acceptance gate. The new batched
+    /// CPU forward must produce **bit-identical** logits to a loop
+    /// of the per-step int forward over the same token sequence.
+    /// Bit-identity, not "approximately equal" — every f32 in the
+    /// logit slab must `to_bits()`-match the per-step reference.
+    ///
+    /// Uses the production Phase-45 checkpoint. Skips cleanly if
+    /// the artifact isn't present (e.g., on CI machines without
+    /// access to `lzr-neural/ckpts/`).
+    #[test]
+    fn batched_forward_int_bit_matches_per_step_phase45() {
+        let lzrm_path = "/Users/creynolds/Programming/lzr-neural/ckpts/\
+                         moe_tok_wider_16k_xlong_lowlr_42_step240000.lzrm";
+        if !std::path::Path::new(lzrm_path).exists() {
+            eprintln!("Phase-45 .lzrm missing — skipping batched parity test");
+            return;
+        }
+        let lzrm = std::fs::read(lzrm_path).expect("read .lzrm");
+        let mut model = MoeByteTransformer::load_lzrm(&lzrm).expect("load");
+        model.apply_quantization(Quantization::Mixed5Asym);
+        model.prepare_int_cache();
+        let vocab = model.cfg.vocab_size;
+
+        let vocab_u32 = u32::try_from(vocab).expect("vocab fits u32");
+        let tokens: Vec<u32> = (0..64u32).map(|i| (i * 37 + 11) % vocab_u32).collect();
+
+        let mut per_step_logits = vec![0f32; tokens.len() * vocab];
+        let mut cache = model.new_kv_cache();
+        for (i, &t) in tokens.iter().enumerate() {
+            let step = model.forward_step_int(&mut cache, t);
+            per_step_logits[i * vocab..(i + 1) * vocab].copy_from_slice(&step);
+        }
+
+        let batched = model.batched_forward_int(&tokens);
+        assert_eq!(batched.len(), per_step_logits.len());
+
+        let mut exact = 0usize;
+        let mut max_abs = 0f32;
+        for (a, b) in batched.iter().zip(per_step_logits.iter()) {
+            if a.to_bits() == b.to_bits() {
+                exact += 1;
+            }
+            let d = (a - b).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+        }
+        eprintln!(
+            "batched vs per-step parity (Phase-45): {exact}/{} bit-exact, max_abs={max_abs:e}",
+            batched.len()
+        );
+        assert_eq!(
+            exact,
+            batched.len(),
+            "batched_forward_int must bit-match per-step; max_abs={max_abs:e}"
+        );
     }
 
     #[test]
