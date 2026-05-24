@@ -139,6 +139,36 @@ pub(crate) fn matmul_i8_i8_per_channel(x_i8: &[i8], x_scale: f32, w: &IntTensor,
     }
 }
 
+/// Env-var-controlled toggle for routing matmuls through the Metal
+/// GPU backend (only available with the `gpu-inference` feature). The
+/// env var is read once on first call.
+#[cfg(feature = "gpu-inference")]
+fn gpu_backend_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LZR_GPU_BACKEND")
+            .ok()
+            .as_deref()
+            .is_some_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// Dispatcher that picks the CPU or GPU backend for one int8 matmul.
+/// Always CPU when the `gpu-inference` feature is off (i.e., the
+/// submission build).
+pub(crate) fn matmul_dispatch(x_i8: &[i8], x_scale: f32, w: &IntTensor, out: &mut [f32]) {
+    #[cfg(feature = "gpu-inference")]
+    if gpu_backend_enabled() {
+        crate::gpu::gpu()
+            .expect("GPU init")
+            .matmul_i8_per_channel(x_i8, x_scale, &w.data, &w.scales, out)
+            .expect("GPU matmul");
+        return;
+    }
+    matmul_i8_i8_per_channel(x_i8, x_scale, w, out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -710,7 +710,7 @@ impl MoeByteTransformer {
             // qkv: int matmul.
             let x_scale = crate::int_inference::quantize_act_i8(&x_norm, &mut act_i8);
             let mut qkv = vec![0f32; 3 * d];
-            crate::int_inference::matmul_i8_i8_per_channel(
+            crate::int_inference::matmul_dispatch(
                 &act_i8,
                 x_scale,
                 &int_block.qkv,
@@ -749,7 +749,7 @@ impl MoeByteTransformer {
             // proj: int matmul.
             let proj_scale = crate::int_inference::quantize_act_i8(&attn_out, &mut act_i8);
             let mut proj_out = vec![0f32; d];
-            crate::int_inference::matmul_i8_i8_per_channel(
+            crate::int_inference::matmul_dispatch(
                 &act_i8,
                 proj_scale,
                 &int_block.proj,
@@ -766,7 +766,7 @@ impl MoeByteTransformer {
             // Router: int matmul.
             let r_scale = crate::int_inference::quantize_act_i8(&x_norm, &mut act_i8);
             let mut router_logits = vec![0f32; cfg.n_experts];
-            crate::int_inference::matmul_i8_i8_per_channel(
+            crate::int_inference::matmul_dispatch(
                 &act_i8,
                 r_scale,
                 &int_block.router,
@@ -780,7 +780,7 @@ impl MoeByteTransformer {
             let int_expert = &int_block.experts[expert_idx];
             let fc1_scale = crate::int_inference::quantize_act_i8(&x_norm, &mut act_i8);
             let mut ff_hidden = vec![0f32; cfg.d_ff];
-            crate::int_inference::matmul_i8_i8_per_channel(
+            crate::int_inference::matmul_dispatch(
                 &act_i8,
                 fc1_scale,
                 &int_expert.fc1,
@@ -790,7 +790,7 @@ impl MoeByteTransformer {
 
             let fc2_scale = crate::int_inference::quantize_act_i8(&ff_hidden, &mut act_i8);
             let mut ff_out = vec![0f32; d];
-            crate::int_inference::matmul_i8_i8_per_channel(
+            crate::int_inference::matmul_dispatch(
                 &act_i8,
                 fc2_scale,
                 &int_expert.fc2,
@@ -804,7 +804,7 @@ impl MoeByteTransformer {
         rmsnorm_inplace(&mut x, &self.norm_f);
         let final_scale = crate::int_inference::quantize_act_i8(&x, &mut act_i8);
         let mut logits = vec![0f32; cfg.vocab_size];
-        crate::int_inference::matmul_i8_i8_per_channel(
+        crate::int_inference::matmul_dispatch(
             &act_i8,
             final_scale,
             &ic.tok_emb,
