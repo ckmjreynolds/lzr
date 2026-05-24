@@ -356,6 +356,78 @@ mod tests {
         assert!(max_diff <= 1e-3 * y_max, "GPU vs CPU drift too large");
     }
 
+    /// Diagnostic: measure CPU vs GPU per-dispatch latency at the
+    /// six matmul shapes that show up in the `MoE` forward pass. Run
+    /// with:
+    /// ```text
+    /// cargo test --features gpu-inference --release \
+    ///     gpu::tests::dispatch_latency_bench -- --nocapture --ignored
+    /// ```
+    /// `--ignored` because we don't want this in the regular suite.
+    #[test]
+    #[ignore = "diagnostic — run on demand with --ignored, not in CI"]
+    fn dispatch_latency_bench() {
+        use crate::int_inference::{IntTensor, matmul_i8_i8_per_channel, quantize_act_i8};
+        use std::time::Instant;
+        let shapes: &[(&str, usize, usize)] = &[
+            ("qkv", 3 * 128, 128),
+            ("proj", 128, 128),
+            ("router", 32, 128),
+            ("fc1", 512, 128),
+            ("fc2", 128, 512),
+            ("vocab", 16384, 128),
+        ];
+        let g = gpu().expect("metal init");
+        let header = format!(
+            "\n{:>8}  {:>5}  {:>5}  {:>10}  {:>10}  {:>10}  match",
+            "shape", "n", "k", "cpu (µs)", "gpu (µs)", "gpu/cpu"
+        );
+        eprintln!("{header}");
+        let sep = "-".repeat(65);
+        eprintln!("{sep}");
+        for (name, n, k) in shapes {
+            let n = *n;
+            let k = *k;
+            let w_f: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32) * 0.013 - 0.2).sin())
+                .collect();
+            let x_f: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.027 + 0.4).cos()).collect();
+            let w = IntTensor::pack_per_channel_sym(&w_f, n, k, 8);
+            let mut x_i8 = Vec::new();
+            let x_scale = quantize_act_i8(&x_f, &mut x_i8);
+            let mut out_cpu = vec![0f32; n];
+            let mut out_gpu = vec![0f32; n];
+            let iters: u32 = 200;
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                matmul_i8_i8_per_channel(&x_i8, x_scale, &w, &mut out_cpu);
+            }
+            let cpu_us = (t0.elapsed().as_secs_f64() * 1e6) / f64::from(iters);
+            let w_gpu = g.upload_tensor(&w.data, &w.scales);
+            g.matmul_with_buffers(&x_i8, x_scale, &w_gpu, n, k, &mut out_gpu)
+                .expect("gpu warmup");
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                g.matmul_with_buffers(&x_i8, x_scale, &w_gpu, n, k, &mut out_gpu)
+                    .expect("gpu");
+            }
+            let gpu_us = (t0.elapsed().as_secs_f64() * 1e6) / f64::from(iters);
+            let mut max_d = 0_f32;
+            for i in 0..n {
+                max_d = max_d.max((out_cpu[i] - out_gpu[i]).abs());
+            }
+            let cpu_max = out_cpu.iter().fold(0_f32, |a, &b| a.max(b.abs()));
+            let ratio = gpu_us / cpu_us;
+            let ok = if max_d <= 1e-3 * cpu_max { "OK" } else { "DRIFT" };
+            eprintln!(
+                "{name:>8}  {n:>5}  {k:>5}  {cpu_us:>10.1}  {gpu_us:>10.1}  {ratio:>9.2}x  {ok}"
+            );
+        }
+        eprintln!(
+            "\nIf gpu (µs) >> cpu (µs), per-dispatch sync dominates — Day-4 batched encode needed.\nIf gpu (µs) <  cpu (µs), kernel itself wins — sync model is the bottleneck."
+        );
+    }
+
     /// Day-3 path: drive the dispatcher with pre-uploaded weight
     /// buffers via `matmul_with_buffers`. Result must be bit-for-bit
     /// identical to the Day-1+2 per-call path because both kernels
