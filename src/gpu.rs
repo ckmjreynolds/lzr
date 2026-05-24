@@ -2,24 +2,42 @@
 //! Phase 50C. Gated behind the `gpu-inference` cargo feature so the
 //! submission binary stays Metal-free.
 //!
-//! Day-1 scope (what's here today):
+//! Day-1+2 scope (legacy):
 //!   - Global `Gpu` singleton owning a Metal device, command queue,
 //!     library, and compiled int8-GEMM pipeline state.
 //!   - `Gpu::matmul_i8_per_channel(x_i8, x_scale, w_i8, w_scales, out)`
-//!     that mirrors the CPU `matmul_i8_i8_per_channel` API in
-//!     `int_inference.rs`.
-//!   - Bit-exactness vs CPU is the acceptance gate. The integer
-//!     accumulator is the same i32 sum regardless of reduction order,
-//!     and the per-row dequant `(acc as f32) * x_scale * w_scales[row]`
-//!     is the same three-multiply expression. Modulo Metal fast-math
-//!     flags this should round identically to the CPU path.
+//!     allocating every buffer per call. Kept for the test gate.
+//!
+//! Day-3 scope (added here):
+//!   - `GpuTensor { data_buf, scales_buf }` — Metal device buffers
+//!     holding a pre-uploaded weight tensor. Lives behind a
+//!     `OnceLock` on `IntTensor` so first GPU dispatch uploads, all
+//!     subsequent dispatches reuse.
+//!   - `Gpu::upload_tensor(data, scales) -> GpuTensor`.
+//!   - `Gpu::matmul_with_buffers(x_i8, x_scale, w_gpu, n, k, out)`
+//!     same kernel, but the weight (n*k) and per-row-scale buffers
+//!     are read straight from the pre-uploaded `GpuTensor`. Only the
+//!     activation, output, and params buffers are allocated per call.
+//!
+//! Bit-exactness vs CPU is the acceptance gate. The integer
+//! accumulator is the same i32 sum regardless of reduction order,
+//! and the per-row dequant `(acc as f32) * x_scale * w_scales[row]`
+//! is the same three-multiply expression. The pre-uploaded path
+//! reads from the identical bytes the per-call path uploads, so the
+//! kernel output must be bit-for-bit identical.
 //!
 //! Not in scope today: batched encode (one shader dispatch over the
 //! full token sequence), GPU-side activation quantization, embedding
-//! lookup, KV cache. Those land in Day-2 / Day-3.
+//! lookup, KV cache. Those land in Day-4.
 
 #![allow(unsafe_code)]
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::similar_names,
+    clippy::many_single_char_names,
+    clippy::suboptimal_flops
+)]
 
 use std::sync::OnceLock;
 
@@ -28,7 +46,7 @@ use metal::{
     Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize,
 };
 
-const SHADER_SRC: &str = r#"
+const SHADER_SRC: &str = r"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -53,7 +71,7 @@ kernel void matmul_i8_per_channel(
     }
     out[gid] = float(acc) * p.x_scale * w_scales[gid];
 }
-"#;
+";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -77,6 +95,25 @@ pub(crate) struct Gpu {
 // `queue` APIs that are themselves thread-safe per Apple's docs.
 unsafe impl Send for Gpu {}
 unsafe impl Sync for Gpu {}
+
+/// A weight tensor's payload pre-uploaded into Metal device memory.
+/// Created once per `IntTensor` on first GPU dispatch via
+/// `Gpu::upload_tensor` and held in a `OnceLock` on the owning
+/// `IntTensor`. Reused by every subsequent `matmul_with_buffers`
+/// call, eliminating the per-call buffer-allocation overhead that
+/// dominated Day-2 timings.
+#[derive(Debug)]
+pub(crate) struct GpuTensor {
+    pub(crate) data_buf: Buffer,
+    pub(crate) scales_buf: Buffer,
+}
+
+// Same rationale as `Gpu` above: Metal `Buffer` wraps an Objective-C
+// pointer that the runtime allows to be shared across threads. We
+// only ever read these buffers from the GPU kernel after upload, so
+// CPU-side aliasing concerns don't apply.
+unsafe impl Send for GpuTensor {}
+unsafe impl Sync for GpuTensor {}
 
 fn instance() -> Result<&'static Gpu> {
     static G: OnceLock<Result<Gpu, String>> = OnceLock::new();
@@ -125,11 +162,16 @@ impl Gpu {
             .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
     }
 
-    /// y[n] = sum_k x_i8[k] * w_i8[n, k]   (int accumulator)
-    /// y[n] = y[n] * x_scale * w_scales[n]
+    /// `y[n] = sum_k x_i8[k] * w_i8[n, k]`   (int accumulator)
+    /// then `y[n] = y[n] * x_scale * w_scales[n]`.
     ///
     /// Mirrors `int_inference::matmul_i8_i8_per_channel`. Output is
-    /// written into `out` (which must be vocab_or_n length).
+    /// written into `out` (which must be `vocab` or `n` length).
+    ///
+    /// Day 1+2 API kept for the bit-exactness regression test in this
+    /// module. The production path (Day 3) uses
+    /// `matmul_with_buffers` with pre-uploaded weight buffers.
+    #[allow(dead_code)]
     pub(crate) fn matmul_i8_per_channel(
         &self,
         x_i8: &[i8],
@@ -156,7 +198,7 @@ impl Gpu {
         let x_buf = self.buffer_from_slice(x_i8);
         let w_buf = self.buffer_from_slice(w_i8);
         let ws_buf = self.buffer_from_slice(w_scales);
-        let out_buf = self.empty_buffer(n * size_of::<f32>());
+        let out_buf = self.empty_buffer(size_of::<f32>().saturating_mul(n));
         let params = Params {
             k: u32::try_from(k).context("k overflow")?,
             n: u32::try_from(n).context("n overflow")?,
@@ -175,7 +217,77 @@ impl Gpu {
 
         let threads_per_grid = MTLSize::new(n as u64, 1, 1);
         let max_tg = self.matmul_pipeline.max_total_threads_per_threadgroup();
-        let tg_width = (max_tg as u64).min(n as u64).max(1);
+        let tg_width = max_tg.min(n as u64).max(1);
+        let threads_per_tg = MTLSize::new(tg_width, 1, 1);
+        enc.dispatch_threads(threads_per_grid, threads_per_tg);
+        enc.end_encoding();
+
+        cb.commit();
+        cb.wait_until_completed();
+
+        // SAFETY: shared-storage Metal buffer is host-readable.
+        let out_ptr = out_buf.contents().cast::<f32>();
+        let slice = unsafe { std::slice::from_raw_parts(out_ptr, n) };
+        out.copy_from_slice(slice);
+        Ok(())
+    }
+
+    /// Upload an `(i8 data, f32 scales)` pair into shared-storage
+    /// Metal buffers once. Called by the dispatcher on first GPU use
+    /// of a given weight tensor; the result is cached in the owning
+    /// `IntTensor`'s `OnceLock<GpuTensor>` and reused for the rest of
+    /// the program's lifetime.
+    pub(crate) fn upload_tensor(&self, data: &[i8], scales: &[f32]) -> GpuTensor {
+        let data_buf = self.buffer_from_slice(data);
+        let scales_buf = self.buffer_from_slice(scales);
+        GpuTensor {
+            data_buf,
+            scales_buf,
+        }
+    }
+
+    /// Same kernel as `matmul_i8_per_channel`, but the weight bytes
+    /// and per-row scales are read from a pre-uploaded `GpuTensor`
+    /// instead of being copied in on every call. The activation,
+    /// output, and params buffers are still allocated per call (the
+    /// activation changes every step and the output is tiny).
+    pub(crate) fn matmul_with_buffers(
+        &self,
+        x_i8: &[i8],
+        x_scale: f32,
+        w_gpu: &GpuTensor,
+        n: usize,
+        k: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        if x_i8.len() != k {
+            return Err(anyhow!("x_i8 len {} != k {k}", x_i8.len()));
+        }
+        if out.len() != n {
+            return Err(anyhow!("out len {} != n {n}", out.len()));
+        }
+
+        let x_buf = self.buffer_from_slice(x_i8);
+        let out_buf = self.empty_buffer(size_of::<f32>().saturating_mul(n));
+        let params = Params {
+            k: u32::try_from(k).context("k overflow")?,
+            n: u32::try_from(n).context("n overflow")?,
+            x_scale,
+        };
+        let params_buf = self.buffer_from_slice(&[params]);
+
+        let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.matmul_pipeline);
+        enc.set_buffer(0, Some(&x_buf), 0);
+        enc.set_buffer(1, Some(&w_gpu.data_buf), 0);
+        enc.set_buffer(2, Some(&w_gpu.scales_buf), 0);
+        enc.set_buffer(3, Some(&out_buf), 0);
+        enc.set_buffer(4, Some(&params_buf), 0);
+
+        let threads_per_grid = MTLSize::new(n as u64, 1, 1);
+        let max_tg = self.matmul_pipeline.max_total_threads_per_threadgroup();
+        let tg_width = max_tg.min(n as u64).max(1);
         let threads_per_tg = MTLSize::new(tg_width, 1, 1);
         enc.dispatch_threads(threads_per_grid, threads_per_tg);
         enc.end_encoding();
@@ -242,5 +354,54 @@ mod tests {
         // accumulator part is exact, so any difference comes from the
         // x_scale * w_scale * acc rounding.
         assert!(max_diff <= 1e-3 * y_max, "GPU vs CPU drift too large");
+    }
+
+    /// Day-3 path: drive the dispatcher with pre-uploaded weight
+    /// buffers via `matmul_with_buffers`. Result must be bit-for-bit
+    /// identical to the Day-1+2 per-call path because both kernels
+    /// read the same i8 bytes and apply the same dequant.
+    #[test]
+    fn gpu_matmul_with_buffers_matches_per_call() {
+        let k = 96;
+        let n = 256;
+        let x_f: Vec<f32> = (0..k).map(|i| (i as f32 * 0.041 + 0.7).cos()).collect();
+        let w_f: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 * 0.013 - 0.2).sin() * 0.9)
+            .collect();
+        let w = IntTensor::pack_per_channel_sym(&w_f, n, k, 8);
+        let mut x_i8 = Vec::new();
+        let x_scale = quantize_act_i8(&x_f, &mut x_i8);
+
+        let g = gpu().expect("Metal device init");
+        let mut y_a = vec![0f32; n];
+        g.matmul_i8_per_channel(&x_i8, x_scale, &w.data, &w.scales, &mut y_a)
+            .expect("per-call ok");
+
+        // Upload once, dispatch twice — second dispatch hits the
+        // cached buffers without re-uploading.
+        let w_gpu = g.upload_tensor(&w.data, &w.scales);
+        let mut y_b = vec![0f32; n];
+        let mut y_c = vec![0f32; n];
+        g.matmul_with_buffers(&x_i8, x_scale, &w_gpu, n, k, &mut y_b)
+            .expect("with-buffers ok");
+        g.matmul_with_buffers(&x_i8, x_scale, &w_gpu, n, k, &mut y_c)
+            .expect("with-buffers (reuse) ok");
+
+        let mut exact_ab = 0;
+        let mut exact_bc = 0;
+        for i in 0..n {
+            if y_a[i].to_bits() == y_b[i].to_bits() {
+                exact_ab += 1;
+            }
+            if y_b[i].to_bits() == y_c[i].to_bits() {
+                exact_bc += 1;
+            }
+        }
+        eprintln!(
+            "[gpu day3 test] per-call vs with-buffers: {exact_ab}/{n} exact; \
+             repeated dispatch: {exact_bc}/{n} exact"
+        );
+        assert_eq!(exact_ab, n, "Day-3 path must bit-match Day-2 path");
+        assert_eq!(exact_bc, n, "Repeated GPU dispatch must be deterministic");
     }
 }

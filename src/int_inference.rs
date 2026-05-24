@@ -23,12 +23,22 @@
 /// Per-output-channel packed int8 weight tensor stored row-major
 /// (rows = output channels, cols = input dim). One f32 scale per row.
 /// Reconstruction: `w_f32[r, c] ≈ w_i8[r, c] * scales[r]`.
-#[derive(Debug, Clone)]
+///
+/// When the `gpu-inference` feature is on, the tensor also carries a
+/// lazily-initialized `OnceLock<GpuTensor>` (Phase 50C Day 3). The
+/// first time the dispatcher routes a matmul on this tensor to the
+/// GPU, the weight bytes and per-row scales are uploaded into Metal
+/// device buffers; every subsequent dispatch reuses them. This
+/// eliminates the per-call buffer-allocation overhead that dominated
+/// the Day-2 GPU timing.
+#[derive(Debug)]
 pub(crate) struct IntTensor {
     pub(crate) data: Vec<i8>,
     pub(crate) scales: Vec<f32>,
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+    #[cfg(feature = "gpu-inference")]
+    pub(crate) gpu: std::sync::OnceLock<crate::gpu::GpuTensor>,
 }
 
 impl IntTensor {
@@ -82,6 +92,8 @@ impl IntTensor {
             scales,
             rows,
             cols,
+            #[cfg(feature = "gpu-inference")]
+            gpu: std::sync::OnceLock::new(),
         }
     }
 }
@@ -157,12 +169,19 @@ fn gpu_backend_enabled() -> bool {
 /// Dispatcher that picks the CPU or GPU backend for one int8 matmul.
 /// Always CPU when the `gpu-inference` feature is off (i.e., the
 /// submission build).
+///
+/// On the GPU path (Day 3 onward) the weight tensor's buffers are
+/// lazily uploaded on the first call and cached on the `IntTensor`
+/// itself via `OnceLock`. The activation buffer is still allocated
+/// per call (it changes every step) but the dominant cost — a
+/// per-call upload of the entire weight matrix, up to 2 MB for the
+/// vocab projection — is paid exactly once per tensor.
 pub(crate) fn matmul_dispatch(x_i8: &[i8], x_scale: f32, w: &IntTensor, out: &mut [f32]) {
     #[cfg(feature = "gpu-inference")]
     if gpu_backend_enabled() {
-        crate::gpu::gpu()
-            .expect("GPU init")
-            .matmul_i8_per_channel(x_i8, x_scale, &w.data, &w.scales, out)
+        let gpu = crate::gpu::gpu().expect("GPU init");
+        let w_gpu = w.gpu.get_or_init(|| gpu.upload_tensor(&w.data, &w.scales));
+        gpu.matmul_with_buffers(x_i8, x_scale, w_gpu, w.rows, w.cols, out)
             .expect("GPU matmul");
         return;
     }

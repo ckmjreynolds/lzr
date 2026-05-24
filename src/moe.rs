@@ -710,12 +710,7 @@ impl MoeByteTransformer {
             // qkv: int matmul.
             let x_scale = crate::int_inference::quantize_act_i8(&x_norm, &mut act_i8);
             let mut qkv = vec![0f32; 3 * d];
-            crate::int_inference::matmul_dispatch(
-                &act_i8,
-                x_scale,
-                &int_block.qkv,
-                &mut qkv,
-            );
+            crate::int_inference::matmul_dispatch(&act_i8, x_scale, &int_block.qkv, &mut qkv);
 
             let layer_cache = &mut cache.layers[l];
             layer_cache.k[p * d..(p + 1) * d].copy_from_slice(&qkv[d..2 * d]);
@@ -790,12 +785,7 @@ impl MoeByteTransformer {
 
             let fc2_scale = crate::int_inference::quantize_act_i8(&ff_hidden, &mut act_i8);
             let mut ff_out = vec![0f32; d];
-            crate::int_inference::matmul_dispatch(
-                &act_i8,
-                fc2_scale,
-                &int_expert.fc2,
-                &mut ff_out,
-            );
+            crate::int_inference::matmul_dispatch(&act_i8, fc2_scale, &int_expert.fc2, &mut ff_out);
             for i in 0..d {
                 x[i] += ff_out[i] * gate_val;
             }
@@ -804,12 +794,7 @@ impl MoeByteTransformer {
         rmsnorm_inplace(&mut x, &self.norm_f);
         let final_scale = crate::int_inference::quantize_act_i8(&x, &mut act_i8);
         let mut logits = vec![0f32; cfg.vocab_size];
-        crate::int_inference::matmul_dispatch(
-            &act_i8,
-            final_scale,
-            &ic.tok_emb,
-            &mut logits,
-        );
+        crate::int_inference::matmul_dispatch(&act_i8, final_scale, &ic.tok_emb, &mut logits);
 
         cache.pos += 1;
         logits
