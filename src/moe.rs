@@ -184,6 +184,44 @@ pub(crate) struct MoeBlock {
     experts: Vec<ExpertWeights>, // len == n_experts
 }
 
+/// Phase 50C Day-4 follow-up: per-token routing trace produced by
+/// [`MoeByteTransformer::dump_routing`]. All vectors are
+/// `[n_layers, n_tokens]` row-major (layer-major).
+///
+/// Used by `lzr routing-analyze` to characterize what each expert
+/// is doing — load distribution, routing confidence, byte-class
+/// specialization. Intentionally minimal: only the per-token chosen
+/// expert, the softmax probability of that choice, and the full
+/// router-distribution entropy. The full 32-way prob distribution
+/// is not stored (would balloon the dump 16× for marginal extra
+/// analytic value).
+#[derive(Debug)]
+pub(crate) struct RoutingTrace {
+    pub(crate) n_layers: usize,
+    pub(crate) n_tokens: usize,
+    pub(crate) n_experts: usize,
+    /// `[n_layers, n_tokens]`. Expert index chosen by argmax at each (layer, position).
+    pub(crate) expert_assignment: Vec<u32>,
+    /// `[n_layers, n_tokens]`. Softmax probability of the chosen expert (gate value).
+    pub(crate) gate_val: Vec<f32>,
+    /// `[n_layers, n_tokens]`. Shannon entropy of the router softmax in nats.
+    pub(crate) router_entropy_nats: Vec<f32>,
+}
+
+impl RoutingTrace {
+    pub(crate) fn new(n_layers: usize, n_tokens: usize, n_experts: usize) -> Self {
+        let total = n_layers * n_tokens;
+        Self {
+            n_layers,
+            n_tokens,
+            n_experts,
+            expert_assignment: vec![0; total],
+            gate_val: vec![0.0; total],
+            router_entropy_nats: vec![0.0; total],
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct MoeByteTransformer {
     pub(crate) cfg: MoeConfig,
@@ -807,6 +845,18 @@ impl MoeByteTransformer {
         logits
     }
 
+    /// Phase 50C Day-4 follow-up: routing diagnostic. Runs the full
+    /// batched forward and captures per-token routing decisions into
+    /// a [`RoutingTrace`]. Used by `lzr routing-analyze` to
+    /// characterize what each of the `n_experts` experts actually
+    /// does — load distribution, routing entropy, and (with the
+    /// codec's BPE table) byte-class × expert crosstabs.
+    pub(crate) fn dump_routing(&self, tokens: &[u32]) -> RoutingTrace {
+        let mut trace = RoutingTrace::new(self.cfg.n_layer, tokens.len(), self.cfg.n_experts);
+        let _ = self.batched_forward_int_traced(tokens, Some(&mut trace));
+        trace
+    }
+
     /// Phase 50C Day-4 Phase-1 — CPU batched forward over a full
     /// token sequence, integer-inference path. Produces the same
     /// `[N * vocab_size]` logits a loop of
@@ -825,6 +875,18 @@ impl MoeByteTransformer {
     /// Constraints: `tokens.len() <= cfg.context` (mirrors the
     /// per-step path's `cache.pos < cfg.context` assert). Callers
     /// chunk longer sequences themselves.
+    /// Public entry point. Thin wrapper around
+    /// [`MoeByteTransformer::batched_forward_int_traced`] with no
+    /// routing capture — same signature and behavior as before
+    /// Phase 50C Day-4 follow-up.
+    pub(crate) fn batched_forward_int(&self, tokens: &[u32]) -> Vec<f32> {
+        self.batched_forward_int_traced(tokens, None)
+    }
+
+    /// Shared implementation. When `trace` is `Some`, captures
+    /// per-token routing decisions into it (used by `dump_routing`).
+    /// Otherwise behaves identically to the plain
+    /// `batched_forward_int`.
     #[allow(
         clippy::many_single_char_names,
         clippy::similar_names,
@@ -833,7 +895,11 @@ impl MoeByteTransformer {
         clippy::suboptimal_flops,
         clippy::cast_precision_loss
     )]
-    pub(crate) fn batched_forward_int(&self, tokens: &[u32]) -> Vec<f32> {
+    pub(crate) fn batched_forward_int_traced(
+        &self,
+        tokens: &[u32],
+        mut trace: Option<&mut RoutingTrace>,
+    ) -> Vec<f32> {
         let ic = self
             .int_cache
             .as_ref()
@@ -990,6 +1056,18 @@ impl MoeByteTransformer {
                 let (expert_idx, gate_val) = argmax_with_value(&probs);
                 expert_assignment[i] = expert_idx;
                 gate_vals[i] = gate_val;
+                // Routing capture (diagnostic — dump_routing path).
+                if let Some(t) = trace.as_deref_mut() {
+                    let idx = l * n + i;
+                    t.expert_assignment[idx] = u32::try_from(expert_idx).expect("expert fits u32");
+                    t.gate_val[idx] = gate_val;
+                    let entropy: f32 = probs
+                        .iter()
+                        .filter(|&&p| p > 0.0)
+                        .map(|&p| -p * p.ln())
+                        .sum();
+                    t.router_entropy_nats[idx] = entropy;
+                }
             }
 
             // Per-expert gather → batched fc1 → gelu → batched fc2 → scatter.
