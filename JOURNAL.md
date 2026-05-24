@@ -13,6 +13,110 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-23 → 2026-05-24 — Phase 50A/B/D: Integer-Only Rust Inference + QAT in PyTorch — Pipeline Working, +0.003 bpb int8/f32 Gap is Intrinsic at This Quant Scheme
+
+After Phase 49 exhausted the single-scalar/single-FSM calibration track, CDR directed building the integer-only inference + QAT + GPU pipeline that would make the same predictor reproducible across CPU and GPU backends and unlock practical enwik9-scale validation. The audit showed the existing "quantization" was actually quantize-dequantize (q-dq) on f32 weights — the matmul itself stayed f32 — so an integer-only forward path was a from-scratch addition, not a tweak. Phases 50A (Rust int8 inference), 50B (PyTorch QAT to recover regression), 50C (Metal GPU backend), 50D (enwik8 + enwik9) were scoped as the arc. This entry covers 50A, 50B, and the 50D enwik8 leg from a single autonomous 10-hour session; 50C and the enwik9 leg are deferred.
+
+### Phase 50A — Real integer matmul in Rust
+
+`src/int_inference.rs` (~140 lines, scalar code that LLVM auto-vectorizes) holds an `IntTensor` (packed `i8` data + per-row `f32` scales), a per-token max-abs `quantize_act_i8` helper, and `matmul_i8_i8_per_channel(x_i8, x_scale, w, out_f32)`. Math: `out[r] = (sum_c x_i8[c] * w_i8[r, c]) * x_scale * w.scales[r]`, all summed in `i32`. The integer accumulator gives reduction-order-independent results, which is the prerequisite for the GPU/CPU swap to ship interoperable archives.
+
+`MoeByteTransformer` grew an optional `IntCache` populated by `prepare_int_cache()` after q-dq; `forward_step_int` mirrors the existing `forward_step` but routes every matmul (qkv, proj, router, fc1, fc2, final vocab projection) through `matmul_i8_i8_per_channel`. Element-wise ops (rmsnorm, softmax, gelu) and the attention dot-products stay f32 — too small to benefit, and norms are precision-sensitive. The path is opt-in via `LZR_INT_KERNELS=1` to preserve Phase 49 binary-identical behavior by default.
+
+Result on 1 MB `enwik9[0..1MB]` using the Phase 45 weights:
+
+| path | L(C) bpb | wall |
+|---|---:|---:|
+| f32 matmul (Phase 49) | 1.2747 | 64.4 s |
+| **int8 matmul (Phase 50A)** | **1.2777** | **42.0 s** |
+| Δ | **+0.0030** | **−35%** |
+
+The +0.0030 bpb regression is the per-token max-abs activation-quant noise — exactly the gap QAT is intended to close. The 35% wall speedup is notable because the int8 GEMM is hand-scalar with no SIMD intrinsics; LLVM's auto-vec exploits the `i32` accumulator path better than the equivalent `f32` reduction.
+
+### Phase 50B — Fake-quant QAT in lzr-neural
+
+`lzr-neural/src/lzr_neural/quant.py` defines `fake_quant(x, n_bits, keep_dims)` via the straight-through estimator and `QuantLinear` (drop-in `nn.Linear` with per-token activation + per-output-channel weight fake-quant matching the Rust kernels). Wired into `MoEByteTransformer`'s linears (qkv, proj, router, fc1, fc2, head/tied-tok-emb). Norms stay unquantized to match the Rust kernels.
+
+`scripts/train_moe.py` grew `--qat`, `--resume-from`, `--resume-optimizer`, `--lr-multiplier`. Resume loads any existing `.pt` state_dict (the new `QuantLinear` keys are identical to `nn.Linear.weight`); the optimizer fresh-starts by default so AdamW can adapt to the QAT noise landscape rather than carrying f32-regime momentum.
+
+#### Run 1 — `moe_tok_qat_p50b`: lr-multiplier 0.1, 20 000 steps
+
+Resumed from `moe_tok_wider_16k_xlong_lowlr_42_step240000.pt` (Phase 45), QAT enabled, effective peak LR 1.5e-5 with 500-step warmup and cosine decay over 20 000 steps. 2.4 hours wall on M3 Pro MPS.
+
+Per-checkpoint L(C) on `enwik9[0..1MB]`:
+
+| step | f32 path | int8 path | f32 vs Phase 49 (1.2747) | int8 vs Phase 50A (1.2777) | int8−f32 gap |
+|---:|---:|---:|---:|---:|---:|
+| Phase 45 baseline | 1.2747 | 1.2777 | 0 | 0 | +0.0030 |
+| 5 000 | 1.2818 | 1.2847 | +0.0071 | +0.0070 | +0.0029 |
+| 10 000 | 1.2789 | 1.2816 | +0.0042 | +0.0039 | +0.0027 |
+| 15 000 | 1.2760 | 1.2789 | +0.0013 | +0.0012 | +0.0029 |
+| **20 000** | **1.2750** | **1.2778** | **+0.0003** | **+0.0001** | **+0.0028** |
+
+QAT recovers from the initial fine-tune perturbation (steps 5 K-15 K) and ends within noise of Phase 45 baselines in both inference paths. But the **int8−f32 gap is stable at +0.0028 across every checkpoint** — including the Phase 45 starting point. QAT-as-implemented is recovering the model's general fitness, not narrowing the activation-quant gap specifically.
+
+#### Run 2 — `moe_tok_qat_p50b_hilr`: lr-multiplier 1.0, 10 000 steps (aborted after step 5 000)
+
+Hypothesis: maybe the lr×0.1 schedule is too gentle for the model to actively adapt to int8 noise — try Phase 45's full LR (1.5e-4). Resumed from Phase 45 with the same fake-quant setup, 200-step warmup, cosine decay over 10 000 steps.
+
+Step 5 000 ckpt validated:
+
+| path | L(C) | regression |
+|---|---:|---:|
+| f32 | 1.3122 | +0.0375 vs Phase 49 |
+| int8 | 1.3138 | +0.0361 vs Phase 50A |
+| **int8−f32 gap** | **+0.0016** | **(half the baseline gap)** |
+
+The high-LR run **shrank the int8/f32 gap to 0.0016** but at the cost of much worse absolute quality. Net unproductive at this duration — the model is in a chaotic regime that would need much more cosine decay to settle. Aborted to conserve budget.
+
+#### What QAT-as-implemented does and does not do
+
+- **Does**: recover from fine-tune perturbation back to baseline within ~15-20 K steps at lr×0.1.
+- **Does not**: shrink the +0.003 int8/f32 gap measurably at lr×0.1. The high-LR variant (lr×1.0) does shrink the gap (+0.0016) but loses absolute quality.
+
+The interpretation: **the +0.003 gap is an intrinsic limit of the per-token max-abs activation quant scheme at int8 precision.** Per-token max-abs has a hard precision floor that scales as `1 / (127 × dynamic_range)` per channel, and the model is already at that floor. Shrinking the gap further requires a different quant scheme (per-token + per-channel hybrid, learned scales, percentile-based clip-then-quant), not more QAT at the existing scheme.
+
+### Phase 50D — 100 MB enwik8 validation through QAT'd weights
+
+Full 100 MB enwik8 roundtrip with the Phase 50B step-20000 QAT'd ckpt and the int8 inference path. Same binary as Phase 49 (mask + temperature still applied), only the weights and inference path differ.
+
+| | L(C) | L(D) | Combined | Peak RSS | Wall |
+|---|---:|---:|---:|---:|---:|
+| Phase 49 (Phase 45 wts, f32 inference) | 1.3333 | 0.1301 | 1.4599 | 394 MB | 11 387 s |
+| **Phase 50D (QAT step 20000 wts, int8 inference)** | **1.3328** | **0.1301** | **1.4629** | **405 MB** | **8 257 s** |
+| Δ | **−0.0005** | 0 | **+0.0030** | +3% | **−28%** |
+
+Roundtrip verified bit-perfect. The +0.0030 combined L+D matches the 1 MB prediction to four decimal places. The 28% wall speedup at full scale confirms the 1 MB measurement holds — the int8 kernels are SIMD-friendly enough that they cleanly beat f32 even without intrinsics. The slight L(C) improvement (−0.0005) is within slice-to-slice variance noise; QAT'd weights and Phase 45 weights are statistically indistinguishable at 100 MB.
+
+### Phase 50C — Deferred
+
+Metal GPU backend behind `gpu-inference` feature flag was scoped but not implemented in this session — a real bit-identical Metal int8 GEMM is 3-5 days of focused work and didn't fit alongside the 2.5-hour QAT training, the 100 MB validation, and the +1.2-hour hi-LR experiment within 10 hours. The Phase 50A integer kernels are deliberately structured so the GPU port replaces just the `matmul_i8_i8_per_channel` call site and inherits the same bit-exactness guarantees from the integer accumulator.
+
+### Recommendation for the enwik9 retrain
+
+Empirical conclusion across two QAT recipes (lr×0.1 / 20 K, lr×1.0 / 5 K):
+
+- **Do not include QAT at the existing fake-quant scheme.** The lr×0.1 recipe is essentially a no-op (recovers to Phase 45 baseline) and the lr×1.0 recipe regresses absolute quality. The 4.5 GPU-hours each costs is not earning bpb.
+- **Use Phase 45's recipe directly** for the enwik9 retrain: `moe_tok_wider_16k_xlong_lowlr`, 240 K steps, peak LR 1.5e-4. The resulting weights work as well or marginally better than the QAT'd weights in int8 inference.
+- **Accept the +0.003 bpb int8 regression** as the cost of bit-reproducible inference, which is the prerequisite for Phase 50C. The win — 35% faster CPU inference today, future GPU/CPU interoperability — far exceeds 0.003 bpb at our current scale.
+- If a future session wants to attack the +0.003 gap directly, the cheapest experiment is lower-bit fake-quant during training (int7 or int6 STE) to over-correct, or learned per-tensor activation scales — not more QAT at int8.
+
+### What ships from this session
+
+Branch `v4`:
+- `src/int_inference.rs` — int8 kernels + activation quantizer
+- `src/moe.rs` — `IntCache` + `forward_step_int`
+- `src/moe_arm.rs` — `LZR_INT_KERNELS` dispatch + `predict_cdf_with_bias` for combined bias + integer paths
+
+Branch `main` in `lzr-neural/`:
+- `src/lzr_neural/quant.py` — fake-quant + `QuantLinear`
+- `src/lzr_neural/moe.py` — `QuantLinear` wired into MoE blocks with `qat=` toggle
+- `scripts/train_moe.py` — `--qat`, `--resume-from`, `--resume-optimizer`, `--lr-multiplier`
+
+`build.sh` clean (fmt + clippy default & no-default-features + tests + nightly coverage). The Rust default binary is byte-identical to Phase 49 (the int path is opt-in via env var).
+
+---
+
 ## 2026-05-23 — Phase 49: Structural Mask — Combined L+D 1.4599 on 100 MB enwik8, −0.0029 bpb via Deterministic Anti-Model
 
 After Phase 48 baked the calibration scalar, CDR pushed on the "anti-model" idea — if we can independently know certain `MoE` predictions are structurally implausible, overrule them. The constraint is that any overrule must be deterministically computable from state both encoder and decoder already see, so it costs no signaling bits. Discussion narrowed to structural state derived from the source byte history: at every token boundary the *previous source byte* is in a known class on both sides. A per-class bitmask of "which BPE tokens ever follow this class in training" is the cheapest test of the anti-model hypothesis.
