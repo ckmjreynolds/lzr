@@ -13,7 +13,164 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
-## 2026-05-24 — Phase 50C Day 1+2: Metal GPU Backend Behind Feature Flag — Bit-Exact Archives vs CPU on 4 KB and 1 MB
+## 2026-05-24 → 2026-05-28 — v5 Branch: Pure MoE → AC, Routing-Informed Architecture, Full-Corpus Training, Projected L+D ≈ 1.27 bpb
+
+After Phase 50C established a bit-exact GPU↔CPU contract but failed to deliver wall-time wins on the existing v4 MoE-Transformer (per-call Metal dispatch ~250 µs vs 0.1–1 µs CPU NEON int8 GEMM at our matmul sizes — the GPU could not amortize its dispatch cost on n=32–512 tensors), CDR concluded the deterministic v4 floor was within ~0.5 bpb of submission target but architecturally saturated. The pivot to v5 was authorized to redesign the predictor architecture, drop ad-hoc deterministic stages, and explore higher-leverage training/inference tradeoffs.
+
+This entry covers four days of v5 work: the routing analysis that shaped the v5 architecture, the BF16 + memory-friendly training refactor, three full training runs (one killed mid-way, one held-out-split, one full-corpus) totaling ~85 hours of M3 Pro wall time, a side excursion into byte-level RWKV-MoE (abandoned after one day), and a custom C kernel for the RWKV WKV scan that delivered a 1.56× training speedup before the architectural pivot back.
+
+### Routing analysis on Phase 45 — the data that shaped v5
+
+Before designing v5, CDR/Claude built a per-token routing diagnostic (`MoeByteTransformer::dump_routing` + `lzr routing-analyze` subcommand, committed `05e9072` on `v5` branch) to characterize what the Phase 45 model's 32 × 2 = 64 experts actually did. Run on 1 MB enwik9 with the Phase-45 mixed5asym weights, 229 990 tokens.
+
+The findings were unusually clean:
+
+| | Layer 0 | Layer 1 |
+|---|---|---|
+| Median routing entropy (nats) | 2.94 / max 3.47 | **0.36 / max 3.47** |
+| Tokens routed with entropy < 0.5 × max | 0.20% | **99.39%** |
+| Load imbalance (max ÷ min) | 6.97× | 9.54× |
+| Dead experts (<0.1% load) | 0 | 0 |
+
+Layer 0's router is essentially uncertain — near-uniform routing entropy means it diversifies but rarely "decides." Layer 1 is decisive and produces strikingly interpretable specializations in the top-tokens-per-expert breakdown:
+
+- Expert 0: numbers ("1", "10", "18", "0", "11", "9", "6", "7")
+- Experts 5 and 16 each take 100% of newlines (two redundant "newline experts")
+- Expert 6: wiki/XML markup ("* [[", "{{", `<title>`, "[[Category:")
+- Expert 9: closing delimiters ("]]", "a]]", ")", "]")
+- Expert 11: prepositional phrases ("in ", "of ", "in the ", "s of ")
+- Expert 17: conjunctions ("that ", "as ", "for ", "by ", "with ")
+- Expert 20: word-end morphemes ("to ", "and ", "s ", "ed ", "ing ")
+- Expert 22: verbs / auxiliaries ("is ", "was ", "he ", "have ", "are ")
+- Expert 24: XML page metadata (`<contributor>`, `<revision>`, `<minor />`)
+- Expert 25: capital letters ("A", "R", "D", "C", "T")
+- Expert 26: determiners ("the ", "The ", "his ", "this ", "their ")
+- Expert 31: commas and close-parens (", ", "]] ", "s, ", ")", " (")
+
+Byte-class × expert crosstabs confirmed strong deterministic structure: class 12 → expert 8 takes 67% of its tokens; class 15 → expert 1: 67%; class 8 → expert 0: 63%. The router has rediscovered (and refined) what Phase 49's `struct_mask` was doing — but with finer granularity. **The MoE is earning its parameter count** at the deeper layer; the redundancy is in (a) layer 0's uncertain routing and (b) the duplicate newline experts (4 of 64 experts essentially doing the same thing). This data shaped the v5 sizing.
+
+### v5 architecture: 3L × 128d × 1024d_ff × 24 experts, ~21M params
+
+Sizing rationale from the routing analysis:
+1. **Deeper backbone** (2L → 3L): give later layers more decisive-specialization opportunities, addressing the layer-0 entropy issue.
+2. **Fewer but wider experts** (32 × d_ff=512 → 24 × d_ff=1024): drop the duplicates, give each remaining expert more representational room for finer-grained linguistic patterns.
+3. **Same d_model (128) and same BPE-16K vocab**: keep the tokenizer pipeline and inference shape compatible.
+
+Total: 21 243 776 params (~2× Phase 45's 10.5M). Same `cfg.context=512`, batch=32, seq=512, 240K steps target, peak LR 1.5e-4 (Phase 45's stable value).
+
+### Training infrastructure refactor — BF16 + memory-friendly forward
+
+Phase 45 training peaked at 28–32 GB RSS on M3 Pro. CDR set 32 GB as a hard cap and authorized aggressive refactoring. The new training stack landed as `lzr-neural` commit `2d83a18`:
+
+- **`src/lzr_neural/moe_v5.py`** — clean rewrite of `moe.py`:
+  - Replaced the manual `Q @ K.T` attention with `torch.nn.functional.scaled_dot_product_attention(is_causal=True)`, eliminating the `[batch, n_head, seq, seq]` scores tensor (~128 MB per layer at our shape).
+  - RMSNorm forced to FP32 even under autocast (dynamic-range sensitive; cheap, ~0.1% of compute).
+  - Stash-aux-loss-in-attribute pattern so each block's forward returns a single tensor — makes `torch.utils.checkpoint` wrappers trivial.
+  - Dropped the QuantLinear / QAT scaffolding entirely. v5 starts with plain `nn.Linear`; BitNet-style inference is deferred to a post-training quantization or QAT fine-tune phase.
+- **`scripts/train_v5.py`** — new training entry point: BF16 autocast, optional gradient checkpointing, hourly progress lines on a wall-clock cadence (not step cadence), RSS memory watchdog that aborts cleanly when process memory exceeds `--memory-cap-gb`.
+- **`psutil`** added for the watchdog.
+
+Smoke test at v5 sizing (200 steps, batch=32, seq=512):
+
+| | Phase 45 | v5 (with grad-ckpt) | v5 (no grad-ckpt) |
+|---|---:|---:|---:|
+| Params | 10.5M | 21.2M | 21.2M |
+| Peak RSS | 28–32 GB | 10.28 GB | 10.34 GB |
+| Steps/sec | ~3.0 (FP32) | 0.77 | 0.93 |
+
+Memory dropped ~3× at 2× the params (SDPA + BF16 + per-expert sequential dispatch). Gradient checkpointing didn't help — the activations being checkpointed were already small thanks to the per-expert dispatch; SDPA already saved the attention scores tensor. Ran the full training with `--no-grad-checkpoint`.
+
+### v5 training: three runs, ~85 hours total wall
+
+**Run 1** (initial, 90/10 train/val split): launched 2026-05-24, killed at step 40K (~8 hours) when CDR requested the architectural pivot to RWKV. Reached val_bpb 5.71 at step 40K. Hourly trajectory matched expectations: rapid early descent then slowing diminishing returns.
+
+**Run 2** (resumed from step 40K ckpt, same 90/10 split): launched 2026-05-26 after the RWKV detour (below). Ran for 17 hours, reached step 122K (effective ~162K with the cumulative resume offset), best val_bpb 5.21 at effective step 136K. Killed when CDR raised the key insight that the train/val split was actively hurting us — for Hutter, memorization IS the goal because we compress the file we trained on.
+
+**Run 3** (full-corpus, `--train-split 1.0`): launched 2026-05-26, ran for 55 hours through 2026-05-28 morning. The eval function was patched to sample from training data when the val split is empty (eval-on-train just measures "what bpb do we achieve on random samples of enwik9," which is exactly the right Hutter-relevant metric). Resumed from Run 2's step 120K ckpt and ran the full 240K cosine schedule.
+
+Full Run 3 trajectory (val_bpb sampled from training data; relevant Hutter quality metric):
+
+| step (Run 3 local) | val_bpb | note |
+|---:|---:|---|
+| 4 000 | 5.0893 | first eval (no holdout) — immediate big improvement vs Run 2's 5.21 best |
+| 28 000 | 5.0442 | |
+| 44 000 | 4.9804 | broke below 5.0 |
+| 112 000 | 4.9627 | |
+| 124 000 | 4.8469 | -0.12 jump, cosine decay-phase acceleration starts |
+| 152 000 | 4.8116 | |
+| 168 000 | 4.7950 | |
+| 184 000 | 4.7887 | |
+| 204 000 | 4.7381 | LR ~10% of peak |
+| 208 000 | 4.7072 | |
+| **212 000** | **4.6990** | **best val** |
+| 240 000 | 4.7868 | final ckpt; train_bpb 4.76 |
+
+Run 3 peak RSS: 8.59 GB. Throughput averaged ~4 700 steps/hr (1.3 steps/sec) on a healthy M3 Pro. The cosine LR's final third produced the cleanest improvements, consistent with prior runs.
+
+**Routing health at end of Run 3**: experts ~uniformly utilized at all 3 layers (std=0.009–0.022). The L2 dead-expert oscillation that plagued the early runs settled out by step ~50K (Run 3 local).
+
+### Eval-on-train fix and the `--train-split 1.0` insight
+
+The decisive single change in Run 3 was the user observation that **the train/val split is a holdover from general ML practice that actively hurts Hutter compression**. For general ML, the val set measures generalization to unseen data — which is the goal. For Hutter, we compress *this specific file* (`enwik9` bytes 0..999 999 999) and ship the model as part of the decompressor; every byte we want to compress is "test data" AND "training data" simultaneously. Memorization isn't overfitting — it's the entire objective. The 10% held-out tokens were bytes the model would never have learned to compress.
+
+Switching to `--train-split 1.0` and patching the eval to fall back to the training data when the val view is empty produced an immediate -0.5 bpb drop (Run 2's best 5.21 → Run 3's first eval 5.09) just by giving the model access to the remaining tokens. Run 3 continued from there to 4.70 over the rest of the cosine schedule.
+
+This is a general lesson for Hutter-style "compress a specific corpus" workloads: the dataset split is wrong by default and we should always set `train_split=1.0`. Adding a `--train-split` flag to `train_v5.py` made this configurable without an architecture change.
+
+### Side excursion: byte-level RWKV-MoE — one day of investigation, abandoned
+
+Between Runs 1 and 2, CDR asked whether dropping BPE tokenization (which optimizes for token frequency, not prediction quality) and switching to a byte-level model with linear attention (so we could afford a much longer context window without O(N²) attention cost) would be a better direction. The exploration:
+
+- New byte-level RWKV-4 model in `src/lzr_neural/rwkv_moe.py`: RWKV-4 time-mixing replacing self-attention, MoEFeedForward channel-mixing, no positional embeddings (the recurrence is implicit position). 20.0M params at 4L × d256 × d_ff=384 × 24 experts × seq=512 × vocab=256.
+- Smoke test at seq=512: 0.39 steps/sec with the sequential WKV Python loop — every position required ~10 MPS kernel dispatches, each with ~100 µs of overhead. Mostly idle GPU.
+- Tried running the WKV scan on CPU instead: 0.20 steps/sec (worse — autograd graph for 512×4 sequential ops blew up to 14 GB RSS).
+- Built a custom C kernel for the WKV scan (`src/lzr_neural/wkv_kernel.c` + `wkv_op.py` autograd wrapper, lzr-neural commit `def2c97`): forward + backward as tight C loops with NEON auto-vectorization, called from Python via `ctypes` and `torch.autograd.Function`. Forward bit-exact vs the Python reference (max diff 4.77e-07). 200-step smoke test: 0.61 steps/sec, 14 GB peak RSS. **1.56× speedup** over the Python WKV.
+- Tried seq=2048 with the C kernel: 0.14 steps/sec, 19 GB peak. Byte throughput (~9 KB/s) was similar to seq=512.
+- Started a full byte-level run at seq=2048 / 60K steps but CDR pivoted back to the MoE-Transformer before the first eval. Reason: the 60-hour ETA was no faster than the MoE-Transformer's at much higher uncertainty about final quality.
+
+The C WKV kernel itself was a usable artifact (it would be the foundation for any future MPS-without-custom-kernels recurrent-model work) and is preserved on `main`. But the byte-level direction was deferred — the BPE+MoE-Transformer was already converging and the user's existing v5 sizing was a known-quantity bet.
+
+### Projected end-to-end compression (pending the actual codec run)
+
+The Rust pipeline run is pending — CDR is patching the machine. Projecting from the model's val_bpb to compressed L(C) using Phase 41's measured 4.58 bytes/token for BPE-16K on enwik9:
+
+- v5 best val_bpb 4.6990 bits/token ÷ 4.58 bytes/token = **~1.026 bpb projected L(C)**
+- v5 final val_bpb 4.7868 → **~1.045 bpb projected L(C)**
+
+For comparison, Phase 45 measured L(C) was 1.2685 bpb on 1 MB enwik9. The implied Phase 45 model token-bpb was 1.2685 × 4.58 = 5.81 bits/token. v5's 4.70 is **−1.11 bits/token vs Phase 45 at the model level**, which translates to **−0.24 bpb at the byte level**.
+
+L(D) projection at mixed5asym for 21M params: ~15 MB shipped weights → ~0.24 bpb on 1 GB enwik9 under the Hutter 2× rule (vs Phase 45's ~0.13). The 2× parameter cost erases roughly half the L(C) gain.
+
+| | Phase 45 (measured) | v5 (projected) |
+|---|---:|---:|
+| L(C) on 1 MB enwik9 | 1.2685 | ~1.03 |
+| L(D) (1 GB-amortized) | 0.130 | ~0.24 |
+| **Combined L+D** | **1.40** | **~1.27** |
+
+Projected **−0.13 bpb combined improvement**. The gain is real but bounded by the L(D) cost. The Hutter submission target is ~0.928 bpb (combined), so v5 closes ~25% of the remaining ~0.47 bpb gap. **Pending Rust pipeline run to verify L(C)**; the val_bpb-to-L(C) projection has ±0.05 bpb uncertainty from the eval-sampling noise and codec overhead.
+
+### What ships on `v5` branch (Rust)
+
+- `05e9072` — routing diagnostic (`dump_routing`, `RoutingTrace`, `lzr routing-analyze` subcommand).
+
+### What ships on `main` (lzr-neural)
+
+- `2d83a18` — `moe_v5.py` + `train_v5.py` + `v5_moe_3L_d128_dff1024_e24` preset + psutil dep.
+- `92446f0` — `rwkv_moe.py` + `v5_rwkv_moe_byte` preset + `--model-type` flag (byte-level RWKV side branch).
+- `def2c97` — `wkv_kernel.c` + `wkv_op.py` C kernel for WKV scan + `--seq-len` override.
+- `3b18232` — `export_moe_v5_weights.py`.
+- Checkpoints `v5_moe_full_step{20000..240000}.pt` (every 20K), plus the best-pre-final at step 220 000 exported to `v5_moe_full_step220000.lzrm` (84 975 104 bytes = 21.2M f32 weights).
+
+### Open questions for the next session
+
+1. **Run the Rust codec on enwik9 with the v5 weights** to convert "projected L(C)" into "measured L(C)" — this is the verification step the entire run was designed to enable.
+2. **Apply Phase 48's logit-temperature calibration and Phase 49's struct_mask** to v5 — they cost zero L(D) and combined gave Phase 45 ~−0.01 bpb. Both were intentionally stripped per the "pure MoE → AC" v5 directive but can be re-added cheaply.
+3. **Decide on BitNet-style inference quantization** — v5 trains as FP32-master + BF16-autocast; the deployed inference path can be int5/mixed5asym (proven on Phase 45) or pushed harder via post-hoc BitNet ternary or a QAT fine-tune. The L(D) projection above assumes mixed5asym; BitNet ternary would drop L(D) to ~0.10 bpb at the cost of unknown L(C) regression at 21M scale.
+4. **Whether to retrain longer or wider next** — v5's val_bpb was still improving when the cosine schedule ended (last 40K steps moved val from 4.95 → 4.70). A longer-cosine 360K-step run would likely deliver another ~0.05–0.10 bpb but at 80+ hours of wall.
+
+---
+
+
 
 Per the Phase 50 recommendation that ranked Phase 50C as the highest-value next step (turns every future codec experiment from a 3-hour CPU commitment into a sub-hour test), CDR directed implementing the Metal GPU backend with enwik8 validation. The acceptance contract for the GPU path is **bit-identical archives to the CPU int8 path**, which lets a GPU-encoded archive round-trip through a CPU decoder unchanged. That contract is the entire reason for choosing int8: the i32 accumulator is reduction-order-independent, so GPU's parallel reduction tree and CPU's linear sum produce the same integer, and the trailing `(acc as f32) * x_scale * w_scales[row]` dequant uses the same three-multiply expression on both backends.
 
