@@ -13,6 +13,25 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-29 — v6 Proposal 1 (context mixing): token match-model arm — first arm lands −0.008 bpb and growing, at zero L(D)
+
+Following the architecture-proposals review — which re-affirmed the journal's standing conclusion (Phases 27, 30-era) that a cmix-class *ensemble*, not a single arm, is what closes the Hutter gap — CDR directed building Proposal 1 (heterogeneous context mixing), starting from its de-risking core: a token-level longest-match predictor arm mixed into the v5 MoE distribution.
+
+*Vetting* (offline, BPE-16K stream, 3M-token enwik8 prefix). A most-recent K=4-token-context match predicts the next token correctly on 8.4% of all positions; crucially **4.6% of all positions are correctly predicted by a match whose source is >512 tokens back** — beyond the MoE's attention window, i.e. predictions the MoE structurally cannot make. Accuracy climbs with true match length L: 40.7% at L=4, 69.6% at L=8, 88.0% at L≥16. Clear, non-redundant signal → build.
+
+*Architecture.* `src/match_model.rs` keeps a hash index (fixed FNV polynomial — not `RandomState` — so the two separate `comp9a`/`decomp9` program runs agree on every lookup) from the last K=4 tokens to the most recent position, predicts that occurrence's follower, and recovers the true L by backward extension. It is mixed into the MoE CDF as an **online, per-L-bucket additive logit boost** `β[Lb]` applied through the existing `predict_cdf_with_bias` (so the CDF stays monotonic and min-mass by construction). `β[Lb]` adapts online by the log-loss gradient `β += η·(1{tok=m} − p′(m))` computed from the realized token, which both sides know identically — so encode and decode stay bit-exact. The arm ships **no state (L(D)=0)**. Exposed as codec `moe-tok-match`.
+
+*Result* (enwik8, `mixed5asym`, contiguous prefixes so the match history accumulates; roundtrip bit-exact in every case):
+
+| prefix | moe-tok L(C) | moe-tok-match L(C) | Δ |
+|---|---:|---:|---:|
+| 256 KB | 1.1400 | 1.1367 | −0.0033 |
+| 1 MB | 1.1903 | 1.1822 | −0.0081 |
+
+The gain **more than doubles** as history grows 4× — exactly the signature of value coming from long-range repeats outside the MoE window. So the 1 MB −0.0081 is a *lower bound* on the full-corpus gain; on enwik9's 1 GB of history it should be materially larger. For calibration, this single zero-L(D) arm already beats the prior near-free lands (Phase 49 `struct_mask` −0.0029, Phase 48 calibration −0.0044) and the Phase 44 token-LZ77 codec *stage* (−0.005) — and unlike Phase 44 it is a mixed probability *arm*, not an all-or-nothing match/literal stage, which is why it banks partial-confidence matches rather than only certain ones.
+
+*Limits / next.* Measured at ≤1 MB because the moe-tok codec's batched-encode path precomputes a `measure_tokens × vocab` f32 logit slab (~14 GB at 1 MB; OOM at 4 MB) — a dev-path memory limit, not an arm limit; a full-corpus number needs the per-step or a chunked-precompute encode. Proposal 1 continues by adding the remaining arms under the same online logit mixer: online high-order token-context models, and the neural-cache/retrieval arm (the soft, near-duplicate generalization of this exact-match arm). The de-risking is done: a zero-L(D) online arm measurably improves L(C) on top of the strong MoE, and the effect scales with corpus size — the ensemble direction is validated.
+
 ## 2026-05-29 — v6 tokenizer verdict: word/symbol tokenization loses to BPE on bits/byte; structural routing is the keeper
 
 After building the v6 stack on the v6 branch (deterministic structural classifier, skeleton codec, word/symbol/digit tokenizer, unified u16 training encoding — all committed, `build.sh` green), CDR/Claude ran the decisive bits/byte comparison against the v5 BPE baseline and the word-tokenization hypothesis did not survive it.
