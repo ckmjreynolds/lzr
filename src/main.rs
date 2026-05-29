@@ -175,6 +175,10 @@ enum Command {
         /// order = id order).
         #[arg(long, default_value = "tools/words_v6.txt")]
         words: PathBuf,
+        /// Symbol-run vocabulary, one run per line as hex (frequency
+        /// order). Enables longest-match markup merging.
+        #[arg(long, default_value = "tools/symruns_v6.txt")]
+        symruns: PathBuf,
     },
 }
 
@@ -436,8 +440,22 @@ fn main() -> Result<()> {
             corpus,
             bytes,
             words,
-        } => run_content_tok_stats(&corpus, bytes, &words),
+            symruns,
+        } => run_content_tok_stats(&corpus, bytes, &words, &symruns),
     }
+}
+
+/// Parse a hex-per-line symbol-run vocabulary file.
+fn parse_symruns(text: &str) -> Vec<Vec<u8>> {
+    text.lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| {
+            let bytes: Option<Vec<u8>> = (0..l.len() / 2)
+                .map(|k| u8::from_str_radix(&l[2 * k..2 * k + 2], 16).ok())
+                .collect();
+            bytes
+        })
+        .collect()
 }
 
 /// Extract the `TextContent` (article-body) byte stream from a corpus
@@ -454,9 +472,15 @@ fn extract_text_content(src: &[u8]) -> Vec<u8> {
     content
 }
 
-/// v6 slice 3: measure the content tokenizer on the article body.
+/// v6 slice 3: measure the content tokenizer (with symbol-run merge
+/// and the lone-space side-channel) on the article body.
 #[allow(clippy::cast_precision_loss)]
-fn run_content_tok_stats(corpus: &PathBuf, bytes: usize, words: &PathBuf) -> Result<()> {
+fn run_content_tok_stats(
+    corpus: &PathBuf,
+    bytes: usize,
+    words: &PathBuf,
+    symruns: &PathBuf,
+) -> Result<()> {
     let raw = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
     let src = if bytes == 0 || bytes >= raw.len() {
         &raw[..]
@@ -470,20 +494,25 @@ fn run_content_tok_stats(corpus: &PathBuf, bytes: usize, words: &PathBuf) -> Res
         .filter(|l| !l.is_empty())
         .map(|l| l.as_bytes().to_vec())
         .collect();
-    let tok = word_tok::WordTok::from_words(&id_to_word);
+    let runs = parse_symruns(
+        &fs::read_to_string(symruns)
+            .with_context(|| format!("reading symrun vocab {}", symruns.display()))?,
+    );
+    let n_runs = runs.len();
+    let tok = word_tok::WordTok::from_words(&id_to_word).with_symruns(runs);
 
     eprintln!("Classifying and extracting article-body stream ...");
     let content = extract_text_content(src);
 
     let s = tok.stats(&content);
     let total = s.total_tokens();
+    let raw_total = total + s.space_after;
 
     // Byte-exact roundtrip on a sample (bounds memory on big corpora).
     let sample_len = content.len().min(8 << 20);
     let sample = &content[..sample_len];
-    let toks = tok.tokenize(sample);
-    let back = tok.detokenize(&toks, &id_to_word);
-    let roundtrip_ok = back == sample;
+    let units = tok.tokenize(sample);
+    let roundtrip_ok = word_tok::WordTok::detokenize(&units, &id_to_word) == sample;
 
     println!(
         "Corpus: {}  ({} bytes; article body {} bytes = {:.1}%)",
@@ -492,17 +521,16 @@ fn run_content_tok_stats(corpus: &PathBuf, bytes: usize, words: &PathBuf) -> Res
         content.len(),
         100.0 * content.len() as f64 / src.len() as f64
     );
-    println!("Word vocab: {} entries\n", tok.vocab_len());
+    println!("Vocab: {} words + {n_runs} symbol-runs\n", tok.vocab_len());
     println!("  class           tokens          share");
     println!("  -------------   ------------   -------");
-    let rows = [
+    for (label, n) in [
         ("words (vocab)", s.words_in_vocab),
         ("<esc> words", s.esc_words),
         ("  esc letters", s.esc_letter_tokens),
         ("digits", s.digits),
-        ("symbols", s.symbols),
-    ];
-    for (label, n) in rows {
+        ("symbol-runs", s.sym_tokens),
+    ] {
         println!(
             "  {:<13}   {:>12}   {:>6.2}%",
             label,
@@ -511,23 +539,22 @@ fn run_content_tok_stats(corpus: &PathBuf, bytes: usize, words: &PathBuf) -> Res
         );
     }
     let word_occ = s.words_in_vocab + s.esc_words;
-    let total_sidech = total - s.single_space;
-    println!("\n  total tokens          : {total}");
+    println!("\n  total tokens                 : {total}");
     println!(
-        "  bytes / token (raw)             : {:.3}  (BPE-16K = 4.58)",
+        "  bytes / token                : {:.3}  (BPE-16K = 4.58)",
         content.len() as f64 / total as f64
     );
     println!(
-        "  bytes / token (space side-channel): {:.3}  ({} single-space tokens pulled out)",
-        content.len() as f64 / total_sidech as f64,
-        s.single_space
+        "  (without space side-channel) : {:.3}  ({} lone spaces side-channeled)",
+        content.len() as f64 / raw_total as f64,
+        s.space_after
     );
     println!(
-        "  word escape rate      : {:.2}% of word occurrences",
+        "  word escape rate             : {:.2}% of word occurrences",
         100.0 * s.esc_words as f64 / word_occ as f64
     );
     println!(
-        "  roundtrip (first {} MiB): {}",
+        "  roundtrip (first {} MiB)      : {}",
         sample_len >> 20,
         if roundtrip_ok {
             "OK (byte-exact)"

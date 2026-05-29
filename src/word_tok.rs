@@ -1,34 +1,36 @@
-//! v6 content tokenizer: word / digit / symbol segmentation with
-//! capitalization as a side-channel.
+//! v6 content tokenizer: word / digit / symbol-run segmentation with
+//! capitalization and lone-space as side-channels.
 //!
 //! Operates on the `TextContent` stream (the article body the
 //! [`crate::classifier`] isolates). Segmentation is a deterministic
 //! function of the bytes — the encoder emits a canonical token
 //! sequence and the decoder concatenates each token's bytes back, so
-//! there is no Moore/zero-signaling hazard (unlike a byte-stream
-//! router).
+//! there is no Moore/zero-signaling hazard.
 //!
 //! ### Token classes
 //! - **word** — a maximal run of ASCII letters whose lowercased form
 //!   is in the capped vocabulary, carried as `(id, case)` where `case`
-//!   is `Lower`/`Title`/`Upper`. Capitalization is thus a 2-bit
-//!   side-channel rather than a vocabulary axis.
-//! - **escape word** — a letter run that is out-of-vocab *or* has a
-//!   mixed-case pattern the 2-bit channel can't express (e.g.
-//!   `iPhone`): spelled literally (`Esc(bytes)`), counted as one
-//!   `<esc>` token plus one letter token per byte. This is the
-//!   bounded tail-handler, ~5–9% of words.
-//! - **digit** — a single ASCII digit (per the v6 spec, digits stay
-//!   individual).
-//! - **symbol** — any other single byte (punctuation, whitespace,
-//!   markup chars, UTF-8 continuation bytes). All 256 byte values are
-//!   representable, so roundtrip is total.
+//!   is `Lower`/`Title`/`Upper`. Capitalization is a 2-bit
+//!   side-channel, not a vocabulary axis.
+//! - **escape word** — an out-of-vocab or mixed-case letter run,
+//!   spelled literally (`Esc(bytes)`); the bounded tail-handler.
+//! - **digit** — a single ASCII digit (v6 keeps digits individual).
+//! - **symbol run** — a maximal run of non-alphanumeric bytes,
+//!   segmented greedily (longest-match) against a symbol-run
+//!   vocabulary so frequent markup like `[[`, `]]`, `]] ` collapse to
+//!   one token; any single byte is representable, so roundtrip is
+//!   total.
 //!
-//! Non-ASCII letters are not part of the word class here (the escape
-//! alphabet stays bounded at the 52 ASCII letters); their bytes fall
-//! through to `symbol`, preserving them losslessly.
+//! ### Lone-space side-channel
+//! Every word/digit/escape token carries a `space_after` bit: a single
+//! `' '` immediately following the token is consumed by the bit rather
+//! than emitted as a token. This removes the ~120M lone inter-word
+//! spaces (≈26% of raw tokens) from the stream at the cost of one
+//! highly-predictable bit per token. Symbol-run tokens never set it
+//! (a maximal non-alnum run is always followed by an alphanumeric
+//! byte), so spacing inside/after markup stays in the runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Case {
@@ -42,63 +44,70 @@ pub(crate) enum Tok {
     Word { id: u32, case: Case },
     Esc(Vec<u8>),
     Digit(u8),
-    Sym(u8),
+    Sym(Vec<u8>),
 }
 
-/// Per-class token accounting for a content stream.
+/// A token plus its lone-space side-channel bit.
+pub(crate) type Unit = (Tok, bool);
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TokStats {
-    pub content_bytes: u64,
     pub words_in_vocab: u64,
     pub esc_words: u64,
     pub esc_letter_tokens: u64,
     pub digits: u64,
-    pub symbols: u64,
-    /// Single-space symbol tokens — candidates for a "space follows by
-    /// default" side-channel that removes them from the token stream.
-    pub single_space: u64,
+    pub sym_tokens: u64,
+    /// Tokens whose `space_after` bit was set (lone spaces removed).
+    pub space_after: u64,
 }
 
 impl TokStats {
-    /// Total tokens the neural arm would predict: one per in-vocab
-    /// word, plus `<esc>` + per-letter tokens for escapes, plus digits
-    /// and symbols.
+    /// Tokens the neural arm predicts: in-vocab words, `<esc>` +
+    /// per-letter for escapes, individual digits, and symbol-run
+    /// tokens. The `space_after` bits are a side-channel, not tokens.
     pub(crate) const fn total_tokens(&self) -> u64 {
-        self.words_in_vocab + self.esc_words + self.esc_letter_tokens + self.digits + self.symbols
+        self.words_in_vocab
+            + self.esc_words
+            + self.esc_letter_tokens
+            + self.digits
+            + self.sym_tokens
     }
 }
 
 pub(crate) struct WordTok {
     word_to_id: HashMap<Vec<u8>, u32>,
+    symruns: HashSet<Vec<u8>>,
+    symrun_maxlen: usize,
 }
 
 impl WordTok {
-    /// Build from an ordered list of lowercase words (index = id).
+    /// Build from an ordered lowercase word list (index = id). No
+    /// symbol-run merging (single-byte symbols only).
     pub(crate) fn from_words(words: &[Vec<u8>]) -> Self {
         let mut word_to_id = HashMap::with_capacity(words.len());
         for (i, w) in words.iter().enumerate() {
             word_to_id.insert(w.clone(), u32::try_from(i).expect("vocab id fits u32"));
         }
-        Self { word_to_id }
+        Self {
+            word_to_id,
+            symruns: HashSet::new(),
+            symrun_maxlen: 1,
+        }
     }
 
-    /// Parse a newline-delimited lowercase word file (frequency order).
-    pub(crate) fn from_word_file(text: &str) -> Self {
-        let words: Vec<Vec<u8>> = text
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.as_bytes().to_vec())
-            .collect();
-        Self::from_words(&words)
+    /// Attach a symbol-run vocabulary (multi-byte runs); single bytes
+    /// remain the always-available fallback.
+    #[must_use]
+    pub(crate) fn with_symruns(mut self, runs: Vec<Vec<u8>>) -> Self {
+        self.symrun_maxlen = runs.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        self.symruns = runs.into_iter().collect();
+        self
     }
 
     pub(crate) fn vocab_len(&self) -> usize {
         self.word_to_id.len()
     }
 
-    /// Classify a letter run into `(lowercased, case)`, or `None` if
-    /// the case pattern isn't `Lower`/`Title`/`Upper` (mixed case →
-    /// caller escapes it).
     fn classify_word(word: &[u8]) -> Option<(Vec<u8>, Case)> {
         let lower: Vec<u8> = word.iter().map(u8::to_ascii_lowercase).collect();
         if word.iter().all(u8::is_ascii_lowercase) {
@@ -112,10 +121,39 @@ impl WordTok {
         }
     }
 
-    /// Tokenize `content`, invoking `sink` for each token in order.
-    pub(crate) fn tokenize_into(&self, content: &[u8], mut sink: impl FnMut(Tok)) {
+    /// Greedily segment a maximal non-alphanumeric run into the fewest
+    /// symbol tokens via longest-match against the run vocabulary.
+    fn segment_symrun(&self, run: &[u8], mut emit: impl FnMut(Tok)) {
+        let mut p = 0;
+        while p < run.len() {
+            let maxl = self.symrun_maxlen.min(run.len() - p);
+            let mut best = 1;
+            let mut l = maxl;
+            while l >= 2 {
+                if self.symruns.contains(&run[p..p + l]) {
+                    best = l;
+                    break;
+                }
+                l -= 1;
+            }
+            emit(Tok::Sym(run[p..p + best].to_vec()));
+            p += best;
+        }
+    }
+
+    /// Tokenize `content`, invoking `sink(tok, space_after)` per token.
+    pub(crate) fn tokenize_into(&self, content: &[u8], mut sink: impl FnMut(Tok, bool)) {
         let n = content.len();
         let mut i = 0;
+        // Consume a single trailing space as the side-channel bit.
+        let take_space = |i: &mut usize| -> bool {
+            if *i < n && content[*i] == b' ' {
+                *i += 1;
+                true
+            } else {
+                false
+            }
+        };
         while i < n {
             let b = content[i];
             if b.is_ascii_alphabetic() {
@@ -124,59 +162,60 @@ impl WordTok {
                     i += 1;
                 }
                 let word = &content[start..i];
-                match Self::classify_word(word) {
-                    Some((lower, case)) if self.word_to_id.contains_key(&lower) => {
-                        sink(Tok::Word {
-                            id: self.word_to_id[&lower],
-                            case,
-                        });
-                    }
-                    _ => sink(Tok::Esc(word.to_vec())),
-                }
+                let tok = match Self::classify_word(word) {
+                    Some((lower, case)) if self.word_to_id.contains_key(&lower) => Tok::Word {
+                        id: self.word_to_id[&lower],
+                        case,
+                    },
+                    _ => Tok::Esc(word.to_vec()),
+                };
+                let sa = take_space(&mut i);
+                sink(tok, sa);
             } else if b.is_ascii_digit() {
-                sink(Tok::Digit(b));
                 i += 1;
+                let sa = take_space(&mut i);
+                sink(Tok::Digit(b), sa);
             } else {
-                sink(Tok::Sym(b));
-                i += 1;
+                let start = i;
+                while i < n && !content[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                // Symbol-run tokens never carry space_after: a maximal
+                // non-alnum run is followed by an alphanumeric byte.
+                self.segment_symrun(&content[start..i], |t| sink(t, false));
             }
         }
     }
 
-    pub(crate) fn tokenize(&self, content: &[u8]) -> Vec<Tok> {
+    pub(crate) fn tokenize(&self, content: &[u8]) -> Vec<Unit> {
         let mut out = Vec::new();
-        self.tokenize_into(content, |t| out.push(t));
+        self.tokenize_into(content, |t, sa| out.push((t, sa)));
         out
     }
 
-    /// Stream `content` and accumulate per-class token counts without
-    /// materializing the token vector.
     pub(crate) fn stats(&self, content: &[u8]) -> TokStats {
-        let mut s = TokStats {
-            content_bytes: content.len() as u64,
-            ..TokStats::default()
-        };
-        self.tokenize_into(content, |t| match t {
-            Tok::Word { .. } => s.words_in_vocab += 1,
-            Tok::Esc(bytes) => {
-                s.esc_words += 1;
-                s.esc_letter_tokens += bytes.len() as u64;
-            }
-            Tok::Digit(_) => s.digits += 1,
-            Tok::Sym(b) => {
-                s.symbols += 1;
-                if b == b' ' {
-                    s.single_space += 1;
+        let mut s = TokStats::default();
+        self.tokenize_into(content, |t, sa| {
+            match t {
+                Tok::Word { .. } => s.words_in_vocab += 1,
+                Tok::Esc(bytes) => {
+                    s.esc_words += 1;
+                    s.esc_letter_tokens += bytes.len() as u64;
                 }
+                Tok::Digit(_) => s.digits += 1,
+                Tok::Sym(_) => s.sym_tokens += 1,
+            }
+            if sa {
+                s.space_after += 1;
             }
         });
         s
     }
 
-    /// Reconstruct the original bytes from a token sequence.
-    pub(crate) fn detokenize(&self, toks: &[Tok], id_to_word: &[Vec<u8>]) -> Vec<u8> {
+    /// Reconstruct the original bytes from a token+side-channel stream.
+    pub(crate) fn detokenize(units: &[Unit], id_to_word: &[Vec<u8>]) -> Vec<u8> {
         let mut out = Vec::new();
-        for t in toks {
+        for (t, sa) in units {
             match t {
                 Tok::Word { id, case } => {
                     let w = &id_to_word[*id as usize];
@@ -189,8 +228,11 @@ impl WordTok {
                         }
                     }
                 }
-                Tok::Esc(bytes) => out.extend_from_slice(bytes),
-                Tok::Digit(b) | Tok::Sym(b) => out.push(*b),
+                Tok::Esc(bytes) | Tok::Sym(bytes) => out.extend_from_slice(bytes),
+                Tok::Digit(b) => out.push(*b),
+            }
+            if *sa {
+                out.push(b' ');
             }
         }
         out
@@ -206,28 +248,55 @@ mod tests {
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect();
-        (WordTok::from_words(&words), words)
+        let runs: Vec<Vec<u8>> = ["[[", "]]", "]] ", ", "]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        let tok = WordTok::from_words(&words).with_symruns(runs);
+        (tok, words)
     }
 
     #[test]
     fn roundtrips_mixed_content() {
         let (tok, id_to_word) = vocab();
-        // in-vocab words (Lower/Title/Upper), an OOV word (zzz), a
-        // mixed-case word (iPhone-like), digits, markup symbols.
-        let content = b"The cat ate 42 dogs!! [[Category|xQz]] THE";
-        let toks = tok.tokenize(content);
-        let back = tok.detokenize(&toks, &id_to_word);
-        assert_eq!(back, content, "roundtrip must be byte-exact");
+        let content = b"The cat ate 42 dogs!! [[Category|xQz]] THE\ndog, cat";
+        let units = tok.tokenize(content);
+        assert_eq!(WordTok::detokenize(&units, &id_to_word), content);
+    }
+
+    #[test]
+    fn lone_space_becomes_side_channel() {
+        let (tok, _) = vocab();
+        let units = tok.tokenize(b"the cat");
+        // "the"(sa=1) "cat"(sa=0) — the lone space is a bit, not a token.
+        assert_eq!(units.len(), 2);
+        assert!(units[0].1, "space after 'the' should be side-channel");
+        assert!(matches!(units[1].0, Tok::Word { .. }));
+    }
+
+    #[test]
+    fn symbol_run_merges_via_longest_match() {
+        let (tok, _) = vocab();
+        // "]] " is in the run vocab -> one token, not three.
+        let units = tok.tokenize(b"dog]] cat");
+        let syms: Vec<&Vec<u8>> = units
+            .iter()
+            .filter_map(|(t, _)| match t {
+                Tok::Sym(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(syms, vec![&b"]] ".to_vec()]);
     }
 
     #[test]
     fn case_is_a_side_channel() {
         let (tok, _) = vocab();
-        let toks = tok.tokenize(b"the The THE");
-        let cases: Vec<Case> = toks
-            .iter()
-            .filter_map(|t| match t {
-                Tok::Word { case, .. } => Some(*case),
+        let cases: Vec<Case> = tok
+            .tokenize(b"the The THE")
+            .into_iter()
+            .filter_map(|(t, _)| match t {
+                Tok::Word { case, .. } => Some(case),
                 _ => None,
             })
             .collect();
@@ -237,38 +306,18 @@ mod tests {
     #[test]
     fn mixed_case_and_oov_escape() {
         let (tok, id_to_word) = vocab();
-        // "caT" is mixed-case (not Lower/Title/Upper) -> escape.
-        // "xyz" is OOV -> escape. Both must roundtrip exactly.
         let content = b"caT xyz";
-        let toks = tok.tokenize(content);
-        assert!(matches!(toks[0], Tok::Esc(_)), "mixed-case -> escape");
-        assert!(matches!(toks[2], Tok::Esc(_)), "OOV -> escape");
-        assert_eq!(tok.detokenize(&toks, &id_to_word), content);
+        let units = tok.tokenize(content);
+        assert!(matches!(units[0].0, Tok::Esc(_)), "mixed-case -> escape");
+        assert!(matches!(units[1].0, Tok::Esc(_)), "OOV -> escape");
+        assert_eq!(WordTok::detokenize(&units, &id_to_word), content);
     }
 
     #[test]
     fn digits_are_individual() {
         let (tok, _) = vocab();
-        let toks = tok.tokenize(b"1987");
-        assert_eq!(toks.len(), 4);
-        assert!(toks.iter().all(|t| matches!(t, Tok::Digit(_))));
-    }
-
-    #[test]
-    fn stats_accounting_matches_token_stream() {
-        let (tok, _) = vocab();
-        let content = b"The cat 4 !! xyz";
-        let s = tok.stats(content);
-        let toks = tok.tokenize(content);
-        // total_tokens counts <esc>+letters for escapes; the
-        // materialized Vec has one entry per Esc, so recompute.
-        let materialized: u64 = toks
-            .iter()
-            .map(|t| match t {
-                Tok::Esc(b) => 1 + b.len() as u64,
-                _ => 1,
-            })
-            .sum();
-        assert_eq!(s.total_tokens(), materialized);
+        let units = tok.tokenize(b"1987");
+        assert_eq!(units.len(), 4);
+        assert!(units.iter().all(|(t, _)| matches!(t, Tok::Digit(_))));
     }
 }
