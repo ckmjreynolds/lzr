@@ -48,6 +48,10 @@ const BPE_TABLE_ENV: &str = "LZR_BPE_TABLE";
 /// boost, and the cap on that boost (in logits).
 const MATCH_ETA: f32 = 0.05;
 const MATCH_BETA_MAX: f32 = 12.0;
+/// Measure tokens per batched-encode window. Bounds the precomputed
+/// logit slab to `ENCODE_WINDOW * vocab` f32 (~0.5 GB at vocab 16384)
+/// instead of `n_tokens * vocab`, which OOMs on large corpora.
+const ENCODE_WINDOW: usize = 8192;
 /// When set to a writable path, the encode loop dumps one CSV row per
 /// emitted token so we can analyze where the predictor loses bits.
 /// Diagnostic only — does not affect bits emitted to the archive.
@@ -258,19 +262,12 @@ impl Codec for MoeTokCodec {
             // tokens one-by-one through the per-step path. The codec
             // loop below then becomes pure CDF/AC work with no
             // per-token forward dispatch. Bit-identical archive.
-            if arms.moe.can_batched_encode() {
-                arms.moe
-                    .precompute_for_encode(&warm_tokens, &measure_tokens);
-                if timing {
-                    eprintln!(
-                        "[timing] batched precompute_for_encode ({} measure tokens): {:.2}s",
-                        measure_tokens.len(),
-                        t_forward_start.elapsed().as_secs_f64()
-                    );
-                }
-            } else {
-                // Legacy per-step path: prime arm with warm tokens
-                // through one-by-one feed.
+            // Batched encode now runs windowed (see the AC loop below):
+            // logits are precomputed one bounded window at a time so the
+            // slab stays small on large corpora. Only the per-step path
+            // needs warm priming here.
+            let batched = arms.moe.can_batched_encode();
+            if !batched {
                 for &tok in &warm_tokens {
                     arms.moe.feed_token(tok);
                 }
@@ -310,31 +307,52 @@ impl Codec for MoeTokCodec {
                 });
                 let mut beta = [0_f32; match_model::MAX_L + 1];
                 let t_ac_start = std::time::Instant::now();
-                for &tok in &measure_tokens {
-                    let class = struct_mask::byte_class(last_byte);
-                    fill_bias(&mut bias, class);
-                    let hit = apply_match_bias(matcher.as_ref(), &beta, &mut bias);
-                    arms.moe.predict_cdf_with_bias(&mut cdf, &bias);
-                    let tok_bytes_view = arms.bpe.token_bytes(tok);
-                    let tok_bytes = tok_bytes_view.len();
-                    if let Some(w) = dump.as_mut() {
-                        let s = lit_stats(&cdf, tok);
-                        writeln!(
-                            w,
-                            "{src_pos},{tok},{tok_bytes},{:.6},{:.6},{:.6},{}",
-                            s.ideal_bits, s.entropy_bits, s.top1_prob, s.rank
-                        )?;
+                // Process measure tokens in bounded windows: in batched
+                // mode, precompute one window's logits at a time so the
+                // slab is `ENCODE_WINDOW * vocab`, not `n_tokens * vocab`.
+                // Per-step mode uses a single window (no precompute).
+                let mut wlo = 0usize;
+                while wlo < measure_tokens.len() {
+                    let whi = if batched {
+                        (wlo + ENCODE_WINDOW).min(measure_tokens.len())
+                    } else {
+                        measure_tokens.len()
+                    };
+                    if batched {
+                        arms.moe.precompute_for_encode_range(
+                            &warm_tokens,
+                            &measure_tokens,
+                            wlo,
+                            whi,
+                        );
                     }
-                    if let Some(&b) = tok_bytes_view.last() {
-                        last_byte = b;
+                    for &tok in &measure_tokens[wlo..whi] {
+                        let class = struct_mask::byte_class(last_byte);
+                        fill_bias(&mut bias, class);
+                        let hit = apply_match_bias(matcher.as_ref(), &beta, &mut bias);
+                        arms.moe.predict_cdf_with_bias(&mut cdf, &bias);
+                        let tok_bytes_view = arms.bpe.token_bytes(tok);
+                        let tok_bytes = tok_bytes_view.len();
+                        if let Some(w) = dump.as_mut() {
+                            let s = lit_stats(&cdf, tok);
+                            writeln!(
+                                w,
+                                "{src_pos},{tok},{tok_bytes},{:.6},{:.6},{:.6},{}",
+                                s.ideal_bits, s.entropy_bits, s.top1_prob, s.rank
+                            )?;
+                        }
+                        if let Some(&b) = tok_bytes_view.last() {
+                            last_byte = b;
+                        }
+                        src_pos += tok_bytes;
+                        enc.encode(&cdf, tok as usize);
+                        update_match_mixer(hit, &mut beta, &cdf, tok);
+                        arms.moe.feed_token(tok);
+                        if let Some(m) = matcher.as_mut() {
+                            m.push(tok);
+                        }
                     }
-                    src_pos += tok_bytes;
-                    enc.encode(&cdf, tok as usize);
-                    update_match_mixer(hit, &mut beta, &cdf, tok);
-                    arms.moe.feed_token(tok);
-                    if let Some(m) = matcher.as_mut() {
-                        m.push(tok);
-                    }
+                    wlo = whi;
                 }
                 bits_after = enc.bits_written();
                 if timing {

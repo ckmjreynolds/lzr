@@ -169,93 +169,82 @@ impl MoeArm {
         self.fed_count = 0;
     }
 
-    /// Phase 50C Day-4 Phase-4 — batched-encode entry point.
+    /// Phase 50C Day-4 Phase-4 — batched-encode entry point, windowed.
     ///
-    /// Precomputes the per-position prediction logits for an entire
-    /// `warm + measure` token sequence in one (chunked) batched
-    /// forward pass, then puts the arm into batched-encode mode. The
-    /// codec encoder thereafter calls `predict_cdf_with_bias` in a
-    /// pure loop with no per-token forward dispatch: each call reads
-    /// the next precomputed logits row.
+    /// Precomputes the per-position prediction logits for the measure
+    /// tokens in `[lo, hi)` (one row each) via the chunked batched
+    /// forward, then puts the arm into batched-encode mode for that
+    /// window. The codec encoder drives this in fixed-size windows so
+    /// the precomputed slab is bounded to `(hi - lo) * vocab` rather
+    /// than `measure.len() * vocab` — the latter is ~14 GB at 1 MB and
+    /// OOMs on larger corpora.
     ///
-    /// The chunking matches the per-step path's KV-cache reset
-    /// boundary (`cfg.context` tokens per chunk), so the produced
-    /// predictions are bit-identical to what the per-step
-    /// `feed_token` + `predict_cdf_with_bias` loop would produce
-    /// over the same `warm + measure` sequence.
+    /// The chunking matches the per-step path's KV-cache reset boundary
+    /// (`cfg.context` tokens per chunk, independent windows), so the
+    /// produced predictions are bit-identical to what the per-step
+    /// `feed_token` + `predict_cdf_with_bias` loop would produce — and
+    /// windowing changes only the grouping of that computation, not its
+    /// result. `next_pos` is reset to 0, so the codec reads rows
+    /// `0..(hi - lo)` for this window.
     ///
-    /// After this call:
-    /// - `predict_cdf_with_bias` consumes precomputed logits in
-    ///   sequence (one row per call, starting from the first
-    ///   measure token).
-    /// - `feed_token` is a no-op except for `fed_count` accounting.
-    /// - `reset()` exits batched mode.
-    ///
-    /// Requires `int_kernels_enabled()`. Panics if `warm` was
-    /// previously fed via `feed_token` (caller must `reset()` first
-    /// — see usage in `moe_tok_codec`).
-    pub(crate) fn precompute_for_encode(&mut self, warm: &[u32], measure: &[u32]) {
+    /// Requires `int_kernels_enabled()` and a populated int cache.
+    pub(crate) fn precompute_for_encode_range(
+        &mut self,
+        warm: &[u32],
+        measure: &[u32],
+        lo: usize,
+        hi: usize,
+    ) {
         assert!(
             int_kernels_enabled(),
-            "precompute_for_encode requires LZR_INT_KERNELS=1"
+            "precompute_for_encode_range requires LZR_INT_KERNELS=1"
         );
         assert!(
             self.model.int_cache_ready(),
-            "precompute_for_encode requires prepare_int_cache()"
+            "precompute_for_encode_range requires prepare_int_cache()"
         );
+        assert!(lo <= hi && hi <= measure.len(), "window out of range");
         let vocab = self.model.cfg.vocab_size;
         let context = self.model.cfg.context;
+        let rows = hi - lo;
+        let mut precomputed = vec![0_f32; rows * vocab];
 
-        // Output: one row per measure token, holding the logits the
-        // codec needs to predict that token before AC-encoding it.
-        let mut precomputed = vec![0_f32; measure.len() * vocab];
-
-        if measure.is_empty() {
-            self.precomputed_logits = Some(precomputed);
-            self.next_pos = 0;
-            return;
-        }
-
-        // Chunking: combined[0..W+M] is the conceptual token stream the
-        // per-step path feeds. The per-step path resets the cache every
-        // `context` tokens, so chunk c covers combined[c*context..min(L, (c+1)*context)].
-        // For position p in the combined stream, the logits the codec
-        // needs to predict combined[p] (when p > 0) is the output of
-        // the model after feeding combined[p-1]. That feed is at
-        // chunk c' = (p-1) / context, position-in-chunk pp' = (p-1) % context.
         let w = warm.len();
         let total = w + measure.len();
-        let mut chunk_start = 0;
-        while chunk_start < total {
-            let chunk_end = (chunk_start + context).min(total);
-            let mut chunk_tokens: Vec<u32> = Vec::with_capacity(chunk_end - chunk_start);
-            for g in chunk_start..chunk_end {
-                chunk_tokens.push(if g < w { warm[g] } else { measure[g - w] });
-            }
-            let chunk_logits = self.model.batched_forward_int(&chunk_tokens);
-
-            // Copy out predictions for measure tokens in this chunk.
-            // Measure token m (global pos g = w + m) needs logits from
-            // feeding the token at global pos g - 1, which is in the
-            // chunk iff chunk_start <= g - 1 < chunk_end.
-            for m in 0..measure.len() {
-                let g = w + m;
-                if g == 0 {
-                    // Truly cold start (w=0 and m=0). The codec's
-                    // `predict_cdf` with no pending logits returns
-                    // uniform. We leave this row at zero — the codec
-                    // detects it via a marker.
-                    continue;
+        // Measure token m (global pos g = w + m, m in [lo, hi)) needs
+        // the logits produced by feeding combined[g - 1]; combined[0]'s
+        // predecessor doesn't exist (cold start → row left zero, the
+        // codec's uniform marker). Compute only the context-chunks that
+        // contain a needed predecessor position.
+        let max_g = w + hi - 1; // largest g in this window
+        if max_g >= 1 {
+            let lo_pos = (w + lo).saturating_sub(1);
+            let hi_pos = w + hi - 2; // predecessor of the last g in window
+            if hi_pos >= lo_pos {
+                let first_chunk = lo_pos / context;
+                let last_chunk = hi_pos / context;
+                for c in first_chunk..=last_chunk {
+                    let chunk_start = c * context;
+                    let chunk_end = (chunk_start + context).min(total);
+                    let chunk_tokens: Vec<u32> = (chunk_start..chunk_end)
+                        .map(|g| if g < w { warm[g] } else { measure[g - w] })
+                        .collect();
+                    let chunk_logits = self.model.batched_forward_int(&chunk_tokens);
+                    for m in lo..hi {
+                        let g = w + m;
+                        if g == 0 {
+                            continue;
+                        }
+                        let g_logits = g - 1;
+                        if g_logits >= chunk_start && g_logits < chunk_end {
+                            let src = (g_logits - chunk_start) * vocab;
+                            let dst = (m - lo) * vocab;
+                            precomputed[dst..dst + vocab]
+                                .copy_from_slice(&chunk_logits[src..src + vocab]);
+                        }
+                    }
                 }
-                let g_logits = g - 1;
-                if g_logits >= chunk_start && g_logits < chunk_end {
-                    let pp = g_logits - chunk_start;
-                    let src = pp * vocab;
-                    let dst = m * vocab;
-                    precomputed[dst..dst + vocab].copy_from_slice(&chunk_logits[src..src + vocab]);
-                }
             }
-            chunk_start += context;
         }
 
         self.precomputed_logits = Some(precomputed);
