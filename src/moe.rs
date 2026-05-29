@@ -85,6 +85,14 @@ pub(crate) enum Quantization {
     /// symmetric (the u8 zero-point), <1% of the row's quant cost
     /// on our architectures.
     Mixed5Asym,
+    /// **`BitNet` b1.58-style ternary**: FFN expert weights quantized to
+    /// per-channel ternary `{-1, 0, +1}` via the absmean rule (each row
+    /// gets a single f32 scale = mean of `|row|`, and every weight maps
+    /// to the nearest of `{-scale, 0, +scale}`); attention / router /
+    /// embedding weights stay per-channel int8; norms stay f32. The
+    /// shipped FFN cost is 1.6 bits/weight via 5-trit-per-byte packing
+    /// (`3^5 = 243 <= 256`). Symmetric — no per-row zero-point.
+    Ternary,
 }
 
 impl Quantization {
@@ -100,6 +108,7 @@ impl Quantization {
             Some("mixed3") => Self::Mixed3,
             Some("mixed5") => Self::Mixed5,
             Some("mixed5asym") => Self::Mixed5Asym,
+            Some("ternary" | "bitnet" | "bitnet158" | "b158") => Self::Ternary,
             _ => Self::F32,
         }
     }
@@ -115,7 +124,7 @@ impl Quantization {
             Self::F32 => Some(4.0),
             Self::Int8 | Self::Int8Ch => Some(1.0),
             Self::Int4 | Self::Int4Ch => Some(0.5),
-            Self::Mixed4 | Self::Mixed3 | Self::Mixed5 | Self::Mixed5Asym => None,
+            Self::Mixed4 | Self::Mixed3 | Self::Mixed5 | Self::Mixed5Asym | Self::Ternary => None,
         }
     }
 
@@ -130,6 +139,7 @@ impl Quantization {
             Self::Mixed3 => "mixed3",
             Self::Mixed5 => "mixed5",
             Self::Mixed5Asym => "mixed5asym",
+            Self::Ternary => "ternary",
         }
     }
 
@@ -347,6 +357,24 @@ impl MoeByteTransformer {
         let cfg = self.cfg;
         let d = cfg.d_model;
 
+        if matches!(q, Quantization::Ternary) {
+            // BitNet b1.58: FFN experts → per-channel ternary
+            // {-1,0,+1} absmean; attn / router / embeddings →
+            // per-channel int8 symmetric; norms stay f32.
+            quantize_dequantize_per_channel(&mut self.tok_emb, cfg.vocab_size, d, 8);
+            quantize_dequantize_per_channel(&mut self.pos_emb, cfg.context, d, 8);
+            for block in &mut self.blocks {
+                quantize_dequantize_per_channel(&mut block.qkv_w, 3 * d, d, 8);
+                quantize_dequantize_per_channel(&mut block.proj_w, d, d, 8);
+                quantize_dequantize_per_channel(&mut block.router_w, cfg.n_experts, d, 8);
+                for expert in &mut block.experts {
+                    quantize_dequantize_ternary_absmean_per_channel(&mut expert.fc1_w, cfg.d_ff, d);
+                    quantize_dequantize_ternary_absmean_per_channel(&mut expert.fc2_w, d, cfg.d_ff);
+                }
+            }
+            return;
+        }
+
         if matches!(
             q,
             Quantization::Mixed4
@@ -387,7 +415,8 @@ impl MoeByteTransformer {
             | Quantization::Mixed4
             | Quantization::Mixed3
             | Quantization::Mixed5
-            | Quantization::Mixed5Asym => {
+            | Quantization::Mixed5Asym
+            | Quantization::Ternary => {
                 unreachable!("handled above")
             }
             Quantization::Int8 => (8, false),
@@ -484,6 +513,33 @@ impl MoeByteTransformer {
                     }
                 }
                 b += per_tensor(self.norm_f.len(), bits);
+                b
+            }
+            Quantization::Ternary => {
+                // FFN per-channel ternary {-1,0,+1} packed 5 trits per
+                // byte (3^5 = 243 <= 256 → 1.6 bits/weight) + one f32
+                // scale per row (symmetric, no zero-point);
+                // attn/router/emb per-channel int8; norms f32.
+                let ffn_ternary_2d = |rows: usize, cols: usize| -> u64 {
+                    let weight_bytes = (rows as u64) * (cols as u64).div_ceil(5);
+                    let scale_bytes = (rows as u64) * 4;
+                    weight_bytes + scale_bytes
+                };
+                let mut b = 0_u64;
+                b += per_channel_2d(cfg.vocab_size, d, 8);
+                b += per_channel_2d(cfg.context, d, 8);
+                for block in &self.blocks {
+                    b += f32_bytes(block.norm1_w.len());
+                    b += per_channel_2d(3 * d, d, 8);
+                    b += per_channel_2d(d, d, 8);
+                    b += f32_bytes(block.norm2_w.len());
+                    b += per_channel_2d(cfg.n_experts, d, 8);
+                    for _ in &block.experts {
+                        b += ffn_ternary_2d(cfg.d_ff, d);
+                        b += ffn_ternary_2d(d, cfg.d_ff);
+                    }
+                }
+                b += f32_bytes(self.norm_f.len());
                 b
             }
             Quantization::Mixed4
@@ -1308,6 +1364,34 @@ fn quantize_dequantize_per_channel(values: &mut [f32], rows: usize, cols: usize,
     }
 }
 
+/// `BitNet` b1.58 per-row ternary quantize-then-dequantize for a
+/// row-major 2D tensor of shape `[rows, cols]`. Each row's scale is
+/// the absmean of that row (`mean(|w|)`); every weight is rounded to
+/// the nearest of `{-1, 0, +1}` after dividing by the scale, then
+/// dequantized back to `{-scale, 0, +scale}`. Matches the
+/// quantization grid the shipped 1.6-bit (5-trit-per-byte) packing
+/// would produce, so the inference path sees exactly the values the
+/// shipped binary would reconstruct. A row whose absmean is zero
+/// (all-zero row) is left untouched.
+///
+/// See `arXiv:2402.17764` (`BitNet` b1.58). Symmetric — no zero-point.
+#[allow(clippy::cast_precision_loss)]
+fn quantize_dequantize_ternary_absmean_per_channel(values: &mut [f32], rows: usize, cols: usize) {
+    assert_eq!(values.len(), rows * cols, "shape mismatch");
+    for row in values.chunks_exact_mut(cols) {
+        let sum_abs: f32 = row.iter().map(|v| v.abs()).sum();
+        let scale = sum_abs / cols as f32;
+        if scale == 0.0 {
+            continue;
+        }
+        let inv_scale = scale.recip();
+        for v in row.iter_mut() {
+            let q = (*v * inv_scale).round().clamp(-1.0, 1.0);
+            *v = q * scale;
+        }
+    }
+}
+
 /// Asymmetric per-channel quantize-then-dequantize: each row of the
 /// `[rows, cols]` 2D tensor gets a `(scale, zero_point)` pair derived
 /// from its `(min, max)` so the full quant grid covers the row's
@@ -1356,6 +1440,44 @@ fn quantize_dequantize_per_channel_asym(values: &mut [f32], rows: usize, cols: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BitNet` b1.58 per-row ternary quant correctness: each weight
+    /// lands on `{-scale, 0, +scale}` where `scale` is the row's
+    /// absmean, using round-half-away-from-zero then clamp to
+    /// `[-1, 1]`. The codec's encode and decode passes both load the
+    /// same `.lzrm` and call `apply_quantization(Ternary)` once, so
+    /// this single deterministic application yields identical
+    /// dequantized weights on both sides — that is what makes the
+    /// roundtrip bit-exact (the op need not be idempotent, and isn't:
+    /// re-applying shifts the row's absmean).
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn ternary_absmean_per_channel_correct() {
+        // Row 0: absmean = (3+1+0+4)/4 = 2.0.
+        //   3/2 = 1.5  → round 2  → clamp 1 → +2.0
+        //  -1/2 = -0.5 → round -1 → clamp -1 → -2.0
+        //   0           → 0
+        //  -4/2 = -2.0 → round -2 → clamp -1 → -2.0
+        // Row 1 is all-zero → absmean 0 → left untouched.
+        let mut values = vec![3.0_f32, -1.0, 0.0, -4.0, 0.0, 0.0, 0.0, 0.0];
+        let rows = 2;
+        let cols = 4;
+        quantize_dequantize_ternary_absmean_per_channel(&mut values, rows, cols);
+
+        let scale0 = 2.0_f32;
+        for &v in &values[..cols] {
+            let levels = [-scale0, 0.0, scale0];
+            assert!(
+                levels.iter().any(|&l| (v - l).abs() < 1e-6),
+                "row-0 value {v} not on ternary grid {levels:?}"
+            );
+        }
+        assert_eq!(values[0], 2.0);
+        assert_eq!(values[1], -2.0);
+        assert_eq!(values[2], 0.0);
+        assert_eq!(values[3], -2.0);
+        assert!(values[cols..].iter().all(|&v| v == 0.0));
+    }
 
     /// Parity check against the `PyTorch` `MoEByteTransformer`'s
     /// batched forward. Reads `ckpt.lzrm` (weights) and

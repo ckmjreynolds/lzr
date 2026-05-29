@@ -13,6 +13,21 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-29 — BitNet b1.58 post-training ternary: non-viable without QAT; also breaks int-kernel roundtrip
+
+CDR/Claude implemented and measured post-training BitNet b1.58 ternary quantization (`LZR_MOE_QUANT=ternary`, aliases `bitnet`/`b158`) for the v5 MoE FFN experts: per-row absmean `{-1,0,+1}` (1.6 bit/weight, 5-trit-per-byte packing since `3^5 = 243 <= 256`), with attention / router / embeddings kept at per-channel int8 and norms f32. Tested on the v5 step-220000 checkpoint (val 4.6990) against the mixed5asym baseline on the identical `bench --quick` enwik8 panel (5 × 64 KiB).
+
+| Mode | L(C) | Weights | L(D) (1 GB, 2×) | Combined |
+|---|---:|---:|---:|---:|
+| mixed5asym | 1.249 | 14.66 MB | 0.2394 | 1.488 |
+| ternary | 3.035 | 6.58 MB | 0.1102 | 3.145 |
+
+Ternary trades −0.129 bpb of L(D) for +1.79 bpb of L(C) — net +1.66 bpb worse. The FFN is ~89% of the 21M params; ternarizing FP32-trained FFN weights post-hoc collapses representational capacity. BitNet b1.58 only works with quantization-aware training (the paper trains ternary from scratch). Conclusion: post-training ternary is not an L(D) lever; if ternary is wanted it must come from a QAT fine-tune in lzr-neural. mixed5asym (~5-bit FFN) remains the L+D sweet spot for v5.
+
+Roundtrip finding: ternary fails the codec roundtrip under `LZR_INT_KERNELS=1` (decoder desyncs, BPE-decode byte-count mismatch — 104 386 vs 131 072 on a 128 KB enwik8 prefix), while mixed5asym roundtrips fine on the same prefix. The codec encodes via the batched int path (`precompute_for_encode` / `batched_forward_int`) but decodes per-step (`forward_step_int`); these are only proven bit-identical for the Phase-45 model (the existing parity test, which still passes). Sharp mixed5asym distributions tolerate the sub-ULP logit differences between the two int paths; ternary's flat / degenerate distributions have near-ties that flip the AC-decoded token, desyncing the stream. With int kernels off (encode and decode share the f32 per-step path), ternary roundtrips bit-exact on a 32 KB prefix — so the ternary quant path itself is deterministic, and the failure is the batched-vs-per-step int parity gap surfaced by a poorly-calibrated model. Corollary: v5's mixed5asym roundtrip-OK under int kernels is a consequence of distribution sharpness, not a guaranteed bit-exact int contract; a v5-specific batched-vs-per-step parity check (the existing one is hardcoded to the Phase-45 checkpoint) is a worthwhile follow-up.
+
+---
+
 ## 2026-05-24 → 2026-05-28 — v5 Branch: Pure MoE → AC, Routing-Informed Architecture, Full-Corpus Training, Projected L+D ≈ 1.27 bpb
 
 After Phase 50C established a bit-exact GPU↔CPU contract but failed to deliver wall-time wins on the existing v4 MoE-Transformer (per-call Metal dispatch ~250 µs vs 0.1–1 µs CPU NEON int8 GEMM at our matmul sizes — the GPU could not amortize its dispatch cost on n=32–512 tensors), CDR concluded the deterministic v4 floor was within ~0.5 bpb of submission target but architecturally saturated. The pivot to v5 was authorized to redesign the predictor architecture, drop ad-hoc deterministic stages, and explore higher-leverage training/inference tradeoffs.

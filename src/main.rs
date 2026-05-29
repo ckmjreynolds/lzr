@@ -104,12 +104,12 @@ enum Command {
     },
 
     /// Phase 50C Day-4 follow-up: characterize what each of the
-    /// `n_experts` MoE experts actually does. Runs the model over a
+    /// `n_experts` `MoE` experts actually does. Runs the model over a
     /// corpus prefix in batched-encode mode, captures per-token
     /// routing decisions, and writes a text report covering:
     /// load distribution per layer, routing entropy, byte-class ×
     /// expert crosstab, and top tokens per expert. Informs v5
-    /// architectural choices (bigger MoE vs dense vs simpler router).
+    /// architectural choices (bigger `MoE` vs dense vs simpler router).
     RoutingAnalyze {
         #[arg(long, default_value = "assets/enwik9")]
         corpus: PathBuf,
@@ -117,7 +117,7 @@ enum Command {
         /// enough for stable statistics on Phase 45.
         #[arg(long, default_value_t = 1_000_000)]
         bytes: usize,
-        /// Path to the MoE `.lzrm` weights. If omitted, falls back
+        /// Path to the `MoE` `.lzrm` weights. If omitted, falls back
         /// to the `LZR_MOE_WEIGHTS` env var.
         #[arg(long)]
         weights: Option<PathBuf>,
@@ -378,7 +378,14 @@ fn main() -> Result<()> {
             bpe,
             out,
             top_k,
-        } => run_routing_analyze(&corpus, bytes, weights.as_deref(), bpe.as_deref(), &out, top_k),
+        } => run_routing_analyze(
+            &corpus,
+            bytes,
+            weights.as_deref(),
+            bpe.as_deref(),
+            &out,
+            top_k,
+        ),
     }
 }
 
@@ -396,7 +403,8 @@ fn run_routing_analyze(
     out: &std::path::Path,
     top_k: usize,
 ) -> Result<()> {
-    use std::io::Write;
+    use std::fmt::Write as _;
+    use std::io::Write as _;
     let weights_path: PathBuf = weights_arg
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("LZR_MOE_WEIGHTS").map(PathBuf::from))
@@ -411,8 +419,8 @@ fn run_routing_analyze(
     eprintln!("Loading MoE weights from {} ...", weights_path.display());
     let weights_bytes = fs::read(&weights_path)
         .with_context(|| format!("reading MoE weights {}", weights_path.display()))?;
-    let mut model = moe::MoeByteTransformer::load_lzrm(&weights_bytes)
-        .with_context(|| "parsing .lzrm")?;
+    let mut model =
+        moe::MoeByteTransformer::load_lzrm(&weights_bytes).with_context(|| "parsing .lzrm")?;
     // Use the same quantization scheme as the codec (mixed5asym was
     // shown to be the L+D sweet spot in Phase 50).
     model.apply_quantization(moe::Quantization::Mixed5Asym);
@@ -426,13 +434,21 @@ fn run_routing_analyze(
         );
     }
 
-    eprintln!("Reading {} bytes from {} ...", bytes_to_eval, corpus.display());
+    eprintln!(
+        "Reading {} bytes from {} ...",
+        bytes_to_eval,
+        corpus.display()
+    );
     let raw = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
     let take = bytes_to_eval.min(raw.len());
     let src = &raw[..take];
     eprintln!("BPE-encoding {take} bytes ...");
     let tokens = bpe_inst.encode(src);
-    eprintln!("  {} tokens ({:.2} bytes/tok)", tokens.len(), take as f64 / tokens.len() as f64);
+    eprintln!(
+        "  {} tokens ({:.2} bytes/tok)",
+        tokens.len(),
+        take as f64 / tokens.len() as f64
+    );
 
     // Run the model in `cfg.context`-sized chunks, accumulating routing.
     eprintln!(
@@ -482,7 +498,6 @@ fn run_routing_analyze(
 
     eprintln!("Writing report to {} ...", out.display());
     let mut report = String::new();
-    use std::fmt::Write as _;
     writeln!(
         report,
         "# MoE routing analysis\n\n\
@@ -517,7 +532,10 @@ fn run_routing_analyze(
             min_c = min_c.min(c);
             max_c = max_c.max(c);
         }
-        let dead = counts.iter().filter(|&&c| (c as f64) < 0.001 * total).count();
+        let dead = counts
+            .iter()
+            .filter(|&&c| (c as f64) < 0.001 * total)
+            .count();
         writeln!(
             report,
             "### Load distribution\n\
@@ -547,7 +565,9 @@ fn run_routing_analyze(
         }
 
         // 2) Routing entropy distribution.
-        let mut ents: Vec<f32> = (0..n).map(|i| combined.router_entropy_nats[l * n + i]).collect();
+        let mut ents: Vec<f32> = (0..n)
+            .map(|i| combined.router_entropy_nats[l * n + i])
+            .collect();
         ents.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let max_entropy = (ne as f32).ln();
         let pct = |p: f64| ents[(((ents.len() - 1) as f64) * p) as usize];
@@ -575,8 +595,8 @@ fn run_routing_analyze(
         let n_classes = struct_mask::N_CLASSES;
         let mut crosstab = vec![0u64; n_classes * ne];
         let mut class_totals = vec![0u64; n_classes];
-        for i in 0..n {
-            let cls = prev_byte_class[i] as usize;
+        for (i, &pbc) in prev_byte_class.iter().enumerate() {
+            let cls = pbc as usize;
             let exp = combined.expert_assignment[l * n + i] as usize;
             crosstab[cls * ne + exp] += 1;
             class_totals[cls] += 1;
@@ -586,16 +606,19 @@ fn run_routing_analyze(
             "\n### Byte-class × expert crosstab (rows normalized; top expert per class bolded)\n"
         )?;
         write!(report, "  class |  tokens  | top exp (share) | second   ")?;
-        writeln!(report, "(rows close to {:.1}% per expert = no specialization)", 100.0 / ne as f64)?;
+        writeln!(
+            report,
+            "(rows close to {:.1}% per expert = no specialization)",
+            100.0 / ne as f64
+        )?;
         writeln!(report, "  ------+----------+-----------------+------------")?;
         for cls in 0..n_classes {
             let ct = class_totals[cls];
             if ct == 0 {
                 continue;
             }
-            let mut sorted: Vec<(usize, u64)> = (0..ne)
-                .map(|e| (e, crosstab[cls * ne + e]))
-                .collect();
+            let mut sorted: Vec<(usize, u64)> =
+                (0..ne).map(|e| (e, crosstab[cls * ne + e])).collect();
             sorted.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
             let (e1, c1) = sorted[0];
             let (e2, c2) = sorted[1];
@@ -617,18 +640,18 @@ fn run_routing_analyze(
             report,
             "\n### Top {top_k} tokens per expert (by routed count)\n"
         )?;
-        for e in 0..ne {
+        for (e, &count_e) in counts.iter().enumerate() {
             let mut tok_counts: std::collections::HashMap<u32, u64> =
                 std::collections::HashMap::new();
-            for i in 0..n {
+            for (i, &tok) in tokens.iter().enumerate() {
                 if combined.expert_assignment[l * n + i] as usize == e {
-                    *tok_counts.entry(tokens[i]).or_insert(0) += 1;
+                    *tok_counts.entry(tok).or_insert(0) += 1;
                 }
             }
             let mut pairs: Vec<(u32, u64)> = tok_counts.into_iter().collect();
             pairs.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
-            let total_e = counts[e] as f64;
-            write!(report, "  expert {e:>2} ({} tokens):", counts[e])?;
+            let total_e = count_e as f64;
+            write!(report, "  expert {e:>2} ({count_e} tokens):")?;
             for (tid, c) in pairs.iter().take(top_k) {
                 let bs = bpe_inst.token_bytes(*tid);
                 let mut s = String::new();
@@ -636,7 +659,7 @@ fn run_routing_analyze(
                     if (0x20..=0x7e).contains(&b) {
                         s.push(b as char);
                     } else {
-                        s.push_str(&format!("\\x{b:02x}"));
+                        let _ = write!(s, "\\x{b:02x}");
                     }
                 }
                 if bs.len() > 20 {
@@ -652,8 +675,8 @@ fn run_routing_analyze(
         }
     }
 
-    let mut f = fs::File::create(out)
-        .with_context(|| format!("creating report {}", out.display()))?;
+    let mut f =
+        fs::File::create(out).with_context(|| format!("creating report {}", out.display()))?;
     f.write_all(report.as_bytes())?;
     eprintln!("Report written ({} bytes).", report.len());
     println!("\n{report}");
