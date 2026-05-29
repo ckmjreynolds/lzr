@@ -38,11 +38,16 @@ use crate::ac::{AcDecoder, AcEncoder, TOTAL};
 use crate::bits::{BitReader, BitWriter};
 use crate::bpe::Bpe;
 use crate::codec::{Codec, Decomposition};
+use crate::match_model::{self, MatchModel};
 use crate::moe_arm::MoeArm;
 use crate::struct_mask;
 
 const WEIGHTS_ENV: &str = "LZR_MOE_WEIGHTS";
 const BPE_TABLE_ENV: &str = "LZR_BPE_TABLE";
+/// Online mixer learning rate for the match arm's per-bucket logit
+/// boost, and the cap on that boost (in logits).
+const MATCH_ETA: f32 = 0.05;
+const MATCH_BETA_MAX: f32 = 12.0;
 /// When set to a writable path, the encode loop dumps one CSV row per
 /// emitted token so we can analyze where the predictor loses bits.
 /// Diagnostic only — does not affect bits emitted to the archive.
@@ -59,6 +64,39 @@ fn fill_bias(bias: &mut [f32], class: usize) {
     for (i, slot) in bias.iter_mut().enumerate() {
         let allowed = struct_mask::mask_bit(class, u32::try_from(i).expect("vocab fits u32"));
         *slot = if allowed { 0.0 } else { MASK_PENALTY_LOG };
+    }
+}
+
+/// If the match arm predicts a token, add its per-length-bucket logit
+/// boost `beta[Lb]` to that token's bias. Returns `(predicted token,
+/// bucket)` so the mixer can be updated after the true token is known.
+/// Shared by encode and decode so both sides apply the identical boost.
+#[inline]
+fn apply_match_bias(
+    matcher: Option<&MatchModel>,
+    beta: &[f32],
+    bias: &mut [f32],
+) -> Option<(u32, usize)> {
+    let (pred, l) = matcher?.predict()?;
+    let lb = l.min(match_model::MAX_L);
+    bias[pred as usize] += beta[lb];
+    Some((pred, lb))
+}
+
+/// Online log-loss update of the match mixer weight for the bucket that
+/// fired: nudge `beta[Lb]` toward the boost whose mixed probability of
+/// the predicted token matches its realized hit-rate. Deterministic
+/// from state both sides have (the CDF used for coding + the true
+/// token), so encode and decode stay in lockstep.
+#[inline]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn update_match_mixer(hit: Option<(u32, usize)>, beta: &mut [f32], cdf: &[u32], tok: u32) {
+    if let Some((pred, lb)) = hit {
+        let p = pred as usize;
+        let pm = f64::from(cdf[p + 1] - cdf[p]) / f64::from(TOTAL);
+        let target = f64::from(u8::from(tok == pred));
+        let next = f64::from(MATCH_ETA).mul_add(target - pm, f64::from(beta[lb]));
+        beta[lb] = (next as f32).clamp(0.0, MATCH_BETA_MAX);
     }
 }
 
@@ -121,6 +159,9 @@ fn open_entropy_dump() -> Result<Option<BufWriter<File>>> {
 #[derive(Debug, Default)]
 pub(crate) struct MoeTokCodec {
     arms: Mutex<Option<TokArms>>,
+    /// When set, mix the token-level longest-match arm into the `MoE`
+    /// distribution via an online per-length-bucket logit boost.
+    match_arm: bool,
 }
 
 #[derive(Debug)]
@@ -133,6 +174,16 @@ impl MoeTokCodec {
     pub(crate) const fn new() -> Self {
         Self {
             arms: Mutex::new(None),
+            match_arm: false,
+        }
+    }
+
+    /// Variant that mixes the token longest-match arm into the `MoE`
+    /// distribution (Proposal 1, slice 1).
+    pub(crate) const fn new_with_match() -> Self {
+        Self {
+            arms: Mutex::new(None),
+            match_arm: true,
         }
     }
 
@@ -167,7 +218,11 @@ impl MoeTokCodec {
 
 impl Codec for MoeTokCodec {
     fn name(&self) -> &'static str {
-        "moe-tok"
+        if self.match_arm {
+            "moe-tok-match"
+        } else {
+            "moe-tok"
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -246,10 +301,19 @@ impl Codec for MoeTokCodec {
                 } else {
                     warm[warm.len() - 1]
                 };
+                let mut matcher = self.match_arm.then(|| {
+                    let mut m = MatchModel::new();
+                    for &t in &warm_tokens {
+                        m.push(t);
+                    }
+                    m
+                });
+                let mut beta = [0_f32; match_model::MAX_L + 1];
                 let t_ac_start = std::time::Instant::now();
                 for &tok in &measure_tokens {
                     let class = struct_mask::byte_class(last_byte);
                     fill_bias(&mut bias, class);
+                    let hit = apply_match_bias(matcher.as_ref(), &beta, &mut bias);
                     arms.moe.predict_cdf_with_bias(&mut cdf, &bias);
                     let tok_bytes_view = arms.bpe.token_bytes(tok);
                     let tok_bytes = tok_bytes_view.len();
@@ -266,7 +330,11 @@ impl Codec for MoeTokCodec {
                     }
                     src_pos += tok_bytes;
                     enc.encode(&cdf, tok as usize);
+                    update_match_mixer(hit, &mut beta, &cdf, tok);
                     arms.moe.feed_token(tok);
+                    if let Some(m) = matcher.as_mut() {
+                        m.push(tok);
+                    }
                 }
                 bits_after = enc.bits_written();
                 if timing {
@@ -328,9 +396,18 @@ impl Codec for MoeTokCodec {
             } else {
                 warm[warm.len() - 1]
             };
+            let mut matcher = self.match_arm.then(|| {
+                let mut m = MatchModel::new();
+                for &t in &warm_tokens {
+                    m.push(t);
+                }
+                m
+            });
+            let mut beta = [0_f32; match_model::MAX_L + 1];
             for _ in 0..n_tokens {
                 let class = struct_mask::byte_class(last_byte);
                 fill_bias(&mut bias, class);
+                let hit = apply_match_bias(matcher.as_ref(), &beta, &mut bias);
                 arms.moe.predict_cdf_with_bias(&mut cdf, &bias);
                 let sym = dec.decode(&cdf)?;
                 let tok = u32::try_from(sym)
@@ -340,7 +417,11 @@ impl Codec for MoeTokCodec {
                     last_byte = b;
                 }
                 tokens.push(tok);
+                update_match_mixer(hit, &mut beta, &cdf, tok);
                 arms.moe.feed_token(tok);
+                if let Some(m) = matcher.as_mut() {
+                    m.push(tok);
+                }
             }
 
             let bytes = arms.bpe.decode(&tokens);

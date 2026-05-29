@@ -78,7 +78,8 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "null" => Ok(Box::new(NullCodec)),
         "moe" => Ok(Box::new(MoeCodec::new())),
         "moe-tok" => Ok(Box::new(MoeTokCodec::new())),
-        other => bail!("unknown codec '{other}' (known: null, moe, moe-tok)"),
+        "moe-tok-match" => Ok(Box::new(MoeTokCodec::new_with_match())),
+        other => bail!("unknown codec '{other}' (known: null, moe, moe-tok, moe-tok-match)"),
     }
 }
 
