@@ -13,6 +13,30 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-29 — v6 tokenizer verdict: word/symbol tokenization loses to BPE on bits/byte; structural routing is the keeper
+
+After building the v6 stack on the v6 branch (deterministic structural classifier, skeleton codec, word/symbol/digit tokenizer, unified u16 training encoding — all committed, `build.sh` green), CDR/Claude ran the decisive bits/byte comparison against the v5 BPE baseline and the word-tokenization hypothesis did not survive it.
+
+Build summary:
+- *Classifier* (`src/classifier.rs`): `<text>`-aware Moore FSM extending v2's; enwik9 splits 90.79% article text / 9.21% XML skeleton.
+- *Skeleton codec* (slice 1): per-mode adaptive order-2 byte models through one AC stream → enwik9 skeleton **0.1185 bpb** amortized (order-2; xz floor 0.054, so a PPM/higher-order skeleton model has ~2× headroom; the metadata `content` mode at 1.90 bpb is the cost driver).
+- *Tokenizer* (slices 3 + b): word(32K)/digit/symbol-run with capitalization and lone-space as side-channels. enwik9 article body 279.4M tokens at **3.249 bytes/token** (~1.28× BPE's 218M, after symbol-run merge cut symbol tokens 240.8M→62.6M and the space side-channel removed 94.8M lone spaces); byte-exact roundtrip.
+- *Markup routing* (slice 2): a real constraint — single-char interspersed markup can't be zero-signaling-routed under the Moore property (the decoder would desync); only delimited non-prose regions (`[[Category:/File:/Image:]]`, `{{templates}}`, tables = 8.65% of corpus) are routable via prefix-buffering. Interspersed markup belongs in the tokenizer as (cheap, merged) symbol tokens.
+- *Training setup* (a): unified u16 vocab (35136) folding case as `<title>`/`<upper>` modifier tokens and materializing the space-after bit as a space token, so the existing single-head AR model trains unchanged; `lzr emit-tokens` → `enwik9.v6.u16` (397M tokens, lossless). v6 preset reuses v5's exact backbone (3L×128×1024×24-expert×512ctx), only `vocab_size` differs (35136 vs 16384) → 23.6M params (+2.4M for the head).
+
+The comparison, LR-matched (both at step 4000, inside the shared 6000-step warmup, identical 1.5e-4 ramp):
+
+| | val bits/token | enwik9 bits/byte |
+|---|---:|---:|
+| v5 BPE-16K (journal Run 3 @4000) | 5.0893 | 1.111 |
+| v6 words (@4000) | 4.8540 | 2.046 |
+
+v6 is ~84% worse on bits/byte. Conversion: v6 L(C) = `0.397 × val_bpt + 0.1185` (content tokens/byte over the full corpus + slice-1 skeleton); v5 L(C) = `val_bpt / 4.58`. The decomposition is the lesson: `bits/byte = bits/token ÷ bytes/token`; the two schemes have near-identical bits/token (4.85 vs 5.09), but v6's unified stream packs only 2.287 bytes/token vs BPE's 4.58. For v6 to break even its tokens would need to be ~2× more predictable (~2.5 bits/token) to offset having ~2× as many — they are not even marginally so. v5's step-4000→convergence gain was only ~8%, far too small to close a 2× gap, so the run was stopped at step 4000 rather than carried to convergence.
+
+Conclusion: word/symbol tokenization is **not** a better prediction target per byte. BPE's merges are frequency-optimized, so the byte sequences that are easy to predict in context become single tokens; linguistic word/symbol/digit boundaries ignore that and hand the model a harder per-token job per byte. The premise that forcing word-level prediction (removing the byte-level "crutch") would lower bits/byte is contradicted by the matched-step data. This also retires the compute motivation: even at ~1.28× BPE token count (best tokenizer variant), more tokens at equal per-token entropy is strictly more total bits.
+
+The keeper from v6 is the **deterministic structural routing**, which is tokenizer-independent: the XML skeleton (9.21% of corpus) codes at ~0.12 bpb (order-2) and is removed from whatever neural arm runs. The productive recombination is **BPE on the article body + v6 structural routing** — keep BPE's prediction strength where it wins, bank the skeleton's near-free cost, and (optionally) route the delimited non-prose markup regions deterministically too.
+
 ## 2026-05-29 — v6 pivot: word/symbol tokenization + deterministic-structural markup routing
 
 CDR proposed moving off BPE toward a word/digit/symbol vocabulary, hypothesizing that forcing word-level prediction (removing the byte-level "crutch") would both improve the neural arm and cut compute, while producing a human-readable vocab. Analysis on enwik9 refined this into a concrete v6 architecture and a clean separation of which motivations survive contact with the data.
