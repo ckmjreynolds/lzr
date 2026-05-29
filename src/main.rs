@@ -27,6 +27,7 @@ mod ngram_arm;
 mod null;
 mod struct_mask;
 mod transformer;
+mod word_tok;
 
 use std::fs;
 use std::path::PathBuf;
@@ -145,6 +146,35 @@ enum Command {
         /// Bytes from the start of the corpus to classify (0 = whole).
         #[arg(long, default_value_t = 0)]
         bytes: usize,
+    },
+
+    /// v6 slice 1: code the deterministic XML skeleton (tag / attr /
+    /// metadata `Content` modes) with a per-mode adaptive order-2 byte
+    /// model through one AC stream, and report the real bpb — both per
+    /// mode and amortized over the full corpus. `TextContent` (the
+    /// article body) is excluded; it is the neural arm's stream.
+    SkeletonBpb {
+        #[arg(long, default_value = "assets/enwik9")]
+        corpus: PathBuf,
+        /// Bytes from the start of the corpus (0 = whole).
+        #[arg(long, default_value_t = 0)]
+        bytes: usize,
+    },
+
+    /// v6 slice 3: tokenize the article-body (`TextContent`) stream
+    /// with the word/digit/symbol tokenizer and report the token
+    /// stream — count, bytes/token, per-class breakdown, escape rate —
+    /// plus a byte-exact roundtrip check on a sample.
+    ContentTokStats {
+        #[arg(long, default_value = "assets/enwik9")]
+        corpus: PathBuf,
+        /// Bytes from the start of the corpus (0 = whole).
+        #[arg(long, default_value_t = 0)]
+        bytes: usize,
+        /// Newline-delimited lowercase word vocabulary (frequency
+        /// order = id order).
+        #[arg(long, default_value = "tools/words_v6.txt")]
+        words: PathBuf,
     },
 }
 
@@ -401,7 +431,208 @@ fn main() -> Result<()> {
             top_k,
         ),
         Command::ClassifyStats { corpus, bytes } => run_classify_stats(&corpus, bytes),
+        Command::SkeletonBpb { corpus, bytes } => run_skeleton_bpb(&corpus, bytes),
+        Command::ContentTokStats {
+            corpus,
+            bytes,
+            words,
+        } => run_content_tok_stats(&corpus, bytes, &words),
     }
+}
+
+/// Extract the `TextContent` (article-body) byte stream from a corpus
+/// slice using the deterministic classifier.
+fn extract_text_content(src: &[u8]) -> Vec<u8> {
+    let mut content = Vec::new();
+    let mut clf = classifier::Classifier::new();
+    for &b in src {
+        if matches!(clf.current_mode(), classifier::Mode::TextContent) {
+            content.push(b);
+        }
+        clf.advance(b);
+    }
+    content
+}
+
+/// v6 slice 3: measure the content tokenizer on the article body.
+#[allow(clippy::cast_precision_loss)]
+fn run_content_tok_stats(corpus: &PathBuf, bytes: usize, words: &PathBuf) -> Result<()> {
+    let raw = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
+    let src = if bytes == 0 || bytes >= raw.len() {
+        &raw[..]
+    } else {
+        &raw[..bytes]
+    };
+    let words_text = fs::read_to_string(words)
+        .with_context(|| format!("reading word vocab {}", words.display()))?;
+    let id_to_word: Vec<Vec<u8>> = words_text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.as_bytes().to_vec())
+        .collect();
+    let tok = word_tok::WordTok::from_words(&id_to_word);
+
+    eprintln!("Classifying and extracting article-body stream ...");
+    let content = extract_text_content(src);
+
+    let s = tok.stats(&content);
+    let total = s.total_tokens();
+
+    // Byte-exact roundtrip on a sample (bounds memory on big corpora).
+    let sample_len = content.len().min(8 << 20);
+    let sample = &content[..sample_len];
+    let toks = tok.tokenize(sample);
+    let back = tok.detokenize(&toks, &id_to_word);
+    let roundtrip_ok = back == sample;
+
+    println!(
+        "Corpus: {}  ({} bytes; article body {} bytes = {:.1}%)",
+        corpus.display(),
+        src.len(),
+        content.len(),
+        100.0 * content.len() as f64 / src.len() as f64
+    );
+    println!("Word vocab: {} entries\n", tok.vocab_len());
+    println!("  class           tokens          share");
+    println!("  -------------   ------------   -------");
+    let rows = [
+        ("words (vocab)", s.words_in_vocab),
+        ("<esc> words", s.esc_words),
+        ("  esc letters", s.esc_letter_tokens),
+        ("digits", s.digits),
+        ("symbols", s.symbols),
+    ];
+    for (label, n) in rows {
+        println!(
+            "  {:<13}   {:>12}   {:>6.2}%",
+            label,
+            n,
+            100.0 * n as f64 / total as f64
+        );
+    }
+    let word_occ = s.words_in_vocab + s.esc_words;
+    let total_sidech = total - s.single_space;
+    println!("\n  total tokens          : {total}");
+    println!(
+        "  bytes / token (raw)             : {:.3}  (BPE-16K = 4.58)",
+        content.len() as f64 / total as f64
+    );
+    println!(
+        "  bytes / token (space side-channel): {:.3}  ({} single-space tokens pulled out)",
+        content.len() as f64 / total_sidech as f64,
+        s.single_space
+    );
+    println!(
+        "  word escape rate      : {:.2}% of word occurrences",
+        100.0 * s.esc_words as f64 / word_occ as f64
+    );
+    println!(
+        "  roundtrip (first {} MiB): {}",
+        sample_len >> 20,
+        if roundtrip_ok {
+            "OK (byte-exact)"
+        } else {
+            "MISMATCH"
+        }
+    );
+    if !roundtrip_ok {
+        bail!("tokenizer roundtrip mismatch");
+    }
+    Ok(())
+}
+
+/// Map a skeleton mode to its per-mode model index; `None` for
+/// `TextContent` (the article body, which the skeleton codec excludes).
+const fn skeleton_model_idx(mode: classifier::Mode) -> Option<usize> {
+    match mode {
+        classifier::Mode::Content => Some(0),
+        classifier::Mode::TagStructure => Some(1),
+        classifier::Mode::AttrValue => Some(2),
+        classifier::Mode::TextContent => None,
+    }
+}
+
+/// v6 slice 1: measure the deterministic skeleton codec. Each skeleton
+/// mode gets its own adaptive order-2 byte model; all three share one
+/// AC stream. Per-symbol information cost is accumulated as
+/// `-log2(p)` for the per-mode decomposition, and the real AC archive
+/// size is reported as the ground-truth total.
+#[allow(clippy::cast_precision_loss)]
+fn run_skeleton_bpb(corpus: &PathBuf, bytes: usize) -> Result<()> {
+    use ac::{AcEncoder, TOTAL};
+    use bits::BitWriter;
+    use ngram_arm::NgramArm;
+
+    let raw = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
+    let src = if bytes == 0 || bytes >= raw.len() {
+        &raw[..]
+    } else {
+        &raw[..bytes]
+    };
+
+    let mut models = [NgramArm::new(), NgramArm::new(), NgramArm::new()];
+    let mut mode_bits = [0.0_f64; 3];
+    let mut mode_bytes = [0_u64; 3];
+    let labels = ["content", "tag", "attr"];
+
+    let mut writer = BitWriter::new();
+    let mut enc = AcEncoder::new(&mut writer);
+    let mut cdf = [0_u32; 257];
+    let mut clf = classifier::Classifier::new();
+    let total_f = f64::from(TOTAL);
+
+    for &b in src {
+        if let Some(i) = skeleton_model_idx(clf.current_mode()) {
+            models[i].predict_byte_cdf(&mut cdf);
+            enc.encode(&cdf, b as usize);
+            let p = f64::from(cdf[b as usize + 1] - cdf[b as usize]) / total_f;
+            mode_bits[i] += -p.log2();
+            mode_bytes[i] += 1;
+            models[i].feed(b);
+        }
+        clf.advance(b);
+    }
+    enc.finish();
+    let (archive, _pad) = writer.finish();
+
+    let skel_bytes: u64 = mode_bytes.iter().sum();
+    let skel_bits: f64 = mode_bits.iter().sum();
+    let total_bytes = src.len() as u64;
+
+    println!("Corpus: {}  ({total_bytes} bytes)", corpus.display());
+    println!("\n  mode      bytes          bpb(on-mode)   share-of-corpus");
+    println!("  -------   ------------   ------------   ---------------");
+    for i in 0..3 {
+        let bpb = if mode_bytes[i] > 0 {
+            mode_bits[i] / mode_bytes[i] as f64
+        } else {
+            0.0
+        };
+        println!(
+            "  {:<7}   {:>12}   {:>12.4}   {:>13.3}%",
+            labels[i],
+            mode_bytes[i],
+            bpb,
+            100.0 * mode_bytes[i] as f64 / total_bytes as f64,
+        );
+    }
+    println!(
+        "\n  skeleton bytes       : {skel_bytes} ({:.2}% of corpus)",
+        100.0 * skel_bytes as f64 / total_bytes as f64
+    );
+    println!(
+        "  skeleton bpb (on skeleton)   : {:.4}",
+        skel_bits / skel_bytes as f64
+    );
+    println!("  skeleton AC archive          : {} bytes", archive.len());
+    println!(
+        "  skeleton bpb AMORTIZED (full corpus): {:.4}",
+        8.0 * archive.len() as f64 / total_bytes as f64
+    );
+    println!(
+        "  -> 2x Hutter rule is N/A here (skeleton is computed, not shipped weights); this is pure L(C) on the skeleton stream."
+    );
+    Ok(())
 }
 
 /// Run the deterministic [`classifier::Classifier`] over a corpus and
