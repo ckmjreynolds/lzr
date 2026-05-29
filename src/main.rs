@@ -180,6 +180,24 @@ enum Command {
         #[arg(long, default_value = "tools/symruns_v6.txt")]
         symruns: PathBuf,
     },
+
+    /// v6 (a): emit the article-body content as a flat unified u16
+    /// token-id stream for neural training (consumable by lzr-neural's
+    /// `train_v5.py --token-corpus`). Lossless: verifies a decode
+    /// roundtrip on a sample before writing.
+    EmitTokens {
+        #[arg(long, default_value = "assets/enwik9")]
+        corpus: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        bytes: usize,
+        #[arg(long, default_value = "tools/words_v6.txt")]
+        words: PathBuf,
+        #[arg(long, default_value = "tools/symruns_v6.txt")]
+        symruns: PathBuf,
+        /// Output `.u16` little-endian token file.
+        #[arg(long, default_value = "/tmp/enwik9.v6.u16")]
+        out: PathBuf,
+    },
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -442,7 +460,74 @@ fn main() -> Result<()> {
             words,
             symruns,
         } => run_content_tok_stats(&corpus, bytes, &words, &symruns),
+        Command::EmitTokens {
+            corpus,
+            bytes,
+            words,
+            symruns,
+            out,
+        } => run_emit_tokens(&corpus, bytes, &words, &symruns, &out),
     }
+}
+
+/// v6 (a): emit the content stream as a flat unified u16 token file.
+#[allow(clippy::cast_precision_loss)]
+fn run_emit_tokens(
+    corpus: &PathBuf,
+    bytes: usize,
+    words: &PathBuf,
+    symruns: &PathBuf,
+    out: &PathBuf,
+) -> Result<()> {
+    let raw = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
+    let src = if bytes == 0 || bytes >= raw.len() {
+        &raw[..]
+    } else {
+        &raw[..bytes]
+    };
+    let id_to_word: Vec<Vec<u8>> = fs::read_to_string(words)
+        .with_context(|| format!("reading word vocab {}", words.display()))?
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.as_bytes().to_vec())
+        .collect();
+    let runs = parse_symruns(
+        &fs::read_to_string(symruns)
+            .with_context(|| format!("reading symrun vocab {}", symruns.display()))?,
+    );
+    let tok = word_tok::WordTok::from_words(&id_to_word).with_symruns(runs.clone());
+
+    eprintln!("Extracting article body and encoding ...");
+    let content = extract_text_content(src);
+    let ids = tok.encode_unified(&content);
+
+    // Verify losslessness on a sample before writing.
+    let sample_len = content.len().min(8 << 20);
+    let sample_ids = tok.encode_unified(&content[..sample_len]);
+    let back = word_tok::WordTok::decode_unified(&sample_ids, &id_to_word, &runs);
+    if back != content[..sample_len] {
+        bail!("unified token roundtrip mismatch — not writing");
+    }
+
+    let mut bytes_out = Vec::with_capacity(ids.len() * 2);
+    for id in &ids {
+        bytes_out.extend_from_slice(&id.to_le_bytes());
+    }
+    fs::write(out, &bytes_out).with_context(|| format!("writing {}", out.display()))?;
+
+    println!("content bytes : {}", content.len());
+    println!("tokens (u16)  : {}", ids.len());
+    println!(
+        "bytes/token   : {:.3}",
+        content.len() as f64 / ids.len() as f64
+    );
+    println!(
+        "vocab_size    : {}  (set this in the lzr-neural v6 config)",
+        word_tok::uni::VOCAB_SIZE
+    );
+    println!("roundtrip     : OK (sample byte-exact)");
+    println!("wrote {} ({} bytes)", out.display(), bytes_out.len());
+    Ok(())
 }
 
 /// Parse a hex-per-line symbol-run vocabulary file.

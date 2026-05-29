@@ -30,7 +30,7 @@
 //! (a maximal non-alnum run is always followed by an alphanumeric
 //! byte), so spacing inside/after markup stays in the runs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Case {
@@ -76,8 +76,26 @@ impl TokStats {
 
 pub(crate) struct WordTok {
     word_to_id: HashMap<Vec<u8>, u32>,
-    symruns: HashSet<Vec<u8>>,
+    run_to_id: HashMap<Vec<u8>, u32>,
     symrun_maxlen: usize,
+}
+
+/// Flat unified u16 token vocabulary for training. Case is folded as
+/// `<title>`/`<upper>` modifier tokens (Lower is unmarked); the
+/// lone-space side-channel is materialized as an explicit space symbol
+/// token. Everything fits in u16 so the existing single-head AR model
+/// + `.u16` data path trains on it unchanged.
+pub(crate) mod uni {
+    pub(crate) const WORD_BASE: u32 = 0;
+    pub(crate) const WORD_CAP: u32 = 32768;
+    pub(crate) const SYM_SINGLE_BASE: u32 = WORD_BASE + WORD_CAP; // 256 single bytes
+    pub(crate) const SYM_RUN_BASE: u32 = SYM_SINGLE_BASE + 256; // up to 2048 runs
+    pub(crate) const SYM_RUN_CAP: u32 = 2048;
+    pub(crate) const DIGIT_BASE: u32 = SYM_RUN_BASE + SYM_RUN_CAP; // 10 digits
+    pub(crate) const LETTER_BASE: u32 = DIGIT_BASE + 10; // 52 escape letters (a-z A-Z)
+    pub(crate) const TITLE: u32 = LETTER_BASE + 52;
+    pub(crate) const UPPER: u32 = TITLE + 1;
+    pub(crate) const VOCAB_SIZE: u32 = UPPER + 1;
 }
 
 impl WordTok {
@@ -90,17 +108,21 @@ impl WordTok {
         }
         Self {
             word_to_id,
-            symruns: HashSet::new(),
+            run_to_id: HashMap::new(),
             symrun_maxlen: 1,
         }
     }
 
-    /// Attach a symbol-run vocabulary (multi-byte runs); single bytes
-    /// remain the always-available fallback.
+    /// Attach a symbol-run vocabulary (multi-byte runs, id = position);
+    /// single bytes remain the always-available fallback.
     #[must_use]
     pub(crate) fn with_symruns(mut self, runs: Vec<Vec<u8>>) -> Self {
         self.symrun_maxlen = runs.iter().map(Vec::len).max().unwrap_or(1).max(1);
-        self.symruns = runs.into_iter().collect();
+        self.run_to_id = runs
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, u32::try_from(i).expect("run id fits u32")))
+            .collect();
         self
     }
 
@@ -130,7 +152,7 @@ impl WordTok {
             let mut best = 1;
             let mut l = maxl;
             while l >= 2 {
-                if self.symruns.contains(&run[p..p + l]) {
+                if self.run_to_id.contains_key(&run[p..p + l]) {
                     best = l;
                     break;
                 }
@@ -210,6 +232,85 @@ impl WordTok {
             }
         });
         s
+    }
+
+    /// Encode `content` into the flat unified u16 token stream (see
+    /// [`uni`]). Case → `<title>`/`<upper>` modifiers; the lone-space
+    /// side-channel → an explicit space symbol token. Lossless: pair
+    /// with [`WordTok::decode_unified`].
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn encode_unified(&self, content: &[u8]) -> Vec<u16> {
+        let mut out = Vec::new();
+        let mut push = |id: u32| out.push(u16::try_from(id).expect("unified id fits u16"));
+        self.tokenize_into(content, |t, sa| {
+            match t {
+                Tok::Word { id, case } => {
+                    match case {
+                        Case::Lower => {}
+                        Case::Title => push(uni::TITLE),
+                        Case::Upper => push(uni::UPPER),
+                    }
+                    push(uni::WORD_BASE + id);
+                }
+                Tok::Esc(bytes) => {
+                    for b in bytes {
+                        let li = if b.is_ascii_lowercase() {
+                            u32::from(b - b'a')
+                        } else {
+                            26 + u32::from(b - b'A')
+                        };
+                        push(uni::LETTER_BASE + li);
+                    }
+                }
+                Tok::Digit(b) => push(uni::DIGIT_BASE + u32::from(b - b'0')),
+                Tok::Sym(bytes) => {
+                    if bytes.len() == 1 {
+                        push(uni::SYM_SINGLE_BASE + u32::from(bytes[0]));
+                    } else {
+                        push(uni::SYM_RUN_BASE + self.run_to_id[&bytes]);
+                    }
+                }
+            }
+            if sa {
+                push(uni::SYM_SINGLE_BASE + u32::from(b' '));
+            }
+        });
+        out
+    }
+
+    /// Inverse of [`WordTok::encode_unified`].
+    pub(crate) fn decode_unified(ids: &[u16], id_to_word: &[Vec<u8>], runs: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pending_case = Case::Lower;
+        for &raw in ids {
+            let id = u32::from(raw);
+            if id == uni::TITLE {
+                pending_case = Case::Title;
+            } else if id == uni::UPPER {
+                pending_case = Case::Upper;
+            } else if id < uni::SYM_SINGLE_BASE {
+                let w = &id_to_word[(id - uni::WORD_BASE) as usize];
+                match pending_case {
+                    Case::Lower => out.extend_from_slice(w),
+                    Case::Upper => out.extend(w.iter().map(u8::to_ascii_uppercase)),
+                    Case::Title => {
+                        out.push(w[0].to_ascii_uppercase());
+                        out.extend_from_slice(&w[1..]);
+                    }
+                }
+                pending_case = Case::Lower;
+            } else if id < uni::SYM_RUN_BASE {
+                out.push((id - uni::SYM_SINGLE_BASE) as u8);
+            } else if id < uni::DIGIT_BASE {
+                out.extend_from_slice(&runs[(id - uni::SYM_RUN_BASE) as usize]);
+            } else if id < uni::LETTER_BASE {
+                out.push(b'0' + (id - uni::DIGIT_BASE) as u8);
+            } else {
+                let li = (id - uni::LETTER_BASE) as u8;
+                out.push(if li < 26 { b'a' + li } else { b'A' + (li - 26) });
+            }
+        }
+        out
     }
 
     /// Reconstruct the original bytes from a token+side-channel stream.
@@ -311,6 +412,24 @@ mod tests {
         assert!(matches!(units[0].0, Tok::Esc(_)), "mixed-case -> escape");
         assert!(matches!(units[1].0, Tok::Esc(_)), "OOV -> escape");
         assert_eq!(WordTok::detokenize(&units, &id_to_word), content);
+    }
+
+    #[test]
+    fn unified_u16_roundtrips() {
+        let words: Vec<Vec<u8>> = ["the", "cat", "dog", "category"]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        let runs: Vec<Vec<u8>> = ["[[", "]]", "]] ", ", "]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        let tok = WordTok::from_words(&words).with_symruns(runs.clone());
+        let content = b"The cat ate 42 dogs!! [[Category|xQz]] THE\ndog, cat";
+        let ids = tok.encode_unified(content);
+        assert!(ids.iter().all(|&i| u32::from(i) < uni::VOCAB_SIZE));
+        let back = WordTok::decode_unified(&ids, &words, &runs);
+        assert_eq!(back, content, "unified u16 roundtrip must be byte-exact");
     }
 
     #[test]
