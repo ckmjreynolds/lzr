@@ -13,6 +13,7 @@
 mod ac;
 mod bits;
 mod bpe;
+mod classifier;
 mod codec;
 mod eval;
 #[cfg(feature = "gpu-inference")]
@@ -131,6 +132,19 @@ enum Command {
         /// Top-K tokens to list per expert.
         #[arg(long, default_value_t = 10)]
         top_k: usize,
+    },
+
+    /// v6 structural split: run the deterministic `Classifier` over a
+    /// corpus and report the byte share of each mode (article
+    /// `TextContent` -> neural arm; `TagStructure`/`AttrValue`/metadata
+    /// `Content` -> deterministic skeleton codec). The split is exact
+    /// and signaling-free; encoder and decoder reproduce it.
+    ClassifyStats {
+        #[arg(long, default_value = "assets/enwik9")]
+        corpus: PathBuf,
+        /// Bytes from the start of the corpus to classify (0 = whole).
+        #[arg(long, default_value_t = 0)]
+        bytes: usize,
     },
 }
 
@@ -386,7 +400,61 @@ fn main() -> Result<()> {
             &out,
             top_k,
         ),
+        Command::ClassifyStats { corpus, bytes } => run_classify_stats(&corpus, bytes),
     }
+}
+
+/// Run the deterministic [`classifier::Classifier`] over a corpus and
+/// report the per-mode byte split — the v6 structural-routing
+/// foundation. `TextContent` is the article-body stream the neural arm
+/// will predict; the rest is the deterministic XML skeleton.
+#[allow(clippy::cast_precision_loss)]
+fn run_classify_stats(corpus: &PathBuf, bytes: usize) -> Result<()> {
+    let raw = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
+    let src = if bytes == 0 || bytes >= raw.len() {
+        &raw[..]
+    } else {
+        &raw[..bytes]
+    };
+
+    let mut counts = [0u64; 4];
+    let mut c = classifier::Classifier::new();
+    for &b in src {
+        counts[c.current_mode() as usize] += 1;
+        c.advance(b);
+    }
+
+    let total = src.len() as f64;
+    let modes = [
+        classifier::Mode::TextContent,
+        classifier::Mode::Content,
+        classifier::Mode::TagStructure,
+        classifier::Mode::AttrValue,
+    ];
+    println!(
+        "Corpus: {}  ({} bytes classified)",
+        corpus.display(),
+        src.len()
+    );
+    println!("  mode          bytes            share");
+    println!("  ------------  ---------------  -------");
+    for m in modes {
+        let n = counts[m as usize];
+        println!(
+            "  {:<12}  {:>15}  {:>6.2}%",
+            m.component_name(),
+            n,
+            100.0 * (n as f64) / total
+        );
+    }
+    let neural = counts[classifier::Mode::TextContent as usize];
+    let skeleton = src.len() as u64 - neural;
+    println!(
+        "\n  neural stream (text): {:.2}%   deterministic skeleton (rest): {:.2}%",
+        100.0 * (neural as f64) / total,
+        100.0 * (skeleton as f64) / total,
+    );
+    Ok(())
 }
 
 #[allow(
