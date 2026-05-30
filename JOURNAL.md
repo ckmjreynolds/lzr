@@ -13,6 +13,24 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-29 — CORRECTION: the structural-routing "win" was a unit error — routing does NOT help; codec-side stays exhausted
+
+Retracting the immediately-preceding entry ("Structural routing re-vetted … would save ~0.025 bpb"). It was wrong, from an amortized-vs-per-stream bpb confusion caught before any code was written.
+
+The routing vet compared the MoE+match cost on the skeleton (0.58 bpb, correct) against a deterministic skeleton codec it took to be ~0.12 bpb. But 0.1185 is the v6 slice-1 order-2 figure **amortized over the whole 1 GB corpus**; the order-2 model's rate **on the skeleton bytes themselves is 1.286 bpb** (slice-1 reported both: "skeleton bpb (on skeleton): 1.2860 / amortized: 0.1185"). Per-stream, the correct comparison is:
+
+| codec on the skeleton bytes | bpb on skeleton |
+|---|---:|
+| order-2 byte model | 1.286 |
+| xz / LZMA-class (0.0545 amortized ÷ 0.092 skeleton fraction) | ~0.59 |
+| **MoE + match (current)** | **0.58** |
+
+So the v5 MoE+match already codes the XML skeleton **as well as an LZMA-class deterministic codec**, and better than order-2 by ~2×. Routing the skeleton out would not save bits — it would *cost* ~+0.04 bpb (order-2) or roughly break even (xz-class). The skeleton's numeric tokens (timestamps/ids) are expensive for *everyone*, not uniquely for the MoE; the MoE+match is not wasting on the skeleton.
+
+Lesson for future vets: skeleton-stream numbers must be compared per-stream (bits ÷ skeleton-bytes), never against a full-corpus-amortized figure — a 9%-fraction stream makes the amortized number ~11× too small.
+
+The conclusion two entries down stands and is now firmly supported from both sides: the v5+match codec is near its codec-side floor (skeleton handled well; the match arm has harvested the repeats; ~80% of the residual is rank-5+ model surprise). The next real lever is the **model/training side**, not another codec stage.
+
 ## 2026-05-29 — Structural routing re-vetted on the v5+match codec: skeleton costs 0.58 bpb, deterministic routing would save ~0.025 bpb (recommended next codec)
 
 The prior entry concluded the codec-side was exhausted because the *match* residual is model-limited. That was too narrow: crossing the entropy dump with the v6 `<text>` classifier shows the v5+match codec is wasting a large amount on the XML skeleton, and routing it out (the v6 "BPE-body + structural routing" keeper) is a real, vetted win — independent of the match arm and of model quality.
