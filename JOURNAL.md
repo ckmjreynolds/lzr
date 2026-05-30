@@ -13,6 +13,23 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-29 — Structural routing re-vetted on the v5+match codec: skeleton costs 0.58 bpb, deterministic routing would save ~0.025 bpb (recommended next codec)
+
+The prior entry concluded the codec-side was exhausted because the *match* residual is model-limited. That was too narrow: crossing the entropy dump with the v6 `<text>` classifier shows the v5+match codec is wasting a large amount on the XML skeleton, and routing it out (the v6 "BPE-body + structural routing" keeper) is a real, vetted win — independent of the match arm and of model quality.
+
+*The waste.* Tagging each emitted token by whether its bytes fall inside `<text>` (article body) vs the XML skeleton (page metadata: tags, ids, timestamps, usernames), and summing the codec's per-token ideal bits:
+
+| slice | skeleton % of bytes | MoE+match bpb **on skeleton** | order-2 byte codec | routing saving |
+|---|---:|---:|---:|---:|
+| first 2 MB | 7.4% | 0.6037 | ~0.12 (v6 slice-1) | 0.041 bpb |
+| mid 2 MB (offset 40 MB) | 5.0% | 0.5814 | ~0.12 | 0.023 bpb |
+
+The MoE+match spends ~0.58–0.60 bpb on the skeleton — ~5× what a dedicated byte-level order-2 model achieves (v6 slice-1: 0.1185 bpb). The mid-slice rules out a one-time `<siteinfo>`-header artifact. Extrapolated to full enwik8 (~6–8% skeleton), routing saves ≈ **0.025–0.03 bpb on top of the match arm** — roughly doubling this session's total (match −0.0225 → combined ~−0.05 vs the 1.2420 baseline).
+
+*Why the MoE is bad here, and why routing must be byte-level.* The skeleton's expensive part is the variable numerics — timestamps and ids — which BPE fragments into rare tokens (exactly the rank-5+ residual). A byte-level model codes digit sequences near-free; BPE-token-level cannot reach that. And the match arm's order-2 back-off already harvests the skeleton's *repetitive* structure (the fixed tags), so a token-level skeleton model would add little — the win specifically requires **byte-level** coding of the routed skeleton.
+
+*Build note (deferred to CDR).* This is the v2 mode-routed pattern fused with the v5 arm: the `<text>`-aware classifier (`src/classifier.rs`, already built) splits the byte stream; text → BPE + MoE + match; skeleton → the order-2 byte model (`skeleton-bpb` logic, already built). The friction is token/byte-boundary handling in a single interleaved AC stream with a classifier-driven decode — a real correctness surface (mis-interleaving silently breaks roundtrip). Token-level routing-by-first-byte-mode is roundtrip-trivial but captures little (see above); the valuable byte-level version warrants careful, attended construction with incremental roundtrip tests, so it was vetted-and-recommended here rather than built unattended. It is the highest-leverage *codec-side* next step; the *model-side* (rank-5+ text residual) remains the larger but training-bound lever.
+
 ## 2026-05-29 — Match arm validation: wall-clock-free, cache arm ruled out — codec-side concluded
 
 Two validation results closing out the match-arm work (above).
