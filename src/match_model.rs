@@ -1,18 +1,21 @@
-//! Token-level PPM-style match predictor arm for the `moe-tok` codec.
+//! Token-level variable-order PPM match predictor arm for the `moe-tok`
+//! codec.
 //!
-//! For the last [`K`] tokens of history (the context), it gathers the
-//! tokens that followed the most recent [`CHAIN_CAP`] prior occurrences
-//! of that context — an LZ-style hash chain — and returns them as a
-//! count-normalized distribution, plus the true match length `L` of the
-//! most recent occurrence as a confidence signal. The codec mixes this
+//! For each order in [`ORDERS`] (longest first), it keeps an LZ-style
+//! hash chain over the last `k` tokens. At prediction it uses the
+//! **longest** context that has a prior match (PPM\* back-off), gathers
+//! the tokens that followed its most recent [`CHAIN_CAP`] occurrences as
+//! a count-normalized distribution, and reports the true match length
+//! `L` (backward extension) as confidence. The codec mixes this
 //! distribution into the `MoE` CDF via an online per-`L`-bucket logit
-//! boost.
+//! boost — so short back-off matches (L=2,3) get their own low-weight
+//! bucket that the mixer drives toward 0 if they don't help, while long
+//! matches (L≥4) get strongly boosted.
 //!
-//! A count *distribution* over followers (vs a single most-recent
-//! follower) is the lever: vetting on the BPE-16K stream showed the
-//! distribution pays ~7.37 vs 8.45 bits per match — when the top
-//! follower is wrong, the actual token still usually has mass, so the
-//! boost helps instead of hurting.
+//! A count *distribution* over followers (not a single most-recent one)
+//! is the key lever: vetting on the BPE-16K stream showed it pays ~7.37
+//! vs 8.45 bits per match — when the top follower is wrong, the actual
+//! token usually still has mass, so the boost helps instead of hurting.
 //!
 //! Ships **no state** (L(D) = 0): both `comp9a` and `decomp9` rebuild
 //! the identical chains from the identical token stream. The context
@@ -21,8 +24,9 @@
 
 use std::collections::HashMap;
 
-/// Hash-context length: predictions key off the last `K` tokens.
-pub(crate) const K: usize = 4;
+/// Context lengths tried, longest first (PPM\* back-off order).
+pub(crate) const ORDERS: [usize; 3] = [8, 4, 2];
+const N_ORDERS: usize = ORDERS.len();
 /// Confidence buckets cap at this true match length.
 pub(crate) const MAX_L: usize = 16;
 /// Cap on backward-extension work per prediction.
@@ -32,22 +36,32 @@ const CHAIN_CAP: usize = 16;
 
 const SENTINEL: u32 = u32::MAX;
 
+/// One LZ-style hash chain: `head[context_hash]` = most recent position
+/// with that context, `prev[pos]` = the previous such position.
+struct Chain {
+    head: HashMap<u64, u32>,
+    prev: Vec<u32>,
+}
+
+impl Chain {
+    fn new() -> Self {
+        Self {
+            head: HashMap::new(),
+            prev: Vec::new(),
+        }
+    }
+}
+
 pub(crate) struct MatchModel {
     history: Vec<u32>,
-    /// Context hash → most recent position whose preceding `K`-context
-    /// hashes here (the follower is `history[pos]`).
-    head: HashMap<u64, u32>,
-    /// `prev[pos]` = previous position with the same context hash, or
-    /// `SENTINEL`. Together with `head` this is an LZ-style hash chain.
-    prev: Vec<u32>,
+    chains: [Chain; N_ORDERS],
 }
 
 impl MatchModel {
     pub(crate) fn new() -> Self {
         Self {
             history: Vec::new(),
-            head: HashMap::new(),
-            prev: Vec::new(),
+            chains: std::array::from_fn(|_| Chain::new()),
         }
     }
 
@@ -62,28 +76,21 @@ impl MatchModel {
         h
     }
 
-    /// Fill `out` with the follower distribution `(token, weight)` for
-    /// the current context (weights sum to 1), and return the true
-    /// match length `L` of the most recent occurrence. `None` (with
-    /// `out` cleared) when there is no `K`-context match.
-    pub(crate) fn predict(&self, out: &mut Vec<(u32, f32)>) -> Option<usize> {
-        out.clear();
-        let n = self.history.len();
-        if n < K {
-            return None;
-        }
-        let key = Self::key(&self.history[n - K..n]);
-        let head_pos = *self.head.get(&key)?;
-
-        // Confidence: true match length of the most recent occurrence.
-        let (mut ai, mut bi, mut mlen) = (n, head_pos as usize, 0usize);
+    /// True match length of the most recent occurrence at `head_pos`:
+    /// the matching suffix ending at `n-1` vs `head_pos-1`.
+    fn match_len(&self, n: usize, head_pos: usize) -> usize {
+        let (mut ai, mut bi, mut mlen) = (n, head_pos, 0usize);
         while ai > 0 && bi > 0 && mlen < MAX_EXT && self.history[ai - 1] == self.history[bi - 1] {
             mlen += 1;
             ai -= 1;
             bi -= 1;
         }
+        mlen
+    }
 
-        // Gather followers over up to CHAIN_CAP prior occurrences.
+    /// Walk chain `ci` from `head_pos` and fill `out` with the
+    /// count-normalized follower distribution.
+    fn gather(&self, ci: usize, head_pos: u32, out: &mut Vec<(u32, f32)>) {
         let mut q = head_pos;
         let mut steps = 0u32;
         while q != SENTINEL && (steps as usize) < CHAIN_CAP {
@@ -93,28 +100,50 @@ impl MatchModel {
             } else {
                 out.push((f, 1.0));
             }
-            q = self.prev[q as usize];
+            q = self.chains[ci].prev[q as usize];
             steps += 1;
         }
         let inv = 1.0 / f32::from(u16::try_from(steps).unwrap_or(u16::MAX));
         for e in out.iter_mut() {
             e.1 *= inv;
         }
-        Some(mlen)
     }
 
-    /// Append an observed token and extend the chain for the context
-    /// preceding it.
+    /// Fill `out` with the follower distribution `(token, weight)` for
+    /// the longest matching context (weights sum to 1), and return its
+    /// true match length `L`. `None` (with `out` cleared) when no order
+    /// has a match.
+    pub(crate) fn predict(&self, out: &mut Vec<(u32, f32)>) -> Option<usize> {
+        out.clear();
+        let n = self.history.len();
+        for (ci, &k) in ORDERS.iter().enumerate() {
+            if n < k {
+                continue;
+            }
+            let key = Self::key(&self.history[n - k..n]);
+            if let Some(&head_pos) = self.chains[ci].head.get(&key) {
+                let l = self.match_len(n, head_pos as usize);
+                self.gather(ci, head_pos, out);
+                return Some(l);
+            }
+        }
+        None
+    }
+
+    /// Append an observed token and extend every order's chain for the
+    /// context preceding it.
     pub(crate) fn push(&mut self, tok: u32) {
         self.history.push(tok);
-        self.prev.push(SENTINEL);
         let pos = self.history.len() - 1;
-        if pos >= K {
-            let key = Self::key(&self.history[pos - K..pos]);
-            let old = self.head.get(&key).copied().unwrap_or(SENTINEL);
-            let pos_u32 = u32::try_from(pos).expect("position fits u32");
-            self.prev[pos] = old;
-            self.head.insert(key, pos_u32);
+        let pos_u32 = u32::try_from(pos).expect("position fits u32");
+        for (ci, &k) in ORDERS.iter().enumerate() {
+            self.chains[ci].prev.push(SENTINEL);
+            if pos >= k {
+                let key = Self::key(&self.history[pos - k..pos]);
+                let old = self.chains[ci].head.get(&key).copied().unwrap_or(SENTINEL);
+                self.chains[ci].prev[pos] = old;
+                self.chains[ci].head.insert(key, pos_u32);
+            }
         }
     }
 }
@@ -129,31 +158,41 @@ mod tests {
     }
 
     #[test]
-    fn predicts_follower_distribution_of_a_repeated_context() {
+    fn uses_longest_context_match() {
         let mut m = MatchModel::new();
         for &t in &[10u32, 20, 30, 40, 99, 7, 8, 9, 10, 20, 30, 40] {
             m.push(t);
         }
-        let (out, l) = dist(&m).expect("a K-context match exists");
-        // Only one prior occurrence of "10 20 30 40", followed by 99.
+        let (out, l) = dist(&m).expect("a context match exists");
         assert_eq!(out, vec![(99, 1.0)]);
-        assert!(l >= K, "match length must be at least K, got {l}");
+        assert!(l >= 4, "longest match (order-4) should give L>=4, got {l}");
     }
 
     #[test]
     fn aggregates_followers_across_occurrences() {
-        // context "1 2 3 4" occurs twice, followed by 7 then 8.
         let mut m = MatchModel::new();
         for &t in &[1u32, 2, 3, 4, 7, 9, 1, 2, 3, 4, 8, 9, 1, 2, 3, 4] {
             m.push(t);
         }
         let (mut out, _) = dist(&m).expect("match exists");
         out.sort_by_key(|&(t, _)| t);
-        // Followers were 8 (more recent) and 7; each weight 0.5.
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, 7);
         assert_eq!(out[1].0, 8);
         assert!((out[0].1 - 0.5).abs() < 1e-6 && (out[1].1 - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn backs_off_to_shorter_order() {
+        // No 4-context repeats, but the 2-context "50 60" recurs (once
+        // followed by 70). Order-4 misses; order-2 catches it.
+        let mut m = MatchModel::new();
+        for &t in &[50u32, 60, 70, 1, 2, 3, 4, 5, 6, 7, 8, 9, 50, 60] {
+            m.push(t);
+        }
+        let (out, l) = dist(&m).expect("order-2 back-off match exists");
+        assert_eq!(out, vec![(70, 1.0)]);
+        assert!(l < 4, "back-off match length should be < 4, got {l}");
     }
 
     #[test]
@@ -175,7 +214,7 @@ mod tests {
             for &t in &pat {
                 m.push(t);
             }
-            m.push(100 + rep); // distinct follower each time
+            m.push(100 + rep);
         }
         for &t in &pat {
             m.push(t);
