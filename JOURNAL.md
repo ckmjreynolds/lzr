@@ -13,6 +13,34 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-29 — Proposal 1 match arm optimization: PPM\* back-off → −0.0225 bpb on full enwik8; residual is model-limited
+
+Autonomous overnight session optimizing the match arm from its first-cut single-follower form. Three measured improvements landed, each eval-first on 1 MB enwik8 (baseline moe-tok 1.1903) and committed green; two negative results bound the design.
+
+*Improvements (1 MB match delta vs baseline):*
+
+| arm | 1 MB L(C) | Δ |
+|---|---:|---:|
+| single most-recent follower, η=0.05 | 1.1822 | −0.0081 |
+| η=0.2 (swept; β_max non-binding) | 1.1814 | −0.0089 |
+| PPM follower **distribution** (LZ hash chain, CHAIN_CAP=16) | 1.1795 | −0.0108 |
+| variable-order **PPM\* back-off** ORDERS=[8,4,2] | 1.1742 | −0.0161 |
+
+1. *Distribution over followers.* Replacing the single most-recent follower with a count-normalized distribution over the chain's prior occurrences. Vet on the BPE-16K stream: the distribution pays 7.37 vs 8.45 bits/match — when the top follower is wrong the actual token usually still has mass, so the per-follower boost (`bias[f] += β[L]·w_f`, β updated by the multi-token log-loss gradient) helps instead of hurting.
+2. *Variable-order back-off (PPM\*).* Multiple LZ chains, longest context first. The big surprise: **online order-2 back-off is strongly additive (−0.0048 on top of PPM), not MoE-redundant** — it captures file-specific local patterns the *frozen* MoE underweights, validating the "online adaptation beats frozen weights on the specific file" thesis (same mechanism the v5 train_split=1.0 insight relied on). Order set saturates at [8,4,2]: order-3/6 add nothing, [8,6,4,3,2] no better.
+
+*Full enwik8 confirmation* (mixed5asym, encode-only; baseline unchanged at 1.2420, roundtrip bit-exact at 4 MB):
+
+| corpus | moe-tok | match (single-follower) | match [8,4,2] PPM\* |
+|---|---:|---:|---:|
+| full enwik8 (100 MB) | 1.2420 | 1.2275 (−0.0145) | **1.2195 (−0.0225)** |
+
+The optimization added −0.0080 bpb at full scale (match delta −0.0145 → −0.0225, +55%), removing 281 KB from the 15.52 MB archive, still at zero L(D). Peak RSS ~3.1 GB (3 hash chains over 21.8M tokens), ~83 min single-core encode.
+
+*Negatives.* Recency-weighting the follower distribution is neutral (decay 0.9→−0.0001, within noise; 0.5 hurts) — uniform counts are already right. CHAIN_CAP saturates by 16 (16/32/64 identical). Lowering the MoE quant to cut L(D) loses on *combined* L(C)+L(D): mixed5asym+match 1.4136 beats mixed4+match 1.4233 on 1 MB (the L(C) hit outruns the L(D) saving) — though the match arm's L(C) help grows as the MoE degrades (−0.016 at mixed5asym → −0.108 at int4ch), it never flips the ranking. mixed5asym stays the combined sweet spot; L(D) reduction needs the training side, not the codec.
+
+*Where the bits are now* (entropy dump of the MoE+match codec on 2 MB, 5.08 bits/token). Decomposed by the rank of the actual token in the codec's mixed distribution: rank-0 (top-1 correct) is 38% of tokens but only 5.8% of bits; **rank-5+ tokens are 42.7% of tokens and 79.8% of bits** (9.49 bits/tok). The model is confident (top1 > 0.9) on just 16.7% of tokens. So after the match arm has harvested the repeats, ~80% of the residual is non-repeated, hard content where the frozen MoE is genuinely surprised — **model-quality-limited, not codec-limited**. The codec-side match levers are largely exhausted; the next lever is the training side (a better/bigger model, distillation, or online adaptation), consistent with the standing cmix-class conclusion. A second exact-match-style arm would not touch this residual.
+
 ## 2026-05-29 — Proposal 1 match arm on FULL enwik8: −0.0145 bpb at zero L(D); chunked encode unblocks full-corpus runs
 
 Follow-up to the Proposal 1 match-arm entry below, which measured ≤1 MB and flagged the full-corpus number as blocked by the moe-tok codec's batched-encode memory. That block is now removed and the full enwik8 number is in.
