@@ -13,6 +13,16 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-29 — Match arm validation: wall-clock-free, cache arm ruled out — codec-side concluded
+
+Two validation results closing out the match-arm work (above).
+
+*Wall-clock is free.* The match arm's compression gain costs essentially no time: on 4 MB the AC encode loop is 203.59 s (baseline moe-tok) vs 203.20 s (match [8,4,2]) — identical within noise. The MoE int8 GEMM dominates; the per-token hash lookups, chain walks (≤16 over 3 orders), and per-follower boost are negligible beside it. So the −0.0225 bpb arrives at **zero L(D) and zero meaningful wall-clock cost** — free on both Hutter-critical axes, which matters because the token codec was already near the time-budget edge (Phase 41). Roundtrip is bit-exact (verified at 4 MB; 100 MB roundtrip confirmed separately).
+
+*A recency-cache arm is ruled out (vetted, not built).* The residual analysis showed ~80% of remaining bits are rank-5+ tokens (the codec is surprised). A natural next codec arm is a cache LM — boost recently/ever-seen tokens, online and L(D)-free. Vetting it on the entropy dump (cross of token-recurrence with the codec's rank) kills it: rank-5+ tokens are *mostly seen before* (95% have occurred earlier in the 2 MB prefix; 62% within the last 8 K tokens) but are *far too rare* to boost — the cache probability of the actual token averages 0.001–0.008. A frequency cache can only meaningfully lift frequent-recently tokens; the residual is rare-but-present tokens, so the cache assigns them near-zero mass and can't recover them. This confirms the residual is genuinely model-quality-limited.
+
+*Conclusion.* The codec-side match levers are exhausted: the arm is optimized (PPM\* [8,4,2]), tuned (η=0.2), wall-clock-free, and the two obvious follow-ons (recency cache, lower-quant-for-L(D)) are ruled out by measurement. The match arm is a clean, shippable win on v5 (−0.0225 bpb, zero L(D), zero time). The next lever is unambiguously the training side — the 80% rank-5+ residual is the frozen 21 M-param MoE's prediction quality on non-repeated hard content, addressable only by a better/bigger model, distillation, or online adaptation (the standing cmix-class conclusion). That is a strategic model-architecture decision, deferred to CDR rather than attempted blind.
+
 ## 2026-05-29 — Proposal 1 match arm optimization: PPM\* back-off → −0.0225 bpb on full enwik8; residual is model-limited
 
 Autonomous overnight session optimizing the match arm from its first-cut single-follower form. Three measured improvements landed, each eval-first on 1 MB enwik8 (baseline moe-tok 1.1903) and committed green; two negative results bound the design.
