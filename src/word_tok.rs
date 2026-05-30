@@ -279,6 +279,7 @@ impl WordTok {
     }
 
     /// Inverse of [`WordTok::encode_unified`].
+    #[allow(clippy::cast_possible_truncation)] // id ranges are bounded < 256 per class
     pub(crate) fn decode_unified(ids: &[u16], id_to_word: &[Vec<u8>], runs: &[Vec<u8>]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut pending_case = Case::Lower;
