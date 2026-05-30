@@ -45,8 +45,12 @@ use crate::struct_mask;
 const WEIGHTS_ENV: &str = "LZR_MOE_WEIGHTS";
 const BPE_TABLE_ENV: &str = "LZR_BPE_TABLE";
 /// Online mixer learning rate for the match arm's per-bucket logit
-/// boost, and the cap on that boost (in logits).
-const MATCH_ETA: f32 = 0.05;
+/// boost, and the cap on that boost (in logits). η swept on 1 MB
+/// enwik8 (0.05→−0.0081, 0.2→−0.0089, saturating by 0.4); 0.2 warms the
+/// per-bucket weights faster and tracks non-stationary content. `β_max`
+/// is non-binding (weights self-calibrate below it). Both overridable
+/// via `LZR_MATCH_ETA` / `LZR_MATCH_BETAMAX`.
+const MATCH_ETA: f32 = 0.2;
 const MATCH_BETA_MAX: f32 = 12.0;
 /// Measure tokens per batched-encode window. Bounds the precomputed
 /// logit slab to `ENCODE_WINDOW * vocab` f32 (~0.5 GB at vocab 16384)
@@ -71,37 +75,69 @@ fn fill_bias(bias: &mut [f32], class: usize) {
     }
 }
 
-/// If the match arm predicts a token, add its per-length-bucket logit
-/// boost `beta[Lb]` to that token's bias. Returns `(predicted token,
-/// bucket)` so the mixer can be updated after the true token is known.
-/// Shared by encode and decode so both sides apply the identical boost.
+/// Apply the PPM match arm's follower distribution as a per-token logit
+/// boost: `bias[f] += beta[Lb] * w_f` for each follower `f`. Fills
+/// `followers` with the `(token, weight)` pairs and returns the bucket
+/// `Lb`, so the mixer update can reuse them. Shared by encode and
+/// decode so both sides apply the identical boost.
 #[inline]
 fn apply_match_bias(
     matcher: Option<&MatchModel>,
     beta: &[f32],
     bias: &mut [f32],
-) -> Option<(u32, usize)> {
-    let (pred, l) = matcher?.predict()?;
+    followers: &mut Vec<(u32, f32)>,
+) -> Option<usize> {
+    let l = matcher?.predict(followers)?;
     let lb = l.min(match_model::MAX_L);
-    bias[pred as usize] += beta[lb];
-    Some((pred, lb))
+    let b = beta[lb];
+    for &(f, w) in followers.iter() {
+        let fi = f as usize;
+        bias[fi] = b.mul_add(w, bias[fi]);
+    }
+    Some(lb)
 }
 
 /// Online log-loss update of the match mixer weight for the bucket that
-/// fired: nudge `beta[Lb]` toward the boost whose mixed probability of
-/// the predicted token matches its realized hit-rate. Deterministic
-/// from state both sides have (the CDF used for coding + the true
-/// token), so encode and decode stay in lockstep.
+/// fired. For the multi-token boost `bias[f] += beta * w_f`, the
+/// gradient of `−log p'(tok)` w.r.t. `beta` is `Σ_f w_f p'(f) − w_tok`;
+/// the descent step `beta += η (w_tok − Σ_f w_f p'(f))` is computed from
+/// the coding CDF and the true token — identical on both sides, so
+/// encode and decode stay in lockstep.
 #[inline]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn update_match_mixer(hit: Option<(u32, usize)>, beta: &mut [f32], cdf: &[u32], tok: u32) {
-    if let Some((pred, lb)) = hit {
-        let p = pred as usize;
-        let pm = f64::from(cdf[p + 1] - cdf[p]) / f64::from(TOTAL);
-        let target = f64::from(u8::from(tok == pred));
-        let next = f64::from(MATCH_ETA).mul_add(target - pm, f64::from(beta[lb]));
-        beta[lb] = (next as f32).clamp(0.0, MATCH_BETA_MAX);
+fn update_match_mixer(
+    lb: Option<usize>,
+    followers: &[(u32, f32)],
+    beta: &mut [f32],
+    cdf: &[u32],
+    tok: u32,
+    eta: f32,
+    beta_max: f32,
+) {
+    if let Some(lb) = lb {
+        let total = f64::from(TOTAL);
+        let mut sum_wp = 0.0_f64;
+        let mut w_tok = 0.0_f64;
+        for &(f, w) in followers {
+            let fi = f as usize;
+            let pf = f64::from(cdf[fi + 1] - cdf[fi]) / total;
+            sum_wp = f64::from(w).mul_add(pf, sum_wp);
+            if f == tok {
+                w_tok = f64::from(w);
+            }
+        }
+        let next = f64::from(eta).mul_add(w_tok - sum_wp, f64::from(beta[lb]));
+        beta[lb] = (next as f32).clamp(0.0, beta_max);
     }
+}
+
+/// Parse an `f32` tuning override from the environment (for sweeps);
+/// falls back to the shipped default.
+fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Diagnostic stats for one literal token: ideal bits paid, `MoE`
@@ -306,6 +342,9 @@ impl Codec for MoeTokCodec {
                     m
                 });
                 let mut beta = [0_f32; match_model::MAX_L + 1];
+                let match_eta = env_f32("LZR_MATCH_ETA", MATCH_ETA);
+                let match_beta_max = env_f32("LZR_MATCH_BETAMAX", MATCH_BETA_MAX);
+                let mut followers: Vec<(u32, f32)> = Vec::new();
                 let t_ac_start = std::time::Instant::now();
                 // Process measure tokens in bounded windows: in batched
                 // mode, precompute one window's logits at a time so the
@@ -329,7 +368,8 @@ impl Codec for MoeTokCodec {
                     for &tok in &measure_tokens[wlo..whi] {
                         let class = struct_mask::byte_class(last_byte);
                         fill_bias(&mut bias, class);
-                        let hit = apply_match_bias(matcher.as_ref(), &beta, &mut bias);
+                        let lb =
+                            apply_match_bias(matcher.as_ref(), &beta, &mut bias, &mut followers);
                         arms.moe.predict_cdf_with_bias(&mut cdf, &bias);
                         let tok_bytes_view = arms.bpe.token_bytes(tok);
                         let tok_bytes = tok_bytes_view.len();
@@ -346,7 +386,15 @@ impl Codec for MoeTokCodec {
                         }
                         src_pos += tok_bytes;
                         enc.encode(&cdf, tok as usize);
-                        update_match_mixer(hit, &mut beta, &cdf, tok);
+                        update_match_mixer(
+                            lb,
+                            &followers,
+                            &mut beta,
+                            &cdf,
+                            tok,
+                            match_eta,
+                            match_beta_max,
+                        );
                         arms.moe.feed_token(tok);
                         if let Some(m) = matcher.as_mut() {
                             m.push(tok);
@@ -422,10 +470,13 @@ impl Codec for MoeTokCodec {
                 m
             });
             let mut beta = [0_f32; match_model::MAX_L + 1];
+            let match_eta = env_f32("LZR_MATCH_ETA", MATCH_ETA);
+            let match_beta_max = env_f32("LZR_MATCH_BETAMAX", MATCH_BETA_MAX);
+            let mut followers: Vec<(u32, f32)> = Vec::new();
             for _ in 0..n_tokens {
                 let class = struct_mask::byte_class(last_byte);
                 fill_bias(&mut bias, class);
-                let hit = apply_match_bias(matcher.as_ref(), &beta, &mut bias);
+                let lb = apply_match_bias(matcher.as_ref(), &beta, &mut bias, &mut followers);
                 arms.moe.predict_cdf_with_bias(&mut cdf, &bias);
                 let sym = dec.decode(&cdf)?;
                 let tok = u32::try_from(sym)
@@ -435,7 +486,15 @@ impl Codec for MoeTokCodec {
                     last_byte = b;
                 }
                 tokens.push(tok);
-                update_match_mixer(hit, &mut beta, &cdf, tok);
+                update_match_mixer(
+                    lb,
+                    &followers,
+                    &mut beta,
+                    &cdf,
+                    tok,
+                    match_eta,
+                    match_beta_max,
+                );
                 arms.moe.feed_token(tok);
                 if let Some(m) = matcher.as_mut() {
                     m.push(tok);
