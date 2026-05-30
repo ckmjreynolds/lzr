@@ -13,6 +13,22 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-05-29 — Proposal 1 match arm on FULL enwik8: −0.0145 bpb at zero L(D); chunked encode unblocks full-corpus runs
+
+Follow-up to the Proposal 1 match-arm entry below, which measured ≤1 MB and flagged the full-corpus number as blocked by the moe-tok codec's batched-encode memory. That block is now removed and the full enwik8 number is in.
+
+*Chunked encode.* `precompute_for_encode` → `precompute_for_encode_range(warm, measure, lo, hi)`: computes only the per-`context` chunks covering a window's predecessor positions and allocates `(hi−lo)×vocab` instead of `measure_len×vocab`. The codec drives it in `ENCODE_WINDOW`=8192-token windows, bounding the precompute slab to ~0.5 GB (was ~14 GB at 1 MB, OOM at 4 MB). Because the chunks are independent (per-`context` KV reset), windowing is bit-identical: the 256 KB panel reproduces the prior 1.1400/1.1367 exactly, and 4 MB (previously OOM) now roundtrips bit-exact at **peak RSS 1.54 GB**, ~4920 tok/s.
+
+*Full enwik8 (100 MB, `mixed5asym`, encode-only — windowing is bit-identical and roundtrip is verified at 4 MB):*
+
+| corpus | moe-tok L(C) | moe-tok-match L(C) | Δ |
+|---|---:|---:|---:|
+| 256 KB | 1.1400 | 1.1367 | −0.0033 |
+| 1 MB | 1.1903 | 1.1822 | −0.0081 |
+| **100 MB (full enwik8)** | **1.2420** | **1.2275** | **−0.0145** |
+
+The gain keeps growing with accumulated history (−0.0033 → −0.0081 → −0.0145), confirming the arm's value is long-range out-of-window repeats. At full corpus the match arm removes **181 294 bytes** from the 15.52 MB archive — **at zero L(D)** (the index is rebuilt online from the token stream on both sides). For calibration, −0.0145 is ~3× the Phase 48 logit-calibration land (−0.0044) and ~5× the Phase 49 struct_mask land (−0.0029), all free; this first ensemble arm clears every prior near-free lever by a wide margin and, unlike them, scales with corpus size — so on enwik9 (10× the history) the amortized gain should be at least this. Encode ~83 min/codec single-core, peak RSS ~1.5 GB (well inside the 10 GB judge limit). Hyperparameters (K=4, η=0.05) are still first-guess.
+
 ## 2026-05-29 — v6 Proposal 1 (context mixing): token match-model arm — first arm lands −0.008 bpb and growing, at zero L(D)
 
 Following the architecture-proposals review — which re-affirmed the journal's standing conclusion (Phases 27, 30-era) that a cmix-class *ensemble*, not a single arm, is what closes the Hutter gap — CDR directed building Proposal 1 (heterogeneous context mixing), starting from its de-risking core: a token-level longest-match predictor arm mixed into the v5 MoE distribution.
