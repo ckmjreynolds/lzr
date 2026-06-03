@@ -13,6 +13,20 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 — case modeling: three attacks, all negative — a strong mixer already models case better than any separated scheme
+
+The residual analyzer flagged uppercase as the expensive byte class (4.73 bpb, 10% of bits on 3.9% of bytes). Three ways to exploit that were tried, escalating in ambition; all failed, and together they settle the question for this architecture.
+
+*Attack 1 — case-folded identity arms (added).* Two extra arms keyed on the lowercased byte history (orders 4 and 7), pooling "The"/"the" for letter identity, alongside the existing case-sensitive arms. Full enwik8: −0.008. Tiny.
+
+*Attack 2 — explicit case-decision arm (added).* A dense arm keyed on the features that predict capitalization — sentence-start (after `. ` etc.), word-start, and the previous word's case class — added as a mixer input. Full enwik8: −0.0002. Essentially nothing, and the diagnosis is instructive: the W1 word arm already conditions on the *previous word's hash* (finer than its case class, so it captures "after `United` → capital `S`tates" directly), and the checksummed order-2 already predicts `. `→capital sharply. The signal was already covered.
+
+*Attack 3 — the case transform (CDR's "predict word and case separately, properly").* Run the *entire* model on the lowercased byte stream and code a separate case bit per letter — the clean decomposition, and the one real chance for a win because it lets every arm pool case variants and cuts distinct contexts (the only way to pool, since the bit-tree's node path diverges at the case bit, so lowercasing contexts alone can't). Full enwik8: 1.700 → **1.783, worse by +0.083**. The reason is decisive: both schemes code the same information (one case bit per letter), but the integrated mixer predicts that bit using the *whole ensemble* (orders + match + SSE + words at node 5) — a lowercase letter in lowercase context costs ~0.015 bits — whereas a dedicated case channel, with far less context, costs ~0.07. We pay more per letter on 70% of bytes, plus lowercasing strips case as a feature the identity arms used for next-byte prediction; the small pooling gain is swamped.
+
+*Conclusion.* For a strong context mixer, case is best left **implicit**. Explicit case/identity separation is a real technique for *weak* per-symbol models (and simpler compressors), but our ensemble already models the node-5 case bit near-optimally; both adding a separate case predictor (nothing) and removing case from the mixer (−0.083) confirm it from opposite directions. Case is closed; the shippable best stays lhi 1.700 at CTX_BITS=24.
+
+The thread still paid off twice: CDR's "the order-n arms over-dilute case" diagnosis was correct *against the old direct-mapped tables* and directly motivated the checksummed-tables fix (a real +0.04, kept); and the residual analyzer earned its keep by showing that uppercase's high per-byte cost is mostly irreducible information, not model slack — a caution against reading per-byte cost as addressable headroom.
+
 ## 2026-06-03 — checksummed hash tables recover most of the collision tax; shippable lhi at 1.700 bpb on full enwik8
 
 The fixed-size tables that bounded memory (see the memory-wall entry below) carried a cost the small-slice numbers hid: on full enwik8, direct-mapped tables collide heavily, and blending unrelated contexts into one predictor cost a lot. Measured collision tax (lword, full enwik8, vs the lossless `HashMap`'s 1.661): 2^22 1.827, 2^23 1.785, 2^24 1.751, 2^25 1.725 — up to +0.166 bpb, more than the word arm gained.
