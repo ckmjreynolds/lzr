@@ -41,7 +41,7 @@ enum Command {
     Bench {
         #[arg(long, default_value = "assets/enwik8")]
         corpus: PathBuf,
-        /// Codec name. v7 knows: `null`, `cmix`, `lmix`, `lmatch`, `lsse`, `lword`.
+        /// Codec name. v7 knows: `null`, `cmix`, `lmix`, `lmatch`, `lsse`, `lword`, `lhi`.
         #[arg(long, default_value = "cmix")]
         codec: String,
         /// Reduce panel to 5 windows × 64 KiB for tight iteration.
@@ -64,6 +64,20 @@ enum Command {
         #[arg(long, default_value_t = false)]
         skip_verify: bool,
     },
+
+    /// Attribute a codec's coding cost by byte class, to see where the bits go.
+    /// Warms on the first `--warm-mb` MiB, then measures the next `--measure-mb`.
+    Analyze {
+        #[arg(long, default_value = "assets/enwik8")]
+        corpus: PathBuf,
+        /// Codec whose model to analyze (one of the `l*` codecs).
+        #[arg(long, default_value = "lhi")]
+        codec: String,
+        #[arg(long, default_value_t = 4)]
+        warm_mb: usize,
+        #[arg(long, default_value_t = 4)]
+        measure_mb: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -81,6 +95,12 @@ fn main() -> Result<()> {
             out,
             skip_verify,
         } => run_compress(&corpus, &codec, &out, skip_verify),
+        Command::Analyze {
+            corpus,
+            codec,
+            warm_mb,
+            measure_mb,
+        } => run_analyze(&corpus, &codec, warm_mb, measure_mb),
     }
 }
 
@@ -162,5 +182,72 @@ fn run_compress(
 
     println!("Decode time:     {decode_elapsed:?}");
     println!("Round-trip:      OK");
+    Ok(())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn run_analyze(corpus: &PathBuf, codec: &str, warm_mb: usize, measure_mb: usize) -> Result<()> {
+    let flags = lmix::flags_for(codec).with_context(|| {
+        format!("'{codec}' is not an analyzable codec (use one of the l* codecs)")
+    })?;
+
+    let warm_len = warm_mb * 1024 * 1024;
+    let measure_len = measure_mb * 1024 * 1024;
+    let bytes = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
+    if bytes.len() < warm_len + measure_len {
+        bail!(
+            "corpus {} has {} bytes; need {} (warm {warm_mb} MiB + measure {measure_mb} MiB)",
+            corpus.display(),
+            bytes.len(),
+            warm_len + measure_len,
+        );
+    }
+    let warm = &bytes[..warm_len];
+    let measure = &bytes[warm_len..warm_len + measure_len];
+
+    eprintln!(
+        "Analyzing `{codec}` on {} (warm {warm_mb} MiB, measure {measure_mb} MiB) ...",
+        corpus.display()
+    );
+    let report = lmix::residual_report(flags, warm, measure);
+
+    let total_bits = report.total_bits();
+    let total_count = report.total_count();
+    let mut order: Vec<usize> = (0..lmix::CLASS_NAMES.len()).collect();
+    order.sort_by(|&a, &b| report.bits[b].total_cmp(&report.bits[a]));
+
+    println!();
+    println!("Codec:  {codec}");
+    println!("Corpus: {}  (measure {measure_mb} MiB)", corpus.display());
+    println!();
+    println!("  class      bytes    %bytes      bits    %bits     bpb");
+    println!("  -------  ---------  ------  ----------  ------  ------");
+    for &c in &order {
+        let cnt = report.count[c];
+        if cnt == 0 {
+            continue;
+        }
+        let bits = report.bits[c];
+        println!(
+            "  {:<7}  {:>9}  {:>5.1}%  {:>10.0}  {:>5.1}%  {:>6.3}",
+            lmix::CLASS_NAMES[c],
+            cnt,
+            100.0 * cnt as f64 / total_count as f64,
+            bits,
+            100.0 * bits / total_bits,
+            bits / cnt as f64,
+        );
+    }
+    println!("  -------  ---------  ------  ----------  ------  ------");
+    println!(
+        "  {:<7}  {:>9}  {:>5}   {:>10.0}  {:>5}   {:>6.3}",
+        "total",
+        total_count,
+        "",
+        total_bits,
+        "",
+        total_bits / total_count as f64,
+    );
+    println!();
     Ok(())
 }

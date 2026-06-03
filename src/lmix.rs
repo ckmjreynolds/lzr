@@ -33,8 +33,6 @@
 //! Archive layout: a 64-bit length prefix, then the AC bitstream — each of the
 //! `8 * len` bits coded against a two-symbol CDF `[0, c0, TOTAL]`.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
 
 use crate::ac::{AcDecoder, AcEncoder, TOTAL};
@@ -45,14 +43,34 @@ use crate::codec::{Codec, Decomposition};
 const MAX_ORDER: usize = 6;
 /// Number of order models.
 const N_ORDERS: usize = MAX_ORDER + 1;
-/// Mixer inputs: one per order, plus the match model and the two word models.
-const N_INPUTS: usize = N_ORDERS + 3;
+/// High-order byte contexts (longer than the `u64`-packable orders, so hashed
+/// from the 16-byte `ctx_hi`). Orders past 16 can't be represented (the
+/// register holds 16 bytes) and silently alias order-16. A quick-panel set
+/// sweep was flat — [8,12,16] 1.706, [7,10,13,16] 1.705, [8,16,24] 1.709 (the
+/// 24 aliases 16, a wasted arm), [7,9,12,16,24] 1.705 — so the gain from longer
+/// byte context saturates by ~order-16; [8,12,16] is the simplest set with no
+/// redundancy.
+const HI_ORDERS: [usize; 3] = [8, 12, 16];
+/// Number of high-order context models.
+const N_HI: usize = HI_ORDERS.len();
+/// Mixer inputs: one per order, the match model, two word models, the high
+/// orders.
+const N_INPUTS: usize = N_ORDERS + 3 + N_HI;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
 const WORD0_IN: usize = N_ORDERS + 1;
 /// Index of the W1 (previous word + current partial word) mixer input.
 const WORD1_IN: usize = N_ORDERS + 2;
+/// Base index of the high-order context mixer inputs (`HI_IN .. HI_IN + N_HI`).
+const HI_IN: usize = N_ORDERS + 3;
+/// Log2 size of each per-context bit-predictor table. The tables are fixed-size
+/// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
+/// regardless of input length — unlike a growing `HashMap`, which is unbounded
+/// and blew past the 10 GB judging limit. 2^22 slots × 16 B = 64 MiB/table.
+const CTX_BITS: u32 = 22;
+/// Number of slots per context table.
+const CTX_SIZE: usize = 1 << CTX_BITS;
 /// Mixer gradient-descent step size on coding loss. An enwik8 quick-panel
 /// sweep bottomed out near 0.002 (0.05 → 2.059, 0.02 → 1.971, 0.004 → 1.936,
 /// 0.002 → 1.933); below that the curve is flat.
@@ -133,6 +151,40 @@ const fn word_key(ctx_hash: u64, node: usize) -> u64 {
 #[inline]
 const fn word_combine(prev: u64, cur: u64) -> u64 {
     prev.wrapping_mul(WORD_MIX).wrapping_add(cur)
+}
+
+/// Map a context key to a slot in a fixed-size context table — a multiplicative
+/// hash taking the high `CTX_BITS` bits (good spread even for the small packed
+/// order keys). Distinct keys may collide and share a predictor; with a large
+/// table that costs little, and it bounds memory.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+const fn slot(key: u64) -> usize {
+    (key.wrapping_mul(WORD_MIX) >> (64 - CTX_BITS)) as usize
+}
+
+/// A fresh fixed-size context table, every slot an untouched (neutral) model.
+fn ctx_table() -> Vec<BitModel> {
+    vec![BitModel::default(); CTX_SIZE]
+}
+
+/// Lookup key for a high-order context: hash the last `order` bytes (the low
+/// `8 * order` bits of the 16-byte `ctx_hi` register) together with the
+/// within-byte tree `node`.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+const fn hi_key(ctx_hi: u128, order: usize, node: usize) -> u64 {
+    let masked = if order >= 16 {
+        ctx_hi
+    } else {
+        ctx_hi & ((1u128 << (8 * order)) - 1)
+    };
+    let lo = masked as u64;
+    let hi = (masked >> 64) as u64;
+    let mixed = lo
+        .wrapping_mul(WORD_MIX)
+        .wrapping_add(hi.wrapping_mul(WORD_MUL));
+    mixed.wrapping_mul(WORD_MIX).wrapping_add(node as u64)
 }
 
 /// One adaptive bit predictor: a probability of "next bit is 1" plus an
@@ -220,22 +272,67 @@ impl Apm {
     }
 }
 
+/// Which model stages are active. Each `l*` codec is one fixed value; the
+/// stack is cumulative — lmix ⊂ lmatch ⊂ lsse ⊂ lword ⊂ lhi. A flags struct is
+/// the legitimate exception to the no-many-bools lint.
+#[derive(Clone, Copy, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct Arms {
+    use_match: bool,
+    use_sse: bool,
+    use_word: bool,
+    use_hi: bool,
+}
+
+impl Arms {
+    const LMIX: Self = Self {
+        use_match: false,
+        use_sse: false,
+        use_word: false,
+        use_hi: false,
+    };
+    const LMATCH: Self = Self {
+        use_match: true,
+        use_sse: false,
+        use_word: false,
+        use_hi: false,
+    };
+    const LSSE: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: false,
+        use_hi: false,
+    };
+    const LWORD: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: false,
+    };
+    const LHI: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+    };
+}
+
 /// Online multi-order bit model with a logistic (logit-domain) mixer, an
 /// optional long-range match model, and optional secondary estimation (SSE).
 #[derive(Debug)]
 struct Model {
     /// Order-0: one predictor per within-byte tree node (`1..=255`).
     o0: Vec<BitModel>,
-    /// Orders `1..=MAX_ORDER`, sparse. `maps[k - 1]` is keyed on the packed
-    /// `(context_k, node)` — see [`Model::key`].
-    maps: Vec<HashMap<u64, BitModel>>,
+    /// Orders `1..=MAX_ORDER`. `maps[k - 1]` is a fixed-size table indexed by
+    /// `slot(key(k, node))` — see [`Model::key`] and [`slot`].
+    maps: Vec<Vec<BitModel>>,
     /// Mixer weights, trained online by gradient descent on coding loss.
     w: [f64; N_INPUTS],
     /// Rolling context — the last up-to-8 bytes, most recent in the low byte.
     ctx: u64,
+    /// Active model stages (which optional arms contribute).
+    arms: Arms,
 
-    /// Whether the match model contributes (selects `lmatch` over `lmix`).
-    use_match: bool,
     /// All bytes seen so far (warm + coded), indexed by the match pointer.
     hist: Vec<u8>,
     /// Match table: hash of the last `MIN_MATCH` bytes → the position that
@@ -249,26 +346,35 @@ struct Model {
     /// Current verified match length, in bytes.
     mlen: u32,
 
-    /// Whether secondary estimation refines the mixer output (selects `lsse`).
-    use_sse: bool,
     /// SSE map keyed on the within-byte tree node (`0..=255`).
     apm: Apm,
 
-    /// Whether the word models contribute (selects `lword`).
-    use_word: bool,
-    /// Per-arm bit predictors: `wmaps[0]` keyed on the current partial word
+    /// Fixed-size predictor tables: `wmaps[0]` keyed on the current partial word
     /// (W0), `wmaps[1]` on the previous word combined with the current one (W1).
-    wmaps: Vec<HashMap<u64, BitModel>>,
+    wmaps: Vec<Vec<BitModel>>,
     /// Rolling hash of the current partial word (`WORD_SEED` when empty).
     word_hash: u64,
     /// Length of the current partial word in letters (`0` between words).
     word_len: u32,
     /// Rolling hash of the most recently completed word (`WORD_SEED` initially).
     prev_word_hash: u64,
+
+    /// Per-high-order fixed-size predictor tables (`himaps[i]` for
+    /// `HI_ORDERS[i]`), indexed by `slot` of the hashed `(context, node)`.
+    himaps: Vec<Vec<BitModel>>,
+    /// Rolling context — the last up-to-16 bytes, most recent in the low byte;
+    /// source for the high-order context hashes.
+    ctx_hi: u128,
 }
 
 impl Model {
-    fn new(use_match: bool, use_sse: bool, use_word: bool) -> Self {
+    fn new(arms: Arms) -> Self {
+        let Arms {
+            use_match,
+            use_sse,
+            use_word,
+            use_hi,
+        } = arms;
         let (hist, mtable, mmap) = if use_match {
             (
                 Vec::new(),
@@ -280,28 +386,33 @@ impl Model {
         };
         let apm = Apm::new(if use_sse { 256 } else { 0 });
         let wmaps = if use_word {
-            vec![HashMap::new(), HashMap::new()]
+            (0..2).map(|_| ctx_table()).collect()
+        } else {
+            Vec::new()
+        };
+        let himaps = if use_hi {
+            (0..N_HI).map(|_| ctx_table()).collect()
         } else {
             Vec::new()
         };
         Self {
             o0: vec![BitModel::default(); 256],
-            maps: (0..MAX_ORDER).map(|_| HashMap::new()).collect(),
+            maps: (0..MAX_ORDER).map(|_| ctx_table()).collect(),
             w: [INIT_W; N_INPUTS],
             ctx: 0,
-            use_match,
+            arms,
             hist,
             mtable,
             mmap,
             mptr: 0,
             mlen: 0,
-            use_sse,
             apm,
-            use_word,
             wmaps,
             word_hash: WORD_SEED,
             word_len: 0,
             prev_word_hash: WORD_SEED,
+            himaps,
+            ctx_hi: 0,
         }
     }
 
@@ -315,9 +426,9 @@ impl Model {
     }
 
     /// Packed lookup key for order `k` at within-byte tree `node`: the order's
-    /// byte history shifted up by 9 bits, with `node` (`< 512`) in the low
-    /// bits. For `k <= 6` the history is `<= 48` bits, so the whole key fits a
-    /// `u64` losslessly — no hashing, no collisions.
+    /// byte history shifted up by 9 bits, with `node` (`< 512`) in the low bits.
+    /// For `k <= 6` the history is `<= 48` bits, so the pair packs into a `u64`
+    /// losslessly before [`slot`] hashes it into the fixed table.
     #[inline]
     const fn key(&self, k: usize, node: usize) -> u64 {
         (self.ctx_k(k) << 9) | node as u64
@@ -328,7 +439,7 @@ impl Model {
     /// coded so far in this byte. Returns `(length bucket, predicted bit)`.
     #[inline]
     fn match_pred(&self, node: usize) -> Option<(usize, u8)> {
-        if !self.use_match || self.mlen == 0 {
+        if !self.arms.use_match || self.mlen == 0 {
             return None;
         }
         let pb = self.hist[self.mptr];
@@ -357,9 +468,7 @@ impl Model {
     ) -> (f64, f64, Option<(usize, usize, f64)>) {
         x[0] = stretch(self.o0[node].p);
         for k in 1..=MAX_ORDER {
-            x[k] = self.maps[k - 1]
-                .get(&self.key(k, node))
-                .map_or(0.0, |bm| stretch(bm.p));
+            x[k] = stretch(self.maps[k - 1][slot(self.key(k, node))].p);
         }
         x[MATCH_IN] = match self.match_pred(node) {
             Some((bucket, pred_bit)) => {
@@ -369,21 +478,29 @@ impl Model {
             }
             None => 0.0,
         };
-        let (w0, w1) = if self.use_word {
+        let (w0, w1) = if self.arms.use_word {
             let k0 = word_key(self.word_hash, node);
             let k1 = word_key(word_combine(self.prev_word_hash, self.word_hash), node);
             (
-                self.wmaps[0].get(&k0).map_or(0.0, |bm| stretch(bm.p)),
-                self.wmaps[1].get(&k1).map_or(0.0, |bm| stretch(bm.p)),
+                stretch(self.wmaps[0][slot(k0)].p),
+                stretch(self.wmaps[1][slot(k1)].p),
             )
         } else {
             (0.0, 0.0)
         };
         x[WORD0_IN] = w0;
         x[WORD1_IN] = w1;
+        for i in 0..N_HI {
+            x[HI_IN + i] = if self.arms.use_hi {
+                let key = hi_key(self.ctx_hi, HI_ORDERS[i], node);
+                stretch(self.himaps[i][slot(key)].p)
+            } else {
+                0.0
+            };
+        }
         let s: f64 = self.w.iter().zip(x.iter()).map(|(wk, xk)| wk * xk).sum();
         let p_mix = squash(s);
-        if self.use_sse {
+        if self.arms.use_sse {
             let (p_apm, i, frac) = self.apm.refine(s, node);
             let p_code = APM_BLEND.mul_add(p_apm, (1.0 - APM_BLEND) * p_mix);
             (p_code, p_mix, Some((node, i, frac)))
@@ -395,7 +512,7 @@ impl Model {
     /// After bit `y` is coded at `node`: step the mixer weights down the
     /// coding-loss gradient (on its own output `p_mix`), update each model's
     /// bit predictor, and nudge the SSE map.
-    #[allow(clippy::suboptimal_flops)]
+    #[allow(clippy::suboptimal_flops, clippy::needless_range_loop)]
     fn step_update(
         &mut self,
         node: usize,
@@ -411,17 +528,26 @@ impl Model {
         let yf = f64::from(y);
         self.o0[node].update(yf);
         for k in 1..=MAX_ORDER {
-            let key = self.key(k, node);
-            self.maps[k - 1].entry(key).or_default().update(yf);
+            let idx = slot(self.key(k, node));
+            self.maps[k - 1][idx].update(yf);
         }
         if let Some((bucket, pred_bit)) = self.match_pred(node) {
             self.mmap[bucket].update(f64::from(u8::from(y == pred_bit)));
         }
-        if self.use_word {
-            let k0 = word_key(self.word_hash, node);
-            let k1 = word_key(word_combine(self.prev_word_hash, self.word_hash), node);
-            self.wmaps[0].entry(k0).or_default().update(yf);
-            self.wmaps[1].entry(k1).or_default().update(yf);
+        if self.arms.use_word {
+            let i0 = slot(word_key(self.word_hash, node));
+            let i1 = slot(word_key(
+                word_combine(self.prev_word_hash, self.word_hash),
+                node,
+            ));
+            self.wmaps[0][i0].update(yf);
+            self.wmaps[1][i1].update(yf);
+        }
+        if self.arms.use_hi {
+            for i in 0..N_HI {
+                let idx = slot(hi_key(self.ctx_hi, HI_ORDERS[i], node));
+                self.himaps[i][idx].update(yf);
+            }
         }
         if let Some((ctx, i, frac)) = sse {
             self.apm.update(ctx, i, frac, yf);
@@ -454,7 +580,7 @@ impl Model {
     /// table, then record this position.
     #[allow(clippy::cast_possible_truncation)]
     fn advance_match(&mut self, b: u8) {
-        if !self.use_match {
+        if !self.arms.use_match {
             return;
         }
         if self.mlen > 0 {
@@ -487,7 +613,7 @@ impl Model {
     /// Fold byte `b` into the word state: extend the current word on a letter,
     /// or close it out (promoting it to `prev_word`) and reset on a boundary.
     fn advance_word(&mut self, b: u8) {
-        if !self.use_word {
+        if !self.arms.use_word {
             return;
         }
         if b.is_ascii_alphabetic() {
@@ -505,6 +631,16 @@ impl Model {
         }
     }
 
+    /// Roll all per-byte context state forward after byte `b` is known: match
+    /// state, word state, and the two rolling context registers. Shared by the
+    /// learn / encode / decode / residual paths so they evolve identically.
+    fn advance(&mut self, b: u8) {
+        self.advance_match(b);
+        self.advance_word(b);
+        self.ctx = (self.ctx << 8) | u64::from(b);
+        self.ctx_hi = (self.ctx_hi << 8) | u128::from(b);
+    }
+
     /// Replay a byte through predict+update without coding it — used to prime
     /// model state from the `warm` prefix on both sides identically.
     fn learn_byte(&mut self, b: u8) {
@@ -516,9 +652,7 @@ impl Model {
             self.step_update(node, &x, p_mix, sse, y);
             node = (node << 1) | usize::from(y);
         }
-        self.advance_match(b);
-        self.advance_word(b);
-        self.ctx = (self.ctx << 8) | u64::from(b);
+        self.advance(b);
     }
 }
 
@@ -535,16 +669,14 @@ fn fill_bit_cdf(p1: f64, cdf: &mut [u32; 3]) {
 /// Shared by the `lmix` / `lmatch` / `lsse` / `lword` codecs.
 #[allow(clippy::cast_possible_truncation)]
 fn encode_impl(
-    use_match: bool,
-    use_sse: bool,
-    use_word: bool,
+    arms: Arms,
     component: &str,
     warm: &[u8],
     measure: &[u8],
 ) -> (Vec<u8>, Decomposition) {
     let mut writer = BitWriter::new();
     writer.write_bits(measure.len() as u64, 64);
-    let mut model = Model::new(use_match, use_sse, use_word);
+    let mut model = Model::new(arms);
     for &b in warm {
         model.learn_byte(b);
     }
@@ -562,9 +694,7 @@ fn encode_impl(
                 model.step_update(node, &x, p_mix, sse, y);
                 node = (node << 1) | usize::from(y);
             }
-            model.advance_match(b);
-            model.advance_word(b);
-            model.ctx = (model.ctx << 8) | u64::from(b);
+            model.advance(b);
         }
         enc.finish();
     }
@@ -575,16 +705,10 @@ fn encode_impl(
 }
 
 /// Decode an archive produced by [`encode_impl`] with the same stages.
-fn decode_impl(
-    use_match: bool,
-    use_sse: bool,
-    use_word: bool,
-    warm: &[u8],
-    archive: &[u8],
-) -> Result<Vec<u8>> {
+fn decode_impl(arms: Arms, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
     let mut reader = BitReader::new(archive);
     let n = usize::try_from(reader.read_bits(64)?).expect("length prefix fits usize");
-    let mut model = Model::new(use_match, use_sse, use_word);
+    let mut model = Model::new(arms);
     for &b in warm {
         model.learn_byte(b);
     }
@@ -603,9 +727,7 @@ fn decode_impl(
             b = (b << 1) | y;
             node = (node << 1) | usize::from(y);
         }
-        model.advance_match(b);
-        model.advance_word(b);
-        model.ctx = (model.ctx << 8) | u64::from(b);
+        model.advance(b);
         out.push(b);
     }
     Ok(out)
@@ -622,11 +744,11 @@ impl Codec for LmixCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(false, false, false, "lmix", warm, measure))
+        Ok(encode_impl(Arms::LMIX, "lmix", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(false, false, false, warm, archive)
+        decode_impl(Arms::LMIX, warm, archive)
     }
 }
 
@@ -640,11 +762,11 @@ impl Codec for LmatchCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(true, false, false, "lmatch", warm, measure))
+        Ok(encode_impl(Arms::LMATCH, "lmatch", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(true, false, false, warm, archive)
+        decode_impl(Arms::LMATCH, warm, archive)
     }
 }
 
@@ -659,11 +781,11 @@ impl Codec for LsseCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(true, true, false, "lsse", warm, measure))
+        Ok(encode_impl(Arms::LSSE, "lsse", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(true, true, false, warm, archive)
+        decode_impl(Arms::LSSE, warm, archive)
     }
 }
 
@@ -677,12 +799,115 @@ impl Codec for LwordCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(true, true, true, "lword", warm, measure))
+        Ok(encode_impl(Arms::LWORD, "lword", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(true, true, true, warm, archive)
+        decode_impl(Arms::LWORD, warm, archive)
     }
+}
+
+/// [`LwordCodec`] plus high-order hashed byte contexts (orders 8/12/16).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LhiCodec;
+
+impl Codec for LhiCodec {
+    fn name(&self) -> &'static str {
+        "lhi"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LHI, "lhi", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LHI, warm, archive)
+    }
+}
+
+/// Map a codec name to its model stages, so the residual analyzer can
+/// reproduce any codec's model exactly.
+pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
+    Some(match name.as_bytes() {
+        b"lmix" => Arms::LMIX,
+        b"lmatch" => Arms::LMATCH,
+        b"lsse" => Arms::LSSE,
+        b"lword" => Arms::LWORD,
+        b"lhi" => Arms::LHI,
+        _ => return None,
+    })
+}
+
+/// Byte-class labels for residual attribution, indexed by [`byte_class`].
+pub(crate) const CLASS_NAMES: [&str; 9] = [
+    "lower", "upper", "digit", "space", "newline", "markup", "punct", "high", "other",
+];
+
+/// Bucket a byte into a residual class. `markup` covers the wiki/XML structural
+/// characters; everything non-letter/digit/space splits into markup vs other
+/// punctuation so we can see which kind of structure is expensive.
+const fn byte_class(b: u8) -> usize {
+    match b {
+        b'a'..=b'z' => 0,
+        b'A'..=b'Z' => 1,
+        b'0'..=b'9' => 2,
+        b' ' => 3,
+        b'\n' => 4,
+        b'<' | b'>' | b'&' | b';' | b'=' | b'[' | b']' | b'{' | b'}' | b'|' | b'/' => 5,
+        0x21..=0x7e => 6,
+        0x80..=0xff => 7,
+        _ => 8,
+    }
+}
+
+/// Per-class coding-cost attribution from running a model over `measure`.
+#[derive(Clone, Debug)]
+pub(crate) struct ResidualReport {
+    /// Ideal coded bits (cross-entropy) spent per class.
+    pub bits: [f64; 9],
+    /// Bytes seen per class.
+    pub count: [u64; 9],
+}
+
+impl ResidualReport {
+    pub(crate) fn total_bits(&self) -> f64 {
+        self.bits.iter().sum()
+    }
+
+    pub(crate) fn total_count(&self) -> u64 {
+        self.count.iter().sum()
+    }
+}
+
+/// Run a codec's model over `measure` (primed by `warm`) and attribute the
+/// ideal coding cost (`-log2 P(actual bit)`, summed) to each byte's class. This
+/// is the model's cross-entropy — what the archive costs, minus negligible AC
+/// framing — so it shows where the bits actually go without needing the coder.
+pub(crate) fn residual_report(arms: Arms, warm: &[u8], measure: &[u8]) -> ResidualReport {
+    let mut model = Model::new(arms);
+    for &b in warm {
+        model.learn_byte(b);
+    }
+    let mut bits = [0.0; 9];
+    let mut count = [0u64; 9];
+    let mut x = [0.0; N_INPUTS];
+    for &b in measure {
+        let cls = byte_class(b);
+        let mut node = 1usize;
+        let mut cost = 0.0;
+        for i in (0..8).rev() {
+            let y = (b >> i) & 1;
+            let (p_code, p_mix, sse) = model.step_predict(node, &mut x);
+            let p = if y == 1 { p_code } else { 1.0 - p_code };
+            cost -= p.max(1e-12).log2();
+            model.step_update(node, &x, p_mix, sse, y);
+            node = (node << 1) | usize::from(y);
+        }
+        model.advance(b);
+        bits[cls] += cost;
+        count[cls] += 1;
+    }
+    ResidualReport { bits, count }
 }
 
 #[cfg(test)]
@@ -756,6 +981,14 @@ mod tests {
         roundtrips_with_warm(&LwordCodec);
         roundtrips_all_bytes(&LwordCodec);
         roundtrips_empty(&LwordCodec);
+    }
+
+    #[test]
+    fn lhi_roundtrips() {
+        roundtrips_text(&LhiCodec);
+        roundtrips_with_warm(&LhiCodec);
+        roundtrips_all_bytes(&LhiCodec);
+        roundtrips_empty(&LhiCodec);
     }
 
     #[test]

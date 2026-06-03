@@ -13,6 +13,27 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 — the memory wall: growing HashMaps bust 10 GB; fixed-size tables bound it, plus a residual analyzer
+
+Adding high-order byte contexts (orders 8/12/16, the `lhi` codec) made a latent problem acute: a full-enwik8 compress climbed past 28 GB RAM and had to be killed. Root cause — every per-context predictor was a `HashMap<key, BitModel>` that grows one entry per distinct `(context, node)` ever seen, so it is unbounded in input size. High orders are pathological: a 12- or 16-byte window is essentially unique at every position, adding ~8 never-reused entries per byte. This was not unique to `lhi`; the order-1..6 and word maps grow the same way, just slower, so even `lword` was almost certainly over the 10 GB judging limit on enwik8 and certainly would be on enwik9. The bpb ladder to date is valid as a modeling result, but the implementation was not submission-viable.
+
+*Fix.* Replace every growing `HashMap` with a fixed-size, direct-mapped table (PAQ/lpaq standard): a `Vec<BitModel>` of `2^CTX_BITS` slots, indexed by a multiplicative hash of the key, tolerating collisions (colliding contexts share a predictor; with a large table that costs little). An untouched slot is `p = 0.5`, i.e. `stretch = 0`, so it is automatically the neutral input a novel context used to get — the lookups got *simpler*, not just bounded. At `CTX_BITS = 22` each table is 64 MiB; the 11 context tables total ~0.7 GB. Measured peak RSS for `lhi` on enwik8 dropped from 28 GB+ to **748 MiB** (→ ~1.75 GB on enwik9 with the 1 GB match-history buffer) — comfortably inside 10 GB, with headroom to enlarge tables if collisions cost too much. Collision cost on full-file bpb is being measured separately; small slices and the bench do not fill the tables, so they understate it.
+
+*Residual analyzer.* To make model design data-driven rather than guessed, added an `analyze` subcommand that runs a codec's model over a chunk and attributes the ideal coding cost (`-log2 P(actual bit)`, summed — the cross-entropy, i.e. the archive cost minus negligible AC framing) to each byte's class. First read, `lhi` over an 8 MiB slice (tables not full, so absolute bpb is optimistic; the per-class structure is the signal):
+
+| class | %bytes | %bits | bpb |
+|---|---:|---:|---:|
+| lower | 66.3 | 64.0 | 1.78 |
+| upper | 3.9 | 10.0 | 4.73 |
+| punct | 4.2 | 7.6 | 3.35 |
+| markup | 7.4 | 6.3 | 1.58 |
+| space | 13.6 | 5.1 | 0.69 |
+| digit | 2.6 | 4.5 | 3.20 |
+| high | 0.8 | 1.2 | 2.86 |
+| newline | 1.2 | 1.2 | 1.96 |
+
+Two readings, both actionable. By cost-per-byte, **uppercase is the worst class by far — 3.9% of bytes but 10% of the bits at 4.73 bpb**, because within any context the model rarely sees a capital and can't predict which one; capitalization is the clear targeted lever. By share-of-total, **lowercase is 64% of all bits**, so even a small per-byte improvement there compounds across the whole corpus. Case-folded contexts (pooling the/The/THE) attack both at once: they sharpen letter-identity for capitals and merge case-variant statistics for the giant lowercase pool. Structure (markup/space/newline, 0.7–1.6 bpb) is already cheap, re-confirming the 2026-05-29 finding that routing it out would not help. The flag set selecting each codec's arms was also folded into one `Arms` value to keep call sites readable as the stack grows.
+
 ## 2026-06-03 — word-context model: 1.661 bpb on full enwik8, and a vindication of "add a model, don't transform the input"
 
 This step started as a design chat. CDR asked whether repurposing the rare high byte values (enwik uses 206 distinct bytes; ~100 carry 99.71% of the mass) as a small static BPE dictionary would help — replacing frequent multi-byte strings with single tokens. The conclusion was no, not the right move: for a strong context model + AC, a reversible token transform is entropy-neutral (the model already codes a frequent n-gram at near its entropy), and v6's word-tokenization loss is direct evidence that opaque tokens hurt by hiding byte-level substructure. The one real thing BPE would buy — longer effective context for our short order-0..6 models — is better had the cmix-native way: add a longer/word context as another mixer arm, non-destructively, and let the mixer weight it. So we built that instead.
