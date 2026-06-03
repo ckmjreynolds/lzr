@@ -68,7 +68,7 @@ const HI_IN: usize = N_ORDERS + 3;
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
 /// and blew past the 10 GB judging limit. 2^22 slots × 16 B = 64 MiB/table.
-const CTX_BITS: u32 = 22;
+const CTX_BITS: u32 = 24;
 /// Number of slots per context table.
 const CTX_SIZE: usize = 1 << CTX_BITS;
 /// Mixer gradient-descent step size on coding loss. An enwik8 quick-panel
@@ -157,10 +157,43 @@ const fn word_combine(prev: u64, cur: u64) -> u64 {
 /// hash taking the high `CTX_BITS` bits (good spread even for the small packed
 /// order keys). Distinct keys may collide and share a predictor; with a large
 /// table that costs little, and it bounds memory.
+/// Hash a context key into a table slot index plus a 16-bit checksum, taken
+/// from adjacent well-mixed high bits of one multiplicative hash. Two keys
+/// landing in the same slot almost always differ in checksum, so a collision
+/// is detected rather than silently blended.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
-const fn slot(key: u64) -> usize {
-    (key.wrapping_mul(WORD_MIX) >> (64 - CTX_BITS)) as usize
+const fn locate(key: u64) -> (usize, u16) {
+    let h = key.wrapping_mul(WORD_MIX);
+    let idx = (h >> (64 - CTX_BITS)) as usize;
+    let check = (h >> (64 - CTX_BITS - 16)) as u16;
+    (idx, check)
+}
+
+/// Read a hashed context's logit: the predictor's `stretch(p)` if the slot's
+/// checksum confirms it holds this key, else a neutral `0` (the slot belongs to
+/// a different context — don't trust its stats).
+#[inline]
+fn ctx_logit(table: &[BitModel], key: u64) -> f64 {
+    let (idx, check) = locate(key);
+    let bm = table[idx];
+    if bm.check == check {
+        stretch(bm.p)
+    } else {
+        0.0
+    }
+}
+
+/// Update a hashed context toward bit `y`, evicting first on a checksum
+/// mismatch — a colliding context claims the slot with fresh stats rather than
+/// corrupting the incumbent's by blending.
+#[inline]
+fn update_ctx(table: &mut [BitModel], key: u64, y: f64) {
+    let (idx, check) = locate(key);
+    if table[idx].check != check {
+        table[idx] = BitModel::fresh(check);
+    }
+    table[idx].update(y);
 }
 
 /// A fresh fixed-size context table, every slot an untouched (neutral) model.
@@ -187,22 +220,40 @@ const fn hi_key(ctx_hi: u128, order: usize, node: usize) -> u64 {
     mixed.wrapping_mul(WORD_MIX).wrapping_add(node as u64)
 }
 
-/// One adaptive bit predictor: a probability of "next bit is 1" plus an
-/// observation count that schedules the learning rate (fast while young,
-/// floored once mature so it keeps tracking drift).
+/// One adaptive bit predictor: a probability of "next bit is 1", an observation
+/// count that schedules the learning rate (fast while young, floored once
+/// mature), and a key checksum used by the hashed context tables to detect
+/// collisions. `check` fits free in the struct's existing 16-byte alignment
+/// padding; the dense order-0 and match-bucket tables index directly and ignore
+/// it.
 #[derive(Clone, Copy, Debug)]
 struct BitModel {
     p: f64,
     n: u32,
+    check: u16,
 }
 
 impl Default for BitModel {
     fn default() -> Self {
-        Self { p: 0.5, n: 0 }
+        Self {
+            p: 0.5,
+            n: 0,
+            check: 0,
+        }
     }
 }
 
 impl BitModel {
+    /// A fresh predictor stamped with `check` (used when a slot is claimed for a
+    /// new context after a collision eviction).
+    const fn fresh(check: u16) -> Self {
+        Self {
+            p: 0.5,
+            n: 0,
+            check,
+        }
+    }
+
     /// Move the probability toward the observed bit and age the counter.
     #[inline]
     #[allow(clippy::suboptimal_flops)]
@@ -428,7 +479,7 @@ impl Model {
     /// Packed lookup key for order `k` at within-byte tree `node`: the order's
     /// byte history shifted up by 9 bits, with `node` (`< 512`) in the low bits.
     /// For `k <= 6` the history is `<= 48` bits, so the pair packs into a `u64`
-    /// losslessly before [`slot`] hashes it into the fixed table.
+    /// losslessly before [`locate`] hashes it into a fixed-table slot.
     #[inline]
     const fn key(&self, k: usize, node: usize) -> u64 {
         (self.ctx_k(k) << 9) | node as u64
@@ -468,7 +519,7 @@ impl Model {
     ) -> (f64, f64, Option<(usize, usize, f64)>) {
         x[0] = stretch(self.o0[node].p);
         for k in 1..=MAX_ORDER {
-            x[k] = stretch(self.maps[k - 1][slot(self.key(k, node))].p);
+            x[k] = ctx_logit(&self.maps[k - 1], self.key(k, node));
         }
         x[MATCH_IN] = match self.match_pred(node) {
             Some((bucket, pred_bit)) => {
@@ -481,10 +532,7 @@ impl Model {
         let (w0, w1) = if self.arms.use_word {
             let k0 = word_key(self.word_hash, node);
             let k1 = word_key(word_combine(self.prev_word_hash, self.word_hash), node);
-            (
-                stretch(self.wmaps[0][slot(k0)].p),
-                stretch(self.wmaps[1][slot(k1)].p),
-            )
+            (ctx_logit(&self.wmaps[0], k0), ctx_logit(&self.wmaps[1], k1))
         } else {
             (0.0, 0.0)
         };
@@ -492,8 +540,7 @@ impl Model {
         x[WORD1_IN] = w1;
         for i in 0..N_HI {
             x[HI_IN + i] = if self.arms.use_hi {
-                let key = hi_key(self.ctx_hi, HI_ORDERS[i], node);
-                stretch(self.himaps[i][slot(key)].p)
+                ctx_logit(&self.himaps[i], hi_key(self.ctx_hi, HI_ORDERS[i], node))
             } else {
                 0.0
             };
@@ -528,25 +575,22 @@ impl Model {
         let yf = f64::from(y);
         self.o0[node].update(yf);
         for k in 1..=MAX_ORDER {
-            let idx = slot(self.key(k, node));
-            self.maps[k - 1][idx].update(yf);
+            let key = self.key(k, node);
+            update_ctx(&mut self.maps[k - 1], key, yf);
         }
         if let Some((bucket, pred_bit)) = self.match_pred(node) {
             self.mmap[bucket].update(f64::from(u8::from(y == pred_bit)));
         }
         if self.arms.use_word {
-            let i0 = slot(word_key(self.word_hash, node));
-            let i1 = slot(word_key(
-                word_combine(self.prev_word_hash, self.word_hash),
-                node,
-            ));
-            self.wmaps[0][i0].update(yf);
-            self.wmaps[1][i1].update(yf);
+            let k0 = word_key(self.word_hash, node);
+            let k1 = word_key(word_combine(self.prev_word_hash, self.word_hash), node);
+            update_ctx(&mut self.wmaps[0], k0, yf);
+            update_ctx(&mut self.wmaps[1], k1, yf);
         }
         if self.arms.use_hi {
             for i in 0..N_HI {
-                let idx = slot(hi_key(self.ctx_hi, HI_ORDERS[i], node));
-                self.himaps[i][idx].update(yf);
+                let key = hi_key(self.ctx_hi, HI_ORDERS[i], node);
+                update_ctx(&mut self.himaps[i], key, yf);
             }
         }
         if let Some((ctx, i, frac)) = sse {

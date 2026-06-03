@@ -13,6 +13,16 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 — checksummed hash tables recover most of the collision tax; shippable lhi at 1.700 bpb on full enwik8
+
+The fixed-size tables that bounded memory (see the memory-wall entry below) carried a cost the small-slice numbers hid: on full enwik8, direct-mapped tables collide heavily, and blending unrelated contexts into one predictor cost a lot. Measured collision tax (lword, full enwik8, vs the lossless `HashMap`'s 1.661): 2^22 1.827, 2^23 1.785, 2^24 1.751, 2^25 1.725 — up to +0.166 bpb, more than the word arm gained.
+
+*Fix (lpaq/zpaq standard).* Give each slot a 16-bit checksum of its key (it fits free in `BitModel`'s existing 16-byte alignment padding — `f64` + `u32` + `u16` still rounds to 16). On read, return the predictor only if the checksum confirms the slot holds this key, else a neutral logit; on update, if the checksum mismatches, evict — claim the slot with fresh stats rather than blending. Two colliding contexts now thrash (each relearns on reclaim) instead of permanently corrupting each other; a frequent context is no longer polluted by a rare collider. The dense order-0 and match-bucket tables index directly and ignore the field.
+
+*Results (lword, full enwik8, checksummed):* 2^22 1.790, 2^23 1.754, 2^24 1.725, 2^25 1.703. The checksum buys roughly a free doubling of the table — checksummed 2^24 (1.725) matches direct-mapped 2^25 (1.725) at half the memory — with the benefit shrinking as tables grow (fewer collisions to catch). Still +0.042 above the unbounded-HashMap 1.661 at 2^25, the residue being genuine capacity (more distinct contexts than slots, so eviction thrash) rather than blending.
+
+Settled on `CTX_BITS = 24` as the default. The headline: **lhi checksummed at 2^24 codes full enwik8 at 1.700 bpb**, round-trip verified, encode 219 s (0.44 MiB/s — faster than the old HashMap lword's 638 s), peak RAM ~2.75 GB tables + 0.1 GB hist on enwik8 (~3.75 GB on enwik9 with the 1 GB hist). So bounded *and* faster than the unbounded version, at L(D) 0. The lossless 1.661 was never shippable (28 GB+); 1.700 is the new shippable best. Two caveats for enwik9: it has ~10x the distinct contexts, so it will collide more at the same table size (the enwik8 number is optimistic for it); and the submission build can raise `CTX_BITS` to 25 (lhi ~6.5 GB on enwik9, inside 10 GB) for roughly another -0.02.
+
 ## 2026-06-03 — the memory wall: growing HashMaps bust 10 GB; fixed-size tables bound it, plus a residual analyzer
 
 Adding high-order byte contexts (orders 8/12/16, the `lhi` codec) made a latent problem acute: a full-enwik8 compress climbed past 28 GB RAM and had to be killed. Root cause — every per-context predictor was a `HashMap<key, BitModel>` that grows one entry per distinct `(context, node)` ever seen, so it is unbounded in input size. High orders are pathological: a 12- or 16-byte window is essentially unique at every position, adding ~8 never-reused entries per byte. This was not unique to `lhi`; the order-1..6 and word maps grow the same way, just slower, so even `lword` was almost certainly over the 10 GB judging limit on enwik8 and certainly would be on enwik9. The bpb ladder to date is valid as a modeling result, but the implementation was not submission-viable.
