@@ -13,6 +13,24 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 — match model: long-range repeats take lmatch to 1.738 bpb on full enwik8, below v3's neural best at zero L(D)
+
+The order-0..6 mixer (see the genesis entry below) sees only six bytes of history, but enwik text repeats verbatim far beyond that — markup boilerplate, recurring titles and link targets, template fragments. The first zero-L(D) lever on top of the logit-domain mixer is therefore a match model (the lpaq design): an extra mixer input that predicts long-range exact repeats.
+
+*Mechanism.* A hash table maps the last `MIN_MATCH` bytes to the position that context last ended at. When no match is active, the current context is looked up; a candidate is byte-verified (guarding against hash collisions) and, if real, seeds a match whose predicted next byte is the byte that followed the earlier occurrence. While the match holds, each bit is predicted as the corresponding bit of the predicted byte — but only while the bits already coded in the current byte remain a prefix of it; once they diverge the match goes silent for the rest of the byte. The prediction's confidence is not a fixed constant: it comes from an adaptive map bucketed by match length, so the model learns that a length-3 match is weaker than a length-40 one. A byte that breaks the prediction drops the match, which re-seeds from the table on the next lookup. The match input joins the logistic mixer as one more `stretch(p)` term with its own online-trained weight.
+
+*Results (A/B, lmix vs lmatch, all round-trip verified, L(D) 0):*
+
+| instrument | lmix | lmatch | delta |
+|---|---:|---:|---:|
+| quick panel (5 x 64 KiB) | 1.933 | 1.805 | -0.128 |
+| full panel (20 x 256 KiB) | 1.961 | 1.862 | -0.099 |
+| full enwik8 (100 MB) | 1.840 | 1.738 | -0.102 |
+
+*Minimum match length.* A quick-panel sweep favored short seeds — 8 -> 1.839, 6 -> 1.839, 5 -> 1.831, 4 -> 1.817, 3 -> 1.805, 2 -> 1.807 — bottoming at `MIN_MATCH = 3` (locked). Counter to the intuition that a longer seed means a more trustworthy match, seeding earlier catches repeats sooner, and the adaptive length-bucketed confidence map absorbs the higher false-match rate a 3-byte seed brings by simply assigning short matches a lower weight. enwik9 positions fit a `u32`, so the table stores 4-byte positions; at 2^22 entries it is 16 MiB.
+
+At 1.738 bpb on full enwik8 this passes v3's 1.811 — which required a shipped neural arm — at L(D) 0, and remains deterministic and single-threaded (encode ~0.28 MiB/s; the match model adds modest overhead over lmix). Implemented as the `lmatch` codec, with `lmix` kept for the clean A/B; both share the module behind a `use_match` flag, and lmix stays bit-identical because its match input is held at a neutral 0. Remaining zero-L(D) levers: SSE/APM secondary estimation, context-selected mixer weight sets, and additional contexts (a second match model, sparse/skip contexts, word contexts).
+
 ## 2026-06-03 — v7 genesis: a deterministic context-mixing base, and logistic mixing takes full enwik8 from 2.127 to 1.840 bpb
 
 Following the L(D) wall (see 2026-06-01 → 2026-06-03), v7 stops fighting the neural arm's shipped-weight penalty and rebuilds on the zero-L(D) codec side: a deterministic, fast, online context-mixing base in the cmix/PAQ family, where encoder and decoder replay the same stream and rebuild byte-identical model state, so no weights ship and L(D) is structurally 0. The 13 neural/arm files (transformer, MoE, tokenizer, classifier, match, ngram, struct-mask, word-tok, GPU/int-inference) were removed; the codec source dropped from 9,144 to 1,485 lines, leaving the AC, bit-IO, eval panel, and the new mixer.

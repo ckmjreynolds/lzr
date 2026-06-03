@@ -41,7 +41,7 @@ enum Command {
     Bench {
         #[arg(long, default_value = "assets/enwik8")]
         corpus: PathBuf,
-        /// Codec name. v7 knows: `null`, `cmix`, `lmix`.
+        /// Codec name. v7 knows: `null`, `cmix`, `lmix`, `lmatch`.
         #[arg(long, default_value = "cmix")]
         codec: String,
         /// Reduce panel to 5 windows × 64 KiB for tight iteration.
