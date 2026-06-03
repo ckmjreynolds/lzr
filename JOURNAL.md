@@ -13,6 +13,24 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 — word-context model: 1.661 bpb on full enwik8, and a vindication of "add a model, don't transform the input"
+
+This step started as a design chat. CDR asked whether repurposing the rare high byte values (enwik uses 206 distinct bytes; ~100 carry 99.71% of the mass) as a small static BPE dictionary would help — replacing frequent multi-byte strings with single tokens. The conclusion was no, not the right move: for a strong context model + AC, a reversible token transform is entropy-neutral (the model already codes a frequent n-gram at near its entropy), and v6's word-tokenization loss is direct evidence that opaque tokens hurt by hiding byte-level substructure. The one real thing BPE would buy — longer effective context for our short order-0..6 models — is better had the cmix-native way: add a longer/word context as another mixer arm, non-destructively, and let the mixer weight it. So we built that instead.
+
+*Mechanism.* A word is a maximal run of ASCII letters; any other byte is a boundary that ends it. Two arms join the mixer: W0 keyed on a rolling hash of the current partial word, W1 on the previous completed word combined with the current partial word. Both are hashed into `HashMap<u64, BitModel>` keyed on `(context_hash, node)` — variable-length word contexts can't be packed losslessly like the order keys, but a 64-bit hash is effectively collision-free and, since the word state is rebuilt from already-coded bytes, identical on both sides (L(D) still 0). After each byte, the word state advances: a letter folds into the rolling hash; a boundary promotes the finished word to `prev_word` and resets.
+
+*Results (A/B, lsse vs lword, round-trip verified, L(D) 0):*
+
+| instrument | lsse | lword | delta |
+|---|---:|---:|---:|
+| quick panel (5 x 64 KiB) | 1.773 | 1.731 | -0.042 |
+| full panel (20 x 256 KiB) | 1.831 | 1.785 | -0.046 |
+| full enwik8 (100 MB) | 1.714 | 1.661 | -0.053 |
+
+A bigger step than SSE (-0.024) and in the match model's class. Why it works: the word context is variable-length and word-aligned, so a long word's full prefix is in-context (past order-6's reach) and its statistics pool across every occurrence regardless of the markup that preceded it; keyed on the full word it also predicts the word-terminating character (e.g. "the" -> space). W1 adds collocation — "United " -> "States", "New " -> "York" — which no fixed byte-order context captures, because the signal is a word back, not k bytes back. The cost is speed: two more per-bit hash lookups push full-enwik8 encode to ~640 s (from ~320 s).
+
+The running v7 ladder on full enwik8 is now cmix 2.127 -> lmix 1.840 -> lmatch 1.738 -> lsse 1.714 -> lword 1.661, all at L(D) 0 and single-threaded. More than the bits, the result settles the BPE question empirically: "longer context" was the lever, and taking it as an additive arm beat the transform-the-bytes shortcut. Shipped as the `lword` codec (= lsse + W0 + W1), lsse kept for the A/B, both flags on the shared model. Next: case-folded word contexts (pool the/The/THE), the still-pending high-order hashed byte contexts (order-8/12/16), and context-selected mixer weight sets.
+
 ## 2026-06-03 — SSE/APM: secondary estimation recalibrates the mixer to 1.714 bpb on full enwik8
 
 The next lpaq-ladder lever after the match model is secondary symbol estimation (SSE) via an adaptive probability map (APM): a learned recalibration of the mixer's output. The logistic mixer can only set linear weights on its inputs' logits, so any systematic miscalibration that survives that — the mixed probability being, say, consistently too timid in some regime — it cannot correct. The APM can.

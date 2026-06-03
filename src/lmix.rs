@@ -45,10 +45,14 @@ use crate::codec::{Codec, Decomposition};
 const MAX_ORDER: usize = 6;
 /// Number of order models.
 const N_ORDERS: usize = MAX_ORDER + 1;
-/// Mixer inputs: one per order, plus the match model.
-const N_INPUTS: usize = N_ORDERS + 1;
+/// Mixer inputs: one per order, plus the match model and the two word models.
+const N_INPUTS: usize = N_ORDERS + 3;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
+/// Index of the W0 (current partial word) mixer input.
+const WORD0_IN: usize = N_ORDERS + 1;
+/// Index of the W1 (previous word + current partial word) mixer input.
+const WORD1_IN: usize = N_ORDERS + 2;
 /// Mixer gradient-descent step size on coding loss. An enwik8 quick-panel
 /// sweep bottomed out near 0.002 (0.05 → 2.059, 0.02 → 1.971, 0.004 → 1.936,
 /// 0.002 → 1.933); below that the curve is flat.
@@ -96,6 +100,14 @@ const APM_RATE: f64 = 0.02;
 /// trusting the APM ~70% beats both the cautious blend and the pure map.
 const APM_BLEND: f64 = 0.7;
 
+/// Word model: rolling-hash seed for an empty word (between words / in markup).
+const WORD_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+/// Word model: rolling-hash multiplier folding each letter into the word hash.
+const WORD_MUL: u64 = 0x0000_0100_0000_01B3;
+/// Word model: golden-ratio prime mixing context hashes with the byte node and
+/// the previous word with the current one.
+const WORD_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Logit of a probability: `ln(p / (1-p))`, clamped to keep it finite.
 #[inline]
 fn stretch(p: f64) -> f64 {
@@ -107,6 +119,20 @@ fn stretch(p: f64) -> f64 {
 #[inline]
 fn squash(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
+}
+
+/// Fold a word-context hash together with the within-byte tree `node` into a
+/// lookup key. `node < 512` so distinct `(ctx, node)` pairs stay distinct.
+#[inline]
+const fn word_key(ctx_hash: u64, node: usize) -> u64 {
+    ctx_hash.wrapping_mul(WORD_MIX).wrapping_add(node as u64)
+}
+
+/// Combine the previous word's hash with the current partial word's (the W1
+/// context).
+#[inline]
+const fn word_combine(prev: u64, cur: u64) -> u64 {
+    prev.wrapping_mul(WORD_MIX).wrapping_add(cur)
 }
 
 /// One adaptive bit predictor: a probability of "next bit is 1" plus an
@@ -227,10 +253,22 @@ struct Model {
     use_sse: bool,
     /// SSE map keyed on the within-byte tree node (`0..=255`).
     apm: Apm,
+
+    /// Whether the word models contribute (selects `lword`).
+    use_word: bool,
+    /// Per-arm bit predictors: `wmaps[0]` keyed on the current partial word
+    /// (W0), `wmaps[1]` on the previous word combined with the current one (W1).
+    wmaps: Vec<HashMap<u64, BitModel>>,
+    /// Rolling hash of the current partial word (`WORD_SEED` when empty).
+    word_hash: u64,
+    /// Length of the current partial word in letters (`0` between words).
+    word_len: u32,
+    /// Rolling hash of the most recently completed word (`WORD_SEED` initially).
+    prev_word_hash: u64,
 }
 
 impl Model {
-    fn new(use_match: bool, use_sse: bool) -> Self {
+    fn new(use_match: bool, use_sse: bool, use_word: bool) -> Self {
         let (hist, mtable, mmap) = if use_match {
             (
                 Vec::new(),
@@ -241,6 +279,11 @@ impl Model {
             (Vec::new(), Vec::new(), Vec::new())
         };
         let apm = Apm::new(if use_sse { 256 } else { 0 });
+        let wmaps = if use_word {
+            vec![HashMap::new(), HashMap::new()]
+        } else {
+            Vec::new()
+        };
         Self {
             o0: vec![BitModel::default(); 256],
             maps: (0..MAX_ORDER).map(|_| HashMap::new()).collect(),
@@ -254,6 +297,11 @@ impl Model {
             mlen: 0,
             use_sse,
             apm,
+            use_word,
+            wmaps,
+            word_hash: WORD_SEED,
+            word_len: 0,
+            prev_word_hash: WORD_SEED,
         }
     }
 
@@ -321,6 +369,18 @@ impl Model {
             }
             None => 0.0,
         };
+        let (w0, w1) = if self.use_word {
+            let k0 = word_key(self.word_hash, node);
+            let k1 = word_key(word_combine(self.prev_word_hash, self.word_hash), node);
+            (
+                self.wmaps[0].get(&k0).map_or(0.0, |bm| stretch(bm.p)),
+                self.wmaps[1].get(&k1).map_or(0.0, |bm| stretch(bm.p)),
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        x[WORD0_IN] = w0;
+        x[WORD1_IN] = w1;
         let s: f64 = self.w.iter().zip(x.iter()).map(|(wk, xk)| wk * xk).sum();
         let p_mix = squash(s);
         if self.use_sse {
@@ -356,6 +416,12 @@ impl Model {
         }
         if let Some((bucket, pred_bit)) = self.match_pred(node) {
             self.mmap[bucket].update(f64::from(u8::from(y == pred_bit)));
+        }
+        if self.use_word {
+            let k0 = word_key(self.word_hash, node);
+            let k1 = word_key(word_combine(self.prev_word_hash, self.word_hash), node);
+            self.wmaps[0].entry(k0).or_default().update(yf);
+            self.wmaps[1].entry(k1).or_default().update(yf);
         }
         if let Some((ctx, i, frac)) = sse {
             self.apm.update(ctx, i, frac, yf);
@@ -418,6 +484,27 @@ impl Model {
         self.mtable[h] = pos as u32;
     }
 
+    /// Fold byte `b` into the word state: extend the current word on a letter,
+    /// or close it out (promoting it to `prev_word`) and reset on a boundary.
+    fn advance_word(&mut self, b: u8) {
+        if !self.use_word {
+            return;
+        }
+        if b.is_ascii_alphabetic() {
+            self.word_hash = self
+                .word_hash
+                .wrapping_mul(WORD_MUL)
+                .wrapping_add(u64::from(b));
+            self.word_len += 1;
+        } else {
+            if self.word_len > 0 {
+                self.prev_word_hash = self.word_hash;
+            }
+            self.word_hash = WORD_SEED;
+            self.word_len = 0;
+        }
+    }
+
     /// Replay a byte through predict+update without coding it — used to prime
     /// model state from the `warm` prefix on both sides identically.
     fn learn_byte(&mut self, b: u8) {
@@ -430,6 +517,7 @@ impl Model {
             node = (node << 1) | usize::from(y);
         }
         self.advance_match(b);
+        self.advance_word(b);
         self.ctx = (self.ctx << 8) | u64::from(b);
     }
 }
@@ -444,18 +532,19 @@ fn fill_bit_cdf(p1: f64, cdf: &mut [u32; 3]) {
 }
 
 /// Encode `measure` (preceded by `warm` priming) with the given model stages.
-/// Shared by the `lmix` / `lmatch` / `lsse` codecs.
+/// Shared by the `lmix` / `lmatch` / `lsse` / `lword` codecs.
 #[allow(clippy::cast_possible_truncation)]
 fn encode_impl(
     use_match: bool,
     use_sse: bool,
+    use_word: bool,
     component: &str,
     warm: &[u8],
     measure: &[u8],
 ) -> (Vec<u8>, Decomposition) {
     let mut writer = BitWriter::new();
     writer.write_bits(measure.len() as u64, 64);
-    let mut model = Model::new(use_match, use_sse);
+    let mut model = Model::new(use_match, use_sse, use_word);
     for &b in warm {
         model.learn_byte(b);
     }
@@ -474,6 +563,7 @@ fn encode_impl(
                 node = (node << 1) | usize::from(y);
             }
             model.advance_match(b);
+            model.advance_word(b);
             model.ctx = (model.ctx << 8) | u64::from(b);
         }
         enc.finish();
@@ -485,10 +575,16 @@ fn encode_impl(
 }
 
 /// Decode an archive produced by [`encode_impl`] with the same stages.
-fn decode_impl(use_match: bool, use_sse: bool, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+fn decode_impl(
+    use_match: bool,
+    use_sse: bool,
+    use_word: bool,
+    warm: &[u8],
+    archive: &[u8],
+) -> Result<Vec<u8>> {
     let mut reader = BitReader::new(archive);
     let n = usize::try_from(reader.read_bits(64)?).expect("length prefix fits usize");
-    let mut model = Model::new(use_match, use_sse);
+    let mut model = Model::new(use_match, use_sse, use_word);
     for &b in warm {
         model.learn_byte(b);
     }
@@ -508,6 +604,7 @@ fn decode_impl(use_match: bool, use_sse: bool, warm: &[u8], archive: &[u8]) -> R
             node = (node << 1) | usize::from(y);
         }
         model.advance_match(b);
+        model.advance_word(b);
         model.ctx = (model.ctx << 8) | u64::from(b);
         out.push(b);
     }
@@ -525,11 +622,11 @@ impl Codec for LmixCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(false, false, "lmix", warm, measure))
+        Ok(encode_impl(false, false, false, "lmix", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(false, false, warm, archive)
+        decode_impl(false, false, false, warm, archive)
     }
 }
 
@@ -543,11 +640,11 @@ impl Codec for LmatchCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(true, false, "lmatch", warm, measure))
+        Ok(encode_impl(true, false, false, "lmatch", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(true, false, warm, archive)
+        decode_impl(true, false, false, warm, archive)
     }
 }
 
@@ -562,11 +659,29 @@ impl Codec for LsseCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(true, true, "lsse", warm, measure))
+        Ok(encode_impl(true, true, false, "lsse", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(true, true, warm, archive)
+        decode_impl(true, true, false, warm, archive)
+    }
+}
+
+/// [`LsseCodec`] plus the W0/W1 word-context models as extra mixer inputs.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LwordCodec;
+
+impl Codec for LwordCodec {
+    fn name(&self) -> &'static str {
+        "lword"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(true, true, true, "lword", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(true, true, true, warm, archive)
     }
 }
 
@@ -633,6 +748,14 @@ mod tests {
         roundtrips_with_warm(&LsseCodec);
         roundtrips_all_bytes(&LsseCodec);
         roundtrips_empty(&LsseCodec);
+    }
+
+    #[test]
+    fn lword_roundtrips() {
+        roundtrips_text(&LwordCodec);
+        roundtrips_with_warm(&LwordCodec);
+        roundtrips_all_bytes(&LwordCodec);
+        roundtrips_empty(&LwordCodec);
     }
 
     #[test]
