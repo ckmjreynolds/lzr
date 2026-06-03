@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::cmix::CmixCodec;
 use crate::codec::{Codec, Decomposition};
-use crate::lmix::{LmatchCodec, LmixCodec};
+use crate::lmix::{LmatchCodec, LmixCodec, LsseCodec};
 use crate::null::NullCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
@@ -79,7 +79,8 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "cmix" => Ok(Box::new(CmixCodec)),
         "lmix" => Ok(Box::new(LmixCodec)),
         "lmatch" => Ok(Box::new(LmatchCodec)),
-        other => bail!("unknown codec '{other}' (known: null, cmix, lmix, lmatch)"),
+        "lsse" => Ok(Box::new(LsseCodec)),
+        other => bail!("unknown codec '{other}' (known: null, cmix, lmix, lmatch, lsse)"),
     }
 }
 

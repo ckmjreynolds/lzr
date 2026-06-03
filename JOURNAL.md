@@ -13,6 +13,24 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 — SSE/APM: secondary estimation recalibrates the mixer to 1.714 bpb on full enwik8
+
+The next lpaq-ladder lever after the match model is secondary symbol estimation (SSE) via an adaptive probability map (APM): a learned recalibration of the mixer's output. The logistic mixer can only set linear weights on its inputs' logits, so any systematic miscalibration that survives that — the mixed probability being, say, consistently too timid in some regime — it cannot correct. The APM can.
+
+*Mechanism.* For each context the APM stores a probability at each of 33 knots spaced evenly across the stretch domain (`±12` in log-odds). A query takes the mixer's logit, finds the two surrounding knots, and linearly interpolates their stored probabilities; the observed bit then nudges those two knots toward it, each weighted by how close the query landed. Every row is initialized to the identity map (`squash(knot_stretch)`), so an untrained APM passes its input through unchanged and only departs from identity where the data demands. The context here is the within-byte tree node (the partial byte, 256 contexts). The refined probability is blended with the raw mixer probability and that blend is what the arithmetic coder sees; the mixer still trains on its own pre-APM output, so the APM is a pure downstream calibrator.
+
+*Results (A/B, lmatch vs lsse, round-trip verified, L(D) 0):*
+
+| instrument | lmatch | lsse | delta |
+|---|---:|---:|---:|
+| quick panel (5 x 64 KiB) | 1.805 | 1.773 | -0.032 |
+| full panel (20 x 256 KiB) | 1.862 | 1.831 | -0.031 |
+| full enwik8 (100 MB) | 1.738 | 1.714 | -0.024 |
+
+*Tuning.* Blend weight on the APM output swept to 0.7 (0.5 -> 1.777, 0.7 -> 1.773, 0.85 -> 1.774, 1.0 -> 1.783) — trusting it ~70% beats both a cautious half-and-half and the pure map, the latter being the worst, which says the APM is a useful but noisy corrector best damped against the mixer. Learning rate was flat around 0.02 (0.008 -> 1.775, 0.05 -> 1.774, 0.1 -> 1.781).
+
+This is a smaller step than logistic mixing (-0.45) or the match model (-0.10), as expected: SSE adds no new information, it only re-calibrates what the mixer already produced. The running v7 ladder on full enwik8 is now cmix 2.127 -> lmix 1.840 -> lmatch 1.738 -> lsse 1.714, all at L(D) 0 and single-threaded. Shipped as the `lsse` codec (= lmatch + SSE), with lmatch kept for the A/B; both are flags on the shared model. Remaining levers: a second chained APM on a different context (e.g. the previous byte, lpaq's recipe), context-selected mixer weight sets, and more model contexts.
+
 ## 2026-06-03 — match model: long-range repeats take lmatch to 1.738 bpb on full enwik8, below v3's neural best at zero L(D)
 
 The order-0..6 mixer (see the genesis entry below) sees only six bytes of history, but enwik text repeats verbatim far beyond that — markup boilerplate, recurring titles and link targets, template fragments. The first zero-L(D) lever on top of the logit-domain mixer is therefore a match model (the lpaq design): an extra mixer input that predicts long-range exact repeats.

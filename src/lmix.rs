@@ -81,6 +81,21 @@ const MATCH_BUCKETS: usize = 64;
 /// real position never collides with it.
 const MATCH_EMPTY: u32 = u32::MAX;
 
+/// SSE/APM: number of interpolation knots spanning the stretch domain.
+const APM_KNOTS: usize = 33;
+/// SSE/APM: half-width of the stretch domain the knots span. Mixer logits past
+/// `±APM_S_MAX` clamp to the extreme knot (probabilities already near 0/1).
+const APM_S_MAX: f64 = 12.0;
+/// SSE/APM: learning rate for nudging knots toward the observed bit. A quick-
+/// panel sweep was flat around it (0.008 → 1.775, 0.02 → 1.773, 0.05 → 1.774,
+/// 0.1 → 1.781).
+const APM_RATE: f64 = 0.02;
+/// SSE/APM: weight on the recalibrated probability when blending it with the
+/// raw mixer probability (damps APM noise; the rest is the mixer's own output).
+/// Quick-panel sweep: 0.5 → 1.777, 0.7 → 1.773, 0.85 → 1.774, 1.0 → 1.783, so
+/// trusting the APM ~70% beats both the cautious blend and the pure map.
+const APM_BLEND: f64 = 0.7;
+
 /// Logit of a probability: `ln(p / (1-p))`, clamped to keep it finite.
 #[inline]
 fn stretch(p: f64) -> f64 {
@@ -122,8 +137,65 @@ impl BitModel {
     }
 }
 
-/// Online multi-order bit model with a logistic (logit-domain) mixer and an
-/// optional long-range match model.
+/// Stretch value of knot `i` — knots span `[-APM_S_MAX, APM_S_MAX]` evenly.
+#[inline]
+#[allow(clippy::cast_precision_loss)]
+fn knot_stretch(i: usize) -> f64 {
+    APM_S_MAX.mul_add(2.0 * i as f64 / (APM_KNOTS - 1) as f64, -APM_S_MAX)
+}
+
+/// Secondary symbol estimation (an adaptive probability map, lpaq's APM): a
+/// learned recalibration of the mixer's probability. For each context it holds
+/// a probability at each of `APM_KNOTS` knots across the stretch domain; a
+/// query stretches the input, linearly interpolates the two surrounding knots,
+/// and the observed bit nudges those two knots. Each row starts as the
+/// identity map (`squash(knot_stretch)`), so an untrained APM passes its input
+/// through unchanged.
+#[derive(Debug)]
+struct Apm {
+    t: Vec<f64>,
+}
+
+impl Apm {
+    fn new(n_ctx: usize) -> Self {
+        let mut t = vec![0.0; n_ctx * APM_KNOTS];
+        for row in t.chunks_exact_mut(APM_KNOTS) {
+            for (i, slot) in row.iter_mut().enumerate() {
+                *slot = squash(knot_stretch(i));
+            }
+        }
+        Self { t }
+    }
+
+    /// Recalibrate logit `s` under context `ctx`. Returns the refined
+    /// probability and the `(knot, frac)` coordinates needed to update later.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    fn refine(&self, s: f64, ctx: usize) -> (f64, usize, f64) {
+        let s = s.clamp(-APM_S_MAX, APM_S_MAX);
+        let pos = (s + APM_S_MAX) / (2.0 * APM_S_MAX) * (APM_KNOTS - 1) as f64;
+        let i = (pos as usize).min(APM_KNOTS - 2);
+        let frac = pos - i as f64;
+        let base = ctx * APM_KNOTS;
+        let p = self.t[base + i].mul_add(1.0 - frac, self.t[base + i + 1] * frac);
+        (p, i, frac)
+    }
+
+    /// Nudge the two knots straddling a prior [`Apm::refine`] toward bit `y`,
+    /// each weighted by how close the query landed to it.
+    #[allow(clippy::suboptimal_flops)]
+    fn update(&mut self, ctx: usize, i: usize, frac: f64, y: f64) {
+        let base = ctx * APM_KNOTS;
+        self.t[base + i] += APM_RATE * (1.0 - frac) * (y - self.t[base + i]);
+        self.t[base + i + 1] += APM_RATE * frac * (y - self.t[base + i + 1]);
+    }
+}
+
+/// Online multi-order bit model with a logistic (logit-domain) mixer, an
+/// optional long-range match model, and optional secondary estimation (SSE).
 #[derive(Debug)]
 struct Model {
     /// Order-0: one predictor per within-byte tree node (`1..=255`).
@@ -150,10 +222,15 @@ struct Model {
     mptr: usize,
     /// Current verified match length, in bytes.
     mlen: u32,
+
+    /// Whether secondary estimation refines the mixer output (selects `lsse`).
+    use_sse: bool,
+    /// SSE map keyed on the within-byte tree node (`0..=255`).
+    apm: Apm,
 }
 
 impl Model {
-    fn new(use_match: bool) -> Self {
+    fn new(use_match: bool, use_sse: bool) -> Self {
         let (hist, mtable, mmap) = if use_match {
             (
                 Vec::new(),
@@ -163,6 +240,7 @@ impl Model {
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
+        let apm = Apm::new(if use_sse { 256 } else { 0 });
         Self {
             o0: vec![BitModel::default(); 256],
             maps: (0..MAX_ORDER).map(|_| HashMap::new()).collect(),
@@ -174,6 +252,8 @@ impl Model {
             mmap,
             mptr: 0,
             mlen: 0,
+            use_sse,
+            apm,
         }
     }
 
@@ -216,10 +296,17 @@ impl Model {
         Some((bucket, pred_bit))
     }
 
-    /// Predict P(next bit = 1) at `node`, filling `x` with each model's logit
-    /// (a novel/inactive model contributes a neutral `stretch(0.5) = 0`).
+    /// Predict the next bit at `node`. Fills `x` with each model's logit (a
+    /// novel/inactive model contributes a neutral `stretch(0.5) = 0`) and
+    /// returns `(p_code, p_mix, sse_coords)`: the probability to code against,
+    /// the raw mixer probability the mixer trains on, and — when SSE is on —
+    /// the APM `(ctx, knot, frac)` to update after the bit is known.
     #[allow(clippy::needless_range_loop)]
-    fn predict_bit(&self, node: usize, x: &mut [f64; N_INPUTS]) -> f64 {
+    fn step_predict(
+        &self,
+        node: usize,
+        x: &mut [f64; N_INPUTS],
+    ) -> (f64, f64, Option<(usize, usize, f64)>) {
         x[0] = stretch(self.o0[node].p);
         for k in 1..=MAX_ORDER {
             x[k] = self.maps[k - 1]
@@ -235,14 +322,29 @@ impl Model {
             None => 0.0,
         };
         let s: f64 = self.w.iter().zip(x.iter()).map(|(wk, xk)| wk * xk).sum();
-        squash(s)
+        let p_mix = squash(s);
+        if self.use_sse {
+            let (p_apm, i, frac) = self.apm.refine(s, node);
+            let p_code = APM_BLEND.mul_add(p_apm, (1.0 - APM_BLEND) * p_mix);
+            (p_code, p_mix, Some((node, i, frac)))
+        } else {
+            (p_mix, p_mix, None)
+        }
     }
 
     /// After bit `y` is coded at `node`: step the mixer weights down the
-    /// coding-loss gradient, then update each model's bit predictor.
+    /// coding-loss gradient (on its own output `p_mix`), update each model's
+    /// bit predictor, and nudge the SSE map.
     #[allow(clippy::suboptimal_flops)]
-    fn update_bit(&mut self, node: usize, x: &[f64; N_INPUTS], p1: f64, y: u8) {
-        let err = f64::from(y) - p1;
+    fn step_update(
+        &mut self,
+        node: usize,
+        x: &[f64; N_INPUTS],
+        p_mix: f64,
+        sse: Option<(usize, usize, f64)>,
+        y: u8,
+    ) {
+        let err = f64::from(y) - p_mix;
         for (wk, &xk) in self.w.iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
@@ -254,6 +356,9 @@ impl Model {
         }
         if let Some((bucket, pred_bit)) = self.match_pred(node) {
             self.mmap[bucket].update(f64::from(u8::from(y == pred_bit)));
+        }
+        if let Some((ctx, i, frac)) = sse {
+            self.apm.update(ctx, i, frac, yf);
         }
     }
 
@@ -320,8 +425,8 @@ impl Model {
         let mut x = [0.0; N_INPUTS];
         for i in (0..8).rev() {
             let y = (b >> i) & 1;
-            let p1 = self.predict_bit(node, &mut x);
-            self.update_bit(node, &x, p1, y);
+            let (_p_code, p_mix, sse) = self.step_predict(node, &mut x);
+            self.step_update(node, &x, p_mix, sse, y);
             node = (node << 1) | usize::from(y);
         }
         self.advance_match(b);
@@ -338,18 +443,19 @@ fn fill_bit_cdf(p1: f64, cdf: &mut [u32; 3]) {
     cdf[1] = c0.clamp(1, TOTAL - 1);
 }
 
-/// Encode `measure` (preceded by `warm` priming) with or without the match
-/// model. Shared by [`LmixCodec`] and [`LmatchCodec`].
+/// Encode `measure` (preceded by `warm` priming) with the given model stages.
+/// Shared by the `lmix` / `lmatch` / `lsse` codecs.
 #[allow(clippy::cast_possible_truncation)]
 fn encode_impl(
     use_match: bool,
+    use_sse: bool,
     component: &str,
     warm: &[u8],
     measure: &[u8],
 ) -> (Vec<u8>, Decomposition) {
     let mut writer = BitWriter::new();
     writer.write_bits(measure.len() as u64, 64);
-    let mut model = Model::new(use_match);
+    let mut model = Model::new(use_match, use_sse);
     for &b in warm {
         model.learn_byte(b);
     }
@@ -361,10 +467,10 @@ fn encode_impl(
             let mut node = 1usize;
             for i in (0..8).rev() {
                 let y = (b >> i) & 1;
-                let p1 = model.predict_bit(node, &mut x);
-                fill_bit_cdf(p1, &mut cdf);
+                let (p_code, p_mix, sse) = model.step_predict(node, &mut x);
+                fill_bit_cdf(p_code, &mut cdf);
                 enc.encode(&cdf, usize::from(y));
-                model.update_bit(node, &x, p1, y);
+                model.step_update(node, &x, p_mix, sse, y);
                 node = (node << 1) | usize::from(y);
             }
             model.advance_match(b);
@@ -378,11 +484,11 @@ fn encode_impl(
     (buf, decomp)
 }
 
-/// Decode an archive produced by [`encode_impl`] with the same `use_match`.
-fn decode_impl(use_match: bool, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+/// Decode an archive produced by [`encode_impl`] with the same stages.
+fn decode_impl(use_match: bool, use_sse: bool, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
     let mut reader = BitReader::new(archive);
     let n = usize::try_from(reader.read_bits(64)?).expect("length prefix fits usize");
-    let mut model = Model::new(use_match);
+    let mut model = Model::new(use_match, use_sse);
     for &b in warm {
         model.learn_byte(b);
     }
@@ -394,10 +500,10 @@ fn decode_impl(use_match: bool, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> 
         let mut node = 1usize;
         let mut b = 0u8;
         for _ in 0..8 {
-            let p1 = model.predict_bit(node, &mut x);
-            fill_bit_cdf(p1, &mut cdf);
+            let (p_code, p_mix, sse) = model.step_predict(node, &mut x);
+            fill_bit_cdf(p_code, &mut cdf);
             let y = u8::try_from(dec.decode(&cdf)?).expect("bit symbol 0/1 fits u8");
-            model.update_bit(node, &x, p1, y);
+            model.step_update(node, &x, p_mix, sse, y);
             b = (b << 1) | y;
             node = (node << 1) | usize::from(y);
         }
@@ -419,11 +525,11 @@ impl Codec for LmixCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(false, "lmix", warm, measure))
+        Ok(encode_impl(false, false, "lmix", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(false, warm, archive)
+        decode_impl(false, false, warm, archive)
     }
 }
 
@@ -437,11 +543,30 @@ impl Codec for LmatchCodec {
     }
 
     fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
-        Ok(encode_impl(true, "lmatch", warm, measure))
+        Ok(encode_impl(true, false, "lmatch", warm, measure))
     }
 
     fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-        decode_impl(true, warm, archive)
+        decode_impl(true, false, warm, archive)
+    }
+}
+
+/// [`LmatchCodec`] plus secondary symbol estimation (SSE/APM) recalibrating
+/// the mixer's output.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LsseCodec;
+
+impl Codec for LsseCodec {
+    fn name(&self) -> &'static str {
+        "lsse"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(true, true, "lsse", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(true, true, warm, archive)
     }
 }
 
@@ -500,6 +625,14 @@ mod tests {
         roundtrips_with_warm(&LmatchCodec);
         roundtrips_all_bytes(&LmatchCodec);
         roundtrips_empty(&LmatchCodec);
+    }
+
+    #[test]
+    fn lsse_roundtrips() {
+        roundtrips_text(&LsseCodec);
+        roundtrips_with_warm(&LsseCodec);
+        roundtrips_all_bytes(&LsseCodec);
+        roundtrips_empty(&LsseCodec);
     }
 
     #[test]
