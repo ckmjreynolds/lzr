@@ -17,6 +17,7 @@ mod bits;
 mod cmix;
 mod codec;
 mod eval;
+mod lmix;
 mod null;
 
 use std::fs;
@@ -40,7 +41,7 @@ enum Command {
     Bench {
         #[arg(long, default_value = "assets/enwik8")]
         corpus: PathBuf,
-        /// Codec name. v7 knows: `null`, `cmix`.
+        /// Codec name. v7 knows: `null`, `cmix`, `lmix`.
         #[arg(long, default_value = "cmix")]
         codec: String,
         /// Reduce panel to 5 windows × 64 KiB for tight iteration.

@@ -13,6 +13,28 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 — v7 genesis: a deterministic context-mixing base, and logistic mixing takes full enwik8 from 2.127 to 1.840 bpb
+
+Following the L(D) wall (see 2026-06-01 → 2026-06-03), v7 stops fighting the neural arm's shipped-weight penalty and rebuilds on the zero-L(D) codec side: a deterministic, fast, online context-mixing base in the cmix/PAQ family, where encoder and decoder replay the same stream and rebuild byte-identical model state, so no weights ship and L(D) is structurally 0. The 13 neural/arm files (transformer, MoE, tokenizer, classifier, match, ngram, struct-mask, word-tok, GPU/int-inference) were removed; the codec source dropped from 9,144 to 1,485 lines, leaving the AC, bit-IO, eval panel, and the new mixer.
+
+*Order-n scale grounding.* enwik9 uses 206 distinct byte values; the ~100 most frequent cover 99.71%, so the alphabet is effectively small and memory is not the binding constraint at low orders (an order-7 dense count table is ~1.31 GB, in budget). The ceiling each single order can reach alone is modest: the best single-order adaptive coder bottoms near 2.236 bpb (order-5 on enwik8), while the in-sample order-7 conditional entropy is 1.216 bpb. The gap between those two — the "sparsity tax" a single high order pays for unseen contexts — is exactly what mixing has to recover.
+
+*Linear base (cmix).* An online ensemble of order-0..6 sparse count models, blended linearly with softmax-of-decayed-log-loss weights, driving the shared AC. Full enwik8: 2.127 bpb (beating the best single order's 2.236), roughly 100x faster than the v5 MoE codec, L(D) 0. Committed as the clean v7 base (ace765c).
+
+*Logistic mixing (lmix).* The linear blend's structural flaw is that it cannot exceed its most-confident input — if order-3 and order-5 both predict 0.9, the blend stays ~0.9. Replacing it with the PAQ/lpaq logit-domain mixer fixes this: each byte is coded as eight binary decisions (MSB-first, walking a within-byte tree node 1..255), every order keeps an adaptive bit predictor per (context, node), and predictions combine as p = squash(sum_k w_k * stretch(p_k)) with the weights trained online by gradient descent on coding loss (w += lr * (y - p) * stretch(p_k)). In the logit domain agreeing evidence adds, so agreement sharpens past either input — that sharpening is the recovered bits.
+
+Results, all round-trip verified, L(D) 0:
+
+| instrument | cmix (linear) | lmix (logistic) | delta |
+|---|---:|---:|---:|
+| quick panel (5 x 64 KiB) | 2.387 | 1.933 | -0.454 |
+| full panel (20 x 256 KiB) | 2.393 | 1.961 | -0.432 |
+| full enwik8 (100 MB) | 2.127 | 1.840 | -0.287 |
+
+A mixer-learning-rate sweep on the quick panel bottomed near 0.002 (0.05 -> 2.059, 0.02 -> 1.971, 0.008 -> 1.944, 0.004 -> 1.936, 0.002 -> 1.933) and was flat below; locked at 0.002. The cost is speed: bitwise coding is 8x the AC calls, and full-enwik8 encode runs at 0.31 MiB/s (312 s) versus the linear base's near-instant pass — still deterministic and single-threaded.
+
+At 1.840 bpb this is within reach of v3's 1.811 (which needed a shipped neural arm) at zero L(D), and it is lpaq-class for an order-0..6 mixer with no match model and no SSE/APM stage. Those are the next zero-L(D) levers — a match model for long-range repeats, SSE/APM secondary estimation, and context-selected mixer weights — the lpaq-to-paq8 ladder. The mixer alone does not reach the ~1.3 territory; the stack does.
+
 ## 2026-06-01 → 2026-06-03 — Using the 95M teacher at deployable size: same-size distillation and QAT-ternary both miss; the L(D) wall
 
 With the 95M teacher established at L(C) 1.075 on enwik8 (see 2026-06-01) — 0.167 below v5's 1.242 — the question was whether any of that headroom reaches a deployable-size model. Two routes were tried; both miss, and together they locate the obstacle precisely.
