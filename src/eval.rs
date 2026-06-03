@@ -21,9 +21,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::cmix::CmixCodec;
 use crate::codec::{Codec, Decomposition};
-use crate::moe_codec::MoeCodec;
-use crate::moe_tok_codec::MoeTokCodec;
 use crate::null::NullCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
@@ -76,10 +75,8 @@ pub(crate) fn make_codec_public(name: &str) -> Result<Box<dyn Codec>> {
 fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
     match name {
         "null" => Ok(Box::new(NullCodec)),
-        "moe" => Ok(Box::new(MoeCodec::new())),
-        "moe-tok" => Ok(Box::new(MoeTokCodec::new())),
-        "moe-tok-match" => Ok(Box::new(MoeTokCodec::new_with_match())),
-        other => bail!("unknown codec '{other}' (known: null, moe, moe-tok, moe-tok-match)"),
+        "cmix" => Ok(Box::new(CmixCodec)),
+        other => bail!("unknown codec '{other}' (known: null, cmix)"),
     }
 }
 

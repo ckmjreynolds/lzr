@@ -5,7 +5,7 @@ edition         = "2024"
 rust-version    = "1.85"
 
 authors         = ["Chris Reynolds <chris@reynolds.guru>"]
-description     = "Mode-routed compression CLI (Hutter prize attempt, v2)."
+description     = "Context-mixing compression CLI (Hutter prize attempt, v7)."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
 repository      = "https://github.com/ckmjreynolds/lzr"
@@ -18,19 +18,12 @@ include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 [features]
 default     = ["submission"]
 # Submission build: zero threading deps, no training dependencies. This is
-# what ships. Training-related code is gated behind `training` and will be
-# added later when (and if) the bit-budget audit calls for a neural arm.
+# what ships. The `build.sh` CI gate verifies no threading crate sneaks in.
 submission  = []
-# Apple Silicon Metal GPU acceleration for the int8 forward path.
-# Dev-only — pulls in objc bindings + Metal framework. Never enabled in
-# the submission build. The submission CI gate in `build.sh` verifies
-# this stays out of the default feature set.
-gpu-inference = ["dep:metal"]
 
 [dependencies]
 anyhow      = "=1.0.102"
 clap        = { version = "=4.6.1", features = ["derive"] }
-metal       = { version = "=0.33.0", optional = true }
 
 [dev-dependencies]
 assert_cmd        = "=2.2.1"

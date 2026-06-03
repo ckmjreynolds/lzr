@@ -114,15 +114,6 @@ impl<'a> AcEncoder<'a> {
         self.pending = 0;
     }
 
-    /// Bits committed to the underlying writer so far. Excludes the
-    /// AC's internal `low`/`high`/`pending` state that hasn't been
-    /// emitted yet — useful for components that want to attribute the
-    /// bit-delta of a single `encode` call but understand the tail
-    /// flush happens lazily.
-    pub(crate) fn bits_written(&self) -> u64 {
-        self.out.bits_written()
-    }
-
     /// Flush remaining state. After `finish` the encoder's bits are
     /// fully committed to the underlying writer.
     ///
