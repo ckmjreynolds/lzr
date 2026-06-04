@@ -13,6 +13,10 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 (overnight autonomous session) — context-selected mixer weights: lhi 1.647 → 1.625 bpb on full enwik8
+
+Start of an autonomous experiment run (CDR away ~10 h; keep wins, discard losses, no neural training). First lever: the mixer used a single global weight vector, so it had to find one blend that works everywhere. Replaced it with 256 weight vectors selected by the previous byte, so the blend can specialize by regime — markup, letters, digits, whitespace each get their own learned weighting. The selector is the same on both sides (low byte of the rolling context, fixed across a byte's 8 bits), so determinism and L(D) 0 hold; memory is trivial (256 × 16 weights). Full enwik8: 1.6469 → 1.6249 (−0.022). Standard lpaq-class technique, confirmed worthwhile here.
+
 ## 2026-06-03 — set-associative buckets attack the collision tax: lhi to 1.647 bpb on full enwik8 at the same memory
 
 With case closed, the dominant remaining loss was the collision tax — even checksummed direct-mapped tables thrash, because every collision evicts the incumbent (the new context takes its one slot). On full enwik8 that was lword 1.725 / lhi 1.700 versus the unbounded-HashMap ceiling 1.661.

@@ -84,6 +84,8 @@ const BUCKET_BITS: u32 = CTX_BITS - CTX_WAYS.ilog2();
 const MIX_LR: f64 = 0.002;
 /// Initial per-input mixer weight (before any online training).
 const INIT_W: f64 = 0.3;
+/// Number of mixer weight sets, selected by the previous byte.
+const N_WSETS: usize = 256;
 /// Floor on a bit-predictor's adaptive learning rate, so a well-observed
 /// context still tracks local drift instead of freezing.
 const RATE_FLOOR: f64 = 1.0 / 256.0;
@@ -394,8 +396,10 @@ struct Model {
     /// Orders `1..=MAX_ORDER`. `maps[k - 1]` is a fixed-size table indexed by
     /// `slot(key(k, node))` — see [`Model::key`] and [`slot`].
     maps: Vec<Vec<BitModel>>,
-    /// Mixer weights, trained online by gradient descent on coding loss.
-    w: [f64; N_INPUTS],
+    /// Mixer weights, trained online by gradient descent on coding loss. One
+    /// weight vector per selection context (the previous byte) — the blend can
+    /// differ between markup, letters, digits, etc.
+    w: Vec<[f64; N_INPUTS]>,
     /// Rolling context — the last up-to-8 bytes, most recent in the low byte.
     ctx: u64,
     /// Active model stages (which optional arms contribute).
@@ -466,7 +470,7 @@ impl Model {
         Self {
             o0: vec![BitModel::default(); 256],
             maps: (0..MAX_ORDER).map(|_| ctx_table()).collect(),
-            w: [INIT_W; N_INPUTS],
+            w: vec![[INIT_W; N_INPUTS]; N_WSETS],
             ctx: 0,
             arms,
             hist,
@@ -562,7 +566,12 @@ impl Model {
                 0.0
             };
         }
-        let s: f64 = self.w.iter().zip(x.iter()).map(|(wk, xk)| wk * xk).sum();
+        let wsel = (self.ctx & 0xFF) as usize;
+        let s: f64 = self.w[wsel]
+            .iter()
+            .zip(x.iter())
+            .map(|(wk, xk)| wk * xk)
+            .sum();
         let p_mix = squash(s);
         if self.arms.use_sse {
             let (p_apm, i, frac) = self.apm.refine(s, node);
@@ -586,7 +595,8 @@ impl Model {
         y: u8,
     ) {
         let err = f64::from(y) - p_mix;
-        for (wk, &xk) in self.w.iter_mut().zip(x.iter()) {
+        let wsel = (self.ctx & 0xFF) as usize;
+        for (wk, &xk) in self.w[wsel].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
         let yf = f64::from(y);
