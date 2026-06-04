@@ -72,14 +72,14 @@ const SPARSE_IN: usize = N_ORDERS + 4 + N_HI;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
-/// and blew past the 10 GB judging limit. 2^22 slots × 16 B = 64 MiB/table.
-const CTX_BITS: u32 = 24;
+/// and blew past the 10 GB judging limit. 2^25 slots × 8 B = 256 MiB/table.
+const CTX_BITS: u32 = 25;
 /// Number of slots per context table.
 const CTX_SIZE: usize = 1 << CTX_BITS;
 /// Set associativity: slots per bucket. A key hashes to a bucket and may take
 /// any slot in it, so up to `CTX_WAYS` colliding contexts coexist before any
 /// eviction — fewer conflict misses than direct-mapped at the same memory.
-/// 4 × 16 B = 64 B = one cache line, so scanning a bucket is one cache miss.
+/// 4 × 8 B = 32 B = half a cache line, so scanning a bucket is one cache miss.
 const CTX_WAYS: usize = 4;
 /// Bits of the hash selecting the bucket (the rest of the table is the ways).
 const BUCKET_BITS: u32 = CTX_BITS - CTX_WAYS.ilog2();
@@ -95,7 +95,7 @@ const N_WSETS: usize = 256 * 8;
 /// context still tracks local drift instead of freezing.
 const RATE_FLOOR: f64 = 1.0 / 256.0;
 /// Cap on a bit-predictor's observation count (caps the slowest rate).
-const N_CAP: u32 = 255;
+const N_CAP: u8 = 255;
 /// Clamp bounds on a probability before `stretch`, so the logit stays finite
 /// (and the mixer never sees an infinite input → `NaN` weight).
 const P_LO: f64 = 1e-6;
@@ -190,7 +190,7 @@ fn ctx_logit(table: &[BitModel], key: u64) -> f64 {
     for s in 0..CTX_WAYS {
         let bm = table[base + s];
         if bm.check == check {
-            return stretch(bm.p);
+            return stretch(f64::from(bm.p));
         }
     }
     0.0
@@ -205,7 +205,7 @@ fn ctx_logit(table: &[BitModel], key: u64) -> f64 {
 fn update_ctx(table: &mut [BitModel], key: u64, y: f64) {
     let (base, check) = locate(key);
     let mut victim = base;
-    let mut min_n = u32::MAX;
+    let mut min_n = u8::MAX;
     for s in 0..CTX_WAYS {
         if table[base + s].check == check {
             table[base + s].update(y);
@@ -252,8 +252,10 @@ const fn hi_key(ctx_hi: u128, order: usize, node: usize) -> u64 {
 /// it.
 #[derive(Clone, Copy, Debug)]
 struct BitModel {
-    p: f64,
-    n: u32,
+    /// Probability stored as `f32` (the AC quantizes to 24 bits anyway) so the
+    /// whole struct is 8 bytes, halving every context table's memory.
+    p: f32,
+    n: u8,
     check: u16,
 }
 
@@ -278,12 +280,14 @@ impl BitModel {
         }
     }
 
-    /// Move the probability toward the observed bit and age the counter.
+    /// Move the probability toward the observed bit and age the counter. The
+    /// step is computed in `f64` and rounded back to the stored `f32`.
     #[inline]
-    #[allow(clippy::suboptimal_flops)]
+    #[allow(clippy::suboptimal_flops, clippy::cast_possible_truncation)]
     fn update(&mut self, y: f64) {
         let rate = (1.0 / (f64::from(self.n) + 1.5)).max(RATE_FLOOR);
-        self.p += rate * (y - self.p);
+        let p = f64::from(self.p);
+        self.p = (p + rate * (y - p)) as f32;
         if self.n < N_CAP {
             self.n += 1;
         }
@@ -574,13 +578,13 @@ impl Model {
         node: usize,
         x: &mut [f64; N_INPUTS],
     ) -> (f64, f64, Option<(usize, usize, f64)>) {
-        x[0] = stretch(self.o0[node].p);
+        x[0] = stretch(f64::from(self.o0[node].p));
         for k in 1..=MAX_ORDER {
             x[k] = ctx_logit(&self.maps[k - 1], self.key(k, node));
         }
         x[MATCH_IN] = match self.match_pred(node) {
             Some((bucket, pred_bit)) => {
-                let pc = self.mmap[bucket].p;
+                let pc = f64::from(self.mmap[bucket].p);
                 let p1 = if pred_bit == 1 { pc } else { 1.0 - pc };
                 stretch(p1)
             }
