@@ -16,6 +16,7 @@ mod ac;
 mod bits;
 mod cmix;
 mod codec;
+mod dict;
 mod eval;
 mod lmix;
 mod null;
@@ -41,7 +42,7 @@ enum Command {
     Bench {
         #[arg(long, default_value = "assets/enwik8")]
         corpus: PathBuf,
-        /// Codec name. v7 knows: `null`, `cmix`, `lmix`, `lmatch`, `lsse`, `lword`, `lhi`.
+        /// Codec name. v7 knows: `null`, `cmix`, `lmix`, `lmatch`, `lsse`, `lword`, `lhi`, `ldict`.
         #[arg(long, default_value = "cmix")]
         codec: String,
         /// Reduce panel to 5 windows × 64 KiB for tight iteration.

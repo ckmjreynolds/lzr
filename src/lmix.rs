@@ -361,6 +361,9 @@ pub(crate) struct Arms {
     use_sse: bool,
     use_word: bool,
     use_hi: bool,
+    /// Dictionary preprocessing: replace frequent words with single byte codes
+    /// before modeling (the model runs on the transformed stream).
+    use_dict: bool,
 }
 
 impl Arms {
@@ -369,30 +372,42 @@ impl Arms {
         use_sse: false,
         use_word: false,
         use_hi: false,
+        use_dict: false,
     };
     const LMATCH: Self = Self {
         use_match: true,
         use_sse: false,
         use_word: false,
         use_hi: false,
+        use_dict: false,
     };
     const LSSE: Self = Self {
         use_match: true,
         use_sse: true,
         use_word: false,
         use_hi: false,
+        use_dict: false,
     };
     const LWORD: Self = Self {
         use_match: true,
         use_sse: true,
         use_word: true,
         use_hi: false,
+        use_dict: false,
     };
     const LHI: Self = Self {
         use_match: true,
         use_sse: true,
         use_word: true,
         use_hi: true,
+        use_dict: false,
+    };
+    const LDICT: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
     };
 }
 
@@ -467,6 +482,7 @@ impl Model {
             use_sse,
             use_word,
             use_hi,
+            use_dict: _,
         } = arms;
         let (hist, mtable, mmap) = if use_match {
             (
@@ -837,6 +853,16 @@ fn encode_impl(
     warm: &[u8],
     measure: &[u8],
 ) -> (Vec<u8>, Decomposition) {
+    // With the dictionary transform, the model runs on the transformed streams.
+    let warm_t;
+    let measure_t;
+    let (warm, measure): (&[u8], &[u8]) = if arms.use_dict {
+        warm_t = crate::dict::transform(warm);
+        measure_t = crate::dict::transform(measure);
+        (&warm_t, &measure_t)
+    } else {
+        (warm, measure)
+    };
     let mut writer = BitWriter::new();
     writer.write_bits(measure.len() as u64, 64);
     let mut model = Model::new(arms);
@@ -869,6 +895,13 @@ fn encode_impl(
 
 /// Decode an archive produced by [`encode_impl`] with the same stages.
 fn decode_impl(arms: Arms, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+    let warm_t;
+    let warm: &[u8] = if arms.use_dict {
+        warm_t = crate::dict::transform(warm);
+        &warm_t
+    } else {
+        warm
+    };
     let mut reader = BitReader::new(archive);
     let n = usize::try_from(reader.read_bits(64)?).expect("length prefix fits usize");
     let mut model = Model::new(arms);
@@ -893,7 +926,12 @@ fn decode_impl(arms: Arms, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
         model.advance(b);
         out.push(b);
     }
-    Ok(out)
+    // `out` holds the transformed stream when the dictionary is active.
+    Ok(if arms.use_dict {
+        crate::dict::untransform(&out)
+    } else {
+        out
+    })
 }
 
 /// The v7 logistic-mixing codec: bitwise multi-order context mixing in the
@@ -988,6 +1026,25 @@ impl Codec for LhiCodec {
     }
 }
 
+/// [`LhiCodec`] plus dictionary preprocessing: frequent words are replaced by
+/// single byte codes before the model sees the stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LdictCodec;
+
+impl Codec for LdictCodec {
+    fn name(&self) -> &'static str {
+        "ldict"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LDICT, "ldict", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LDICT, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -997,6 +1054,7 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"lsse" => Arms::LSSE,
         b"lword" => Arms::LWORD,
         b"lhi" => Arms::LHI,
+        b"ldict" => Arms::LDICT,
         _ => return None,
     })
 }
@@ -1152,6 +1210,14 @@ mod tests {
         roundtrips_with_warm(&LhiCodec);
         roundtrips_all_bytes(&LhiCodec);
         roundtrips_empty(&LhiCodec);
+    }
+
+    #[test]
+    fn ldict_roundtrips() {
+        roundtrips_text(&LdictCodec);
+        roundtrips_with_warm(&LdictCodec);
+        roundtrips_all_bytes(&LdictCodec);
+        roundtrips_empty(&LdictCodec);
     }
 
     #[test]
