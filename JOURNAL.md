@@ -13,6 +13,14 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-04 — dictionary preprocessing works: ldict 1.5615 → 1.5540 bpb on full enwik8
+
+The dictionary preprocessor — CDR's language idea, deferred twice as a larger, uncertain build — now tested and kept. A reversible word→byte-code transform runs before the model; the model codes the transformed stream. Frequent whole words (ASCII letter-runs) are replaced by byte values unused by the corpus: the top 49 by a single-byte code, the next 256 (length ≥ 3) by a two-byte `ESC_WORD + index` code; a second escape (`ESC_LIT`) precedes any literal code/escape byte so the transform round-trips on *arbitrary* input — verified on the all-bytes test and a full-corpus round-trip. The 305 words cover 47% of word occurrences. The dictionary is corpus-derived and ships in the binary (~2 KB) — the first thing in v7 that isn't `L(D) = 0`, but at the 2× rule that's ~negligible (<1e-5 bpb on 1 GB), dwarfed by the L(C) gain; and the escape makes the transform correct on enwik9 even if a chosen code byte happens to occur there.
+
+*Results (full enwik8, round-trip verified).* lhi 1.5615 → 50-word single-byte dict 1.5551 (−0.0064) → 305-word with two-byte codes **1.5540** (−0.0075 total). It also runs slightly faster (~9% fewer symbols to code). Diminishing, though: the 256 extra two-byte words bought only −0.0011 beyond the top 49, and a length-≥2 word-selection variant was marginally *worse* than raw top-frequency (the frequent 1-byte words like "a"/"I" help as consistent single tokens even though their code saves no length).
+
+*Reading.* Confirms the earlier prediction: the dictionary helps but modestly, because the context-rich model (orders + match + word arms + high-orders) already captures much of the reach the transform extends — it is not the ~1–2% the Hutter leaders get from it, in a model that has fewer of those arms. The win is real and the direction is validated; further expansion (thousands of words, space-prefixed " the" tokens) would add more with continued diminishing returns. `ldict` (= lhi + the transform) is the new shippable best at **1.5540 bpb**.
+
 ## 2026-06-04 (overnight autonomous session summary) — lhi 1.647 → 1.5615 bpb on full enwik8, round-trip verified
 
 An autonomous run (CDR away ~10 h; keep wins, discard losses, no neural training, language-focused). Net: full enwik8 1.6469 → **1.5615** (−0.085, −5.2%), bounded ~4 GB RAM (≈6 GB projected on enwik9, inside the 10 GB limit), round-trip verified on the full corpus. ~19 experiments; the wins and the instructive negatives:
