@@ -13,6 +13,16 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-04 (overnight autonomous session summary) — lhi 1.647 → 1.5615 bpb on full enwik8, round-trip verified
+
+An autonomous run (CDR away ~10 h; keep wins, discard losses, no neural training, language-focused). Net: full enwik8 1.6469 → **1.5615** (−0.085, −5.2%), bounded ~4 GB RAM (≈6 GB projected on enwik9, inside the 10 GB limit), round-trip verified on the full corpus. ~19 experiments; the wins and the instructive negatives:
+
+*Wins (cumulative).* The dominant lever was the **mixer**, in two forms. (1) Context-selected weights: one weight vector per (previous byte, bit-position) instead of a single global vector (−0.036 across two steps). (2) **Multi-mixer averaging**: several first-level mixers, each selected by a different context, their pre-squash logits averaged — c1, c2, c3 (−0.020) plus a fourth selected by the *current word's hash* (−0.006). The decisive finding here: a learned second-level mixer over the *correlated* c1/c2/c3 selectors never beat equal averaging, but a *decorrelated* selector (the word regime) added real value — so diversity of selection context, not a cleverer combine, is what pays. Other wins: an 8-byte `BitModel` (f32 probability — bit-identical, since the AC quantizes to 2^24) which halved table memory and made `CTX_BITS=25` affordable within the enwik9 budget (−0.015); sparse non-contiguous byte contexts {c1,c3}{c2,c4} (−0.002); a word-trigram arm (−0.004); 8-way set-associativity (now one cache line with 8-byte slots, −0.001); and retuning APM_BLEND down to 0.5 (the stronger mixer needs less SSE correction, −0.0015).
+
+*Negatives (recorded so they aren't re-tried).* A learned 2-level meta-mixer over correlated selectors (ties the average at best); a second chained APM stage (redundant with the per-previous-byte mixer selection); a 5th mixer (the mixer saturates at four selectors); a suffix-class word arm (redundant with the identity word arms); 16-way associativity (over-associates).
+
+*Reading for the morning.* The model is now mixer-rich and well-tuned; further single arms give ~0.002. The biggest untested lever remains the dictionary preprocessor (CDR's language idea) — deferred as a larger, riskier build with uncertain marginal value given the context-rich model, but it is the clear next swing. The detailed per-experiment log lived in `/tmp/lzr_explog.md` during the run; the commits (244ca56 → 1ff097f) carry the individual results.
+
 ## 2026-06-03 (overnight autonomous session) — context-selected mixer weights: lhi 1.647 → 1.625 bpb on full enwik8
 
 Start of an autonomous experiment run (CDR away ~10 h; keep wins, discard losses, no neural training). First lever: the mixer used a single global weight vector, so it had to find one blend that works everywhere. Replaced it with 256 weight vectors selected by the previous byte, so the blend can specialize by regime — markup, letters, digits, whitespace each get their own learned weighting. The selector is the same on both sides (low byte of the rolling context, fixed across a byte's 8 bits), so determinism and L(D) 0 hold; memory is trivial (256 × 16 weights). Full enwik8: 1.6469 → 1.6249 (−0.022). Standard lpaq-class technique, confirmed worthwhile here.
