@@ -405,6 +405,9 @@ struct Model {
     /// weight vector per selection context (the previous byte) — the blend can
     /// differ between markup, letters, digits, etc.
     w: Vec<[f64; N_INPUTS]>,
+    /// Second mixer, selected by the byte two back; its output is averaged with
+    /// the first so the blend is conditioned on two independent regimes.
+    w2: Vec<[f64; N_INPUTS]>,
     /// Rolling context — the last up-to-8 bytes, most recent in the low byte.
     ctx: u64,
     /// Active model stages (which optional arms contribute).
@@ -485,6 +488,7 @@ impl Model {
             o0: vec![BitModel::default(); 256],
             maps: (0..MAX_ORDER).map(|_| ctx_table()).collect(),
             w: vec![[INIT_W; N_INPUTS]; N_WSETS],
+            w2: vec![[INIT_W; N_INPUTS]; N_WSETS],
             ctx: 0,
             arms,
             hist,
@@ -561,7 +565,7 @@ impl Model {
     /// returns `(p_code, p_mix, sse_coords)`: the probability to code against,
     /// the raw mixer probability the mixer trains on, and — when SSE is on —
     /// the APM `(ctx, knot, frac)` to update after the bit is known.
-    #[allow(clippy::needless_range_loop)]
+    #[allow(clippy::needless_range_loop, clippy::similar_names)]
     fn step_predict(
         &self,
         node: usize,
@@ -612,12 +616,20 @@ impl Model {
                 0.0
             };
         }
-        let wsel = (((self.ctx & 0xFF) as usize) << 3) | node.ilog2() as usize;
-        let s: f64 = self.w[wsel]
+        let bitpos = node.ilog2() as usize;
+        let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
+        let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
+        let s1: f64 = self.w[sel1]
             .iter()
             .zip(x.iter())
             .map(|(wk, xk)| wk * xk)
             .sum();
+        let s2: f64 = self.w2[sel2]
+            .iter()
+            .zip(x.iter())
+            .map(|(wk, xk)| wk * xk)
+            .sum();
+        let s = f64::midpoint(s1, s2);
         let p_mix = squash(s);
         if self.arms.use_sse {
             let (p_apm, i, frac) = self.apm.refine(s, node);
@@ -631,7 +643,11 @@ impl Model {
     /// After bit `y` is coded at `node`: step the mixer weights down the
     /// coding-loss gradient (on its own output `p_mix`), update each model's
     /// bit predictor, and nudge the SSE map.
-    #[allow(clippy::suboptimal_flops, clippy::needless_range_loop)]
+    #[allow(
+        clippy::suboptimal_flops,
+        clippy::needless_range_loop,
+        clippy::similar_names
+    )]
     fn step_update(
         &mut self,
         node: usize,
@@ -641,8 +657,13 @@ impl Model {
         y: u8,
     ) {
         let err = f64::from(y) - p_mix;
-        let wsel = (((self.ctx & 0xFF) as usize) << 3) | node.ilog2() as usize;
-        for (wk, &xk) in self.w[wsel].iter_mut().zip(x.iter()) {
+        let bitpos = node.ilog2() as usize;
+        let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
+        let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
+        for (wk, &xk) in self.w[sel1].iter_mut().zip(x.iter()) {
+            *wk += MIX_LR * err * xk;
+        }
+        for (wk, &xk) in self.w2[sel2].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
         let yf = f64::from(y);
