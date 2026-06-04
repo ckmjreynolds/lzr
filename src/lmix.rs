@@ -84,8 +84,8 @@ const BUCKET_BITS: u32 = CTX_BITS - CTX_WAYS.ilog2();
 const MIX_LR: f64 = 0.002;
 /// Initial per-input mixer weight (before any online training).
 const INIT_W: f64 = 0.3;
-/// Number of mixer weight sets, selected by the previous byte.
-const N_WSETS: usize = 256;
+/// Number of mixer weight sets, selected by (previous byte, bit position).
+const N_WSETS: usize = 256 * 8;
 /// Floor on a bit-predictor's adaptive learning rate, so a well-observed
 /// context still tracks local drift instead of freezing.
 const RATE_FLOOR: f64 = 1.0 / 256.0;
@@ -566,7 +566,7 @@ impl Model {
                 0.0
             };
         }
-        let wsel = (self.ctx & 0xFF) as usize;
+        let wsel = (((self.ctx & 0xFF) as usize) << 3) | node.ilog2() as usize;
         let s: f64 = self.w[wsel]
             .iter()
             .zip(x.iter())
@@ -595,7 +595,7 @@ impl Model {
         y: u8,
     ) {
         let err = f64::from(y) - p_mix;
-        let wsel = (self.ctx & 0xFF) as usize;
+        let wsel = (((self.ctx & 0xFF) as usize) << 3) | node.ilog2() as usize;
         for (wk, &xk) in self.w[wsel].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
