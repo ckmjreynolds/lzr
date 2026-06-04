@@ -414,6 +414,9 @@ struct Model {
     w2: Vec<[f64; N_INPUTS]>,
     /// Third mixer, selected by the byte three back.
     w3: Vec<[f64; N_INPUTS]>,
+    /// Fourth mixer, selected by the current word's hash (a language regime,
+    /// decorrelated from the byte selectors).
+    w4: Vec<[f64; N_INPUTS]>,
     /// Rolling context — the last up-to-8 bytes, most recent in the low byte.
     ctx: u64,
     /// Active model stages (which optional arms contribute).
@@ -496,6 +499,7 @@ impl Model {
             w: vec![[INIT_W; N_INPUTS]; N_WSETS],
             w2: vec![[INIT_W; N_INPUTS]; N_WSETS],
             w3: vec![[INIT_W; N_INPUTS]; N_WSETS],
+            w4: vec![[INIT_W; N_INPUTS]; N_WSETS],
             ctx: 0,
             arms,
             hist,
@@ -627,8 +631,11 @@ impl Model {
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
         let sel3 = ((((self.ctx >> 16) & 0xFF) as usize) << 3) | bitpos;
+        let sel4 = (((self.word_hash & 0xFF) as usize) << 3) | bitpos;
         let dot = |w: &[f64; N_INPUTS]| -> f64 { w.iter().zip(x.iter()).map(|(a, b)| a * b).sum() };
-        let s = (dot(&self.w[sel1]) + dot(&self.w2[sel2]) + dot(&self.w3[sel3])) / 3.0;
+        let s =
+            (dot(&self.w[sel1]) + dot(&self.w2[sel2]) + dot(&self.w3[sel3]) + dot(&self.w4[sel4]))
+                / 4.0;
         let p_mix = squash(s);
         if self.arms.use_sse {
             let (p_apm, i, frac) = self.apm.refine(s, node);
@@ -660,6 +667,7 @@ impl Model {
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
         let sel3 = ((((self.ctx >> 16) & 0xFF) as usize) << 3) | bitpos;
+        let sel4 = (((self.word_hash & 0xFF) as usize) << 3) | bitpos;
         for (wk, &xk) in self.w[sel1].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
@@ -667,6 +675,9 @@ impl Model {
             *wk += MIX_LR * err * xk;
         }
         for (wk, &xk) in self.w3[sel3].iter_mut().zip(x.iter()) {
+            *wk += MIX_LR * err * xk;
+        }
+        for (wk, &xk) in self.w4[sel4].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
         let yf = f64::from(y);
