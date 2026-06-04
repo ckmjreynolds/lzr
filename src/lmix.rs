@@ -149,8 +149,10 @@ const NN_EMB: usize = 16;
 const NN_CTX: usize = 3;
 /// Neural arm: hidden-layer width.
 const NN_HID: usize = 32;
-/// Neural arm: input width — `NN_CTX` byte embeddings plus the node embedding.
-const NN_IN_DIM: usize = (NN_CTX + 1) * NN_EMB;
+/// Neural arm: hidden-layer input width — the `NN_CTX` context byte embeddings
+/// concatenated. The within-byte node enters at the per-node output head, not
+/// the hidden layer, so the hidden state is computed once per byte.
+const NN_IN_DIM: usize = NN_CTX * NN_EMB;
 /// Neural arm: SGD step size on its in-loop boosting gradient.
 const NN_LR: f64 = 0.01;
 
@@ -384,53 +386,61 @@ fn nn_init(seed: u64, n: usize, scale: f64) -> Vec<f64> {
 }
 
 /// In-loop neural arm: a tiny one-hidden-layer MLP over a learned embedding of
-/// the last `NN_CTX` bytes and the within-byte tree node. It is trained online
-/// like the other arms — both sides replay the same bytes and run identical
-/// SGD, so its weights never ship (`L(D) = 0`). Crucially it is trained on the
-/// *boosting* gradient: the upstream signal is `(y - p_mix) * w_eff`, the
-/// coding-loss gradient routed back through the mixer's weight on this input.
-/// So it learns the residual the deterministic ensemble cannot capture, rather
-/// than re-learning what the order/word/match arms already predict.
+/// the last `NN_CTX` bytes. The hidden state is computed **once per byte** from
+/// context (the expensive layer); each of the byte's eight bit decisions then
+/// reads it through a per-node output head (`s = b2[node] + w2[node]·h`), so the
+/// hidden layer runs 1×/byte rather than 8×. It is trained online like the other
+/// arms — both sides replay the same bytes and run identical SGD, so its weights
+/// never ship (`L(D) = 0`). Crucially it is trained on the *boosting* gradient:
+/// the upstream signal is `(y - p_mix) * w_eff`, the coding-loss gradient routed
+/// back through the mixer's weight on this input. So it learns the residual the
+/// deterministic ensemble cannot capture, rather than re-learning what the
+/// order/word/match arms already predict.
 #[derive(Debug)]
 struct NnArm {
+    /// Context byte embeddings, `256 * NN_EMB`.
     byte_emb: Vec<f64>,
-    node_emb: Vec<f64>,
+    /// Hidden-layer weights, `NN_HID * NN_IN_DIM` (context → hidden).
     w1: Vec<f64>,
+    /// Hidden-layer biases, `NN_HID`.
     b1: Vec<f64>,
+    /// Per-node output weights, `256 * NN_HID` (hidden → logit, by node).
     w2: Vec<f64>,
-    b2: f64,
-    inv: [f64; NN_IN_DIM],
+    /// Per-node output biases, `256`.
+    b2: Vec<f64>,
+    /// Hidden activations cached for the current byte.
     hid: [f64; NN_HID],
+    /// Input embedding (concatenated context byte embeddings) for the byte.
+    inv: [f64; NN_IN_DIM],
+    /// Hidden-state gradient accumulated over the byte's eight bits.
+    dh: [f64; NN_HID],
+    /// Context byte values that fed `inv` (for the embedding gradient).
     cbytes: [usize; NN_CTX],
-    node: usize,
 }
 
 impl NnArm {
     fn new() -> Self {
         Self {
             byte_emb: nn_init(0x1234_5678_9abc_def0, 256 * NN_EMB, 0.1),
-            node_emb: nn_init(0x0fed_cba9_8765_4321, 256 * NN_EMB, 0.1),
             w1: nn_init(0xa5a5_5a5a_c3c3_3c3c, NN_HID * NN_IN_DIM, 0.1),
             b1: vec![0.0; NN_HID],
-            w2: nn_init(0x2468_ace0_1357_9bdf, NN_HID, 0.05),
-            b2: 0.0,
-            inv: [0.0; NN_IN_DIM],
+            w2: nn_init(0x2468_ace0_1357_9bdf, 256 * NN_HID, 0.05),
+            b2: vec![0.0; 256],
             hid: [0.0; NN_HID],
+            inv: [0.0; NN_IN_DIM],
+            dh: [0.0; NN_HID],
             cbytes: [0; NN_CTX],
-            node: 0,
         }
     }
 
-    /// Forward pass for the bit at `node` in context `ctx`: assemble the input
-    /// embedding, run the hidden layer, and return the output logit (added to
-    /// the mixer in the stretch domain). Activations are cached for [`NnArm::backward`].
+    /// Start a byte: assemble the context embedding and run the hidden layer
+    /// once; the eight bit decisions reuse the cached hidden state.
     #[allow(
         clippy::needless_range_loop,
         clippy::cast_possible_truncation,
         clippy::suboptimal_flops
     )]
-    fn forward(&mut self, node: usize, ctx: u64) -> f64 {
-        self.node = node;
+    fn byte_begin(&mut self, ctx: u64) {
         for j in 0..NN_CTX {
             let b = ((ctx >> (8 * j)) & 0xFF) as usize;
             self.cbytes[j] = b;
@@ -438,49 +448,64 @@ impl NnArm {
             self.inv[j * NN_EMB..(j + 1) * NN_EMB]
                 .copy_from_slice(&self.byte_emb[src..src + NN_EMB]);
         }
-        let nsrc = node * NN_EMB;
-        self.inv[NN_CTX * NN_EMB..].copy_from_slice(&self.node_emb[nsrc..nsrc + NN_EMB]);
-        let mut s = self.b2;
         for h in 0..NN_HID {
             let base = h * NN_IN_DIM;
             let mut a = self.b1[h];
             for k in 0..NN_IN_DIM {
                 a += self.w1[base + k] * self.inv[k];
             }
-            let hv = a.tanh();
-            self.hid[h] = hv;
-            s += self.w2[h] * hv;
+            self.hid[h] = a.tanh();
+            self.dh[h] = 0.0;
+        }
+    }
+
+    /// Output logit for the bit at `node`, read from the cached hidden state
+    /// through the node's output head.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn bit_forward(&self, node: usize) -> f64 {
+        let base = node * NN_HID;
+        let mut s = self.b2[node];
+        for h in 0..NN_HID {
+            s += self.w2[base + h] * self.hid[h];
         }
         s
     }
 
-    /// Backward pass with upstream gradient `g = (y - p_mix) * w_eff`: ascend
-    /// the log-likelihood (descend coding loss) through the cached activations,
-    /// updating the output layer, hidden layer, and the embeddings that fed it.
+    /// Apply the bit's boosting gradient: update the per-node output head and
+    /// accumulate its contribution to the hidden-state gradient (applied at
+    /// [`NnArm::byte_end`]).
     #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
-    fn backward(&mut self, g: f64) {
-        let mut dh = [0.0; NN_HID];
+    fn bit_backward(&mut self, node: usize, g: f64) {
+        let base = node * NN_HID;
         for h in 0..NN_HID {
-            dh[h] = g * self.w2[h] * (1.0 - self.hid[h] * self.hid[h]);
+            self.dh[h] += g * self.w2[base + h];
+            self.w2[base + h] += NN_LR * g * self.hid[h];
+        }
+        self.b2[node] += NN_LR * g;
+    }
+
+    /// Finish a byte: backprop the accumulated hidden-state gradient through the
+    /// tanh and the hidden layer, updating `w1`, `b1`, and the context embeddings.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn byte_end(&mut self) {
+        let mut da = [0.0; NN_HID];
+        for h in 0..NN_HID {
+            da[h] = self.dh[h] * (1.0 - self.hid[h] * self.hid[h]);
         }
         let mut din = [0.0; NN_IN_DIM];
         for h in 0..NN_HID {
             let base = h * NN_IN_DIM;
-            let dhh = dh[h];
+            let dah = da[h];
             for k in 0..NN_IN_DIM {
-                din[k] += dhh * self.w1[base + k];
+                din[k] += dah * self.w1[base + k];
             }
         }
         for h in 0..NN_HID {
-            self.w2[h] += NN_LR * g * self.hid[h];
-        }
-        self.b2 += NN_LR * g;
-        for h in 0..NN_HID {
             let base = h * NN_IN_DIM;
-            let dhh = dh[h];
-            self.b1[h] += NN_LR * dhh;
+            let dah = da[h];
+            self.b1[h] += NN_LR * dah;
             for k in 0..NN_IN_DIM {
-                self.w1[base + k] += NN_LR * dhh * self.inv[k];
+                self.w1[base + k] += NN_LR * dah * self.inv[k];
             }
         }
         for j in 0..NN_CTX {
@@ -488,10 +513,6 @@ impl NnArm {
             for e in 0..NN_EMB {
                 self.byte_emb[base + e] += NN_LR * din[j * NN_EMB + e];
             }
-        }
-        let nbase = self.node * NN_EMB;
-        for e in 0..NN_EMB {
-            self.node_emb[nbase + e] += NN_LR * din[NN_CTX * NN_EMB + e];
         }
     }
 }
@@ -768,7 +789,7 @@ impl Model {
     /// the APM `(ctx, knot, frac)` to update after the bit is known.
     #[allow(clippy::needless_range_loop, clippy::similar_names)]
     fn step_predict(
-        &mut self,
+        &self,
         node: usize,
         x: &mut [f64; N_INPUTS],
     ) -> (f64, f64, Option<(usize, usize, f64)>) {
@@ -818,8 +839,7 @@ impl Model {
             };
         }
         x[NN_IN] = if self.arms.use_nn {
-            let ctx = self.ctx;
-            self.nn.forward(node, ctx)
+            self.nn.bit_forward(node)
         } else {
             0.0
         };
@@ -889,7 +909,7 @@ impl Model {
             *wk += MIX_LR * err * xk;
         }
         if self.arms.use_nn {
-            self.nn.backward(err * w_eff);
+            self.nn.bit_backward(node, err * w_eff);
         }
         let yf = f64::from(y);
         self.o0[node].update(yf);
@@ -1015,17 +1035,36 @@ impl Model {
         self.ctx_hi = (self.ctx_hi << 8) | u128::from(b);
     }
 
+    /// Compute the neural arm's per-byte hidden state (once, before the byte's
+    /// eight bit decisions). No-op when the arm is inactive.
+    fn nn_byte_begin(&mut self) {
+        if self.arms.use_nn {
+            let ctx = self.ctx;
+            self.nn.byte_begin(ctx);
+        }
+    }
+
+    /// Apply the neural arm's accumulated per-byte hidden-layer gradient (after
+    /// the byte's eight bit decisions). No-op when the arm is inactive.
+    fn nn_byte_end(&mut self) {
+        if self.arms.use_nn {
+            self.nn.byte_end();
+        }
+    }
+
     /// Replay a byte through predict+update without coding it — used to prime
     /// model state from the `warm` prefix on both sides identically.
     fn learn_byte(&mut self, b: u8) {
         let mut node = 1usize;
         let mut x = [0.0; N_INPUTS];
+        self.nn_byte_begin();
         for i in (0..8).rev() {
             let y = (b >> i) & 1;
             let (_p_code, p_mix, sse) = self.step_predict(node, &mut x);
             self.step_update(node, &x, p_mix, sse, y);
             node = (node << 1) | usize::from(y);
         }
+        self.nn_byte_end();
         self.advance(b);
     }
 }
@@ -1070,6 +1109,7 @@ fn encode_impl(
         let mut cdf = [0u32, 0, TOTAL];
         for &b in measure {
             let mut node = 1usize;
+            model.nn_byte_begin();
             for i in (0..8).rev() {
                 let y = (b >> i) & 1;
                 let (p_code, p_mix, sse) = model.step_predict(node, &mut x);
@@ -1078,6 +1118,7 @@ fn encode_impl(
                 model.step_update(node, &x, p_mix, sse, y);
                 node = (node << 1) | usize::from(y);
             }
+            model.nn_byte_end();
             model.advance(b);
         }
         enc.finish();
@@ -1110,6 +1151,7 @@ fn decode_impl(arms: Arms, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
     for _ in 0..n {
         let mut node = 1usize;
         let mut b = 0u8;
+        model.nn_byte_begin();
         for _ in 0..8 {
             let (p_code, p_mix, sse) = model.step_predict(node, &mut x);
             fill_bit_cdf(p_code, &mut cdf);
@@ -1118,6 +1160,7 @@ fn decode_impl(arms: Arms, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
             b = (b << 1) | y;
             node = (node << 1) | usize::from(y);
         }
+        model.nn_byte_end();
         model.advance(b);
         out.push(b);
     }
@@ -1350,6 +1393,7 @@ pub(crate) fn residual_report(arms: Arms, warm: &[u8], measure: &[u8]) -> Residu
         let cls = byte_class(b);
         let mut node = 1usize;
         let mut cost = 0.0;
+        model.nn_byte_begin();
         for i in (0..8).rev() {
             let y = (b >> i) & 1;
             let (p_code, p_mix, sse) = model.step_predict(node, &mut x);
@@ -1358,6 +1402,7 @@ pub(crate) fn residual_report(arms: Arms, warm: &[u8], measure: &[u8]) -> Residu
             model.step_update(node, &x, p_mix, sse, y);
             node = (node << 1) | usize::from(y);
         }
+        model.nn_byte_end();
         model.advance(b);
         bits[cls] += cost;
         count[cls] += 1;
