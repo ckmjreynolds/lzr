@@ -408,6 +408,8 @@ struct Model {
     /// Second mixer, selected by the byte two back; its output is averaged with
     /// the first so the blend is conditioned on two independent regimes.
     w2: Vec<[f64; N_INPUTS]>,
+    /// Third mixer, selected by the byte three back.
+    w3: Vec<[f64; N_INPUTS]>,
     /// Rolling context — the last up-to-8 bytes, most recent in the low byte.
     ctx: u64,
     /// Active model stages (which optional arms contribute).
@@ -489,6 +491,7 @@ impl Model {
             maps: (0..MAX_ORDER).map(|_| ctx_table()).collect(),
             w: vec![[INIT_W; N_INPUTS]; N_WSETS],
             w2: vec![[INIT_W; N_INPUTS]; N_WSETS],
+            w3: vec![[INIT_W; N_INPUTS]; N_WSETS],
             ctx: 0,
             arms,
             hist,
@@ -619,17 +622,9 @@ impl Model {
         let bitpos = node.ilog2() as usize;
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
-        let s1: f64 = self.w[sel1]
-            .iter()
-            .zip(x.iter())
-            .map(|(wk, xk)| wk * xk)
-            .sum();
-        let s2: f64 = self.w2[sel2]
-            .iter()
-            .zip(x.iter())
-            .map(|(wk, xk)| wk * xk)
-            .sum();
-        let s = f64::midpoint(s1, s2);
+        let sel3 = ((((self.ctx >> 16) & 0xFF) as usize) << 3) | bitpos;
+        let dot = |w: &[f64; N_INPUTS]| -> f64 { w.iter().zip(x.iter()).map(|(a, b)| a * b).sum() };
+        let s = (dot(&self.w[sel1]) + dot(&self.w2[sel2]) + dot(&self.w3[sel3])) / 3.0;
         let p_mix = squash(s);
         if self.arms.use_sse {
             let (p_apm, i, frac) = self.apm.refine(s, node);
@@ -660,10 +655,14 @@ impl Model {
         let bitpos = node.ilog2() as usize;
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
+        let sel3 = ((((self.ctx >> 16) & 0xFF) as usize) << 3) | bitpos;
         for (wk, &xk) in self.w[sel1].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
         for (wk, &xk) in self.w2[sel2].iter_mut().zip(x.iter()) {
+            *wk += MIX_LR * err * xk;
+        }
+        for (wk, &xk) in self.w3[sel3].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
         let yf = f64::from(y);
