@@ -54,8 +54,8 @@ const HI_ORDERS: [usize; 3] = [8, 12, 16];
 /// Number of high-order context models.
 const N_HI: usize = HI_ORDERS.len();
 /// Mixer inputs: one per order, the match model, two word models, the high
-/// orders.
-const N_INPUTS: usize = N_ORDERS + 3 + N_HI;
+/// orders, the word-trigram model.
+const N_INPUTS: usize = N_ORDERS + 4 + N_HI;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
@@ -64,6 +64,8 @@ const WORD0_IN: usize = N_ORDERS + 1;
 const WORD1_IN: usize = N_ORDERS + 2;
 /// Base index of the high-order context mixer inputs (`HI_IN .. HI_IN + N_HI`).
 const HI_IN: usize = N_ORDERS + 3;
+/// Index of the W2 (previous two words + current partial word) mixer input.
+const WORD2_IN: usize = N_ORDERS + 3 + N_HI;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -430,6 +432,8 @@ struct Model {
     word_len: u32,
     /// Rolling hash of the most recently completed word (`WORD_SEED` initially).
     prev_word_hash: u64,
+    /// Rolling hash of the word completed before `prev_word_hash` (W2 context).
+    prev2_word_hash: u64,
 
     /// Per-high-order fixed-size predictor tables (`himaps[i]` for
     /// `HI_ORDERS[i]`), indexed by `slot` of the hashed `(context, node)`.
@@ -458,7 +462,7 @@ impl Model {
         };
         let apm = Apm::new(if use_sse { 256 } else { 0 });
         let wmaps = if use_word {
-            (0..2).map(|_| ctx_table()).collect()
+            (0..3).map(|_| ctx_table()).collect()
         } else {
             Vec::new()
         };
@@ -483,6 +487,7 @@ impl Model {
             word_hash: WORD_SEED,
             word_len: 0,
             prev_word_hash: WORD_SEED,
+            prev2_word_hash: WORD_SEED,
             himaps,
             ctx_hi: 0,
         }
@@ -550,15 +555,25 @@ impl Model {
             }
             None => 0.0,
         };
-        let (w0, w1) = if self.arms.use_word {
+        let (w0, w1, w2) = if self.arms.use_word {
             let k0 = word_key(self.word_hash, node);
             let k1 = word_key(word_combine(self.prev_word_hash, self.word_hash), node);
-            (ctx_logit(&self.wmaps[0], k0), ctx_logit(&self.wmaps[1], k1))
+            let ctx2 = word_combine(
+                word_combine(self.prev2_word_hash, self.prev_word_hash),
+                self.word_hash,
+            );
+            let k2 = word_key(ctx2, node);
+            (
+                ctx_logit(&self.wmaps[0], k0),
+                ctx_logit(&self.wmaps[1], k1),
+                ctx_logit(&self.wmaps[2], k2),
+            )
         } else {
-            (0.0, 0.0)
+            (0.0, 0.0, 0.0)
         };
         x[WORD0_IN] = w0;
         x[WORD1_IN] = w1;
+        x[WORD2_IN] = w2;
         for i in 0..N_HI {
             x[HI_IN + i] = if self.arms.use_hi {
                 ctx_logit(&self.himaps[i], hi_key(self.ctx_hi, HI_ORDERS[i], node))
@@ -611,8 +626,14 @@ impl Model {
         if self.arms.use_word {
             let k0 = word_key(self.word_hash, node);
             let k1 = word_key(word_combine(self.prev_word_hash, self.word_hash), node);
+            let ctx2 = word_combine(
+                word_combine(self.prev2_word_hash, self.prev_word_hash),
+                self.word_hash,
+            );
+            let k2 = word_key(ctx2, node);
             update_ctx(&mut self.wmaps[0], k0, yf);
             update_ctx(&mut self.wmaps[1], k1, yf);
+            update_ctx(&mut self.wmaps[2], k2, yf);
         }
         if self.arms.use_hi {
             for i in 0..N_HI {
@@ -695,6 +716,7 @@ impl Model {
             self.word_len += 1;
         } else {
             if self.word_len > 0 {
+                self.prev2_word_hash = self.prev_word_hash;
                 self.prev_word_hash = self.word_hash;
             }
             self.word_hash = WORD_SEED;
