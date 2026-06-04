@@ -71,6 +71,13 @@ const HI_IN: usize = N_ORDERS + 3;
 const CTX_BITS: u32 = 24;
 /// Number of slots per context table.
 const CTX_SIZE: usize = 1 << CTX_BITS;
+/// Set associativity: slots per bucket. A key hashes to a bucket and may take
+/// any slot in it, so up to `CTX_WAYS` colliding contexts coexist before any
+/// eviction — fewer conflict misses than direct-mapped at the same memory.
+/// 4 × 16 B = 64 B = one cache line, so scanning a bucket is one cache miss.
+const CTX_WAYS: usize = 4;
+/// Bits of the hash selecting the bucket (the rest of the table is the ways).
+const BUCKET_BITS: u32 = CTX_BITS - CTX_WAYS.ilog2();
 /// Mixer gradient-descent step size on coding loss. An enwik8 quick-panel
 /// sweep bottomed out near 0.002 (0.05 → 2.059, 0.02 → 1.971, 0.004 → 1.936,
 /// 0.002 → 1.933); below that the curve is flat.
@@ -153,47 +160,57 @@ const fn word_combine(prev: u64, cur: u64) -> u64 {
     prev.wrapping_mul(WORD_MIX).wrapping_add(cur)
 }
 
-/// Map a context key to a slot in a fixed-size context table — a multiplicative
-/// hash taking the high `CTX_BITS` bits (good spread even for the small packed
-/// order keys). Distinct keys may collide and share a predictor; with a large
-/// table that costs little, and it bounds memory.
-/// Hash a context key into a table slot index plus a 16-bit checksum, taken
-/// from adjacent well-mixed high bits of one multiplicative hash. Two keys
-/// landing in the same slot almost always differ in checksum, so a collision
-/// is detected rather than silently blended.
+/// Hash a context key into its bucket's base slot index plus a 16-bit checksum,
+/// taken from adjacent well-mixed high bits of one multiplicative hash. Two keys
+/// in the same bucket almost always differ in checksum, so a collision is
+/// detected rather than silently blended.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
 const fn locate(key: u64) -> (usize, u16) {
     let h = key.wrapping_mul(WORD_MIX);
-    let idx = (h >> (64 - CTX_BITS)) as usize;
-    let check = (h >> (64 - CTX_BITS - 16)) as u16;
-    (idx, check)
+    let bucket = (h >> (64 - BUCKET_BITS)) as usize;
+    let check = (h >> (64 - BUCKET_BITS - 16)) as u16;
+    (bucket * CTX_WAYS, check)
 }
 
-/// Read a hashed context's logit: the predictor's `stretch(p)` if the slot's
-/// checksum confirms it holds this key, else a neutral `0` (the slot belongs to
-/// a different context — don't trust its stats).
+/// Read a hashed context's logit: the predictor's `stretch(p)` from the slot in
+/// its bucket whose checksum confirms this key, else a neutral `0` (no slot
+/// holds this context — don't trust the others' stats).
 #[inline]
+#[allow(clippy::needless_range_loop)]
 fn ctx_logit(table: &[BitModel], key: u64) -> f64 {
-    let (idx, check) = locate(key);
-    let bm = table[idx];
-    if bm.check == check {
-        stretch(bm.p)
-    } else {
-        0.0
+    let (base, check) = locate(key);
+    for s in 0..CTX_WAYS {
+        let bm = table[base + s];
+        if bm.check == check {
+            return stretch(bm.p);
+        }
     }
+    0.0
 }
 
-/// Update a hashed context toward bit `y`, evicting first on a checksum
-/// mismatch — a colliding context claims the slot with fresh stats rather than
-/// corrupting the incumbent's by blending.
+/// Update a hashed context toward bit `y`. If the bucket already holds this key,
+/// update it; otherwise claim the least-trained slot (lowest count) with fresh
+/// stats — so a colliding context evicts the cheapest entry to lose rather than
+/// corrupting a well-trained one.
 #[inline]
+#[allow(clippy::needless_range_loop)]
 fn update_ctx(table: &mut [BitModel], key: u64, y: f64) {
-    let (idx, check) = locate(key);
-    if table[idx].check != check {
-        table[idx] = BitModel::fresh(check);
+    let (base, check) = locate(key);
+    let mut victim = base;
+    let mut min_n = u32::MAX;
+    for s in 0..CTX_WAYS {
+        if table[base + s].check == check {
+            table[base + s].update(y);
+            return;
+        }
+        if table[base + s].n < min_n {
+            min_n = table[base + s].n;
+            victim = base + s;
+        }
     }
-    table[idx].update(y);
+    table[victim] = BitModel::fresh(check);
+    table[victim].update(y);
 }
 
 /// A fresh fixed-size context table, every slot an untouched (neutral) model.

@@ -13,6 +13,23 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-03 — set-associative buckets attack the collision tax: lhi to 1.647 bpb on full enwik8 at the same memory
+
+With case closed, the dominant remaining loss was the collision tax — even checksummed direct-mapped tables thrash, because every collision evicts the incumbent (the new context takes its one slot). On full enwik8 that was lword 1.725 / lhi 1.700 versus the unbounded-HashMap ceiling 1.661.
+
+*Fix.* Make the tables set-associative: divide each into 4-slot buckets; a key hashes to a bucket and may occupy any slot in it. On read, scan the bucket for the checksum-matching slot; on update, update the match if present, else claim the least-trained slot (lowest observation count) — so a colliding context evicts the cheapest entry to lose, not a well-trained one, and up to four colliding contexts coexist before any eviction. This is classic conflict-miss reduction at the same total memory. A bonus from the layout: 4 × 16 B = 64 B = one cache line, so a whole bucket scan is a single cache miss.
+
+*Results (full enwik8, CTX_BITS=24, identical memory):*
+
+| codec | direct-mapped | 4-way set-assoc | delta |
+|---|---:|---:|---:|
+| lword | 1.725 | 1.684 | -0.041 |
+| lhi | 1.700 | 1.647 | -0.053 |
+
+The biggest single step since the match model, and it came from *retention*, not new information. An associativity sweep on lhi was 1-way 1.700, 2-way 1.657, 4-way 1.647, 8-way 1.645 — 4-way is the knee (nearly all the gain in one cache line; 8-way buys 0.002 for a second line). Notably lhi at 1.647 now codes *below* the unbounded-HashMap lword ceiling of 1.661, at bounded memory — the bounded codec beats the unbounded design it replaced, because lhi carries more arms and the associativity recovered the collision tax that had been hiding the high-order arm's value.
+
+New shippable best: **lhi 1.647 bpb on full enwik8** at CTX_BITS=24, 4-way, round-trip verified, ~2.75 GB RAM. This vindicates the call to attack the collision tax over adding another arm: it was the dominant loss, and set-associativity recovered ~0.05 of it where any single arm would have given ~0.01–0.03.
+
 ## 2026-06-03 — case modeling: three attacks, all negative — a strong mixer already models case better than any separated scheme
 
 The residual analyzer flagged uppercase as the expensive byte class (4.73 bpb, 10% of bits on 3.9% of bytes). Three ways to exploit that were tried, escalating in ambition; all failed, and together they settle the question for this architecture.
