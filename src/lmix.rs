@@ -83,7 +83,7 @@ const BUCKET_BITS: u32 = CTX_BITS - CTX_WAYS.ilog2();
 /// Mixer gradient-descent step size on coding loss. An enwik8 quick-panel
 /// sweep bottomed out near 0.002 (0.05 → 2.059, 0.02 → 1.971, 0.004 → 1.936,
 /// 0.002 → 1.933); below that the curve is flat.
-const MIX_LR: f64 = 0.002;
+const MIX_LR: f64 = 0.004;
 /// Initial per-input mixer weight (before any online training).
 const INIT_W: f64 = 0.3;
 /// Number of mixer weight sets, selected by (previous byte, bit position).
