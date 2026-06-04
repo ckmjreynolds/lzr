@@ -56,8 +56,8 @@ const N_HI: usize = HI_ORDERS.len();
 /// Number of sparse (non-contiguous byte) context models.
 const N_SPARSE: usize = 2;
 /// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse,
-/// and the in-loop neural arm.
-const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 1;
+/// and the two in-loop neural arms (MLP + recurrent).
+const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 2;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
@@ -70,8 +70,10 @@ const HI_IN: usize = N_ORDERS + 3;
 const WORD2_IN: usize = N_ORDERS + 3 + N_HI;
 /// Base index of the sparse-context mixer inputs.
 const SPARSE_IN: usize = N_ORDERS + 4 + N_HI;
-/// Index of the neural arm's mixer input (the last slot).
+/// Index of the (MLP) neural arm's mixer input.
 const NN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE;
+/// Index of the recurrent neural arm's mixer input (the last slot).
+const RNN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 1;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -159,6 +161,20 @@ const NN_HID: usize = 64;
 const NN_IN_DIM: usize = NN_CTX * NN_EMB;
 /// Neural arm: SGD step size on its in-loop boosting gradient.
 const NN_LR: f64 = 0.01;
+
+/// Recurrent arm: embedding width of the byte fed into the recurrence each step.
+const RNN_EMB: usize = 16;
+/// Recurrent arm: hidden-state width (the carried long-context summary).
+const RNN_HID: usize = 64;
+/// Recurrent arm: truncated-BPTT horizon — how many recent steps the
+/// coding-loss gradient is propagated back through. The forward state carries
+/// unbounded context regardless; this bounds credit assignment (and compute).
+const RNN_TBPTT: usize = 8;
+/// Recurrent arm: SGD step size on its in-loop boosting gradient.
+const RNN_LR: f64 = 0.01;
+/// Recurrent arm: per-element clamp on the through-time gradient, so the
+/// recurrence cannot explode during truncated BPTT.
+const RNN_CLIP: f64 = 2.0;
 
 /// Logit of a probability: `ln(p / (1-p))`, clamped to keep it finite.
 #[inline]
@@ -521,6 +537,198 @@ impl NnArm {
     }
 }
 
+/// In-loop **recurrent** neural arm: a vanilla RNN whose hidden state carries an
+/// unbounded summary of all prior bytes forward, `h = tanh(Wx·x + Wh·h_prev + b)`.
+/// Each byte feeds its embedding into the recurrence (advancing the state once
+/// per byte); the eight bit decisions read the current state through a per-node
+/// output head (`s = b2[node] + w2[node]·h`), as in [`NnArm`]. Trained in-loop on
+/// the same boosting gradient `(y - p_mix) * w_eff`, by truncated BPTT over the
+/// last `RNN_TBPTT` steps (the forward state still carries context past the
+/// horizon; only credit assignment is bounded). Weights never ship (`L(D) = 0`).
+/// Where [`NnArm`] adds nonlinear short-context generalization, this adds
+/// long-range memory the fixed-window arms cannot.
+#[derive(Debug)]
+struct RnnArm {
+    /// Byte embeddings fed into the recurrence, `256 * RNN_EMB`.
+    emb: Vec<f64>,
+    /// Input weights, `RNN_HID * RNN_EMB`.
+    wx: Vec<f64>,
+    /// Recurrent weights, `RNN_HID * RNN_HID`.
+    wh: Vec<f64>,
+    /// Recurrent biases, `RNN_HID`.
+    b: Vec<f64>,
+    /// Per-node output weights, `256 * RNN_HID`.
+    w2: Vec<f64>,
+    /// Per-node output biases, `256`.
+    b2: Vec<f64>,
+    /// Current hidden state (summary of all bytes coded so far).
+    h: [f64; RNN_HID],
+    /// Hidden-state gradient accumulated over the current byte's eight bits.
+    dh: [f64; RNN_HID],
+    /// Truncated-BPTT history: inputs, prior states, and resulting states of the
+    /// last `RNN_TBPTT` recurrent steps (oldest at index 0).
+    buf_x: [[f64; RNN_EMB]; RNN_TBPTT],
+    buf_hprev: [[f64; RNN_HID]; RNN_TBPTT],
+    buf_h: [[f64; RNN_HID]; RNN_TBPTT],
+    buf_byte: [usize; RNN_TBPTT],
+    /// Number of valid entries in the history (`<= RNN_TBPTT`).
+    buf_len: usize,
+}
+
+impl RnnArm {
+    fn new() -> Self {
+        Self {
+            emb: nn_init(0x51ed_270b_2e07_6e51, 256 * RNN_EMB, 0.1),
+            wx: nn_init(0x3c6e_f372_fe94_f82a, RNN_HID * RNN_EMB, 0.1),
+            wh: nn_init(0xc2b2_ae3d_27d4_eb4f, RNN_HID * RNN_HID, 0.05),
+            b: vec![0.0; RNN_HID],
+            w2: nn_init(0x1656_67b1_9e37_79f9, 256 * RNN_HID, 0.05),
+            b2: vec![0.0; 256],
+            h: [0.0; RNN_HID],
+            dh: [0.0; RNN_HID],
+            buf_x: [[0.0; RNN_EMB]; RNN_TBPTT],
+            buf_hprev: [[0.0; RNN_HID]; RNN_TBPTT],
+            buf_h: [[0.0; RNN_HID]; RNN_TBPTT],
+            buf_byte: [0; RNN_TBPTT],
+            buf_len: 0,
+        }
+    }
+
+    /// One recurrent step: `tanh(Wx·x + Wh·h_prev + b)`.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn step(&self, x: &[f64; RNN_EMB], hprev: &[f64; RNN_HID]) -> [f64; RNN_HID] {
+        let mut h = [0.0; RNN_HID];
+        for i in 0..RNN_HID {
+            let mut a = self.b[i];
+            let bx = i * RNN_EMB;
+            for k in 0..RNN_EMB {
+                a += self.wx[bx + k] * x[k];
+            }
+            let bh = i * RNN_HID;
+            for k in 0..RNN_HID {
+                a += self.wh[bh + k] * hprev[k];
+            }
+            h[i] = a.tanh();
+        }
+        h
+    }
+
+    /// Output logit for the bit at `node`, read from the current hidden state.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn bit_forward(&self, node: usize) -> f64 {
+        let base = node * RNN_HID;
+        let mut s = self.b2[node];
+        for i in 0..RNN_HID {
+            s += self.w2[base + i] * self.h[i];
+        }
+        s
+    }
+
+    /// Apply the bit's boosting gradient: update the per-node output head and
+    /// accumulate its contribution to the hidden-state gradient.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn bit_backward(&mut self, node: usize, g: f64) {
+        let base = node * RNN_HID;
+        for i in 0..RNN_HID {
+            self.dh[i] += g * self.w2[base + i];
+            self.w2[base + i] += RNN_LR * g * self.h[i];
+        }
+        self.b2[node] += RNN_LR * g;
+    }
+
+    /// Truncated BPTT: propagate the byte's accumulated hidden-state gradient
+    /// back through the last `buf_len` recurrent steps, accumulate weight and
+    /// embedding gradients, and apply them. Resets the accumulator.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn bptt(&mut self) {
+        if self.buf_len == 0 {
+            self.dh = [0.0; RNN_HID];
+            return;
+        }
+        let mut gwx = vec![0.0; RNN_HID * RNN_EMB];
+        let mut gwh = vec![0.0; RNN_HID * RNN_HID];
+        let mut gb = [0.0; RNN_HID];
+        let mut dh = self.dh;
+        for s in (0..self.buf_len).rev() {
+            let x = &self.buf_x[s];
+            let hprev = &self.buf_hprev[s];
+            let h = &self.buf_h[s];
+            let mut da = [0.0; RNN_HID];
+            for i in 0..RNN_HID {
+                let d = dh[i].clamp(-RNN_CLIP, RNN_CLIP);
+                da[i] = d * (1.0 - h[i] * h[i]);
+            }
+            for i in 0..RNN_HID {
+                gb[i] += da[i];
+                let bx = i * RNN_EMB;
+                for k in 0..RNN_EMB {
+                    gwx[bx + k] += da[i] * x[k];
+                }
+                let bh = i * RNN_HID;
+                for k in 0..RNN_HID {
+                    gwh[bh + k] += da[i] * hprev[k];
+                }
+            }
+            let bid = self.buf_byte[s] * RNN_EMB;
+            for k in 0..RNN_EMB {
+                let mut dxk = 0.0;
+                for i in 0..RNN_HID {
+                    dxk += self.wx[i * RNN_EMB + k] * da[i];
+                }
+                self.emb[bid + k] += RNN_LR * dxk;
+            }
+            let mut dprev = [0.0; RNN_HID];
+            for k in 0..RNN_HID {
+                let mut acc = 0.0;
+                for i in 0..RNN_HID {
+                    acc += self.wh[i * RNN_HID + k] * da[i];
+                }
+                dprev[k] = acc;
+            }
+            dh = dprev;
+        }
+        for i in 0..RNN_HID * RNN_EMB {
+            self.wx[i] += RNN_LR * gwx[i];
+        }
+        for i in 0..RNN_HID * RNN_HID {
+            self.wh[i] += RNN_LR * gwh[i];
+        }
+        for i in 0..RNN_HID {
+            self.b[i] += RNN_LR * gb[i];
+        }
+        self.dh = [0.0; RNN_HID];
+    }
+
+    /// Finish a byte: run truncated BPTT for the just-coded byte, then advance
+    /// the recurrent state with byte `byte` and record the step in the history.
+    fn byte_end(&mut self, byte: u8) {
+        self.bptt();
+        let bid = usize::from(byte);
+        let mut x = [0.0; RNN_EMB];
+        x.copy_from_slice(&self.emb[bid * RNN_EMB..bid * RNN_EMB + RNN_EMB]);
+        let hprev = self.h;
+        let hnew = self.step(&x, &hprev);
+        let slot = if self.buf_len < RNN_TBPTT {
+            let s = self.buf_len;
+            self.buf_len += 1;
+            s
+        } else {
+            for s in 1..RNN_TBPTT {
+                self.buf_x[s - 1] = self.buf_x[s];
+                self.buf_hprev[s - 1] = self.buf_hprev[s];
+                self.buf_h[s - 1] = self.buf_h[s];
+                self.buf_byte[s - 1] = self.buf_byte[s];
+            }
+            RNN_TBPTT - 1
+        };
+        self.buf_x[slot] = x;
+        self.buf_hprev[slot] = hprev;
+        self.buf_h[slot] = hnew;
+        self.buf_byte[slot] = bid;
+        self.h = hnew;
+    }
+}
+
 /// Which model stages are active. Each `l*` codec is one fixed value; the
 /// stack is cumulative — lmix ⊂ lmatch ⊂ lsse ⊂ lword ⊂ lhi. A flags struct is
 /// the legitimate exception to the no-many-bools lint.
@@ -537,6 +745,8 @@ pub(crate) struct Arms {
     /// In-loop neural arm as an extra mixer input (trained on the boosting
     /// gradient — the residual the deterministic ensemble misses).
     use_nn: bool,
+    /// In-loop recurrent neural arm (long-context memory) as an extra input.
+    use_rnn: bool,
 }
 
 impl Arms {
@@ -547,6 +757,7 @@ impl Arms {
         use_hi: false,
         use_dict: false,
         use_nn: false,
+        use_rnn: false,
     };
     const LMATCH: Self = Self {
         use_match: true,
@@ -555,6 +766,7 @@ impl Arms {
         use_hi: false,
         use_dict: false,
         use_nn: false,
+        use_rnn: false,
     };
     const LSSE: Self = Self {
         use_match: true,
@@ -563,6 +775,7 @@ impl Arms {
         use_hi: false,
         use_dict: false,
         use_nn: false,
+        use_rnn: false,
     };
     const LWORD: Self = Self {
         use_match: true,
@@ -571,6 +784,7 @@ impl Arms {
         use_hi: false,
         use_dict: false,
         use_nn: false,
+        use_rnn: false,
     };
     const LHI: Self = Self {
         use_match: true,
@@ -579,6 +793,7 @@ impl Arms {
         use_hi: true,
         use_dict: false,
         use_nn: false,
+        use_rnn: false,
     };
     const LDICT: Self = Self {
         use_match: true,
@@ -587,6 +802,7 @@ impl Arms {
         use_hi: true,
         use_dict: true,
         use_nn: false,
+        use_rnn: false,
     };
     const LNN: Self = Self {
         use_match: true,
@@ -595,6 +811,7 @@ impl Arms {
         use_hi: true,
         use_dict: false,
         use_nn: true,
+        use_rnn: false,
     };
     const LNNDICT: Self = Self {
         use_match: true,
@@ -603,6 +820,25 @@ impl Arms {
         use_hi: true,
         use_dict: true,
         use_nn: true,
+        use_rnn: false,
+    };
+    const LRNN: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: false,
+        use_nn: false,
+        use_rnn: true,
+    };
+    const LRNNDICT: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
+        use_nn: false,
+        use_rnn: true,
     };
 }
 
@@ -670,6 +906,8 @@ struct Model {
     spmaps: Vec<Vec<BitModel>>,
     /// In-loop neural arm (active iff `arms.use_nn`).
     nn: NnArm,
+    /// In-loop recurrent neural arm (active iff `arms.use_rnn`).
+    rnn: RnnArm,
 }
 
 impl Model {
@@ -681,6 +919,7 @@ impl Model {
             use_hi,
             use_dict: _,
             use_nn: _,
+            use_rnn: _,
         } = arms;
         let (hist, mtable, mmap) = if use_match {
             (
@@ -731,6 +970,7 @@ impl Model {
             ctx_hi: 0,
             spmaps,
             nn: NnArm::new(),
+            rnn: RnnArm::new(),
         }
     }
 
@@ -847,6 +1087,11 @@ impl Model {
         } else {
             0.0
         };
+        x[RNN_IN] = if self.arms.use_rnn {
+            self.rnn.bit_forward(node)
+        } else {
+            0.0
+        };
         let bitpos = node.ilog2() as usize;
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
@@ -900,6 +1145,15 @@ impl Model {
         } else {
             0.0
         };
+        let w_eff_rnn = if self.arms.use_rnn {
+            (self.w[sel1][RNN_IN]
+                + self.w2[sel2][RNN_IN]
+                + self.w3[sel3][RNN_IN]
+                + self.w4[sel4][RNN_IN])
+                / 4.0
+        } else {
+            0.0
+        };
         for (wk, &xk) in self.w[sel1].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
@@ -914,6 +1168,9 @@ impl Model {
         }
         if self.arms.use_nn {
             self.nn.bit_backward(node, err * w_eff);
+        }
+        if self.arms.use_rnn {
+            self.rnn.bit_backward(node, err * w_eff_rnn);
         }
         let yf = f64::from(y);
         self.o0[node].update(yf);
@@ -1048,11 +1305,15 @@ impl Model {
         }
     }
 
-    /// Apply the neural arm's accumulated per-byte hidden-layer gradient (after
-    /// the byte's eight bit decisions). No-op when the arm is inactive.
-    fn nn_byte_end(&mut self) {
+    /// Apply each neural arm's accumulated per-byte gradient (after the byte's
+    /// eight bit decisions) and advance the recurrent state with the now-known
+    /// byte `b`. No-op for whichever arm is inactive.
+    fn nn_byte_end(&mut self, b: u8) {
         if self.arms.use_nn {
             self.nn.byte_end();
+        }
+        if self.arms.use_rnn {
+            self.rnn.byte_end(b);
         }
     }
 
@@ -1068,7 +1329,7 @@ impl Model {
             self.step_update(node, &x, p_mix, sse, y);
             node = (node << 1) | usize::from(y);
         }
-        self.nn_byte_end();
+        self.nn_byte_end(b);
         self.advance(b);
     }
 }
@@ -1122,7 +1383,7 @@ fn encode_impl(
                 model.step_update(node, &x, p_mix, sse, y);
                 node = (node << 1) | usize::from(y);
             }
-            model.nn_byte_end();
+            model.nn_byte_end(b);
             model.advance(b);
         }
         enc.finish();
@@ -1164,7 +1425,7 @@ fn decode_impl(arms: Arms, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
             b = (b << 1) | y;
             node = (node << 1) | usize::from(y);
         }
-        model.nn_byte_end();
+        model.nn_byte_end(b);
         model.advance(b);
         out.push(b);
     }
@@ -1324,6 +1585,43 @@ impl Codec for LnndictCodec {
     }
 }
 
+/// [`LhiCodec`] plus the in-loop recurrent neural arm (long-context memory).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LrnnCodec;
+
+impl Codec for LrnnCodec {
+    fn name(&self) -> &'static str {
+        "lrnn"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LRNN, "lrnn", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LRNN, warm, archive)
+    }
+}
+
+/// [`LdictCodec`] plus the in-loop recurrent neural arm — dictionary
+/// preprocessing and long-context recurrent memory stacked together.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LrnndictCodec;
+
+impl Codec for LrnndictCodec {
+    fn name(&self) -> &'static str {
+        "lrnndict"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LRNNDICT, "lrnndict", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LRNNDICT, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -1336,6 +1634,8 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"ldict" => Arms::LDICT,
         b"lnn" => Arms::LNN,
         b"lnndict" => Arms::LNNDICT,
+        b"lrnn" => Arms::LRNN,
+        b"lrnndict" => Arms::LRNNDICT,
         _ => return None,
     })
 }
@@ -1406,7 +1706,7 @@ pub(crate) fn residual_report(arms: Arms, warm: &[u8], measure: &[u8]) -> Residu
             model.step_update(node, &x, p_mix, sse, y);
             node = (node << 1) | usize::from(y);
         }
-        model.nn_byte_end();
+        model.nn_byte_end(b);
         model.advance(b);
         bits[cls] += cost;
         count[cls] += 1;
@@ -1517,6 +1817,22 @@ mod tests {
         roundtrips_with_warm(&LnndictCodec);
         roundtrips_all_bytes(&LnndictCodec);
         roundtrips_empty(&LnndictCodec);
+    }
+
+    #[test]
+    fn lrnn_roundtrips() {
+        roundtrips_text(&LrnnCodec);
+        roundtrips_with_warm(&LrnnCodec);
+        roundtrips_all_bytes(&LrnnCodec);
+        roundtrips_empty(&LrnnCodec);
+    }
+
+    #[test]
+    fn lrnndict_roundtrips() {
+        roundtrips_text(&LrnndictCodec);
+        roundtrips_with_warm(&LrnndictCodec);
+        roundtrips_all_bytes(&LrnndictCodec);
+        roundtrips_empty(&LrnndictCodec);
     }
 
     #[test]
