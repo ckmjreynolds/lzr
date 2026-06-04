@@ -130,7 +130,7 @@ const APM_RATE: f64 = 0.02;
 /// raw mixer probability (damps APM noise; the rest is the mixer's own output).
 /// Quick-panel sweep: 0.5 → 1.777, 0.7 → 1.773, 0.85 → 1.774, 1.0 → 1.783, so
 /// trusting the APM ~70% beats both the cautious blend and the pure map.
-const APM_BLEND: f64 = 0.7;
+const APM_BLEND: f64 = 0.5;
 
 /// Word model: rolling-hash seed for an empty word (between words / in markup).
 const WORD_SEED: u64 = 0xcbf2_9ce4_8422_2325;
