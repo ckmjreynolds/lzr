@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::cmix::CmixCodec;
 use crate::codec::{Codec, Decomposition};
-use crate::lmix::{LdictCodec, LhiCodec, LmatchCodec, LmixCodec, LsseCodec, LwordCodec};
+use crate::lmix::{LdictCodec, LhiCodec, LmatchCodec, LmixCodec, LnnCodec, LsseCodec, LwordCodec};
 use crate::null::NullCodec;
 
 const SAMPLE_BYTES_FULL: usize = 256 * 1024;
@@ -83,8 +83,9 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "lword" => Ok(Box::new(LwordCodec)),
         "lhi" => Ok(Box::new(LhiCodec)),
         "ldict" => Ok(Box::new(LdictCodec)),
+        "lnn" => Ok(Box::new(LnnCodec)),
         other => bail!(
-            "unknown codec '{other}' (known: null, cmix, lmix, lmatch, lsse, lword, lhi, ldict)"
+            "unknown codec '{other}' (known: null, cmix, lmix, lmatch, lsse, lword, lhi, ldict, lnn)"
         ),
     }
 }

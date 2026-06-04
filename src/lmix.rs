@@ -55,8 +55,9 @@ const HI_ORDERS: [usize; 3] = [8, 12, 16];
 const N_HI: usize = HI_ORDERS.len();
 /// Number of sparse (non-contiguous byte) context models.
 const N_SPARSE: usize = 2;
-/// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse.
-const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE;
+/// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse,
+/// and the in-loop neural arm.
+const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 1;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
@@ -69,6 +70,8 @@ const HI_IN: usize = N_ORDERS + 3;
 const WORD2_IN: usize = N_ORDERS + 3 + N_HI;
 /// Base index of the sparse-context mixer inputs.
 const SPARSE_IN: usize = N_ORDERS + 4 + N_HI;
+/// Index of the neural arm's mixer input (the last slot).
+const NN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -139,6 +142,17 @@ const WORD_MUL: u64 = 0x0000_0100_0000_01B3;
 /// Word model: golden-ratio prime mixing context hashes with the byte node and
 /// the previous word with the current one.
 const WORD_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Neural arm: embedding width per byte / per within-byte node.
+const NN_EMB: usize = 16;
+/// Neural arm: number of preceding context bytes embedded (concatenated).
+const NN_CTX: usize = 3;
+/// Neural arm: hidden-layer width.
+const NN_HID: usize = 32;
+/// Neural arm: input width — `NN_CTX` byte embeddings plus the node embedding.
+const NN_IN_DIM: usize = (NN_CTX + 1) * NN_EMB;
+/// Neural arm: SGD step size on its in-loop boosting gradient.
+const NN_LR: f64 = 0.01;
 
 /// Logit of a probability: `ln(p / (1-p))`, clamped to keep it finite.
 #[inline]
@@ -351,6 +365,137 @@ impl Apm {
     }
 }
 
+/// Deterministic small init value for parameter `i` under `seed` — a splitmix64
+/// hash mapped to `[-1, 1)`. No global RNG, so encoder and decoder build the
+/// identical starting weights (`L(D)` stays 0; nothing is shipped).
+#[inline]
+#[allow(clippy::cast_precision_loss)]
+fn nn_rand(seed: u64, i: usize) -> f64 {
+    let mut z = seed.wrapping_add((i as u64).wrapping_mul(WORD_MIX));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z >> 11) as f64 / (1u64 << 53) as f64).mul_add(2.0, -1.0)
+}
+
+/// A deterministic vector of `n` small init values from `seed`, scaled.
+fn nn_init(seed: u64, n: usize, scale: f64) -> Vec<f64> {
+    (0..n).map(|i| nn_rand(seed, i) * scale).collect()
+}
+
+/// In-loop neural arm: a tiny one-hidden-layer MLP over a learned embedding of
+/// the last `NN_CTX` bytes and the within-byte tree node. It is trained online
+/// like the other arms — both sides replay the same bytes and run identical
+/// SGD, so its weights never ship (`L(D) = 0`). Crucially it is trained on the
+/// *boosting* gradient: the upstream signal is `(y - p_mix) * w_eff`, the
+/// coding-loss gradient routed back through the mixer's weight on this input.
+/// So it learns the residual the deterministic ensemble cannot capture, rather
+/// than re-learning what the order/word/match arms already predict.
+#[derive(Debug)]
+struct NnArm {
+    byte_emb: Vec<f64>,
+    node_emb: Vec<f64>,
+    w1: Vec<f64>,
+    b1: Vec<f64>,
+    w2: Vec<f64>,
+    b2: f64,
+    inv: [f64; NN_IN_DIM],
+    hid: [f64; NN_HID],
+    cbytes: [usize; NN_CTX],
+    node: usize,
+}
+
+impl NnArm {
+    fn new() -> Self {
+        Self {
+            byte_emb: nn_init(0x1234_5678_9abc_def0, 256 * NN_EMB, 0.1),
+            node_emb: nn_init(0x0fed_cba9_8765_4321, 256 * NN_EMB, 0.1),
+            w1: nn_init(0xa5a5_5a5a_c3c3_3c3c, NN_HID * NN_IN_DIM, 0.1),
+            b1: vec![0.0; NN_HID],
+            w2: nn_init(0x2468_ace0_1357_9bdf, NN_HID, 0.05),
+            b2: 0.0,
+            inv: [0.0; NN_IN_DIM],
+            hid: [0.0; NN_HID],
+            cbytes: [0; NN_CTX],
+            node: 0,
+        }
+    }
+
+    /// Forward pass for the bit at `node` in context `ctx`: assemble the input
+    /// embedding, run the hidden layer, and return the output logit (added to
+    /// the mixer in the stretch domain). Activations are cached for [`NnArm::backward`].
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::cast_possible_truncation,
+        clippy::suboptimal_flops
+    )]
+    fn forward(&mut self, node: usize, ctx: u64) -> f64 {
+        self.node = node;
+        for j in 0..NN_CTX {
+            let b = ((ctx >> (8 * j)) & 0xFF) as usize;
+            self.cbytes[j] = b;
+            let src = b * NN_EMB;
+            self.inv[j * NN_EMB..(j + 1) * NN_EMB]
+                .copy_from_slice(&self.byte_emb[src..src + NN_EMB]);
+        }
+        let nsrc = node * NN_EMB;
+        self.inv[NN_CTX * NN_EMB..].copy_from_slice(&self.node_emb[nsrc..nsrc + NN_EMB]);
+        let mut s = self.b2;
+        for h in 0..NN_HID {
+            let base = h * NN_IN_DIM;
+            let mut a = self.b1[h];
+            for k in 0..NN_IN_DIM {
+                a += self.w1[base + k] * self.inv[k];
+            }
+            let hv = a.tanh();
+            self.hid[h] = hv;
+            s += self.w2[h] * hv;
+        }
+        s
+    }
+
+    /// Backward pass with upstream gradient `g = (y - p_mix) * w_eff`: ascend
+    /// the log-likelihood (descend coding loss) through the cached activations,
+    /// updating the output layer, hidden layer, and the embeddings that fed it.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn backward(&mut self, g: f64) {
+        let mut dh = [0.0; NN_HID];
+        for h in 0..NN_HID {
+            dh[h] = g * self.w2[h] * (1.0 - self.hid[h] * self.hid[h]);
+        }
+        let mut din = [0.0; NN_IN_DIM];
+        for h in 0..NN_HID {
+            let base = h * NN_IN_DIM;
+            let dhh = dh[h];
+            for k in 0..NN_IN_DIM {
+                din[k] += dhh * self.w1[base + k];
+            }
+        }
+        for h in 0..NN_HID {
+            self.w2[h] += NN_LR * g * self.hid[h];
+        }
+        self.b2 += NN_LR * g;
+        for h in 0..NN_HID {
+            let base = h * NN_IN_DIM;
+            let dhh = dh[h];
+            self.b1[h] += NN_LR * dhh;
+            for k in 0..NN_IN_DIM {
+                self.w1[base + k] += NN_LR * dhh * self.inv[k];
+            }
+        }
+        for j in 0..NN_CTX {
+            let base = self.cbytes[j] * NN_EMB;
+            for e in 0..NN_EMB {
+                self.byte_emb[base + e] += NN_LR * din[j * NN_EMB + e];
+            }
+        }
+        let nbase = self.node * NN_EMB;
+        for e in 0..NN_EMB {
+            self.node_emb[nbase + e] += NN_LR * din[NN_CTX * NN_EMB + e];
+        }
+    }
+}
+
 /// Which model stages are active. Each `l*` codec is one fixed value; the
 /// stack is cumulative — lmix ⊂ lmatch ⊂ lsse ⊂ lword ⊂ lhi. A flags struct is
 /// the legitimate exception to the no-many-bools lint.
@@ -364,6 +509,9 @@ pub(crate) struct Arms {
     /// Dictionary preprocessing: replace frequent words with single byte codes
     /// before modeling (the model runs on the transformed stream).
     use_dict: bool,
+    /// In-loop neural arm as an extra mixer input (trained on the boosting
+    /// gradient — the residual the deterministic ensemble misses).
+    use_nn: bool,
 }
 
 impl Arms {
@@ -373,6 +521,7 @@ impl Arms {
         use_word: false,
         use_hi: false,
         use_dict: false,
+        use_nn: false,
     };
     const LMATCH: Self = Self {
         use_match: true,
@@ -380,6 +529,7 @@ impl Arms {
         use_word: false,
         use_hi: false,
         use_dict: false,
+        use_nn: false,
     };
     const LSSE: Self = Self {
         use_match: true,
@@ -387,6 +537,7 @@ impl Arms {
         use_word: false,
         use_hi: false,
         use_dict: false,
+        use_nn: false,
     };
     const LWORD: Self = Self {
         use_match: true,
@@ -394,6 +545,7 @@ impl Arms {
         use_word: true,
         use_hi: false,
         use_dict: false,
+        use_nn: false,
     };
     const LHI: Self = Self {
         use_match: true,
@@ -401,6 +553,7 @@ impl Arms {
         use_word: true,
         use_hi: true,
         use_dict: false,
+        use_nn: false,
     };
     const LDICT: Self = Self {
         use_match: true,
@@ -408,6 +561,15 @@ impl Arms {
         use_word: true,
         use_hi: true,
         use_dict: true,
+        use_nn: false,
+    };
+    const LNN: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: false,
+        use_nn: true,
     };
 }
 
@@ -473,6 +635,8 @@ struct Model {
     ctx_hi: u128,
     /// Sparse (non-contiguous byte) predictor tables.
     spmaps: Vec<Vec<BitModel>>,
+    /// In-loop neural arm (active iff `arms.use_nn`).
+    nn: NnArm,
 }
 
 impl Model {
@@ -483,6 +647,7 @@ impl Model {
             use_word,
             use_hi,
             use_dict: _,
+            use_nn: _,
         } = arms;
         let (hist, mtable, mmap) = if use_match {
             (
@@ -532,6 +697,7 @@ impl Model {
             himaps,
             ctx_hi: 0,
             spmaps,
+            nn: NnArm::new(),
         }
     }
 
@@ -594,7 +760,7 @@ impl Model {
     /// the APM `(ctx, knot, frac)` to update after the bit is known.
     #[allow(clippy::needless_range_loop, clippy::similar_names)]
     fn step_predict(
-        &self,
+        &mut self,
         node: usize,
         x: &mut [f64; N_INPUTS],
     ) -> (f64, f64, Option<(usize, usize, f64)>) {
@@ -643,6 +809,12 @@ impl Model {
                 0.0
             };
         }
+        x[NN_IN] = if self.arms.use_nn {
+            let ctx = self.ctx;
+            self.nn.forward(node, ctx)
+        } else {
+            0.0
+        };
         let bitpos = node.ilog2() as usize;
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
@@ -684,6 +856,18 @@ impl Model {
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
         let sel3 = ((((self.ctx >> 16) & 0xFF) as usize) << 3) | bitpos;
         let sel4 = (((self.word_hash & 0xFF) as usize) << 3) | bitpos;
+        // The mixer's effective weight on the neural input (averaged over the
+        // four selected mixers), captured before the weights step — this routes
+        // the coding-loss gradient back into the net.
+        let w_eff = if self.arms.use_nn {
+            (self.w[sel1][NN_IN]
+                + self.w2[sel2][NN_IN]
+                + self.w3[sel3][NN_IN]
+                + self.w4[sel4][NN_IN])
+                / 4.0
+        } else {
+            0.0
+        };
         for (wk, &xk) in self.w[sel1].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
@@ -695,6 +879,9 @@ impl Model {
         }
         for (wk, &xk) in self.w4[sel4].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
+        }
+        if self.arms.use_nn {
+            self.nn.backward(err * w_eff);
         }
         let yf = f64::from(y);
         self.o0[node].update(yf);
@@ -1045,6 +1232,24 @@ impl Codec for LdictCodec {
     }
 }
 
+/// [`LhiCodec`] plus the in-loop neural arm as an extra mixer input.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LnnCodec;
+
+impl Codec for LnnCodec {
+    fn name(&self) -> &'static str {
+        "lnn"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LNN, "lnn", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LNN, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -1055,6 +1260,7 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"lword" => Arms::LWORD,
         b"lhi" => Arms::LHI,
         b"ldict" => Arms::LDICT,
+        b"lnn" => Arms::LNN,
         _ => return None,
     })
 }
@@ -1218,6 +1424,14 @@ mod tests {
         roundtrips_with_warm(&LdictCodec);
         roundtrips_all_bytes(&LdictCodec);
         roundtrips_empty(&LdictCodec);
+    }
+
+    #[test]
+    fn lnn_roundtrips() {
+        roundtrips_text(&LnnCodec);
+        roundtrips_with_warm(&LnnCodec);
+        roundtrips_all_bytes(&LnnCodec);
+        roundtrips_empty(&LnnCodec);
     }
 
     #[test]
