@@ -571,6 +571,14 @@ impl Arms {
         use_dict: false,
         use_nn: true,
     };
+    const LNNDICT: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
+        use_nn: true,
+    };
 }
 
 /// Online multi-order bit model with a logistic (logit-domain) mixer, an
@@ -1250,6 +1258,25 @@ impl Codec for LnnCodec {
     }
 }
 
+/// [`LdictCodec`] plus the in-loop neural arm — dictionary preprocessing and
+/// the residual-trained net stacked together.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LnndictCodec;
+
+impl Codec for LnndictCodec {
+    fn name(&self) -> &'static str {
+        "lnndict"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LNNDICT, "lnndict", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LNNDICT, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -1261,6 +1288,7 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"lhi" => Arms::LHI,
         b"ldict" => Arms::LDICT,
         b"lnn" => Arms::LNN,
+        b"lnndict" => Arms::LNNDICT,
         _ => return None,
     })
 }
@@ -1432,6 +1460,14 @@ mod tests {
         roundtrips_with_warm(&LnnCodec);
         roundtrips_all_bytes(&LnnCodec);
         roundtrips_empty(&LnnCodec);
+    }
+
+    #[test]
+    fn lnndict_roundtrips() {
+        roundtrips_text(&LnndictCodec);
+        roundtrips_with_warm(&LnndictCodec);
+        roundtrips_all_bytes(&LnndictCodec);
+        roundtrips_empty(&LnndictCodec);
     }
 
     #[test]
