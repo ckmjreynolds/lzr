@@ -53,9 +53,10 @@ const N_ORDERS: usize = MAX_ORDER + 1;
 const HI_ORDERS: [usize; 3] = [8, 12, 16];
 /// Number of high-order context models.
 const N_HI: usize = HI_ORDERS.len();
-/// Mixer inputs: one per order, the match model, two word models, the high
-/// orders, the word-trigram model.
-const N_INPUTS: usize = N_ORDERS + 4 + N_HI;
+/// Number of sparse (non-contiguous byte) context models.
+const N_SPARSE: usize = 2;
+/// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse.
+const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
@@ -66,6 +67,8 @@ const WORD1_IN: usize = N_ORDERS + 2;
 const HI_IN: usize = N_ORDERS + 3;
 /// Index of the W2 (previous two words + current partial word) mixer input.
 const WORD2_IN: usize = N_ORDERS + 3 + N_HI;
+/// Base index of the sparse-context mixer inputs.
+const SPARSE_IN: usize = N_ORDERS + 4 + N_HI;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -441,6 +444,8 @@ struct Model {
     /// Rolling context — the last up-to-16 bytes, most recent in the low byte;
     /// source for the high-order context hashes.
     ctx_hi: u128,
+    /// Sparse (non-contiguous byte) predictor tables.
+    spmaps: Vec<Vec<BitModel>>,
 }
 
 impl Model {
@@ -471,6 +476,11 @@ impl Model {
         } else {
             Vec::new()
         };
+        let spmaps = if use_hi {
+            (0..N_SPARSE).map(|_| ctx_table()).collect()
+        } else {
+            Vec::new()
+        };
         Self {
             o0: vec![BitModel::default(); 256],
             maps: (0..MAX_ORDER).map(|_| ctx_table()).collect(),
@@ -490,7 +500,21 @@ impl Model {
             prev2_word_hash: WORD_SEED,
             himaps,
             ctx_hi: 0,
+            spmaps,
         }
+    }
+
+    /// Lookup key for sparse context `which` at `node`: a hash of two
+    /// non-contiguous history bytes — {c1,c3} for 0, {c2,c4} for 1 — so the
+    /// model can exploit patterns where the skipped byte is noise.
+    #[inline]
+    const fn sparse_key(&self, which: usize, node: usize) -> u64 {
+        let sctx = if which == 0 {
+            (self.ctx & 0xFF) | (((self.ctx >> 16) & 0xFF) << 8)
+        } else {
+            ((self.ctx >> 8) & 0xFF) | (((self.ctx >> 24) & 0xFF) << 8)
+        };
+        word_key(sctx, node)
     }
 
     /// Low `8 * k` bits of the rolling context (order-`k` byte history).
@@ -581,6 +605,13 @@ impl Model {
                 0.0
             };
         }
+        for i in 0..N_SPARSE {
+            x[SPARSE_IN + i] = if self.arms.use_hi {
+                ctx_logit(&self.spmaps[i], self.sparse_key(i, node))
+            } else {
+                0.0
+            };
+        }
         let wsel = (((self.ctx & 0xFF) as usize) << 3) | node.ilog2() as usize;
         let s: f64 = self.w[wsel]
             .iter()
@@ -639,6 +670,10 @@ impl Model {
             for i in 0..N_HI {
                 let key = hi_key(self.ctx_hi, HI_ORDERS[i], node);
                 update_ctx(&mut self.himaps[i], key, yf);
+            }
+            for i in 0..N_SPARSE {
+                let key = self.sparse_key(i, node);
+                update_ctx(&mut self.spmaps[i], key, yf);
             }
         }
         if let Some((ctx, i, frac)) = sse {
