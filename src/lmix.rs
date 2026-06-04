@@ -79,8 +79,8 @@ const CTX_SIZE: usize = 1 << CTX_BITS;
 /// Set associativity: slots per bucket. A key hashes to a bucket and may take
 /// any slot in it, so up to `CTX_WAYS` colliding contexts coexist before any
 /// eviction — fewer conflict misses than direct-mapped at the same memory.
-/// 4 × 8 B = 32 B = half a cache line, so scanning a bucket is one cache miss.
-const CTX_WAYS: usize = 4;
+/// 8 × 8 B = 64 B = one cache line, so scanning a bucket is one cache miss.
+const CTX_WAYS: usize = 8;
 /// Bits of the hash selecting the bucket (the rest of the table is the ways).
 const BUCKET_BITS: u32 = CTX_BITS - CTX_WAYS.ilog2();
 /// Mixer gradient-descent step size on coding loss. An enwik8 quick-panel
