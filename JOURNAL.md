@@ -13,6 +13,30 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-04 — in-loop neural arm trained on the mixer residual: lnndict 1.5442 bpb on full enwik8, the neural direction at L(D) = 0
+
+CDR asked whether a neural arm could be trained specifically to help *the deterministic mixing already in place* rather than as a standalone model. It can, and it reopens the neural direction the teacher-distillation campaign closed: a standalone LM is worthless as a mixer input here (a 2.45-bpb arm adds nothing to a 1.55 ensemble) for two compounding reasons — it is redundant with what the order/word/match arms already predict, and shipping its weights costs 2× under the Hutter rule. Both dissolve together if the net is trained on the residual, in-loop.
+
+*Boosting gradient.* The net's scalar output is added as one more mixer input (stretch domain). Its training signal is not its own cross-entropy but the coding-loss error routed back through the mixer: `g = (y − p_mix) · w_eff`, with `w_eff` the mixer's averaged weight on the net's input. The net thus ascends the *combined* log-likelihood — rewarded only for residual the rest of the ensemble gets wrong, pushed toward decorrelation by construction. Functional gradient boosting of the mixer.
+
+*In-loop, L(D) = 0.* Like every other arm, the net is initialized from a fixed seed (shipped: code, not weights) and trained by online SGD as it codes; the decoder replays identical bytes and runs identical SGD, reconstructing the same weights bit-for-bit. Nothing learned enters the archive — the nncp/cmix design, which sidesteps the 2× shipped-weight penalty that killed the v5/teacher arms. (Bit-exact-`f64` determinism is the same property the existing `f64` mixer relies on; confirmed by full-corpus round-trip.)
+
+*Architecture.* A one-hidden-layer MLP over learned embeddings of the last `NN_CTX` bytes → tanh hidden → a per-node linear output head (`s = b2[node] + w2[node]·h`). The hidden state is computed once per byte from context; the eight within-byte bit decisions each read it through their node's head, so the expensive layer runs 1×/byte not 8× (~9× less net work — the refactor that made capacity sweeps affordable). Other codecs stay bit-identical (the input sits at 0 when the arm is off).
+
+*Results (full enwik8, round-trip verified).*
+
+| step | bpb | note |
+|---|---:|---|
+| lhi | 1.5615 | baseline, L(D) 0 |
+| lnn 32/16 | 1.5537 | tiny net already beats ldict |
+| lnn 64/24 | 1.5510 | capacity knee |
+| lnn 128/32 | 1.5506 | −0.0004 for 2× compute — flat |
+| lnndict 64/24 | **1.5442** | + dictionary, new best |
+
+*What the lever is — and isn't.* Context length is not it: widening the net from 3 to 7 bytes moved the full bench panel by 0.000 (the order/hi arms cover reach; the net's value is nonlinear generalization over short context, which a linear mixer and sparse count tables structurally cannot do). Capacity is the lever, but its gain materialises only at convergence: at a 30 MB prefix the 32/16 → 64/24 step read −0.0007 (noise), while on full 100 MB the same step was −0.0027 — bigger nets under-converge on short corpora. The curve then flattens (64/24 → 128/32 only −0.0004), so 64/24 is the knee. The dictionary stacks almost perfectly (−0.0068 marginal at 64/24 vs −0.0069 at 32/16): the dictionary shortens reach, the net adds short-context nonlinearity — different residual — so lnndict 64/24 = **1.5442 bpb**, −0.0173 vs lhi, −1.1% under the prior best.
+
+*Reading.* The convergence dependence is the strategic point: the in-loop net's gain *grows with corpus size* (more bytes = more training), the opposite of a shipped-weight arm whose L(D) is fixed — so on the enwik9 target (10× the data) a bigger net should pay more, not less, the one place capacity scaling and the Hutter economics align. The remaining ceiling on this arm is architectural: a short-context MLP saturates by ~30K params; reaching further needs a long-context/recurrent in-loop model (a real nncp/cmix-class LSTM or transformer trained on the boosting gradient) — a much larger, slower build, but now a validated direction. Cost today: ~2× the lhi encode time at 64/24 after the per-byte refactor (was ~5× per-bit), inside the Hutter time budget. New shippable best **lnndict 1.5442**; the `lnn`/`lnndict` codecs and `NnArm` carry it.
+
 ## 2026-06-04 — dictionary preprocessing works: ldict 1.5615 → 1.5540 bpb on full enwik8
 
 The dictionary preprocessor — CDR's language idea, deferred twice as a larger, uncertain build — now tested and kept. A reversible word→byte-code transform runs before the model; the model codes the transformed stream. Frequent whole words (ASCII letter-runs) are replaced by byte values unused by the corpus: the top 49 by a single-byte code, the next 256 (length ≥ 3) by a two-byte `ESC_WORD + index` code; a second escape (`ESC_LIT`) precedes any literal code/escape byte so the transform round-trips on *arbitrary* input — verified on the all-bytes test and a full-corpus round-trip. The 305 words cover 47% of word occurrences. The dictionary is corpus-derived and ships in the binary (~2 KB) — the first thing in v7 that isn't `L(D) = 0`, but at the 2× rule that's ~negligible (<1e-5 bpb on 1 GB), dwarfed by the L(C) gain; and the escape makes the transform correct on enwik9 even if a chosen code byte happens to occur there.
