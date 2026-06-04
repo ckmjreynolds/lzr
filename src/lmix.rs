@@ -143,12 +143,16 @@ const WORD_MUL: u64 = 0x0000_0100_0000_01B3;
 /// the previous word with the current one.
 const WORD_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Neural arm: embedding width per byte / per within-byte node.
-const NN_EMB: usize = 16;
-/// Neural arm: number of preceding context bytes embedded (concatenated).
+/// Neural arm: embedding width per byte / per within-byte node. A full-enwik8
+/// capacity sweep put the knee here: hidden/embedding 32/16 → 1.5537, 64/24 →
+/// 1.5510 (−0.0027), 128/32 → 1.5506 (only −0.0004 more for 2× the compute).
+const NN_EMB: usize = 24;
+/// Neural arm: number of preceding context bytes embedded (concatenated). A
+/// 3 → 7 sweep was flat — the gain is nonlinear generalization over short
+/// context, not reach (the order/hi arms already cover long contexts).
 const NN_CTX: usize = 3;
-/// Neural arm: hidden-layer width.
-const NN_HID: usize = 32;
+/// Neural arm: hidden-layer width (see [`NN_EMB`] for the capacity sweep).
+const NN_HID: usize = 64;
 /// Neural arm: hidden-layer input width — the `NN_CTX` context byte embeddings
 /// concatenated. The within-byte node enters at the per-node output head, not
 /// the hidden layer, so the hidden state is computed once per byte.
