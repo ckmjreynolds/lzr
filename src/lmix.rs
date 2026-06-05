@@ -183,8 +183,10 @@ const RNN_CLIP: f64 = 2.0;
 
 /// GRU arm: byte-embedding width fed into the recurrence each step.
 const GRU_EMB: usize = 16;
-/// GRU arm: hidden-state width.
-const GRU_HID: usize = 64;
+/// GRU arm: hidden-state width. A full-enwik8 width step paid as capacity does
+/// at convergence: 64 → 1.5069, 96 → 1.5019 (−0.0050), at ~quadratic compute
+/// (77 → 148 min). 128 (~4.4 h/run) deferred — diminishing return vs cost.
+const GRU_HID: usize = 96;
 /// GRU arm: truncated-BPTT horizon. Matched to the RNN's 8 for a clean cell-type
 /// comparison; the gates can in principle carry credit further, to revisit if
 /// the GRU (unlike the vanilla RNN) shows it exploits depth.
