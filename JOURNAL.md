@@ -13,6 +13,14 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-05 — GRU width scaling to 1.5019, and why the bptt allocation is load-bearing (an auto-vectorization lesson)
+
+Two follow-ups to the GRU win, under a tight time budget (CDR steering for time/memory).
+
+*Width pays at convergence — the capacity pattern, again.* Scaling the GRU hidden width on full enwik8: 64 → **96 = 1.5019** (−0.0050), the same "capacity only pays with enough data" behaviour seen for the MLP. Cost is ~quadratic in width (the backward is `K · HID²`): 77 → 148 min for 64 → 96. HID=128 (~4.4 h/run) was deferred — diminishing return against a quadratically growing cost, and an aborted first attempt (the HID=128 *quick-bench smoke test alone* ran 90 min before it was killed, implying ~7.5 h for a full run) made clear width is the binding time constraint, worse on enwik9. New shippable best **lgrudict (GRU HID=96 + dict) = 1.5019 bpb**, −0.0596 vs lhi, −3.35% under the pre-neural ldict.
+
+*The obvious GRU speedup is a 2.5× pessimization.* Before scaling, the plan was to make the GRU faster (CDR's call: speed up before paying for width). The obvious target: `GruArm::bptt` allocates six gradient-accumulator `Vec`s per byte — ~600 M allocations over enwik8. Hoisting them into reusable struct fields (zeroed in place, zero allocation) measured **2.5× slower** on a fixed 5 MB benchmark — encode 277 s → 686 s, bpb bit-identical (1.7463), confirming a pure functional no-op. The cause sharpens this project's "trust auto-vec" rule: as *locals*, the accumulators provably do not alias `self.wnh`/`wrh`/`wzh`, so LLVM auto-vectorizes the hot backward loop; behind `self` they may alias the weight matrices, so it falls back to scalar. The allocation is noise; the no-alias guarantee is load-bearing — the per-byte `vec!` is now commented as intentional. There is no free 2–3× here: the GRU is already near-optimal for autovec scalar `f64`; going faster needs a smaller BPTT horizon (a quality change) or a hand `std::arch` SIMD kernel on 96-wide matrices.
+
 ## 2026-06-05 — gated recurrence is the lever: lgrudict 1.5069 bpb on full enwik8 (the GRU crushes the vanilla RNN, −3.0% under the pre-neural best)
 
 CDR's call to upgrade the recurrent arm to a gated cell paid off decisively. Built `lgru` = lhi + a GRU (update/reset gates + candidate: `z = σ(Wzx·x + Wzh·h)`, `r = σ(Wrx·x + Wrh·h)`, `n = tanh(Wnx·x + r ⊙ (Wnh·h))`, `h' = (1−z) ⊙ n + z ⊙ h`), the update-gate bias initialized to +1 to favor remembering. Hidden 64, BPTT horizon 8, LR 0.005 — matched to the vanilla RNN so the comparison isolates the cell type. Full forward and truncated-BPTT backward written by hand, gradient-clipped; per-node output head; trained in-loop on the boosting gradient; L(D) = 0.
