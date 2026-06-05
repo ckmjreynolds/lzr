@@ -901,6 +901,11 @@ impl GruArm {
             self.dh = [0.0; GRU_HID];
             return;
         }
+        // These accumulators are fresh per-byte `Vec`s on purpose. Hoisting them
+        // into reusable struct fields (to skip the allocation) measured 2.5×
+        // *slower*: as locals they provably don't alias `self.w*`, which is what
+        // lets the hot backward loop auto-vectorize. The allocation is noise; the
+        // no-alias guarantee is load-bearing. Do not "optimize" this away.
         let mut gwzx = vec![0.0; GRU_HID * GRU_EMB];
         let mut gwzh = vec![0.0; GRU_HID * GRU_HID];
         let mut gbz = [0.0; GRU_HID];
