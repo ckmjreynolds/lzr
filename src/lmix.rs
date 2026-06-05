@@ -56,8 +56,8 @@ const N_HI: usize = HI_ORDERS.len();
 /// Number of sparse (non-contiguous byte) context models.
 const N_SPARSE: usize = 2;
 /// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse,
-/// and the two in-loop neural arms (MLP + recurrent).
-const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 2;
+/// and the three in-loop neural arms (MLP + recurrent RNN + gated GRU).
+const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
@@ -72,8 +72,10 @@ const WORD2_IN: usize = N_ORDERS + 3 + N_HI;
 const SPARSE_IN: usize = N_ORDERS + 4 + N_HI;
 /// Index of the (MLP) neural arm's mixer input.
 const NN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE;
-/// Index of the recurrent neural arm's mixer input (the last slot).
+/// Index of the recurrent (vanilla RNN) neural arm's mixer input.
 const RNN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 1;
+/// Index of the gated-recurrent (GRU) neural arm's mixer input (the last slot).
+const GRU_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 2;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -178,6 +180,19 @@ const RNN_LR: f64 = 0.005;
 /// Recurrent arm: per-element clamp on the through-time gradient, so the
 /// recurrence cannot explode during truncated BPTT.
 const RNN_CLIP: f64 = 2.0;
+
+/// GRU arm: byte-embedding width fed into the recurrence each step.
+const GRU_EMB: usize = 16;
+/// GRU arm: hidden-state width.
+const GRU_HID: usize = 64;
+/// GRU arm: truncated-BPTT horizon. Matched to the RNN's 8 for a clean cell-type
+/// comparison; the gates can in principle carry credit further, to revisit if
+/// the GRU (unlike the vanilla RNN) shows it exploits depth.
+const GRU_TBPTT: usize = 8;
+/// GRU arm: SGD step size on its in-loop boosting gradient.
+const GRU_LR: f64 = 0.005;
+/// GRU arm: per-element clamp on the through-time gradient during BPTT.
+const GRU_CLIP: f64 = 2.0;
 
 /// Logit of a probability: `ln(p / (1-p))`, clamped to keep it finite.
 #[inline]
@@ -732,6 +747,279 @@ impl RnnArm {
     }
 }
 
+/// In-loop **gated recurrent** neural arm (GRU). Where the vanilla [`RnnArm`]
+/// cannot learn to carry credit past its BPTT horizon (vanishing gradients —
+/// deepening it was flat), the GRU's update/reset gates let the state hold and
+/// release information, so it can in principle exploit long-range dependence.
+/// Per step: `z = σ(Wzx·x + Wzh·h)`, `r = σ(Wrx·x + Wrh·h)`,
+/// `n = tanh(Wnx·x + r ⊙ (Wnh·h))`, `h' = (1-z) ⊙ n + z ⊙ h`. The eight bit
+/// decisions read the state through a per-node output head, and it is trained
+/// in-loop on the boosting gradient by truncated BPTT, exactly like the other
+/// arms. Weights never ship; L(D) = 0.
+#[derive(Debug)]
+struct GruArm {
+    emb: Vec<f64>,
+    wzx: Vec<f64>,
+    wzh: Vec<f64>,
+    bz: Vec<f64>,
+    wrx: Vec<f64>,
+    wrh: Vec<f64>,
+    br: Vec<f64>,
+    wnx: Vec<f64>,
+    wnh: Vec<f64>,
+    bn: Vec<f64>,
+    w2: Vec<f64>,
+    b2: Vec<f64>,
+    h: [f64; GRU_HID],
+    dh: [f64; GRU_HID],
+    buf_x: [[f64; GRU_EMB]; GRU_TBPTT],
+    buf_hprev: [[f64; GRU_HID]; GRU_TBPTT],
+    buf_z: [[f64; GRU_HID]; GRU_TBPTT],
+    buf_r: [[f64; GRU_HID]; GRU_TBPTT],
+    buf_n: [[f64; GRU_HID]; GRU_TBPTT],
+    buf_gh: [[f64; GRU_HID]; GRU_TBPTT],
+    buf_byte: [usize; GRU_TBPTT],
+    buf_len: usize,
+}
+
+impl GruArm {
+    fn new() -> Self {
+        Self {
+            emb: nn_init(0x7f4a_7c15_9e37_79b9, 256 * GRU_EMB, 0.1),
+            wzx: nn_init(0xd1b5_4a32_d192_ed03, GRU_HID * GRU_EMB, 0.1),
+            wzh: nn_init(0xaef1_7502_108e_f2d9, GRU_HID * GRU_HID, 0.05),
+            bz: vec![1.0; GRU_HID],
+            wrx: nn_init(0xf1bb_cdcb_9e44_7f8a, GRU_HID * GRU_EMB, 0.1),
+            wrh: nn_init(0x6b43_a9b1_0e1f_2c3d, GRU_HID * GRU_HID, 0.05),
+            br: vec![0.0; GRU_HID],
+            wnx: nn_init(0x21e6_b3a0_7c2e_94f5, GRU_HID * GRU_EMB, 0.1),
+            wnh: nn_init(0x9d2c_8f1b_6a5e_4d07, GRU_HID * GRU_HID, 0.05),
+            bn: vec![0.0; GRU_HID],
+            w2: nn_init(0x3a5f_1c9e_7b8d_06a2, 256 * GRU_HID, 0.05),
+            b2: vec![0.0; 256],
+            h: [0.0; GRU_HID],
+            dh: [0.0; GRU_HID],
+            buf_x: [[0.0; GRU_EMB]; GRU_TBPTT],
+            buf_hprev: [[0.0; GRU_HID]; GRU_TBPTT],
+            buf_z: [[0.0; GRU_HID]; GRU_TBPTT],
+            buf_r: [[0.0; GRU_HID]; GRU_TBPTT],
+            buf_n: [[0.0; GRU_HID]; GRU_TBPTT],
+            buf_gh: [[0.0; GRU_HID]; GRU_TBPTT],
+            buf_byte: [0; GRU_TBPTT],
+            buf_len: 0,
+        }
+    }
+
+    /// One GRU step. Returns the new state plus the gate activations and the
+    /// recurrent candidate term `gh = Wnh·h_prev`, all cached for BPTT.
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::suboptimal_flops,
+        clippy::type_complexity,
+        clippy::many_single_char_names
+    )]
+    fn step(
+        &self,
+        x: &[f64; GRU_EMB],
+        hprev: &[f64; GRU_HID],
+    ) -> (
+        [f64; GRU_HID],
+        [f64; GRU_HID],
+        [f64; GRU_HID],
+        [f64; GRU_HID],
+        [f64; GRU_HID],
+    ) {
+        let mut z = [0.0; GRU_HID];
+        let mut r = [0.0; GRU_HID];
+        let mut n = [0.0; GRU_HID];
+        let mut gh = [0.0; GRU_HID];
+        let mut hnew = [0.0; GRU_HID];
+        for i in 0..GRU_HID {
+            let mut az = self.bz[i];
+            let mut ar = self.br[i];
+            let bx = i * GRU_EMB;
+            for k in 0..GRU_EMB {
+                az += self.wzx[bx + k] * x[k];
+                ar += self.wrx[bx + k] * x[k];
+            }
+            let bh = i * GRU_HID;
+            let mut gg = 0.0;
+            for k in 0..GRU_HID {
+                az += self.wzh[bh + k] * hprev[k];
+                ar += self.wrh[bh + k] * hprev[k];
+                gg += self.wnh[bh + k] * hprev[k];
+            }
+            z[i] = squash(az);
+            r[i] = squash(ar);
+            gh[i] = gg;
+        }
+        for i in 0..GRU_HID {
+            let mut an = self.bn[i] + r[i] * gh[i];
+            let bx = i * GRU_EMB;
+            for k in 0..GRU_EMB {
+                an += self.wnx[bx + k] * x[k];
+            }
+            n[i] = an.tanh();
+            hnew[i] = (1.0 - z[i]) * n[i] + z[i] * hprev[i];
+        }
+        (hnew, z, r, n, gh)
+    }
+
+    /// Output logit for the bit at `node`, read from the current state.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn bit_forward(&self, node: usize) -> f64 {
+        let base = node * GRU_HID;
+        let mut s = self.b2[node];
+        for i in 0..GRU_HID {
+            s += self.w2[base + i] * self.h[i];
+        }
+        s
+    }
+
+    /// Update the per-node output head and accumulate the hidden-state gradient.
+    #[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+    fn bit_backward(&mut self, node: usize, g: f64) {
+        let base = node * GRU_HID;
+        for i in 0..GRU_HID {
+            self.dh[i] += g * self.w2[base + i];
+            self.w2[base + i] += GRU_LR * g * self.h[i];
+        }
+        self.b2[node] += GRU_LR * g;
+    }
+
+    /// Truncated BPTT through the gated recurrence: propagate the byte's hidden
+    /// gradient back through the last `buf_len` steps, accumulate gate/weight
+    /// gradients, apply them, and reset the accumulator.
+    #[allow(
+        clippy::needless_range_loop,
+        clippy::suboptimal_flops,
+        clippy::similar_names,
+        clippy::many_single_char_names
+    )]
+    fn bptt(&mut self) {
+        if self.buf_len == 0 {
+            self.dh = [0.0; GRU_HID];
+            return;
+        }
+        let mut gwzx = vec![0.0; GRU_HID * GRU_EMB];
+        let mut gwzh = vec![0.0; GRU_HID * GRU_HID];
+        let mut gbz = [0.0; GRU_HID];
+        let mut gwrx = vec![0.0; GRU_HID * GRU_EMB];
+        let mut gwrh = vec![0.0; GRU_HID * GRU_HID];
+        let mut gbr = [0.0; GRU_HID];
+        let mut gwnx = vec![0.0; GRU_HID * GRU_EMB];
+        let mut gwnh = vec![0.0; GRU_HID * GRU_HID];
+        let mut gbn = [0.0; GRU_HID];
+        let mut dh = self.dh;
+        for s in (0..self.buf_len).rev() {
+            let x = &self.buf_x[s];
+            let hprev = &self.buf_hprev[s];
+            let z = &self.buf_z[s];
+            let r = &self.buf_r[s];
+            let n = &self.buf_n[s];
+            let gh = &self.buf_gh[s];
+            let mut daz = [0.0; GRU_HID];
+            let mut dar = [0.0; GRU_HID];
+            let mut dan = [0.0; GRU_HID];
+            let mut dgh = [0.0; GRU_HID];
+            let mut dhprev = [0.0; GRU_HID];
+            for i in 0..GRU_HID {
+                let dhc = dh[i].clamp(-GRU_CLIP, GRU_CLIP);
+                let dn = dhc * (1.0 - z[i]);
+                let dz = dhc * (hprev[i] - n[i]);
+                dhprev[i] = dhc * z[i];
+                let dani = dn * (1.0 - n[i] * n[i]);
+                dan[i] = dani;
+                dgh[i] = dani * r[i];
+                let dri = dani * gh[i];
+                dar[i] = dri * r[i] * (1.0 - r[i]);
+                daz[i] = dz * z[i] * (1.0 - z[i]);
+                gbn[i] += dani;
+                gbr[i] += dar[i];
+                gbz[i] += daz[i];
+            }
+            let mut dx = [0.0; GRU_EMB];
+            for i in 0..GRU_HID {
+                let bx = i * GRU_EMB;
+                for k in 0..GRU_EMB {
+                    gwnx[bx + k] += dan[i] * x[k];
+                    gwrx[bx + k] += dar[i] * x[k];
+                    gwzx[bx + k] += daz[i] * x[k];
+                    dx[k] += self.wnx[bx + k] * dan[i]
+                        + self.wrx[bx + k] * dar[i]
+                        + self.wzx[bx + k] * daz[i];
+                }
+                let bh = i * GRU_HID;
+                for k in 0..GRU_HID {
+                    gwnh[bh + k] += dgh[i] * hprev[k];
+                    gwrh[bh + k] += dar[i] * hprev[k];
+                    gwzh[bh + k] += daz[i] * hprev[k];
+                    dhprev[k] += self.wnh[bh + k] * dgh[i]
+                        + self.wrh[bh + k] * dar[i]
+                        + self.wzh[bh + k] * daz[i];
+                }
+            }
+            let bid = self.buf_byte[s] * GRU_EMB;
+            for k in 0..GRU_EMB {
+                self.emb[bid + k] += GRU_LR * dx[k];
+            }
+            dh = dhprev;
+        }
+        for i in 0..GRU_HID * GRU_EMB {
+            self.wzx[i] += GRU_LR * gwzx[i];
+            self.wrx[i] += GRU_LR * gwrx[i];
+            self.wnx[i] += GRU_LR * gwnx[i];
+        }
+        for i in 0..GRU_HID * GRU_HID {
+            self.wzh[i] += GRU_LR * gwzh[i];
+            self.wrh[i] += GRU_LR * gwrh[i];
+            self.wnh[i] += GRU_LR * gwnh[i];
+        }
+        for i in 0..GRU_HID {
+            self.bz[i] += GRU_LR * gbz[i];
+            self.br[i] += GRU_LR * gbr[i];
+            self.bn[i] += GRU_LR * gbn[i];
+        }
+        self.dh = [0.0; GRU_HID];
+    }
+
+    /// Finish a byte: run truncated BPTT, then advance the state with byte
+    /// `byte` and record the step (with its gate activations) in the history.
+    #[allow(clippy::many_single_char_names)]
+    fn byte_end(&mut self, byte: u8) {
+        self.bptt();
+        let bid = usize::from(byte);
+        let mut x = [0.0; GRU_EMB];
+        x.copy_from_slice(&self.emb[bid * GRU_EMB..bid * GRU_EMB + GRU_EMB]);
+        let hprev = self.h;
+        let (hnew, z, r, n, gh) = self.step(&x, &hprev);
+        let slot = if self.buf_len < GRU_TBPTT {
+            let s = self.buf_len;
+            self.buf_len += 1;
+            s
+        } else {
+            for s in 1..GRU_TBPTT {
+                self.buf_x[s - 1] = self.buf_x[s];
+                self.buf_hprev[s - 1] = self.buf_hprev[s];
+                self.buf_z[s - 1] = self.buf_z[s];
+                self.buf_r[s - 1] = self.buf_r[s];
+                self.buf_n[s - 1] = self.buf_n[s];
+                self.buf_gh[s - 1] = self.buf_gh[s];
+                self.buf_byte[s - 1] = self.buf_byte[s];
+            }
+            GRU_TBPTT - 1
+        };
+        self.buf_x[slot] = x;
+        self.buf_hprev[slot] = hprev;
+        self.buf_z[slot] = z;
+        self.buf_r[slot] = r;
+        self.buf_n[slot] = n;
+        self.buf_gh[slot] = gh;
+        self.buf_byte[slot] = bid;
+        self.h = hnew;
+    }
+}
+
 /// Which model stages are active. Each `l*` codec is one fixed value; the
 /// stack is cumulative — lmix ⊂ lmatch ⊂ lsse ⊂ lword ⊂ lhi. A flags struct is
 /// the legitimate exception to the no-many-bools lint.
@@ -750,6 +1038,8 @@ pub(crate) struct Arms {
     use_nn: bool,
     /// In-loop recurrent neural arm (long-context memory) as an extra input.
     use_rnn: bool,
+    /// In-loop gated-recurrent (GRU) neural arm as an extra input.
+    use_gru: bool,
 }
 
 impl Arms {
@@ -761,6 +1051,7 @@ impl Arms {
         use_dict: false,
         use_nn: false,
         use_rnn: false,
+        use_gru: false,
     };
     const LMATCH: Self = Self {
         use_match: true,
@@ -770,6 +1061,7 @@ impl Arms {
         use_dict: false,
         use_nn: false,
         use_rnn: false,
+        use_gru: false,
     };
     const LSSE: Self = Self {
         use_match: true,
@@ -779,6 +1071,7 @@ impl Arms {
         use_dict: false,
         use_nn: false,
         use_rnn: false,
+        use_gru: false,
     };
     const LWORD: Self = Self {
         use_match: true,
@@ -788,6 +1081,7 @@ impl Arms {
         use_dict: false,
         use_nn: false,
         use_rnn: false,
+        use_gru: false,
     };
     const LHI: Self = Self {
         use_match: true,
@@ -797,6 +1091,7 @@ impl Arms {
         use_dict: false,
         use_nn: false,
         use_rnn: false,
+        use_gru: false,
     };
     const LDICT: Self = Self {
         use_match: true,
@@ -806,6 +1101,7 @@ impl Arms {
         use_dict: true,
         use_nn: false,
         use_rnn: false,
+        use_gru: false,
     };
     const LNN: Self = Self {
         use_match: true,
@@ -815,6 +1111,7 @@ impl Arms {
         use_dict: false,
         use_nn: true,
         use_rnn: false,
+        use_gru: false,
     };
     const LNNDICT: Self = Self {
         use_match: true,
@@ -824,6 +1121,7 @@ impl Arms {
         use_dict: true,
         use_nn: true,
         use_rnn: false,
+        use_gru: false,
     };
     const LRNN: Self = Self {
         use_match: true,
@@ -833,6 +1131,7 @@ impl Arms {
         use_dict: false,
         use_nn: false,
         use_rnn: true,
+        use_gru: false,
     };
     const LRNNDICT: Self = Self {
         use_match: true,
@@ -842,6 +1141,27 @@ impl Arms {
         use_dict: true,
         use_nn: false,
         use_rnn: true,
+        use_gru: false,
+    };
+    const LGRU: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: false,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: true,
+    };
+    const LGRUDICT: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: true,
     };
 }
 
@@ -911,6 +1231,8 @@ struct Model {
     nn: NnArm,
     /// In-loop recurrent neural arm (active iff `arms.use_rnn`).
     rnn: RnnArm,
+    /// In-loop gated-recurrent (GRU) neural arm (active iff `arms.use_gru`).
+    gru: GruArm,
 }
 
 impl Model {
@@ -923,6 +1245,7 @@ impl Model {
             use_dict: _,
             use_nn: _,
             use_rnn: _,
+            use_gru: _,
         } = arms;
         let (hist, mtable, mmap) = if use_match {
             (
@@ -974,6 +1297,7 @@ impl Model {
             spmaps,
             nn: NnArm::new(),
             rnn: RnnArm::new(),
+            gru: GruArm::new(),
         }
     }
 
@@ -1095,6 +1419,11 @@ impl Model {
         } else {
             0.0
         };
+        x[GRU_IN] = if self.arms.use_gru {
+            self.gru.bit_forward(node)
+        } else {
+            0.0
+        };
         let bitpos = node.ilog2() as usize;
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
@@ -1157,6 +1486,15 @@ impl Model {
         } else {
             0.0
         };
+        let w_eff_gru = if self.arms.use_gru {
+            (self.w[sel1][GRU_IN]
+                + self.w2[sel2][GRU_IN]
+                + self.w3[sel3][GRU_IN]
+                + self.w4[sel4][GRU_IN])
+                / 4.0
+        } else {
+            0.0
+        };
         for (wk, &xk) in self.w[sel1].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
         }
@@ -1174,6 +1512,9 @@ impl Model {
         }
         if self.arms.use_rnn {
             self.rnn.bit_backward(node, err * w_eff_rnn);
+        }
+        if self.arms.use_gru {
+            self.gru.bit_backward(node, err * w_eff_gru);
         }
         let yf = f64::from(y);
         self.o0[node].update(yf);
@@ -1317,6 +1658,9 @@ impl Model {
         }
         if self.arms.use_rnn {
             self.rnn.byte_end(b);
+        }
+        if self.arms.use_gru {
+            self.gru.byte_end(b);
         }
     }
 
@@ -1625,6 +1969,43 @@ impl Codec for LrnndictCodec {
     }
 }
 
+/// [`LhiCodec`] plus the in-loop gated-recurrent (GRU) neural arm.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LgruCodec;
+
+impl Codec for LgruCodec {
+    fn name(&self) -> &'static str {
+        "lgru"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LGRU, "lgru", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LGRU, warm, archive)
+    }
+}
+
+/// [`LdictCodec`] plus the in-loop GRU arm — dictionary and gated long-context
+/// recurrence stacked together.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LgrudictCodec;
+
+impl Codec for LgrudictCodec {
+    fn name(&self) -> &'static str {
+        "lgrudict"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LGRUDICT, "lgrudict", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LGRUDICT, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -1639,6 +2020,8 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"lnndict" => Arms::LNNDICT,
         b"lrnn" => Arms::LRNN,
         b"lrnndict" => Arms::LRNNDICT,
+        b"lgru" => Arms::LGRU,
+        b"lgrudict" => Arms::LGRUDICT,
         _ => return None,
     })
 }
@@ -1836,6 +2219,22 @@ mod tests {
         roundtrips_with_warm(&LrnndictCodec);
         roundtrips_all_bytes(&LrnndictCodec);
         roundtrips_empty(&LrnndictCodec);
+    }
+
+    #[test]
+    fn lgru_roundtrips() {
+        roundtrips_text(&LgruCodec);
+        roundtrips_with_warm(&LgruCodec);
+        roundtrips_all_bytes(&LgruCodec);
+        roundtrips_empty(&LgruCodec);
+    }
+
+    #[test]
+    fn lgrudict_roundtrips() {
+        roundtrips_text(&LgrudictCodec);
+        roundtrips_with_warm(&LgrudictCodec);
+        roundtrips_all_bytes(&LgrudictCodec);
+        roundtrips_empty(&LgrudictCodec);
     }
 
     #[test]
