@@ -170,8 +170,11 @@ const RNN_HID: usize = 64;
 /// coding-loss gradient is propagated back through. The forward state carries
 /// unbounded context regardless; this bounds credit assignment (and compute).
 const RNN_TBPTT: usize = 8;
-/// Recurrent arm: SGD step size on its in-loop boosting gradient.
-const RNN_LR: f64 = 0.01;
+/// Recurrent arm: SGD step size on its in-loop boosting gradient. A 30 MB LR
+/// sweep was a clean U — 0.002 → 1.6229, 0.003 → 1.6196, 0.005 → 1.6166,
+/// 0.01 → 1.6197, 0.02 → 1.6196 — so 0.005 is the knee (the recurrence wants a
+/// gentler step than the MLP's 0.01). Deepening BPTT 8 → 16 was flat.
+const RNN_LR: f64 = 0.005;
 /// Recurrent arm: per-element clamp on the through-time gradient, so the
 /// recurrence cannot explode during truncated BPTT.
 const RNN_CLIP: f64 = 2.0;
