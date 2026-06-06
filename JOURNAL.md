@@ -13,6 +13,18 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-06 — case transform reopens a closed verdict (CDR was right): coupled dict ⟹ case → lall 1.4526 bpb on full enwik8
+
+CDR challenged the 2026-06-03 "case is closed, negative" verdict, suspecting our implementation was flawed. It was. That verdict tested case as a *separate, weakly-modelled side channel* on a pre-indirect base. The transform SOTA actually uses is an *in-stream* capitalization marker, and re-running it on the current ensemble flips the result.
+
+*In-stream case transform.* Lowercase the stream and emit a non-alphabetic marker before capitals — `CAP1` (single uppercase letter), `CAPW` (all-caps run) — with `CASE_ESC` escaping a literal marker so it round-trips on arbitrary input. Because the markers are non-alphabetic, the word/dictionary models still fold the pooled lowercase run, and the full mixer codes the marker with context. (The old scheme's fatal flaw was a dedicated case channel at ~0.07 bits/letter; in-stream, the mixer codes the marker at ~0.015.) Full enwik8: lind 1.5101 → **lindcase 1.5050 (−0.0051)** — the pooling plus reduced collision tax beats the marker cost. The earlier negative was an artifact of the side-channel scheme and a weaker base.
+
+*Why it is more than a coding-cost question (CDR's point).* Lowercasing is not just about the case bit — it (1) frees the entire uppercase byte range `A`..`Z` for the single-byte dictionary, and (2) halves the letter alphabet, shrinking distinct contexts and the collision tax in the fixed order/indirect tables. So we coupled them (**`use_dict` implies the case transform**) and rebuilt the dictionary on the lowercased corpus: 49 → **72 single-byte words** using the freed codes, re-derived by a generator (`gen_dict_tables`, an ignored test). linddict (case + 72-word dict + indirect) = **1.4919**, −0.003 versus the old mixed-case linddict.
+
+*New overall best.* Applied to the full stack — case + dictionary + indirect + GRU — full enwik8 **lall = 1.4526 bpb**, −0.0087 under the pre-case lall (1.4613). The full-stack gain exceeds the deterministic −0.0051, consistent with the smaller alphabet also easing the GRU's online convergence. Round-trip verified (the dictionary's own tests now exercise the coupled case+dict pipeline; gate + 28 round-trips pass).
+
+*Reading.* A clean negative on a stale base is not a permanent verdict. The lesson generalises: SOTA preprocessing transforms (case here; article-reordering and the paq8px NLP/stemmer still untried) are worth re-validating in the *current* architecture and with the *right scheme* (in-stream, not a side channel). Case is now a kept, compounding lever that touches ratio, the dictionary's reach, table memory, and neural convergence at once. New best **lall 1.4526**; a `use_case` flag, the `dict ⟹ case` coupling, and the case-rebuilt dictionary carry it. (`linddictcase` is now a redundant alias of `linddict` — flagged for cleanup.)
+
 ## 2026-06-05 (overnight autonomous session 2) — indirect context models: deterministic stack to linddict 1.5013, beating the prior GRU-based best at L(D) = 0
 
 An autonomous run (CDR away ~11 h; continue incorporating/inventing models, consider multi-threading). The threading question resolved cleanly against the submission's single-thread invariant: the codec is inherently sequential (an online adaptive model + arithmetic coder cannot be parallelized within a run), so parallelism went to the *experiment* level — independent single-threaded `lzr` processes across the 12 cores, no dependency added. The substantive win was a new model family.
