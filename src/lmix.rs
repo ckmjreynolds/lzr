@@ -72,8 +72,8 @@ const SPARSE_PATTERNS: [&[usize]; N_SPARSE] = [
     &[1, 3, 5], // c2 c4 c6
 ];
 /// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse,
-/// the indirect model, and the three in-loop neural arms (MLP + RNN + GRU).
-const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 4;
+/// the three in-loop neural arms (MLP + RNN + GRU), and the indirect models.
+const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3 + N_IND;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
@@ -92,10 +92,16 @@ const NN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE;
 const RNN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 1;
 /// Index of the gated-recurrent (GRU) neural arm's mixer input.
 const GRU_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 2;
-/// Index of the indirect-context model's mixer input (the last slot).
+/// Base index of the indirect-context model inputs (`IND_IN .. IND_IN + N_IND`).
 const IND_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3;
-/// Log2 size of the indirect history table (context-hash → last following byte).
+/// Log2 size of each indirect history table (context-hash → last following byte).
 const IND_BITS: u32 = 22;
+/// Context orders used by the indirect models (predict from the byte that last
+/// followed each order-`o` context). Order-3 alone gave −0.0078; diverse orders
+/// add decorrelated "what-followed" signal.
+const INDIRECT_ORDERS: [usize; 4] = [2, 3, 4, 6];
+/// Number of indirect models.
+const N_IND: usize = INDIRECT_ORDERS.len();
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -1286,11 +1292,11 @@ struct Model {
     rnn: RnnArm,
     /// In-loop gated-recurrent (GRU) neural arm (active iff `arms.use_gru`).
     gru: GruArm,
-    /// Indirect model: for each order-3 context hash, the last byte that
-    /// followed it (`2^IND_BITS` entries). Empty unless `arms.use_ind`.
-    ind_hist: Vec<u8>,
-    /// Indirect model's bit-predictor table, keyed on (that byte, `c1`, node).
-    ind_map: Vec<BitModel>,
+    /// Indirect models: `ind_hist[i]` maps each order-`INDIRECT_ORDERS[i]`
+    /// context hash to the last byte that followed it. Empty unless `use_ind`.
+    ind_hist: Vec<Vec<u8>>,
+    /// Indirect bit-predictor tables, `ind_map[i]` keyed on (that byte, `c1`, node).
+    ind_map: Vec<Vec<BitModel>>,
 }
 
 impl Model {
@@ -1332,7 +1338,10 @@ impl Model {
             Vec::new()
         };
         let (ind_hist, ind_map) = if use_ind {
-            (vec![0u8; 1 << IND_BITS], ctx_table())
+            (
+                (0..N_IND).map(|_| vec![0u8; 1 << IND_BITS]).collect(),
+                (0..N_IND).map(|_| ctx_table()).collect(),
+            )
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1367,20 +1376,20 @@ impl Model {
         }
     }
 
-    /// Index into [`Model::ind_hist`] for the current order-3 context: hash the
-    /// low three bytes of the rolling context into `IND_BITS`.
+    /// Index into `ind_hist[which]` for the current order-`INDIRECT_ORDERS[which]`
+    /// context: hash that many low bytes of the rolling context into `IND_BITS`.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
-    const fn ind_index(&self) -> usize {
-        let ctx3 = self.ctx & 0x00FF_FFFF;
-        (ctx3.wrapping_mul(WORD_MIX) >> (64 - IND_BITS)) as usize
+    const fn ind_index(&self, which: usize) -> usize {
+        let ctxo = self.ctx_k(INDIRECT_ORDERS[which]);
+        (ctxo.wrapping_mul(WORD_MIX) >> (64 - IND_BITS)) as usize
     }
 
-    /// Lookup key for the indirect model at `node`: combine the byte that last
-    /// followed this order-3 context with the current `c1` byte and the node.
+    /// Lookup key for indirect model `which` at `node`: combine the byte that
+    /// last followed its order-`o` context with the current `c1` byte and node.
     #[inline]
-    fn ind_key(&self, node: usize) -> u64 {
-        let pb = self.ind_hist[self.ind_index()];
+    fn ind_key(&self, which: usize, node: usize) -> u64 {
+        let pb = self.ind_hist[which][self.ind_index(which)];
         word_key((u64::from(pb) << 8) | (self.ctx & 0xFF), node)
     }
 
@@ -1510,11 +1519,13 @@ impl Model {
         } else {
             0.0
         };
-        x[IND_IN] = if self.arms.use_ind {
-            ctx_logit(&self.ind_map, self.ind_key(node))
-        } else {
-            0.0
-        };
+        for i in 0..N_IND {
+            x[IND_IN + i] = if self.arms.use_ind {
+                ctx_logit(&self.ind_map[i], self.ind_key(i, node))
+            } else {
+                0.0
+            };
+        }
         let bitpos = node.ilog2() as usize;
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
@@ -1639,8 +1650,10 @@ impl Model {
             }
         }
         if self.arms.use_ind {
-            let key = self.ind_key(node);
-            update_ctx(&mut self.ind_map, key, yf);
+            for i in 0..N_IND {
+                let key = self.ind_key(i, node);
+                update_ctx(&mut self.ind_map[i], key, yf);
+            }
         }
         if let Some((ctx, i, frac)) = sse {
             self.apm.update(ctx, i, frac, yf);
@@ -1730,11 +1743,13 @@ impl Model {
     /// learn / encode / decode / residual paths so they evolve identically.
     fn advance(&mut self, b: u8) {
         if self.arms.use_ind {
-            // Record that `b` followed the current order-3 context, before the
-            // context rolls forward — this is what the indirect model reads next
-            // time it sees the same order-3 context.
-            let ih = self.ind_index();
-            self.ind_hist[ih] = b;
+            // Record that `b` followed each indirect order-`o` context, before
+            // the context rolls forward — this is what the indirect models read
+            // next time they see the same order-`o` context.
+            for i in 0..N_IND {
+                let ih = self.ind_index(i);
+                self.ind_hist[i][ih] = b;
+            }
         }
         self.advance_match(b);
         self.advance_word(b);
