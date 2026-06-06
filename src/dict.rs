@@ -423,9 +423,152 @@ pub(crate) fn untransform(t: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Case transform: lowercase the stream and mark capitalization in-band, so the
+/// model sees a single pooled lowercase alphabet (fewer distinct contexts → less
+/// collision tax) and the uppercase byte range `A`..=`Z` is freed for a larger
+/// dictionary. `CAP1` precedes a single uppercased letter, `CAPW` an all-caps
+/// letter run; `CASE_ESC` escapes a literal marker byte so the transform
+/// round-trips on arbitrary input. Markers are non-alphabetic so word/dict
+/// detection still folds the lowercase run.
+const CAP1: u8 = 0x0E;
+const CAPW: u8 = 0x0F;
+const CASE_ESC: u8 = 0x10;
+
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn case_transform(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + input.len() / 8);
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        if b.is_ascii_alphabetic() {
+            let start = i;
+            while i < input.len() && input[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            let run = &input[start..i];
+            let n_upper = run.iter().filter(|c| c.is_ascii_uppercase()).count();
+            if n_upper == run.len() && run.len() >= 2 {
+                out.push(CAPW);
+                out.extend(run.iter().map(u8::to_ascii_lowercase));
+            } else if n_upper == 0 {
+                out.extend_from_slice(run);
+            } else {
+                for &c in run {
+                    if c.is_ascii_uppercase() {
+                        out.push(CAP1);
+                        out.push(c.to_ascii_lowercase());
+                    } else {
+                        out.push(c);
+                    }
+                }
+            }
+        } else {
+            if b == CAP1 || b == CAPW || b == CASE_ESC {
+                out.push(CASE_ESC);
+            }
+            out.push(b);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Inverse of [`case_transform`].
+pub(crate) fn case_untransform(t: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(t.len());
+    let mut i = 0;
+    while i < t.len() {
+        let b = t[i];
+        if b == CAP1 {
+            out.push(t[i + 1].to_ascii_uppercase());
+            i += 2;
+        } else if b == CAPW {
+            i += 1;
+            while i < t.len() && t[i].is_ascii_alphabetic() {
+                out.push(t[i].to_ascii_uppercase());
+                i += 1;
+            }
+        } else if b == CASE_ESC {
+            out.push(t[i + 1]);
+            i += 2;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn case_roundtrips_text() {
+        let s = b"The Quick BROWN fox, iPhone NASA McDonald's. UTF-8 \x0e\x0f\x10 done.";
+        assert_eq!(case_untransform(&case_transform(s)), s);
+    }
+
+    #[test]
+    fn case_roundtrips_all_bytes() {
+        let s: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        assert_eq!(case_untransform(&case_transform(&s)), s);
+    }
+
+    /// Regenerate the dictionary tables on the *case-transformed* (lowercased)
+    /// corpus, using every byte the transform frees (uppercase range, minus the
+    /// markers). Run: `cargo test --release gen_dict_tables -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gen_dict_tables() {
+        use std::collections::HashMap;
+        let bytes = std::fs::read("assets/enwik8").unwrap();
+        let cased = case_transform(&bytes);
+        let mut used = [false; 256];
+        for &b in &cased {
+            used[b as usize] = true;
+        }
+        let avail: Vec<u8> = (0u16..=255)
+            .map(|x| x as u8)
+            .filter(|&b| !used[b as usize] && b != ESC_WORD && b != ESC_LIT)
+            .collect();
+        let mut freq: HashMap<&[u8], u64> = HashMap::new();
+        let mut i = 0;
+        while i < cased.len() {
+            if cased[i].is_ascii_alphabetic() {
+                let s = i;
+                while i < cased.len() && cased[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                *freq.entry(&cased[s..i]).or_insert(0) += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let mut words: Vec<(&[u8], u64)> = freq.into_iter().collect();
+        words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let n1 = avail.len();
+        let w1: Vec<&[u8]> = words.iter().take(n1).map(|&(w, _)| w).collect();
+        let w2: Vec<&[u8]> = words
+            .iter()
+            .skip(n1)
+            .filter(|&&(w, _)| w.len() >= 3)
+            .take(256)
+            .map(|&(w, _)| w)
+            .collect();
+        let fmt = |ws: &[&[u8]]| -> String {
+            ws.iter()
+                .map(|w| format!("b\"{}\"", std::str::from_utf8(w).unwrap()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!("pub(crate) const NW1: usize = {n1};");
+        println!("pub(crate) const NW2: usize = {};", w2.len());
+        println!("const WORDS1: [&[u8]; NW1] = [{}];", fmt(&w1));
+        let codes: Vec<String> = avail.iter().map(|b| format!("0x{b:02x}")).collect();
+        println!("const CODES1: [u8; NW1] = [{}];", codes.join(", "));
+        println!("const WORDS2: [&[u8]; NW2] = [{}];", fmt(&w2));
+    }
 
     #[test]
     fn transform_roundtrips_text() {

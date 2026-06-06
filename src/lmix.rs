@@ -1076,6 +1076,9 @@ pub(crate) struct Arms {
     /// Indirect context model (predict from the byte that last followed the
     /// current order-3 context) as an extra input.
     use_ind: bool,
+    /// Case transform: lowercase the stream with in-band capitalization markers
+    /// (preprocessing), pooling the alphabet and freeing the uppercase codes.
+    use_case: bool,
 }
 
 impl Arms {
@@ -1089,6 +1092,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LMATCH: Self = Self {
         use_match: true,
@@ -1100,6 +1104,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LSSE: Self = Self {
         use_match: true,
@@ -1111,6 +1116,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LWORD: Self = Self {
         use_match: true,
@@ -1122,6 +1128,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LHI: Self = Self {
         use_match: true,
@@ -1133,6 +1140,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LDICT: Self = Self {
         use_match: true,
@@ -1144,6 +1152,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LNN: Self = Self {
         use_match: true,
@@ -1155,6 +1164,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LNNDICT: Self = Self {
         use_match: true,
@@ -1166,6 +1176,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LRNN: Self = Self {
         use_match: true,
@@ -1177,6 +1188,7 @@ impl Arms {
         use_rnn: true,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LRNNDICT: Self = Self {
         use_match: true,
@@ -1188,6 +1200,7 @@ impl Arms {
         use_rnn: true,
         use_gru: false,
         use_ind: false,
+        use_case: false,
     };
     const LGRU: Self = Self {
         use_match: true,
@@ -1199,6 +1212,7 @@ impl Arms {
         use_rnn: false,
         use_gru: true,
         use_ind: false,
+        use_case: false,
     };
     const LGRUDICT: Self = Self {
         use_match: true,
@@ -1210,6 +1224,7 @@ impl Arms {
         use_rnn: false,
         use_gru: true,
         use_ind: false,
+        use_case: false,
     };
     const LIND: Self = Self {
         use_match: true,
@@ -1221,6 +1236,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: true,
+        use_case: false,
     };
     const LINDDICT: Self = Self {
         use_match: true,
@@ -1232,6 +1248,7 @@ impl Arms {
         use_rnn: false,
         use_gru: false,
         use_ind: true,
+        use_case: false,
     };
     /// Everything: the full deterministic ensemble + dictionary + indirect models
     /// + the in-loop GRU. The new overall-best stack.
@@ -1245,6 +1262,34 @@ impl Arms {
         use_rnn: false,
         use_gru: true,
         use_ind: true,
+        use_case: false,
+    };
+    /// `lind` + the case transform — isolates the case transform's effect on the
+    /// deterministic ensemble (pooling + collision tax), no dictionary.
+    const LINDCASE: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: false,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: false,
+        use_ind: true,
+        use_case: true,
+    };
+    /// `linddict` + the case transform (case then dictionary).
+    const LINDDICTCASE: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: false,
+        use_ind: true,
+        use_case: true,
     };
 }
 
@@ -1335,6 +1380,7 @@ impl Model {
             use_rnn: _,
             use_gru: _,
             use_ind,
+            use_case: _,
         } = arms;
         let (hist, mtable, mmap) = if use_match {
             (
@@ -1834,22 +1880,48 @@ fn fill_bit_cdf(p1: f64, cdf: &mut [u32; 3]) {
 /// Encode `measure` (preceded by `warm` priming) with the given model stages.
 /// Shared by the `lmix` / `lmatch` / `lsse` / `lword` codecs.
 #[allow(clippy::cast_possible_truncation)]
+/// Apply the preprocessing transforms the active arms request, in order (case
+/// then dictionary). The model runs on the result.
+fn preprocess(arms: Arms, bytes: &[u8]) -> Vec<u8> {
+    let cased;
+    let b: &[u8] = if arms.use_case {
+        cased = crate::dict::case_transform(bytes);
+        &cased
+    } else {
+        bytes
+    };
+    if arms.use_dict {
+        crate::dict::transform(b)
+    } else {
+        b.to_vec()
+    }
+}
+
+/// Inverse of [`preprocess`]: undo the dictionary, then the case transform.
+fn postprocess(arms: Arms, bytes: Vec<u8>) -> Vec<u8> {
+    let b = if arms.use_dict {
+        crate::dict::untransform(&bytes)
+    } else {
+        bytes
+    };
+    if arms.use_case {
+        crate::dict::case_untransform(&b)
+    } else {
+        b
+    }
+}
+
 fn encode_impl(
     arms: Arms,
     component: &str,
     warm: &[u8],
     measure: &[u8],
 ) -> (Vec<u8>, Decomposition) {
-    // With the dictionary transform, the model runs on the transformed streams.
-    let warm_t;
-    let measure_t;
-    let (warm, measure): (&[u8], &[u8]) = if arms.use_dict {
-        warm_t = crate::dict::transform(warm);
-        measure_t = crate::dict::transform(measure);
-        (&warm_t, &measure_t)
-    } else {
-        (warm, measure)
-    };
+    // The model runs on the preprocessed (case/dictionary) streams.
+    let warm_t = preprocess(arms, warm);
+    let measure_t = preprocess(arms, measure);
+    let warm: &[u8] = &warm_t;
+    let measure: &[u8] = &measure_t;
     let mut writer = BitWriter::new();
     writer.write_bits(measure.len() as u64, 64);
     let mut model = Model::new(arms);
@@ -1884,13 +1956,8 @@ fn encode_impl(
 
 /// Decode an archive produced by [`encode_impl`] with the same stages.
 fn decode_impl(arms: Arms, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
-    let warm_t;
-    let warm: &[u8] = if arms.use_dict {
-        warm_t = crate::dict::transform(warm);
-        &warm_t
-    } else {
-        warm
-    };
+    let warm_t = preprocess(arms, warm);
+    let warm: &[u8] = &warm_t;
     let mut reader = BitReader::new(archive);
     let n = usize::try_from(reader.read_bits(64)?).expect("length prefix fits usize");
     let mut model = Model::new(arms);
@@ -1917,12 +1984,8 @@ fn decode_impl(arms: Arms, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
         model.advance(b);
         out.push(b);
     }
-    // `out` holds the transformed stream when the dictionary is active.
-    Ok(if arms.use_dict {
-        crate::dict::untransform(&out)
-    } else {
-        out
-    })
+    // `out` holds the preprocessed stream; undo case/dictionary to recover input.
+    Ok(postprocess(arms, out))
 }
 
 /// The v7 logistic-mixing codec: bitwise multi-order context mixing in the
@@ -2201,6 +2264,47 @@ impl Codec for LallCodec {
     }
 }
 
+/// [`LindCodec`] plus the case transform (isolates case on the deterministic ensemble).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LindcaseCodec;
+
+impl Codec for LindcaseCodec {
+    fn name(&self) -> &'static str {
+        "lindcase"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LINDCASE, "lindcase", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LINDCASE, warm, archive)
+    }
+}
+
+/// `linddict` plus the case transform (case then dictionary).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LinddictcaseCodec;
+
+impl Codec for LinddictcaseCodec {
+    fn name(&self) -> &'static str {
+        "linddictcase"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(
+            Arms::LINDDICTCASE,
+            "linddictcase",
+            warm,
+            measure,
+        ))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LINDDICTCASE, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -2220,6 +2324,8 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"lind" => Arms::LIND,
         b"linddict" => Arms::LINDDICT,
         b"lall" => Arms::LALL,
+        b"lindcase" => Arms::LINDCASE,
+        b"linddictcase" => Arms::LINDDICTCASE,
         _ => return None,
     })
 }
@@ -2441,6 +2547,22 @@ mod tests {
         roundtrips_with_warm(&LindCodec);
         roundtrips_all_bytes(&LindCodec);
         roundtrips_empty(&LindCodec);
+    }
+
+    #[test]
+    fn lindcase_roundtrips() {
+        roundtrips_text(&LindcaseCodec);
+        roundtrips_with_warm(&LindcaseCodec);
+        roundtrips_all_bytes(&LindcaseCodec);
+        roundtrips_empty(&LindcaseCodec);
+    }
+
+    #[test]
+    fn linddictcase_roundtrips() {
+        roundtrips_text(&LinddictcaseCodec);
+        roundtrips_with_warm(&LinddictcaseCodec);
+        roundtrips_all_bytes(&LinddictcaseCodec);
+        roundtrips_empty(&LinddictcaseCodec);
     }
 
     #[test]
