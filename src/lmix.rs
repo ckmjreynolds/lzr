@@ -54,7 +54,19 @@ const HI_ORDERS: [usize; 3] = [8, 12, 16];
 /// Number of high-order context models.
 const N_HI: usize = HI_ORDERS.len();
 /// Number of sparse (non-contiguous byte) context models.
-const N_SPARSE: usize = 2;
+const N_SPARSE: usize = 6;
+/// Sparse-context patterns: each lists byte offsets into the rolling context
+/// (`0` = most recent byte `c1`, `1` = `c2`, …). Non-contiguous gaps let a model
+/// exploit regularities where the skipped bytes are noise. Each ≤ 8 offsets so
+/// the gathered bytes pack into one `u64` before hashing.
+const SPARSE_PATTERNS: [&[usize]; N_SPARSE] = [
+    &[0, 2],    // c1 c3
+    &[1, 3],    // c2 c4
+    &[0, 3],    // c1 c4 (wider gap)
+    &[0, 1, 3], // c1 c2 c4 (skip c3)
+    &[1, 2, 4], // c2 c3 c5
+    &[0, 2, 4], // c1 c3 c5 (every other)
+];
 /// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse,
 /// and the three in-loop neural arms (MLP + recurrent RNN + gated GRU).
 const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3;
@@ -1308,16 +1320,19 @@ impl Model {
         }
     }
 
-    /// Lookup key for sparse context `which` at `node`: a hash of two
-    /// non-contiguous history bytes — {c1,c3} for 0, {c2,c4} for 1 — so the
-    /// model can exploit patterns where the skipped byte is noise.
+    /// Lookup key for sparse context `which` at `node`: gather the bytes named
+    /// by the `which`-th entry of [`SPARSE_PATTERNS`] from the rolling context
+    /// into a packed value, then fold in `node`. A `while` loop keeps it `const`.
     #[inline]
     const fn sparse_key(&self, which: usize, node: usize) -> u64 {
-        let sctx = if which == 0 {
-            (self.ctx & 0xFF) | (((self.ctx >> 16) & 0xFF) << 8)
-        } else {
-            ((self.ctx >> 8) & 0xFF) | (((self.ctx >> 24) & 0xFF) << 8)
-        };
+        let pat = SPARSE_PATTERNS[which];
+        let mut sctx = 0u64;
+        let mut j = 0;
+        while j < pat.len() {
+            let byte = (self.ctx >> (8 * pat[j])) & 0xFF;
+            sctx |= byte << (8 * j);
+            j += 1;
+        }
         word_key(sctx, node)
     }
 
