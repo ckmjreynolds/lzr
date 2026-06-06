@@ -50,11 +50,11 @@ const N_ORDERS: usize = MAX_ORDER + 1;
 /// 24 aliases 16, a wasted arm), [7,9,12,16,24] 1.705 — so the gain from longer
 /// byte context saturates by ~order-16; [8,12,16] is the simplest set with no
 /// redundancy.
-const HI_ORDERS: [usize; 3] = [8, 12, 16];
+const HI_ORDERS: [usize; 4] = [7, 8, 12, 16];
 /// Number of high-order context models.
 const N_HI: usize = HI_ORDERS.len();
 /// Number of sparse (non-contiguous byte) context models.
-const N_SPARSE: usize = 6;
+const N_SPARSE: usize = 10;
 /// Sparse-context patterns: each lists byte offsets into the rolling context
 /// (`0` = most recent byte `c1`, `1` = `c2`, …). Non-contiguous gaps let a model
 /// exploit regularities where the skipped bytes are noise. Each ≤ 8 offsets so
@@ -66,10 +66,14 @@ const SPARSE_PATTERNS: [&[usize]; N_SPARSE] = [
     &[0, 1, 3], // c1 c2 c4 (skip c3)
     &[1, 2, 4], // c2 c3 c5
     &[0, 2, 4], // c1 c3 c5 (every other)
+    &[0, 4],    // c1 c5
+    &[1, 4],    // c2 c5
+    &[0, 1, 4], // c1 c2 c5
+    &[1, 3, 5], // c2 c4 c6
 ];
 /// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse,
-/// and the three in-loop neural arms (MLP + recurrent RNN + gated GRU).
-const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3;
+/// the indirect model, and the three in-loop neural arms (MLP + RNN + GRU).
+const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 4;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
@@ -86,8 +90,12 @@ const SPARSE_IN: usize = N_ORDERS + 4 + N_HI;
 const NN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE;
 /// Index of the recurrent (vanilla RNN) neural arm's mixer input.
 const RNN_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 1;
-/// Index of the gated-recurrent (GRU) neural arm's mixer input (the last slot).
+/// Index of the gated-recurrent (GRU) neural arm's mixer input.
 const GRU_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 2;
+/// Index of the indirect-context model's mixer input (the last slot).
+const IND_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3;
+/// Log2 size of the indirect history table (context-hash → last following byte).
+const IND_BITS: u32 = 22;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -1059,6 +1067,9 @@ pub(crate) struct Arms {
     use_rnn: bool,
     /// In-loop gated-recurrent (GRU) neural arm as an extra input.
     use_gru: bool,
+    /// Indirect context model (predict from the byte that last followed the
+    /// current order-3 context) as an extra input.
+    use_ind: bool,
 }
 
 impl Arms {
@@ -1071,6 +1082,7 @@ impl Arms {
         use_nn: false,
         use_rnn: false,
         use_gru: false,
+        use_ind: false,
     };
     const LMATCH: Self = Self {
         use_match: true,
@@ -1081,6 +1093,7 @@ impl Arms {
         use_nn: false,
         use_rnn: false,
         use_gru: false,
+        use_ind: false,
     };
     const LSSE: Self = Self {
         use_match: true,
@@ -1091,6 +1104,7 @@ impl Arms {
         use_nn: false,
         use_rnn: false,
         use_gru: false,
+        use_ind: false,
     };
     const LWORD: Self = Self {
         use_match: true,
@@ -1101,6 +1115,7 @@ impl Arms {
         use_nn: false,
         use_rnn: false,
         use_gru: false,
+        use_ind: false,
     };
     const LHI: Self = Self {
         use_match: true,
@@ -1111,6 +1126,7 @@ impl Arms {
         use_nn: false,
         use_rnn: false,
         use_gru: false,
+        use_ind: false,
     };
     const LDICT: Self = Self {
         use_match: true,
@@ -1121,6 +1137,7 @@ impl Arms {
         use_nn: false,
         use_rnn: false,
         use_gru: false,
+        use_ind: false,
     };
     const LNN: Self = Self {
         use_match: true,
@@ -1131,6 +1148,7 @@ impl Arms {
         use_nn: true,
         use_rnn: false,
         use_gru: false,
+        use_ind: false,
     };
     const LNNDICT: Self = Self {
         use_match: true,
@@ -1141,6 +1159,7 @@ impl Arms {
         use_nn: true,
         use_rnn: false,
         use_gru: false,
+        use_ind: false,
     };
     const LRNN: Self = Self {
         use_match: true,
@@ -1151,6 +1170,7 @@ impl Arms {
         use_nn: false,
         use_rnn: true,
         use_gru: false,
+        use_ind: false,
     };
     const LRNNDICT: Self = Self {
         use_match: true,
@@ -1161,6 +1181,7 @@ impl Arms {
         use_nn: false,
         use_rnn: true,
         use_gru: false,
+        use_ind: false,
     };
     const LGRU: Self = Self {
         use_match: true,
@@ -1171,6 +1192,7 @@ impl Arms {
         use_nn: false,
         use_rnn: false,
         use_gru: true,
+        use_ind: false,
     };
     const LGRUDICT: Self = Self {
         use_match: true,
@@ -1181,6 +1203,18 @@ impl Arms {
         use_nn: false,
         use_rnn: false,
         use_gru: true,
+        use_ind: false,
+    };
+    const LIND: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: false,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: false,
+        use_ind: true,
     };
 }
 
@@ -1252,6 +1286,11 @@ struct Model {
     rnn: RnnArm,
     /// In-loop gated-recurrent (GRU) neural arm (active iff `arms.use_gru`).
     gru: GruArm,
+    /// Indirect model: for each order-3 context hash, the last byte that
+    /// followed it (`2^IND_BITS` entries). Empty unless `arms.use_ind`.
+    ind_hist: Vec<u8>,
+    /// Indirect model's bit-predictor table, keyed on (that byte, `c1`, node).
+    ind_map: Vec<BitModel>,
 }
 
 impl Model {
@@ -1265,6 +1304,7 @@ impl Model {
             use_nn: _,
             use_rnn: _,
             use_gru: _,
+            use_ind,
         } = arms;
         let (hist, mtable, mmap) = if use_match {
             (
@@ -1290,6 +1330,11 @@ impl Model {
             (0..N_SPARSE).map(|_| ctx_table()).collect()
         } else {
             Vec::new()
+        };
+        let (ind_hist, ind_map) = if use_ind {
+            (vec![0u8; 1 << IND_BITS], ctx_table())
+        } else {
+            (Vec::new(), Vec::new())
         };
         Self {
             o0: vec![BitModel::default(); 256],
@@ -1317,7 +1362,26 @@ impl Model {
             nn: NnArm::new(),
             rnn: RnnArm::new(),
             gru: GruArm::new(),
+            ind_hist,
+            ind_map,
         }
+    }
+
+    /// Index into [`Model::ind_hist`] for the current order-3 context: hash the
+    /// low three bytes of the rolling context into `IND_BITS`.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    const fn ind_index(&self) -> usize {
+        let ctx3 = self.ctx & 0x00FF_FFFF;
+        (ctx3.wrapping_mul(WORD_MIX) >> (64 - IND_BITS)) as usize
+    }
+
+    /// Lookup key for the indirect model at `node`: combine the byte that last
+    /// followed this order-3 context with the current `c1` byte and the node.
+    #[inline]
+    fn ind_key(&self, node: usize) -> u64 {
+        let pb = self.ind_hist[self.ind_index()];
+        word_key((u64::from(pb) << 8) | (self.ctx & 0xFF), node)
     }
 
     /// Lookup key for sparse context `which` at `node`: gather the bytes named
@@ -1446,6 +1510,11 @@ impl Model {
         } else {
             0.0
         };
+        x[IND_IN] = if self.arms.use_ind {
+            ctx_logit(&self.ind_map, self.ind_key(node))
+        } else {
+            0.0
+        };
         let bitpos = node.ilog2() as usize;
         let sel1 = (((self.ctx & 0xFF) as usize) << 3) | bitpos;
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
@@ -1569,6 +1638,10 @@ impl Model {
                 update_ctx(&mut self.spmaps[i], key, yf);
             }
         }
+        if self.arms.use_ind {
+            let key = self.ind_key(node);
+            update_ctx(&mut self.ind_map, key, yf);
+        }
         if let Some((ctx, i, frac)) = sse {
             self.apm.update(ctx, i, frac, yf);
         }
@@ -1656,6 +1729,13 @@ impl Model {
     /// state, word state, and the two rolling context registers. Shared by the
     /// learn / encode / decode / residual paths so they evolve identically.
     fn advance(&mut self, b: u8) {
+        if self.arms.use_ind {
+            // Record that `b` followed the current order-3 context, before the
+            // context rolls forward — this is what the indirect model reads next
+            // time it sees the same order-3 context.
+            let ih = self.ind_index();
+            self.ind_hist[ih] = b;
+        }
         self.advance_match(b);
         self.advance_word(b);
         self.ctx = (self.ctx << 8) | u64::from(b);
@@ -2028,6 +2108,24 @@ impl Codec for LgrudictCodec {
     }
 }
 
+/// [`LhiCodec`] plus the indirect context model.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LindCodec;
+
+impl Codec for LindCodec {
+    fn name(&self) -> &'static str {
+        "lind"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LIND, "lind", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LIND, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -2044,6 +2142,7 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"lrnndict" => Arms::LRNNDICT,
         b"lgru" => Arms::LGRU,
         b"lgrudict" => Arms::LGRUDICT,
+        b"lind" => Arms::LIND,
         _ => return None,
     })
 }
@@ -2257,6 +2356,14 @@ mod tests {
         roundtrips_with_warm(&LgrudictCodec);
         roundtrips_all_bytes(&LgrudictCodec);
         roundtrips_empty(&LgrudictCodec);
+    }
+
+    #[test]
+    fn lind_roundtrips() {
+        roundtrips_text(&LindCodec);
+        roundtrips_with_warm(&LindCodec);
+        roundtrips_all_bytes(&LindCodec);
+        roundtrips_empty(&LindCodec);
     }
 
     #[test]
