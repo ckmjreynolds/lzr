@@ -347,8 +347,8 @@ const WORDS2: [&[u8]; NW2] = [
     b"single",
     b"become",
 ];
-const ESC_WORD: u8 = 0xfe;
-const ESC_LIT: u8 = 0xff;
+pub(crate) const ESC_WORD: u8 = 0xfe;
+pub(crate) const ESC_LIT: u8 = 0xff;
 
 use std::collections::HashMap;
 
@@ -543,7 +543,7 @@ mod tests {
     /// corpus, using every byte the transform frees (uppercase range, minus the
     /// markers). Run: `cargo test --release gen_dict_tables -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "regenerates dictionary tables from assets/enwik8; run manually"]
     fn gen_dict_tables() {
         use std::collections::HashMap;
         let bytes = std::fs::read("assets/enwik8").unwrap();
@@ -552,8 +552,7 @@ mod tests {
         for &b in &cased {
             used[b as usize] = true;
         }
-        let avail: Vec<u8> = (0u16..=255)
-            .map(|x| x as u8)
+        let avail: Vec<u8> = (0u8..=255)
             .filter(|&b| {
                 !used[b as usize]
                     && b != ESC_WORD

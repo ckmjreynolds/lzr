@@ -124,6 +124,20 @@ const MIX_LR: f64 = 0.004;
 const INIT_W: f64 = 0.3;
 /// Number of mixer weight sets, selected by (previous byte, bit position).
 const N_WSETS: usize = 256 * 8;
+/// Structural modes emitted by the mode FSM (a persistent regime tag that local
+/// byte selectors can't see). `Content` is wikitext/prose; `Tag` is inside an
+/// XML `<...>`; `Attr` is a quoted attribute value within a tag; `Template` and
+/// `Link` are wikitext `{{...}}` and `[[...]]` (depth-tracked).
+const MODE_CONTENT: u8 = 0;
+const MODE_TAG: u8 = 1;
+const MODE_ATTR: u8 = 2;
+const MODE_TEMPLATE: u8 = 3;
+const MODE_LINK: u8 = 4;
+/// Number of structural modes.
+const N_MODES: usize = 5;
+/// Mode-mixer weight sets, selected by (mode, bit position). The 5th mixer is a
+/// decorrelated, non-local selector (cf. the word-hash 4th mixer).
+const N_MODE_WSETS: usize = N_MODES * 8;
 /// Floor on a bit-predictor's adaptive learning rate, so a well-observed
 /// context still tracks local drift instead of freezing.
 const RATE_FLOOR: f64 = 1.0 / 256.0;
@@ -1079,6 +1093,9 @@ pub(crate) struct Arms {
     /// Case transform: lowercase the stream with in-band capitalization markers
     /// (preprocessing), pooling the alphabet and freeing the uppercase codes.
     use_case: bool,
+    /// Mode FSM: tag each byte with a persistent structural mode (content / tag /
+    /// attribute / template / link) used as a 5th, decorrelated mixer selector.
+    use_mode: bool,
 }
 
 impl Arms {
@@ -1093,6 +1110,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LMATCH: Self = Self {
         use_match: true,
@@ -1105,6 +1123,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LSSE: Self = Self {
         use_match: true,
@@ -1117,6 +1136,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LWORD: Self = Self {
         use_match: true,
@@ -1129,6 +1149,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LHI: Self = Self {
         use_match: true,
@@ -1141,6 +1162,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LDICT: Self = Self {
         use_match: true,
@@ -1153,6 +1175,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LNN: Self = Self {
         use_match: true,
@@ -1165,6 +1188,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LNNDICT: Self = Self {
         use_match: true,
@@ -1177,6 +1201,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LRNN: Self = Self {
         use_match: true,
@@ -1189,6 +1214,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LRNNDICT: Self = Self {
         use_match: true,
@@ -1201,6 +1227,7 @@ impl Arms {
         use_gru: false,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LGRU: Self = Self {
         use_match: true,
@@ -1213,6 +1240,7 @@ impl Arms {
         use_gru: true,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LGRUDICT: Self = Self {
         use_match: true,
@@ -1225,6 +1253,7 @@ impl Arms {
         use_gru: true,
         use_ind: false,
         use_case: false,
+        use_mode: false,
     };
     const LIND: Self = Self {
         use_match: true,
@@ -1237,6 +1266,7 @@ impl Arms {
         use_gru: false,
         use_ind: true,
         use_case: false,
+        use_mode: false,
     };
     const LINDDICT: Self = Self {
         use_match: true,
@@ -1249,6 +1279,7 @@ impl Arms {
         use_gru: false,
         use_ind: true,
         use_case: false,
+        use_mode: false,
     };
     /// Everything: the full deterministic ensemble + dictionary + indirect models
     /// + the in-loop GRU. The new overall-best stack.
@@ -1263,6 +1294,7 @@ impl Arms {
         use_gru: true,
         use_ind: true,
         use_case: false,
+        use_mode: false,
     };
     /// `lind` + the case transform — isolates the case transform's effect on the
     /// deterministic ensemble (pooling + collision tax), no dictionary.
@@ -1277,6 +1309,7 @@ impl Arms {
         use_gru: false,
         use_ind: true,
         use_case: true,
+        use_mode: false,
     };
     /// `linddict` + the case transform (case then dictionary).
     const LINDDICTCASE: Self = Self {
@@ -1290,6 +1323,36 @@ impl Arms {
         use_gru: false,
         use_ind: true,
         use_case: true,
+        use_mode: false,
+    };
+    /// `lindcase` + the mode FSM — isolates the structural-mode mixer selector on
+    /// the dictionary-free deterministic base (no escape bytes in the stream).
+    const LINDCASEMODE: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: false,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: false,
+        use_ind: true,
+        use_case: true,
+        use_mode: true,
+    };
+    /// `lall` + the mode FSM — the full stack with the structural-mode selector.
+    const LALLMODE: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: true,
+        use_ind: true,
+        use_case: false,
+        use_mode: true,
     };
 }
 
@@ -1314,10 +1377,22 @@ struct Model {
     /// Fourth mixer, selected by the current word's hash (a language regime,
     /// decorrelated from the byte selectors).
     w4: Vec<[f64; N_INPUTS]>,
+    /// Fifth mixer, selected by the structural mode (a persistent regime the
+    /// local byte/word selectors can't see). Empty unless `use_mode`.
+    w5: Vec<[f64; N_INPUTS]>,
     /// Rolling context — the last up-to-8 bytes, most recent in the low byte.
     ctx: u64,
     /// Active model stages (which optional arms contribute).
     arms: Arms,
+    /// Current structural mode (one of `MODE_*`), updated by the mode FSM.
+    mode: u8,
+    /// Nesting depth for the bracket modes (`Template`/`Link`).
+    mode_depth: u16,
+    /// Byte preceding the current one for the mode FSM's two-char rules, with
+    /// dictionary-escape payloads neutralized to `0` so they can't false-trigger.
+    mode_prev: u8,
+    /// True when the next byte is a literal payload after a dictionary escape.
+    mode_skip: bool,
 
     /// All bytes seen so far (warm + coded), indexed by the match pointer.
     hist: Vec<u8>,
@@ -1381,6 +1456,7 @@ impl Model {
             use_gru: _,
             use_ind,
             use_case: _,
+            use_mode,
         } = arms;
         let (hist, mtable, mmap) = if use_match {
             (
@@ -1422,8 +1498,17 @@ impl Model {
             w2: vec![[INIT_W; N_INPUTS]; N_WSETS],
             w3: vec![[INIT_W; N_INPUTS]; N_WSETS],
             w4: vec![[INIT_W; N_INPUTS]; N_WSETS],
+            w5: if use_mode {
+                vec![[INIT_W; N_INPUTS]; N_MODE_WSETS]
+            } else {
+                Vec::new()
+            },
             ctx: 0,
             arms,
+            mode: MODE_CONTENT,
+            mode_depth: 0,
+            mode_prev: 0,
+            mode_skip: false,
             hist,
             mtable,
             mmap,
@@ -1602,9 +1687,15 @@ impl Model {
         let sel3 = ((((self.ctx >> 16) & 0xFF) as usize) << 3) | bitpos;
         let sel4 = (((self.word_hash & 0xFF) as usize) << 3) | bitpos;
         let dot = |w: &[f64; N_INPUTS]| -> f64 { w.iter().zip(x.iter()).map(|(a, b)| a * b).sum() };
-        let s =
-            (dot(&self.w[sel1]) + dot(&self.w2[sel2]) + dot(&self.w3[sel3]) + dot(&self.w4[sel4]))
-                / 4.0;
+        let base =
+            dot(&self.w[sel1]) + dot(&self.w2[sel2]) + dot(&self.w3[sel3]) + dot(&self.w4[sel4]);
+        let (sum, n_mix) = if self.arms.use_mode {
+            let sel5 = ((self.mode as usize) << 3) | bitpos;
+            (base + dot(&self.w5[sel5]), 5.0)
+        } else {
+            (base, 4.0)
+        };
+        let s = sum / n_mix;
         let p_mix = squash(s);
         if self.arms.use_sse {
             let (p_apm, i, frac) = self.apm.refine(s, node);
@@ -1637,33 +1728,33 @@ impl Model {
         let sel2 = ((((self.ctx >> 8) & 0xFF) as usize) << 3) | bitpos;
         let sel3 = ((((self.ctx >> 16) & 0xFF) as usize) << 3) | bitpos;
         let sel4 = (((self.word_hash & 0xFF) as usize) << 3) | bitpos;
-        // The mixer's effective weight on the neural input (averaged over the
-        // four selected mixers), captured before the weights step — this routes
-        // the coding-loss gradient back into the net.
+        let sel5 = ((self.mode as usize) << 3) | bitpos;
+        let n_mix = if self.arms.use_mode { 5.0 } else { 4.0 };
+        // The mixer's effective weight on a neural input (averaged over the
+        // selected mixers), captured before the weights step — this routes the
+        // coding-loss gradient back into the net.
+        let w_eff_at = |idx: usize| -> f64 {
+            let base =
+                self.w[sel1][idx] + self.w2[sel2][idx] + self.w3[sel3][idx] + self.w4[sel4][idx];
+            let total = if self.arms.use_mode {
+                base + self.w5[sel5][idx]
+            } else {
+                base
+            };
+            total / n_mix
+        };
         let w_eff = if self.arms.use_nn {
-            (self.w[sel1][NN_IN]
-                + self.w2[sel2][NN_IN]
-                + self.w3[sel3][NN_IN]
-                + self.w4[sel4][NN_IN])
-                / 4.0
+            w_eff_at(NN_IN)
         } else {
             0.0
         };
         let w_eff_rnn = if self.arms.use_rnn {
-            (self.w[sel1][RNN_IN]
-                + self.w2[sel2][RNN_IN]
-                + self.w3[sel3][RNN_IN]
-                + self.w4[sel4][RNN_IN])
-                / 4.0
+            w_eff_at(RNN_IN)
         } else {
             0.0
         };
         let w_eff_gru = if self.arms.use_gru {
-            (self.w[sel1][GRU_IN]
-                + self.w2[sel2][GRU_IN]
-                + self.w3[sel3][GRU_IN]
-                + self.w4[sel4][GRU_IN])
-                / 4.0
+            w_eff_at(GRU_IN)
         } else {
             0.0
         };
@@ -1678,6 +1769,11 @@ impl Model {
         }
         for (wk, &xk) in self.w4[sel4].iter_mut().zip(x.iter()) {
             *wk += MIX_LR * err * xk;
+        }
+        if self.arms.use_mode {
+            for (wk, &xk) in self.w5[sel5].iter_mut().zip(x.iter()) {
+                *wk += MIX_LR * err * xk;
+            }
         }
         if self.arms.use_nn {
             self.nn.bit_backward(node, err * w_eff);
@@ -1808,6 +1904,74 @@ impl Model {
         }
     }
 
+    /// Fold byte `b` into the structural-mode FSM. Runs on the transformed
+    /// (case/dictionary) stream — the structural delimiters (`<>"{}[]`) survive
+    /// both transforms, and dictionary-escape payloads are neutralized so they
+    /// can't false-trigger the two-char (`{{` / `[[`) rules.
+    const fn advance_mode(&mut self, b: u8) {
+        if !self.arms.use_mode {
+            return;
+        }
+        if self.mode_skip {
+            self.mode_skip = false;
+            self.mode_prev = 0;
+            return;
+        }
+        if b == crate::dict::ESC_WORD || b == crate::dict::ESC_LIT {
+            self.mode_skip = true;
+            self.mode_prev = 0;
+            return;
+        }
+        let prev = self.mode_prev;
+        match self.mode {
+            MODE_CONTENT => {
+                if b == b'<' {
+                    self.mode = MODE_TAG;
+                } else if b == b'{' && prev == b'{' {
+                    self.mode = MODE_TEMPLATE;
+                    self.mode_depth = 1;
+                } else if b == b'[' && prev == b'[' {
+                    self.mode = MODE_LINK;
+                    self.mode_depth = 1;
+                }
+            }
+            MODE_TAG => {
+                if b == b'>' {
+                    self.mode = MODE_CONTENT;
+                } else if b == b'"' {
+                    self.mode = MODE_ATTR;
+                }
+            }
+            MODE_ATTR => {
+                if b == b'"' {
+                    self.mode = MODE_TAG;
+                }
+            }
+            MODE_TEMPLATE => {
+                if b == b'{' && prev == b'{' {
+                    self.mode_depth += 1;
+                } else if b == b'}' && prev == b'}' {
+                    self.mode_depth = self.mode_depth.saturating_sub(1);
+                    if self.mode_depth == 0 {
+                        self.mode = MODE_CONTENT;
+                    }
+                }
+            }
+            MODE_LINK => {
+                if b == b'[' && prev == b'[' {
+                    self.mode_depth += 1;
+                } else if b == b']' && prev == b']' {
+                    self.mode_depth = self.mode_depth.saturating_sub(1);
+                    if self.mode_depth == 0 {
+                        self.mode = MODE_CONTENT;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.mode_prev = b;
+    }
+
     /// Roll all per-byte context state forward after byte `b` is known: match
     /// state, word state, and the two rolling context registers. Shared by the
     /// learn / encode / decode / residual paths so they evolve identically.
@@ -1823,6 +1987,7 @@ impl Model {
         }
         self.advance_match(b);
         self.advance_word(b);
+        self.advance_mode(b);
         self.ctx = (self.ctx << 8) | u64::from(b);
         self.ctx_hi = (self.ctx_hi << 8) | u128::from(b);
     }
@@ -2307,6 +2472,47 @@ impl Codec for LinddictcaseCodec {
     }
 }
 
+/// `lindcase` plus the structural-mode mixer selector (dictionary-free base).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LindcasemodeCodec;
+
+impl Codec for LindcasemodeCodec {
+    fn name(&self) -> &'static str {
+        "lindcasemode"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(
+            Arms::LINDCASEMODE,
+            "lindcasemode",
+            warm,
+            measure,
+        ))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LINDCASEMODE, warm, archive)
+    }
+}
+
+/// `lall` plus the structural-mode mixer selector (full dictionary-coupled stack).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LallmodeCodec;
+
+impl Codec for LallmodeCodec {
+    fn name(&self) -> &'static str {
+        "lallmode"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LALLMODE, "lallmode", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LALLMODE, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -2328,6 +2534,8 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"lall" => Arms::LALL,
         b"lindcase" => Arms::LINDCASE,
         b"linddictcase" => Arms::LINDDICTCASE,
+        b"lindcasemode" => Arms::LINDCASEMODE,
+        b"lallmode" => Arms::LALLMODE,
         _ => return None,
     })
 }
@@ -2581,6 +2789,22 @@ mod tests {
         roundtrips_with_warm(&LallCodec);
         roundtrips_all_bytes(&LallCodec);
         roundtrips_empty(&LallCodec);
+    }
+
+    #[test]
+    fn lindcasemode_roundtrips() {
+        roundtrips_text(&LindcasemodeCodec);
+        roundtrips_with_warm(&LindcasemodeCodec);
+        roundtrips_all_bytes(&LindcasemodeCodec);
+        roundtrips_empty(&LindcasemodeCodec);
+    }
+
+    #[test]
+    fn lallmode_roundtrips() {
+        roundtrips_text(&LallmodeCodec);
+        roundtrips_with_warm(&LallmodeCodec);
+        roundtrips_all_bytes(&LallmodeCodec);
+        roundtrips_empty(&LallmodeCodec);
     }
 
     #[test]
