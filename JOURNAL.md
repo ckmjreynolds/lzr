@@ -13,6 +13,18 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-06 — structural-mode FSM as a 5th mixer selector: new best lallmode 1.4456 bpb (−0.0070 full stack), reviving v2's classifier at L(D) = 0
+
+CDR proposed reviving v2's abandoned `Content`/`TagStructure`/`AttrValue` classifier — not as a routing decision but as a persistent *regime tag* the mixer conditions on. The mixer's four selectors are all local (the previous three bytes c1/c2/c3 and the current word hash); none can see that we are 200 bytes deep inside a `<...>` tag or a `{{template}}` whose bytes locally resemble prose. A coarse structural-mode tag supplies exactly that decorrelated, non-local conditioning.
+
+*The FSM.* A 5-state Moore FSM tags each byte: Content (wikitext/prose, default), Tag (inside `<...>`), Attr (a quoted value within a tag), Template (`{{...}}`, depth-tracked), Link (`[[...]]`, depth-tracked). It runs deterministically in `advance` on the *transformed* stream — the delimiters `<>"{}[]` survive both the case and dictionary transforms (none collide with the single-byte dictionary codes), and dictionary-escape payloads (`ESC_WORD`/`ESC_LIT` + index) are skipped and neutralized as the two-char trigger context so a word-index byte equal to `{`/`[` cannot false-fire. Encoder and decoder run the identical FSM, so the tag costs zero signaling bits.
+
+*The selector.* A 5th mixer weight set `w5`, selected by `(mode << 3) | bitpos` — only `N_MODES × 8 = 40` weight vectors, deliberately coarse and decorrelated, the same shape as the word-hash 4th mixer that earned its place. When active the mixer averages five dot products instead of four, and the in-loop neural-arm gradient routing (`w_eff`) divides by five and includes the w5 term. Off → empty vector, zero cost.
+
+*Result.* Full enwik8. Dictionary-free deterministic base: **lindcase 1.5050 → lindcasemode 1.4965 (−0.0085)** — the same magnitude as the case transform itself, for a selector that ships nothing. Full stack: **lall 1.4526 → lallmode 1.4456 (−0.0070)**, a new overall best. The full-stack gain is slightly under the deterministic one — the GRU and indirect models already absorb a little structural signal — but most survives, confirming the mode tag is largely decorrelated from the existing arms.
+
+*Reading.* This refines the earlier "mixer saturates at 4 selectors" note: it saturates on more *correlated/local* selectors (a 5th byte selector did not help), not on decorrelated ones — both the word-hash 4th and now the structural-mode 5th pay. The rule is "add a mixer only when its selector is decorrelated from the existing local ones." It also vindicates v2's classifier idea — a deterministic structural tag is useful — but as soft mixer conditioning rather than the hard per-mode codec routing v2 used. Open extensions: a finer mode set (table / list / heading), a `mode × c1` selector if the coarse win warrants more selector entropy, and CDR's "sentence-start" mode that both predicts the `. <space> Capital` pattern and switches the mixer into prose regime.
+
 ## 2026-06-06 — case transform reopens a closed verdict (CDR was right): coupled dict ⟹ case → lall 1.4526 bpb on full enwik8
 
 CDR challenged the 2026-06-03 "case is closed, negative" verdict, suspecting our implementation was flawed. It was. That verdict tested case as a *separate, weakly-modelled side channel* on a pre-indirect base. The transform SOTA actually uses is an *in-stream* capitalization marker, and re-running it on the current ensemble flips the result.
