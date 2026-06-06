@@ -1881,10 +1881,12 @@ fn fill_bit_cdf(p1: f64, cdf: &mut [u32; 3]) {
 /// Shared by the `lmix` / `lmatch` / `lsse` / `lword` codecs.
 #[allow(clippy::cast_possible_truncation)]
 /// Apply the preprocessing transforms the active arms request, in order (case
-/// then dictionary). The model runs on the result.
+/// then dictionary). The dictionary always runs on a case-folded stream — its
+/// codes reuse the freed uppercase byte range, and its words are built from the
+/// lowercased corpus — so `use_dict` *implies* the case transform.
 fn preprocess(arms: Arms, bytes: &[u8]) -> Vec<u8> {
     let cased;
-    let b: &[u8] = if arms.use_case {
+    let b: &[u8] = if arms.use_case || arms.use_dict {
         cased = crate::dict::case_transform(bytes);
         &cased
     } else {
@@ -1904,7 +1906,7 @@ fn postprocess(arms: Arms, bytes: Vec<u8>) -> Vec<u8> {
     } else {
         bytes
     };
-    if arms.use_case {
+    if arms.use_case || arms.use_dict {
         crate::dict::case_untransform(&b)
     } else {
         b
