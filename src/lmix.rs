@@ -95,7 +95,7 @@ const GRU_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 2;
 /// Base index of the indirect-context model inputs (`IND_IN .. IND_IN + N_IND`).
 const IND_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3;
 /// Log2 size of each indirect history table (context-hash → last following byte).
-const IND_BITS: u32 = 22;
+const IND_BITS: u32 = 25;
 /// Context orders used by the indirect models (predict from the byte that last
 /// followed each order-`o` context). Order-3 alone gave −0.0078; diverse orders
 /// add decorrelated "what-followed" signal.

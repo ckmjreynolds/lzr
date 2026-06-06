@@ -13,6 +13,23 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-05 (overnight autonomous session 2) — indirect context models: deterministic stack to linddict 1.5013, beating the prior GRU-based best at L(D) = 0
+
+An autonomous run (CDR away ~11 h; continue incorporating/inventing models, consider multi-threading). The threading question resolved cleanly against the submission's single-thread invariant: the codec is inherently sequential (an online adaptive model + arithmetic coder cannot be parallelized within a run), so parallelism went to the *experiment* level — independent single-threaded `lzr` processes across the 12 cores, no dependency added. The substantive win was a new model family.
+
+*Indirect context models — the breakthrough.* The biggest structural gap versus the frontier (fx2-cmix carries hundreds of context models) was breadth, so the session added the canonical paq "indirect" model: for each order-`o` context, a history table `ind_hist[o][hash(ctx_o)]` records the byte(s) that last followed it, and a bit-predictor is keyed on (that follower history, c1, node) — generalizing across contexts that share the same "what-followed" pattern. It pays on two independent axes, both large:
+
+- *Order count.* One indirect model per order, orders [1..8] (order-8 is the 8-byte ctx-register limit). Single order-3 gave −0.0078 over lhi; 4 orders [2,3,4,6] gave **−0.0180** beyond that; 7 orders [1,2,3,4,5,6,8] another −0.0065. Adding order-7 to make [1..8] dilutes by ~0.0007, so [1,2,3,4,5,6,8] is the sweet spot.
+- *History depth.* Storing the last *two* follower bytes (`ind_hist` u16, rolling) beat one byte (u8) by −0.0090 at 4 orders and **−0.0113** at 8 orders — richer history pays more with more orders. Four bytes (u32) over-specifies (+0.0057 worse), so u16 is the knee. Enriching the predictor key with c2 also over-specifies (+0.0014): the c1-only key's generalization is load-bearing.
+
+Combined, the indirect family took the deterministic base from the session-start **lhi 1.5615 → lind 1.5141** (−0.0474), at L(D) = 0 and ~15 min/run. Stacking the dictionary, **linddict = 1.5013** — which **beats the prior overall best, the GRU-based lgrudict (1.5019), purely deterministically** (L(D) ~2 KB, no neural arm, ~21 min versus the GRU's 148 min). The biggest single lever since the GRU, and it ships nothing.
+
+*Other breadth (smaller).* The sparse-context mechanism was generalized to a pattern table (2 → 6 → 10 patterns, −0.0037 total, diminishing); order-7 was added to the high-order set (−0.0010, filling the order-6 → hashed-8 gap).
+
+*The full stack — lall = indirect + dictionary + GRU.* LALL_RESULT_PENDING
+
+*Reading.* Indirect models are the deterministic breadth lever the frontier coders rely on, and they compound with everything already in the codec (orders, match, words, sparse, dictionary, GRU). The gap from our base toward the ~0.886-bpb record narrowed materially this session, almost entirely at near-zero L(D). Memory is the emerging constraint: each model now carries ~27 context tables (~7 GB), tightening the enwik9 10 GB budget — future work must weigh each arm's value against its table footprint, or shrink `CTX_BITS`.
+
 ## 2026-06-05 — GRU width scaling to 1.5019, and why the bptt allocation is load-bearing (an auto-vectorization lesson)
 
 Two follow-ups to the GRU win, under a tight time budget (CDR steering for time/memory).
