@@ -99,7 +99,7 @@ const IND_BITS: u32 = 22;
 /// Context orders used by the indirect models (predict from the byte that last
 /// followed each order-`o` context). Order-3 alone gave −0.0078; diverse orders
 /// add decorrelated "what-followed" signal.
-const INDIRECT_ORDERS: [usize; 4] = [2, 3, 4, 6];
+const INDIRECT_ORDERS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 /// Number of indirect models.
 const N_IND: usize = INDIRECT_ORDERS.len();
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
@@ -1222,6 +1222,30 @@ impl Arms {
         use_gru: false,
         use_ind: true,
     };
+    const LINDDICT: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: false,
+        use_ind: true,
+    };
+    /// Everything: the full deterministic ensemble + dictionary + indirect models
+    /// + the in-loop GRU. The new overall-best stack.
+    const LALL: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: true,
+        use_ind: true,
+    };
 }
 
 /// Online multi-order bit model with a logistic (logit-domain) mixer, an
@@ -1294,7 +1318,7 @@ struct Model {
     gru: GruArm,
     /// Indirect models: `ind_hist[i]` maps each order-`INDIRECT_ORDERS[i]`
     /// context hash to the last byte that followed it. Empty unless `use_ind`.
-    ind_hist: Vec<Vec<u8>>,
+    ind_hist: Vec<Vec<u16>>,
     /// Indirect bit-predictor tables, `ind_map[i]` keyed on (that byte, `c1`, node).
     ind_map: Vec<Vec<BitModel>>,
 }
@@ -1339,7 +1363,7 @@ impl Model {
         };
         let (ind_hist, ind_map) = if use_ind {
             (
-                (0..N_IND).map(|_| vec![0u8; 1 << IND_BITS]).collect(),
+                (0..N_IND).map(|_| vec![0u16; 1 << IND_BITS]).collect(),
                 (0..N_IND).map(|_| ctx_table()).collect(),
             )
         } else {
@@ -1748,7 +1772,7 @@ impl Model {
             // next time they see the same order-`o` context.
             for i in 0..N_IND {
                 let ih = self.ind_index(i);
-                self.ind_hist[i][ih] = b;
+                self.ind_hist[i][ih] = (self.ind_hist[i][ih] << 8) | u16::from(b);
             }
         }
         self.advance_match(b);
@@ -2141,6 +2165,42 @@ impl Codec for LindCodec {
     }
 }
 
+/// [`LindCodec`] plus dictionary preprocessing.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LinddictCodec;
+
+impl Codec for LinddictCodec {
+    fn name(&self) -> &'static str {
+        "linddict"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LINDDICT, "linddict", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LINDDICT, warm, archive)
+    }
+}
+
+/// The full stack: deterministic ensemble + indirect models + dictionary + GRU.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LallCodec;
+
+impl Codec for LallCodec {
+    fn name(&self) -> &'static str {
+        "lall"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LALL, "lall", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LALL, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -2158,6 +2218,8 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"lgru" => Arms::LGRU,
         b"lgrudict" => Arms::LGRUDICT,
         b"lind" => Arms::LIND,
+        b"linddict" => Arms::LINDDICT,
+        b"lall" => Arms::LALL,
         _ => return None,
     })
 }
@@ -2379,6 +2441,22 @@ mod tests {
         roundtrips_with_warm(&LindCodec);
         roundtrips_all_bytes(&LindCodec);
         roundtrips_empty(&LindCodec);
+    }
+
+    #[test]
+    fn linddict_roundtrips() {
+        roundtrips_text(&LinddictCodec);
+        roundtrips_with_warm(&LinddictCodec);
+        roundtrips_all_bytes(&LinddictCodec);
+        roundtrips_empty(&LinddictCodec);
+    }
+
+    #[test]
+    fn lall_roundtrips() {
+        roundtrips_text(&LallCodec);
+        roundtrips_with_warm(&LallCodec);
+        roundtrips_all_bytes(&LallCodec);
+        roundtrips_empty(&LallCodec);
     }
 
     #[test]
