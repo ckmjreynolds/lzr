@@ -26,7 +26,7 @@ Combined, the indirect family took the deterministic base from the session-start
 
 *Other breadth (smaller).* The sparse-context mechanism was generalized to a pattern table (2 → 6 → 10 patterns, −0.0037 total, diminishing); order-7 was added to the high-order set (−0.0010, filling the order-6 → hashed-8 gap).
 
-*The full stack — lall = indirect + dictionary + GRU.* LALL_RESULT_PENDING
+*The full stack — lall = indirect + dictionary + GRU.* The endgame run combined the strong indirect+dictionary deterministic base with the in-loop GRU: full enwik8 **lall = 1.4613 bpb** — −0.0406 under the prior overall best (the GRU-based lgrudict, 1.5019), and −0.0354 below the deterministic linddict (1.4967). The GRU's marginal is *larger* on this stronger base than on the old weak one (~−0.035 versus ~−0.025), confirming that the indirect "what-followed" models and the GRU's learned long-range representation are highly complementary — different signal, stacking cleanly. Cost ~160 min (the GRU dominates). **New overall best: 1.4613 bpb on full enwik8** — the session moved the overall best 1.5019 → 1.4613 (−0.0406, −2.7%), most of it deterministic and at L(D) ≈ 0.
 
 *Reading.* Indirect models are the deterministic breadth lever the frontier coders rely on, and they compound with everything already in the codec (orders, match, words, sparse, dictionary, GRU). The gap from our base toward the ~0.886-bpb record narrowed materially this session, almost entirely at near-zero L(D). Memory is the emerging constraint: each model now carries ~27 context tables (~7 GB), tightening the enwik9 10 GB budget — future work must weigh each arm's value against its table footprint, or shrink `CTX_BITS`.
 
