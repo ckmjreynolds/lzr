@@ -13,6 +13,19 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-06 — negative: `mode × c1` selector wins the lean base but loses the full stack (a base-vs-e2e sign flip)
+
+Follow-up to the mode-FSM entry below, which left "a `mode × c1` selector if the coarse win warrants more selector entropy" as an open extension. Tested: give each mode its own c1-conditioned 5th mixer — `sel5 = ((mode << 8) | c1) << 3 | bitpos`, growing `w5` from `N_MODES × 8 = 40` weight vectors to `N_MODES × 256 × 8 = 10240`.
+
+Result reverses between the lean and full configurations:
+
+- Dictionary-free deterministic base: lindcasemode (mode-only) 1.4965 → mode×c1 **1.4935 (−0.0030)**, a clear win. The mode/c1 interaction is real signal.
+- Full stack: lallmode (mode-only) 1.4456 → mode×c1 **1.4516 (+0.0060)**, a clear loss.
+
+Diagnosis: convergence, not signal. The 256×-sparser w5 cells get 256× fewer updates each, and on the full stack that bites two ways the lean base avoids — the stream is dictionary-transformed (shorter → fewer total updates) and carries the live GRU input (a richer per-cell blend to learn). The interaction signal exists but the cells never train in, so noise dominates. On the lean base (no dict, no GRU, longer stream) the same cells converge enough for the signal to surface.
+
+Reverted; mode-only (lallmode 1.4456) stays best. Lesson — this is a sign-flip, not just a magnitude gap, between a panel/lean-base measurement and the e2e full stack (cf. [[feedback-mlp-panel-vs-e2e]], which warned on magnitude; here even the sign disagreed). It refines the "decorrelated selectors help" rule: selector *richness* is bounded by data-per-cell, and anything that shortens the stream or enriches the input blend (dict, neural arms) tightens that bound. Coarse-but-converged beats rich-but-sparse. A middle richness (e.g. `mode × byte_class`, ~360 cells) might thread it, but must be judged on the full stack, not the base.
+
 ## 2026-06-06 — structural-mode FSM as a 5th mixer selector: new best lallmode 1.4456 bpb (−0.0070 full stack), reviving v2's classifier at L(D) = 0
 
 CDR proposed reviving v2's abandoned `Content`/`TagStructure`/`AttrValue` classifier — not as a routing decision but as a persistent *regime tag* the mixer conditions on. The mixer's four selectors are all local (the previous three bytes c1/c2/c3 and the current word hash); none can see that we are 200 bytes deep inside a `<...>` tag or a `{{template}}` whose bytes locally resemble prose. A coarse structural-mode tag supplies exactly that decorrelated, non-local conditioning.
