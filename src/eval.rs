@@ -24,9 +24,10 @@ use anyhow::{Context, Result, bail};
 use crate::cmix::CmixCodec;
 use crate::codec::{Codec, Decomposition};
 use crate::lmix::{
-    LallCodec, LallmodeCodec, LdictCodec, LgruCodec, LgrudictCodec, LhiCodec, LindCodec,
-    LindcaseCodec, LindcasemodeCodec, LinddictCodec, LinddictcaseCodec, LmatchCodec, LmixCodec,
-    LnnCodec, LnndictCodec, LrnnCodec, LrnndictCodec, LsseCodec, LwordCodec,
+    LallCodec, LallmodeCodec, LallxCodec, LdictCodec, LgruCodec, LgrudictCodec, LhiCodec,
+    LindCodec, LindcaseCodec, LindcasemodeCodec, LindcasexCodec, LinddictCodec, LinddictcaseCodec,
+    LmatchCodec, LmixCodec, LnnCodec, LnndictCodec, LrnnCodec, LrnndictCodec, LsseCodec,
+    LwordCodec,
 };
 use crate::null::NullCodec;
 
@@ -100,8 +101,10 @@ fn make_codec(name: &str) -> Result<Box<dyn Codec>> {
         "linddictcase" => Ok(Box::new(LinddictcaseCodec)),
         "lindcasemode" => Ok(Box::new(LindcasemodeCodec)),
         "lallmode" => Ok(Box::new(LallmodeCodec)),
+        "lindcasex" => Ok(Box::new(LindcasexCodec)),
+        "lallx" => Ok(Box::new(LallxCodec)),
         other => bail!(
-            "unknown codec '{other}' (known: null, cmix, lmix, lmatch, lsse, lword, lhi, ldict, lnn, lnndict, lrnn, lrnndict, lgru, lgrudict, lind, linddict, lall, lindcase, linddictcase, lindcasemode, lallmode)"
+            "unknown codec '{other}' (known: null, cmix, lmix, lmatch, lsse, lword, lhi, ldict, lnn, lnndict, lrnn, lrnndict, lgru, lgrudict, lind, linddict, lall, lindcase, linddictcase, lindcasemode, lallmode, lindcasex, lallx)"
         ),
     }
 }

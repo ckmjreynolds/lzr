@@ -72,8 +72,9 @@ const SPARSE_PATTERNS: [&[usize]; N_SPARSE] = [
     &[1, 3, 5], // c2 c4 c6
 ];
 /// Mixer inputs: orders, match, two words, high orders, word-trigram, sparse,
-/// the three in-loop neural arms (MLP + RNN + GRU), and the indirect models.
-const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3 + N_IND;
+/// the three in-loop neural arms (MLP + RNN + GRU), the indirect models, and the
+/// exact data-indexed match models.
+const N_INPUTS: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3 + N_IND + N_XMATCH;
 /// Index of the match model's mixer input.
 const MATCH_IN: usize = N_ORDERS;
 /// Index of the W0 (current partial word) mixer input.
@@ -102,6 +103,24 @@ const IND_BITS: u32 = 25;
 const INDIRECT_ORDERS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 /// Number of indirect models.
 const N_IND: usize = INDIRECT_ORDERS.len();
+/// Base index of the exact data-indexed match inputs (`XMATCH_IN .. + N_XMATCH`).
+const XMATCH_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3 + N_IND;
+/// Context orders for the exact match models. Each gathers the last `XMATCH_K`
+/// verified occurrences of its order-`o` context directly from the data and
+/// predicts from the empirical follower distribution — zero collision tax,
+/// unlike the hashed high-order tables.
+const XMATCH_ORDERS: [usize; 3] = [6, 8, 12];
+/// Number of exact match models.
+const N_XMATCH: usize = XMATCH_ORDERS.len();
+/// Log2 size of each exact-match head table (context-hash → last position).
+const XMATCH_BITS: u32 = 24;
+/// Occurrences gathered per exact-match context (the follower-distribution size).
+const XMATCH_K: usize = 16;
+/// Cap on chain entries visited per context per byte. Without it, a rare context
+/// in a popular hash bucket walks a chain that grows with the data — quadratic
+/// total cost. Recent occurrences sit at the chain head, so a small cap keeps
+/// the gather O(1) while still collecting the most relevant followers.
+const XMATCH_MAX_WALK: usize = 64;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -1096,6 +1115,10 @@ pub(crate) struct Arms {
     /// Mode FSM: tag each byte with a persistent structural mode (content / tag /
     /// attribute / template / link) used as a 5th, decorrelated mixer selector.
     use_mode: bool,
+    /// Exact data-indexed match models: gather recent verified occurrences of
+    /// high-order contexts directly from the data → follower distribution as
+    /// extra mixer inputs (zero collision tax, no shipped weights).
+    use_xmatch: bool,
 }
 
 impl Arms {
@@ -1111,6 +1134,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LMATCH: Self = Self {
         use_match: true,
@@ -1124,6 +1148,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LSSE: Self = Self {
         use_match: true,
@@ -1137,6 +1162,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LWORD: Self = Self {
         use_match: true,
@@ -1150,6 +1176,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LHI: Self = Self {
         use_match: true,
@@ -1163,6 +1190,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LDICT: Self = Self {
         use_match: true,
@@ -1176,6 +1204,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LNN: Self = Self {
         use_match: true,
@@ -1189,6 +1218,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LNNDICT: Self = Self {
         use_match: true,
@@ -1202,6 +1232,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LRNN: Self = Self {
         use_match: true,
@@ -1215,6 +1246,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LRNNDICT: Self = Self {
         use_match: true,
@@ -1228,6 +1260,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LGRU: Self = Self {
         use_match: true,
@@ -1241,6 +1274,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LGRUDICT: Self = Self {
         use_match: true,
@@ -1254,6 +1288,7 @@ impl Arms {
         use_ind: false,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LIND: Self = Self {
         use_match: true,
@@ -1267,6 +1302,7 @@ impl Arms {
         use_ind: true,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     const LINDDICT: Self = Self {
         use_match: true,
@@ -1280,6 +1316,7 @@ impl Arms {
         use_ind: true,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     /// Everything: the full deterministic ensemble + dictionary + indirect models
     /// + the in-loop GRU. The new overall-best stack.
@@ -1295,6 +1332,7 @@ impl Arms {
         use_ind: true,
         use_case: false,
         use_mode: false,
+        use_xmatch: false,
     };
     /// `lind` + the case transform — isolates the case transform's effect on the
     /// deterministic ensemble (pooling + collision tax), no dictionary.
@@ -1310,6 +1348,7 @@ impl Arms {
         use_ind: true,
         use_case: true,
         use_mode: false,
+        use_xmatch: false,
     };
     /// `linddict` + the case transform (case then dictionary).
     const LINDDICTCASE: Self = Self {
@@ -1324,6 +1363,7 @@ impl Arms {
         use_ind: true,
         use_case: true,
         use_mode: false,
+        use_xmatch: false,
     };
     /// `lindcase` + the mode FSM — isolates the structural-mode mixer selector on
     /// the dictionary-free deterministic base (no escape bytes in the stream).
@@ -1339,6 +1379,7 @@ impl Arms {
         use_ind: true,
         use_case: true,
         use_mode: true,
+        use_xmatch: false,
     };
     /// `lall` + the mode FSM — the full stack with the structural-mode selector.
     const LALLMODE: Self = Self {
@@ -1353,6 +1394,38 @@ impl Arms {
         use_ind: true,
         use_case: false,
         use_mode: true,
+        use_xmatch: false,
+    };
+    /// `lindcasemode` + the exact data-indexed match arm — fast deterministic
+    /// base for isolating the exact-match arm's effect.
+    const LINDCASEX: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: false,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: false,
+        use_ind: true,
+        use_case: true,
+        use_mode: true,
+        use_xmatch: true,
+    };
+    /// `lallmode` + the exact data-indexed match arm — the full stack.
+    const LALLX: Self = Self {
+        use_match: true,
+        use_sse: true,
+        use_word: true,
+        use_hi: true,
+        use_dict: true,
+        use_nn: false,
+        use_rnn: false,
+        use_gru: true,
+        use_ind: true,
+        use_case: false,
+        use_mode: true,
+        use_xmatch: true,
     };
 }
 
@@ -1441,6 +1514,19 @@ struct Model {
     ind_hist: Vec<Vec<u16>>,
     /// Indirect bit-predictor tables, `ind_map[i]` keyed on (that byte, `c1`, node).
     ind_map: Vec<Vec<BitModel>>,
+    /// Exact-match head tables: `xheads[i]` maps an order-`XMATCH_ORDERS[i]`
+    /// context hash to the last position that context ended at. Empty unless
+    /// `use_xmatch`.
+    xheads: Vec<Vec<u32>>,
+    /// Exact-match position chains: `xchains[i][pos]` is the previous position
+    /// with the same order-`i` context hash (`MATCH_EMPTY` if none). One entry
+    /// per byte of `hist`, kept aligned with it.
+    xchains: Vec<Vec<u32>>,
+    /// Per-byte gathered follower bytes for each exact-match order (filled by
+    /// `xmatch_byte_begin`, read per bit in `step_predict`).
+    xcand: [[u8; XMATCH_K]; N_XMATCH],
+    /// Count of valid entries in each `xcand[i]`.
+    xcnt: [usize; N_XMATCH],
 }
 
 impl Model {
@@ -1457,15 +1543,27 @@ impl Model {
             use_ind,
             use_case: _,
             use_mode,
+            use_xmatch,
         } = arms;
-        let (hist, mtable, mmap) = if use_match {
+        let (mtable, mmap) = if use_match {
             (
-                Vec::new(),
                 vec![MATCH_EMPTY; 1usize << MATCH_BITS],
                 vec![BitModel::default(); MATCH_BUCKETS],
             )
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new())
+        };
+        // `hist` is shared by the match model and the exact-match arm.
+        let hist = Vec::new();
+        let (xheads, xchains) = if use_xmatch {
+            (
+                (0..N_XMATCH)
+                    .map(|_| vec![MATCH_EMPTY; 1usize << XMATCH_BITS])
+                    .collect(),
+                (0..N_XMATCH).map(|_| Vec::new()).collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
         };
         let apm = Apm::new(if use_sse { 256 } else { 0 });
         let wmaps = if use_word {
@@ -1528,6 +1626,10 @@ impl Model {
             gru: GruArm::new(),
             ind_hist,
             ind_map,
+            xheads,
+            xchains,
+            xcand: [[0u8; XMATCH_K]; N_XMATCH],
+            xcnt: [0usize; N_XMATCH],
         }
     }
 
@@ -1677,6 +1779,13 @@ impl Model {
         for i in 0..N_IND {
             x[IND_IN + i] = if self.arms.use_ind {
                 ctx_logit(&self.ind_map[i], self.ind_key(i, node))
+            } else {
+                0.0
+            };
+        }
+        for i in 0..N_XMATCH {
+            x[XMATCH_IN + i] = if self.arms.use_xmatch {
+                self.xmatch_logit(i, node)
             } else {
                 0.0
             };
@@ -1847,6 +1956,104 @@ impl Model {
         (0..MIN_MATCH).all(|i| self.hist[ci - i] == self.hist[pos - i])
     }
 
+    /// Hash of the `o` bytes ending at `pos` (caller guarantees `pos + 1 >= o`).
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    fn xhash_at(&self, pos: usize, o: usize) -> usize {
+        let mut h = 0x9E37_79B9_7F4A_7C15u64;
+        for &byte in &self.hist[pos + 1 - o..=pos] {
+            h = h
+                .wrapping_mul(0x0100_0000_01B3)
+                .wrapping_add(u64::from(byte));
+        }
+        h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (h >> (64 - XMATCH_BITS)) as usize
+    }
+
+    /// True if the `o` bytes ending at `ci` equal those ending at `pos`.
+    #[inline]
+    fn xverify(&self, ci: usize, pos: usize, o: usize) -> bool {
+        (0..o).all(|i| self.hist[ci - i] == self.hist[pos - i])
+    }
+
+    /// Record the just-appended position (`hist.len() - 1`) in each exact-match
+    /// order's head table and position chain. Called once per byte in `advance`.
+    #[allow(clippy::cast_possible_truncation, clippy::needless_range_loop)]
+    fn advance_xmatch(&mut self) {
+        let pos = self.hist.len() - 1;
+        for oi in 0..N_XMATCH {
+            let o = XMATCH_ORDERS[oi];
+            if pos + 1 < o {
+                self.xchains[oi].push(MATCH_EMPTY);
+                continue;
+            }
+            let h = self.xhash_at(pos, o);
+            let prev = self.xheads[oi][h];
+            self.xchains[oi].push(prev);
+            self.xheads[oi][h] = pos as u32;
+        }
+    }
+
+    /// Gather, for each exact-match order, the followers of the last `XMATCH_K`
+    /// verified occurrences of the current context — the empirical distribution
+    /// of "what byte comes next". Called once per byte before its eight bits.
+    #[allow(clippy::needless_range_loop)]
+    fn xmatch_byte_begin(&mut self) {
+        let len = self.hist.len();
+        if len == 0 {
+            self.xcnt = [0; N_XMATCH];
+            return;
+        }
+        let pos_ctx = len - 1;
+        for oi in 0..N_XMATCH {
+            let o = XMATCH_ORDERS[oi];
+            if pos_ctx + 1 < o {
+                self.xcnt[oi] = 0;
+                continue;
+            }
+            let h = self.xhash_at(pos_ctx, o);
+            let mut q = self.xheads[oi][h];
+            let mut n = 0;
+            let mut steps = 0;
+            while q != MATCH_EMPTY && n < XMATCH_K && steps < XMATCH_MAX_WALK {
+                let qq = q as usize;
+                if qq + 1 < len && self.xverify(qq, pos_ctx, o) {
+                    self.xcand[oi][n] = self.hist[qq + 1];
+                    n += 1;
+                }
+                q = self.xchains[oi][qq];
+                steps += 1;
+            }
+            self.xcnt[oi] = n;
+        }
+    }
+
+    /// Exact-match logit for order `oi` at tree `node`: the smoothed empirical
+    /// P(next bit = 1) among the gathered followers consistent with the bits
+    /// coded so far. Neutral `0` when no follower applies.
+    #[inline]
+    fn xmatch_logit(&self, oi: usize, node: usize) -> f64 {
+        let n = self.xcnt[oi];
+        if n == 0 {
+            return 0.0;
+        }
+        let j = node.ilog2();
+        let prefix = node & ((1usize << j) - 1);
+        let mut ones = 0u32;
+        let mut tot = 0u32;
+        for &b in &self.xcand[oi][..n] {
+            if usize::from(b) >> (8 - j) == prefix {
+                tot += 1;
+                ones += u32::from((b >> (7 - j)) & 1);
+            }
+        }
+        if tot == 0 {
+            return 0.0;
+        }
+        let p1 = (f64::from(ones) + 0.2) / (f64::from(tot) + 0.4);
+        stretch(p1)
+    }
+
     /// Fold byte `b` into the match state: extend or break the current match,
     /// append to history, and (if no match is active) seed a new one from the
     /// table, then record this position.
@@ -1986,6 +2193,14 @@ impl Model {
             }
         }
         self.advance_match(b);
+        if self.arms.use_xmatch {
+            // `advance_match` appends `b` to `hist` only when `use_match`; keep
+            // `hist` filled for the exact-match arm when the match model is off.
+            if !self.arms.use_match {
+                self.hist.push(b);
+            }
+            self.advance_xmatch();
+        }
         self.advance_word(b);
         self.advance_mode(b);
         self.ctx = (self.ctx << 8) | u64::from(b);
@@ -1993,11 +2208,15 @@ impl Model {
     }
 
     /// Compute the neural arm's per-byte hidden state (once, before the byte's
-    /// eight bit decisions). No-op when the arm is inactive.
+    /// eight bit decisions). No-op when the arm is inactive. Also gathers the
+    /// exact-match follower distributions for the byte.
     fn nn_byte_begin(&mut self) {
         if self.arms.use_nn {
             let ctx = self.ctx;
             self.nn.byte_begin(ctx);
+        }
+        if self.arms.use_xmatch {
+            self.xmatch_byte_begin();
         }
     }
 
@@ -2513,6 +2732,42 @@ impl Codec for LallmodeCodec {
     }
 }
 
+/// `lindcasemode` plus the exact data-indexed match arm (fast deterministic base).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LindcasexCodec;
+
+impl Codec for LindcasexCodec {
+    fn name(&self) -> &'static str {
+        "lindcasex"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LINDCASEX, "lindcasex", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LINDCASEX, warm, archive)
+    }
+}
+
+/// `lallmode` plus the exact data-indexed match arm (full dictionary-coupled stack).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LallxCodec;
+
+impl Codec for LallxCodec {
+    fn name(&self) -> &'static str {
+        "lallx"
+    }
+
+    fn encode_window(&self, warm: &[u8], measure: &[u8]) -> Result<(Vec<u8>, Decomposition)> {
+        Ok(encode_impl(Arms::LALLX, "lallx", warm, measure))
+    }
+
+    fn decode_window(&self, warm: &[u8], archive: &[u8]) -> Result<Vec<u8>> {
+        decode_impl(Arms::LALLX, warm, archive)
+    }
+}
+
 /// Map a codec name to its model stages, so the residual analyzer can
 /// reproduce any codec's model exactly.
 pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
@@ -2536,6 +2791,8 @@ pub(crate) const fn flags_for(name: &str) -> Option<Arms> {
         b"linddictcase" => Arms::LINDDICTCASE,
         b"lindcasemode" => Arms::LINDCASEMODE,
         b"lallmode" => Arms::LALLMODE,
+        b"lindcasex" => Arms::LINDCASEX,
+        b"lallx" => Arms::LALLX,
         _ => return None,
     })
 }
@@ -2805,6 +3062,22 @@ mod tests {
         roundtrips_with_warm(&LallmodeCodec);
         roundtrips_all_bytes(&LallmodeCodec);
         roundtrips_empty(&LallmodeCodec);
+    }
+
+    #[test]
+    fn lindcasex_roundtrips() {
+        roundtrips_text(&LindcasexCodec);
+        roundtrips_with_warm(&LindcasexCodec);
+        roundtrips_all_bytes(&LindcasexCodec);
+        roundtrips_empty(&LindcasexCodec);
+    }
+
+    #[test]
+    fn lallx_roundtrips() {
+        roundtrips_text(&LallxCodec);
+        roundtrips_with_warm(&LallxCodec);
+        roundtrips_all_bytes(&LallxCodec);
+        roundtrips_empty(&LallxCodec);
     }
 
     #[test]
