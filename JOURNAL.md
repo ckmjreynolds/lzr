@@ -13,6 +13,14 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-07 — rare-byte escaping doubles the single-byte dictionary: new best lallx 1.4361, and ~2% faster
+
+CDR's observation: enwik holds many byte values that appear but rarely — 101 values occur fewer than 10k times each, together only 0.39% of the stream (almost all high bytes / UTF-8 fragments, plus a few rare punctuation like `@`, `` ` ``, `~`). Each one locks up a byte value that could instead be a single-byte dictionary code. The escape machinery already existed: `ESC_LIT` precedes any literal occurrence of a code byte, so freeing a rare byte costs only its (rare) literal occurrences. Widening the generator's code set from "never-seen" bytes to "rare" bytes (`count < 10_000` on the case-transformed corpus) grew the single-byte dictionary from 72 to 173 words; transform/untransform are unchanged and round-trip on all 256 byte values.
+
+Two effects, both small and both favourable. *Coding*: linddict 1.4919 → 1.4912 (−0.0007 deterministic); full stack lallx 1.4372 → **1.4361** (−0.0011). The larger full-stack gain matches the known pattern that the dictionary helps the GRU more — a shorter stream lets its fixed horizon reach further. *Speed*: the transformed stream shrinks 87.45 M → 85.67 M bytes (−2.03%, net of the ~0.39% escape overhead), so the per-byte models do ~2% less work — free wall-clock that compounds on the expensive GRU (≈30 min on an enwik9 lall-class run). New best **lallx 1.4361** at L(D)≈0 (the dictionary ships ~2 KB).
+
+The realised coding gain is modest — the mixer's word arms already capture most word regularity, so the byte-count arithmetic (escape 0.4% to free 100 codes) far overstates the bits — but CDR's framing was right that rarely-seen bytes are wasted code space, and the change is a pure win on both ratio and speed. (Open: the 10k threshold is untuned; a frequency-aware greedy pairing of bytes-to-free with words-to-promote could squeeze a little more.)
+
 ## 2026-06-07 — negative: xmatch does not subsume the high-order tables — keep the himaps
 
 Tested the idea-3 memory follow-up — replace the hashed high-order tables (himaps, orders 7/8/12/16) with the xmatch exact-data index, since both target high-order context. Dropped the himaps (`HI_ORDERS = []`, sparse contexts kept), leaving xmatch [6,8,12] to cover. Base lindcasex 1.4870 → 1.4922 (+0.0052); full stack lallx 1.4372 → 1.4404 (+0.0032). The full-stack loss is *smaller* than the base loss — the GRU and dictionary overlap the himaps' long-range signal, so the himaps are less load-bearing once those are present — but they are not redundant. The two are complementary: a himap is the all-history adaptive average per high-order context; xmatch is the recent empirical follower distribution. +0.0032 is about a third of the entire xmatch win, to save 1 GB — not worth it. Keep both.
