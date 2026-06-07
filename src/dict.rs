@@ -1,12 +1,14 @@
 //! Static word dictionary + reversible substitution transform.
 //!
 //! Frequent whole words in enwik8 are replaced before modeling: the top NW1 by
-//! single unused byte codes, the next 256 (length >= 3) by a two-byte code
-//! (`ESC_WORD` + index). A second escape (`ESC_LIT`) precedes any literal code/
-//! escape byte so the transform round-trips on arbitrary input. The dictionary
-//! ships in the binary (small L(D)). See JOURNAL: dictionary preprocessing.
+//! single byte codes, the next 256 (length >= 3) by a two-byte code (`ESC_WORD`
+//! then index). The single-byte codes reuse byte values freed by escaping their
+//! rare literal occurrences (`< RARE_THRESHOLD` in the corpus); `ESC_LIT`
+//! precedes any literal code/escape byte so the transform round-trips on
+//! arbitrary input. The dictionary ships in the binary (small L(D)). See
+//! JOURNAL: dictionary preprocessing.
 
-pub(crate) const NW1: usize = 72;
+pub(crate) const NW1: usize = 173;
 pub(crate) const NW2: usize = 256;
 const WORDS1: [&[u8]; NW1] = [
     b"the",
@@ -81,21 +83,15 @@ const WORDS1: [&[u8]; NW1] = [
     b"who",
     b"d",
     b"used",
-];
-const CODES1: [u8; NW1] = [
-    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x0b, 0x0c, 0x0d, 0x11, 0x12, 0x13, 0x14,
-    0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x41, 0x42, 0x43, 0x44, 0x45,
-    0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55,
-    0x56, 0x57, 0x58, 0x59, 0x5a, 0x7f, 0xc0, 0xc1, 0xdd, 0xdf, 0xee, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5,
-    0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd,
-];
-const WORDS2: [&[u8]; NW2] = [
     b"there",
+    b"de",
     b"image",
     b"two",
+    b"b",
     b"time",
     b"space",
     b"after",
+    b"no",
     b"see",
     b"when",
     b"united",
@@ -104,17 +100,23 @@ const WORDS2: [&[u8]; NW2] = [
     b"language",
     b"only",
     b"world",
+    b"e",
     b"may",
+    b"c",
+    b"z",
     b"than",
     b"states",
     b"american",
+    b"th",
     b"align",
     b"right",
+    b"n",
     b"org",
     b"would",
     b"math",
     b"history",
     b"html",
+    b"m",
     b"preserve",
     b"people",
     b"xml",
@@ -124,7 +126,10 @@ const WORDS2: [&[u8]; NW2] = [
     b"over",
     b"system",
     b"center",
+    b"if",
     b"years",
+    b"f",
+    b"x",
     b"war",
     b"sup",
     b"use",
@@ -135,16 +140,21 @@ const WORDS2: [&[u8]; NW2] = [
     b"called",
     b"nbsp",
     b"during",
+    b"px",
     b"english",
     b"number",
     b"left",
     b"will",
     b"jpg",
     b"often",
+    b"so",
+    b"u",
     b"small",
     b"city",
     b"list",
+    b"g",
     b"thumb",
+    b"up",
     b"where",
     b"year",
     b"while",
@@ -156,12 +166,14 @@ const WORDS2: [&[u8]; NW2] = [
     b"then",
     b"under",
     b"century",
+    b"p",
     b"them",
     b"well",
     b"made",
     b"british",
     b"government",
     b"film",
+    b"r",
     b"since",
     b"national",
     b"part",
@@ -172,6 +184,21 @@ const WORDS2: [&[u8]; NW2] = [
     b"early",
     b"three",
     b"like",
+];
+const CODES1: [u8; NW1] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0b, 0x0c, 0x0d, 0x11, 0x12, 0x13,
+    0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x24, 0x2b, 0x40, 0x41,
+    0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51,
+    0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5e, 0x60, 0x7e, 0x7f, 0x81, 0x84, 0x85,
+    0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95,
+    0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5,
+    0xa6, 0xa7, 0xa8, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+    0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc0, 0xc1, 0xc2, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9,
+    0xca, 0xcb, 0xcc, 0xcd, 0xcf, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd,
+    0xde, 0xdf, 0xe1, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xf0,
+    0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd,
+];
+const WORDS2: [&[u8]; NW2] = [
     b"ndash",
     b"example",
     b"same",
@@ -346,6 +373,88 @@ const WORDS2: [&[u8]; NW2] = [
     b"school",
     b"single",
     b"become",
+    b"edu",
+    b"football",
+    b"america",
+    b"christian",
+    b"class",
+    b"generally",
+    b"development",
+    b"less",
+    b"color",
+    b"best",
+    b"few",
+    b"george",
+    b"islands",
+    b"written",
+    b"groups",
+    b"earth",
+    b"standard",
+    b"field",
+    b"books",
+    b"according",
+    b"down",
+    b"land",
+    b"david",
+    b"born",
+    b"battle",
+    b"began",
+    b"led",
+    b"official",
+    b"software",
+    b"rather",
+    b"service",
+    b"red",
+    b"body",
+    b"london",
+    b"works",
+    b"character",
+    b"million",
+    b"army",
+    b"sea",
+    b"short",
+    b"type",
+    b"support",
+    b"social",
+    b"economic",
+    b"open",
+    b"river",
+    b"court",
+    b"fact",
+    b"charles",
+    b"just",
+    b"every",
+    b"white",
+    b"culture",
+    b"off",
+    b"late",
+    b"current",
+    b"either",
+    b"special",
+    b"story",
+    b"show",
+    b"press",
+    b"december",
+    b"published",
+    b"named",
+    b"society",
+    b"natural",
+    b"region",
+    b"png",
+    b"good",
+    b"result",
+    b"ancient",
+    b"means",
+    b"today",
+    b"research",
+    b"league",
+    b"emperor",
+    b"said",
+    b"bgcolor",
+    b"person",
+    b"third",
+    b"play",
+    b"possible",
 ];
 pub(crate) const ESC_WORD: u8 = 0xfe;
 pub(crate) const ESC_LIT: u8 = 0xff;
@@ -546,15 +655,21 @@ mod tests {
     #[ignore = "regenerates dictionary tables from assets/enwik8; run manually"]
     fn gen_dict_tables() {
         use std::collections::HashMap;
+        // Bytes appearing fewer than this in the case-transformed corpus are
+        // "rare": escaping their literal occurrences (via ESC_LIT, the same
+        // mechanism that protects code bytes) frees their value as a single-byte
+        // dictionary code. ~0.4% of the stream is escape overhead at 10k; in
+        // return the single-byte dictionary roughly doubles.
+        const RARE_THRESHOLD: u64 = 10_000;
         let bytes = std::fs::read("assets/enwik8").unwrap();
         let cased = case_transform(&bytes);
-        let mut used = [false; 256];
+        let mut count = [0u64; 256];
         for &b in &cased {
-            used[b as usize] = true;
+            count[b as usize] += 1;
         }
         let avail: Vec<u8> = (0u8..=255)
             .filter(|&b| {
-                !used[b as usize]
+                count[b as usize] < RARE_THRESHOLD
                     && b != ESC_WORD
                     && b != ESC_LIT
                     && b != CAP1
