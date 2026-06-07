@@ -13,6 +13,12 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-07 — negative: xmatch does not subsume the high-order tables — keep the himaps
+
+Tested the idea-3 memory follow-up — replace the hashed high-order tables (himaps, orders 7/8/12/16) with the xmatch exact-data index, since both target high-order context. Dropped the himaps (`HI_ORDERS = []`, sparse contexts kept), leaving xmatch [6,8,12] to cover. Base lindcasex 1.4870 → 1.4922 (+0.0052); full stack lallx 1.4372 → 1.4404 (+0.0032). The full-stack loss is *smaller* than the base loss — the GRU and dictionary overlap the himaps' long-range signal, so the himaps are less load-bearing once those are present — but they are not redundant. The two are complementary: a himap is the all-history adaptive average per high-order context; xmatch is the recent empirical follower distribution. +0.0032 is about a third of the entire xmatch win, to save 1 GB — not worth it. Keep both.
+
+The "replace tables with the index" framing also does not help enwik9 directly: the xmatch position chains (~4 B × N per order, ~12 GB at enwik9) already *exceed* the fixed himaps (1 GB), so the index is the larger cost, not the smaller. The enwik9 memory problem (fixed tables ~8 GB + chains ~12 GB, over the 10 GB cap) routes through a memory-efficient index (suffix automaton) or holistic table shrinking — not dropping the himaps. lallx 1.4372 (himaps + xmatch) stays best.
+
 ## 2026-06-07 — exact data-indexed match arm (idea 3): new best lallx 1.4372 (−0.0084 full stack), trading hashed tables for the data at L(D) = 0
 
 CDR's framing: we are not writing a streaming compressor — the whole file is in memory at encode time, and the decoder reconstructs the same past as it goes, so some lookup structures can be replaced by indexing the actual data. The hashed high-order context tables carry a collision/eviction tax; an index into the data has none (it is linear in the data, not in the context space) and is causal, so the decoder rebuilds it identically — L(D) = 0.
