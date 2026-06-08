@@ -20,15 +20,27 @@ default     = ["submission"]
 # Submission build: zero threading deps, no training dependencies. This is
 # what ships. The `build.sh` CI gate verifies no threading crate sneaks in.
 submission  = []
+# v8 neural codec: pulls in burn (heavy, threaded) — NOT in the submission set.
+neural      = ["dep:burn"]
 
 [dependencies]
 anyhow      = "=1.0.102"
 clap        = { version = "=4.6.1", features = ["derive"] }
+burn        = { version = "0.21", optional = true, default-features = false, features = ["std", "wgpu", "ndarray", "autodiff"] }
 
 [dev-dependencies]
 assert_cmd        = "=2.2.1"
 pretty_assertions = "=1.4.1"
 proptest          = "=1.11.0"
+
+[[example]]
+name = "burnbench"
+required-features = ["neural"]
+
+# Optimize dependencies even in dev so neural iteration (CPU matmul etc.) is
+# fair/fast; keep our own crate at dev opt for quick recompiles.
+[profile.dev.package."*"]
+opt-level = 3
 
 [lints.rust]
 keyword_idents = { level = "forbid", priority = -1 }
