@@ -19,6 +19,7 @@ use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
 use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::Distribution;
 
 // ---------------------------------------------------------------------------
 // Carryless range coder (Subbotin style). Multi-symbol via cumulative-freq CDF.
@@ -153,13 +154,48 @@ fn ac_decode_symbol(dec: &mut RangeDecoder, cdf: &[u32]) -> usize {
 // Decoder-only Transformer (byte/token-level), tied embeddings, learned pos.
 // fp first; BitNet QAT linear is a localized swap once round-trip works.
 // ---------------------------------------------------------------------------
+// BitNet b1.58 QAT linear: ternary absmean weights + per-token int8 activations,
+// straight-through estimator via detach(). Forward == quantized; grad == identity
+// to the latent fp weight. detach() is a no-op off-autodiff, so the same forward
+// runs for training (Autodiff) and inference. No bias (BitNet removes biases).
+#[derive(Module, Debug)]
+struct BitLinear<B: Backend> {
+    weight: burn::module::Param<Tensor<B, 2>>, // [out, in] latent fp
+    bit: bool,                                 // false = plain fp linear (A/B toggle)
+}
+
+impl<B: Backend> BitLinear<B> {
+    fn new(in_f: usize, out_f: usize, bit: bool, device: &B::Device) -> Self {
+        let std = (1.0 / in_f as f64).sqrt();
+        let weight = Tensor::random([out_f, in_f], Distribution::Normal(0.0, std), device);
+        Self { weight: burn::module::Param::from_tensor(weight), bit }
+    }
+
+    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let w = self.weight.val(); // [out, in]
+        if !self.bit {
+            return x.matmul(w.transpose().unsqueeze_dim(0));
+        }
+        // ternary weight (per-tensor absmean) with STE
+        let gamma = w.clone().abs().mean().reshape([1, 1]).add_scalar(1e-5);
+        let w_t = w.clone().div(gamma.clone()).round().clamp(-1.0, 1.0);
+        let w_q = w_t.mul(gamma);
+        let w_used = w.clone() + (w_q - w).detach();
+        // per-token int8 activation (absmax) with STE
+        let s = x.clone().abs().max_dim(2).div_scalar(127.0).clamp_min(1e-5); // [b,t,1]
+        let x_q = x.clone().div(s.clone()).round().clamp(-127.0, 127.0).mul(s);
+        let x_used = x.clone() + (x_q - x).detach();
+        x_used.matmul(w_used.transpose().unsqueeze_dim(0))
+    }
+}
+
 #[derive(Module, Debug)]
 struct Block<B: Backend> {
     norm1: LayerNorm<B>,
     attn: MultiHeadAttention<B>,
     norm2: LayerNorm<B>,
-    ff1: Linear<B>,
-    ff2: Linear<B>,
+    ff1: BitLinear<B>,
+    ff2: BitLinear<B>,
 }
 
 #[derive(Module, Debug)]
@@ -178,6 +214,8 @@ struct GptConfig {
     n_heads: usize,
     ffn: usize,
     ctx: usize,
+    #[config(default = false)]
+    bit: bool,
 }
 
 impl GptConfig {
@@ -189,8 +227,8 @@ impl GptConfig {
                     .with_dropout(0.0)
                     .init(device),
                 norm2: LayerNormConfig::new(self.d_model).init(device),
-                ff1: LinearConfig::new(self.d_model, self.ffn).init(device),
-                ff2: LinearConfig::new(self.ffn, self.d_model).init(device),
+                ff1: BitLinear::new(self.d_model, self.ffn, self.bit, device),
+                ff2: BitLinear::new(self.ffn, self.d_model, self.bit, device),
             })
             .collect();
         Gpt {
@@ -378,46 +416,48 @@ fn nn_decode<B: Backend>(
     out
 }
 
-fn main() {
-    test_coder();
-
-    let data = std::fs::read("assets/enwik8").expect("read enwik8");
-    let train_data = &data[..256 * 1024];
-    let test = &data[256 * 1024..256 * 1024 + 240]; // held-out slice
-    let cfg = GptConfig::new(VOCAB, 128, 4, 4, 512, 256);
-
-    // ---- train on GPU (autodiff) ----
+fn train_and_eval(data: &[u8], test: &[u8], cfg: &GptConfig, label: &str) {
     type GpuAd = Autodiff<Wgpu<f32, i32>>;
     let gdev = WgpuDevice::default();
-    println!("training on GPU ({} params)...", cfg.init::<Wgpu<f32, i32>>(&gdev).num_params());
-    let model = train::<GpuAd>(train_data, &cfg, &gdev, 300);
+    let nparams = cfg.init::<Wgpu<f32, i32>>(&gdev).num_params();
+    println!("[{label}] training on GPU ({nparams} params)...");
+    let model = train::<GpuAd>(&data[..256 * 1024], cfg, &gdev, 300);
 
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-    model.clone().save_file("/tmp/v8model", &recorder).expect("save");
+    let path = format!("/tmp/v8model_{label}");
+    model.clone().save_file(&path, &recorder).expect("save");
 
-    // ---- GPU inference round-trip ----
-    let gpu_model = model.valid(); // Gpt<Wgpu>
+    let gpu_model = model.valid();
     let arc = nn_encode::<Wgpu<f32, i32>>(&gpu_model, &gdev, test, 0);
     let dec = nn_decode::<Wgpu<f32, i32>>(&gpu_model, &gdev, &arc, test.len(), 0);
     println!(
-        "GPU: roundtrip {}  bpb {:.3}  ({} bytes -> {} bytes)",
+        "[{label}] GPU: roundtrip {}  bpb {:.3}  ({} -> {} bytes)",
         dec == test,
         8.0 * arc.len() as f64 / test.len() as f64,
         test.len(),
         arc.len()
     );
 
-    // ---- CPU inference round-trip (load GPU-trained weights onto NdArray) ----
     let cdev = NdArrayDevice::Cpu;
     let cpu_model = cfg
         .init::<NdArray<f32, i32>>(&cdev)
-        .load_file("/tmp/v8model", &recorder, &cdev)
+        .load_file(&path, &recorder, &cdev)
         .expect("load");
     let arc_c = nn_encode::<NdArray<f32, i32>>(&cpu_model, &cdev, test, 0);
     let dec_c = nn_decode::<NdArray<f32, i32>>(&cpu_model, &cdev, &arc_c, test.len(), 0);
     println!(
-        "CPU: roundtrip {}  bpb {:.3}",
+        "[{label}] CPU: roundtrip {}  bpb {:.3}",
         dec_c == test,
         8.0 * arc_c.len() as f64 / test.len() as f64
     );
+}
+
+fn main() {
+    test_coder();
+    let data = std::fs::read("assets/enwik8").expect("read enwik8");
+    let test = &data[256 * 1024..256 * 1024 + 240]; // held-out slice
+    let fp = GptConfig::new(VOCAB, 128, 4, 4, 512, 256).with_bit(false);
+    let bit = GptConfig::new(VOCAB, 128, 4, 4, 512, 256).with_bit(true);
+    train_and_eval(&data, test, &fp, "fp");
+    train_and_eval(&data, test, &bit, "bitnet");
 }
