@@ -309,6 +309,20 @@ impl Model {
             blocks,
         }
     }
+
+    /// `(vocab, d_model, n_layers, n_heads, ffn, ctx)` for reporting.
+    pub(crate) const fn dims(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let c = self.cfg;
+        (c.vocab, c.d_model, c.n_layers, c.n_heads, c.ffn, c.ctx)
+    }
+
+    /// Total parameter count (ternary weights counted as 1 each).
+    pub(crate) const fn num_params(&self) -> usize {
+        let c = self.cfg;
+        let (d, ffn) = (c.d_model, c.ffn);
+        let per_block = 2 * d /* norm1 */ + 4 * d * d /* qkvo */ + 2 * d /* norm2 */ + 2 * d * ffn;
+        c.vocab * d /* tok */ + c.ctx * d /* pos */ + 2 * d /* norm_f */ + c.n_layers * per_block
+    }
 }
 
 // --- scalar math -----------------------------------------------------------
@@ -679,13 +693,20 @@ mod tests {
             .into_bytes()
     }
 
-    /// Build a minimal valid v2 blob (real tiny BPE + tiny model with
-    /// deterministic pseudo-random ternary/f32 weights) — exercises the reader,
-    /// tokenizer, forward, and coder end-to-end without the GPU trainer.
-    fn tiny_blob() -> (Vec<u8>, usize) {
-        let bpe = crate::bpe::Bpe::learn(&corpus(), 288);
+    /// Assemble a valid v2 blob for `bpe` with deterministic pseudo-random
+    /// ternary/f32 weights — a random-init model that round-trips (round-trip
+    /// is weight-independent), exercising reader + tokenizer + forward + coder
+    /// without the GPU trainer.
+    fn build_blob(
+        bpe: &crate::bpe::Bpe,
+        d: usize,
+        layers: usize,
+        heads: usize,
+        ffn: usize,
+        ctx: usize,
+        seed: u32,
+    ) -> Vec<u8> {
         let vocab = bpe.vocab_size();
-        let (d, layers, heads, ffn, ctx) = (8usize, 2usize, 2usize, 16usize, 32usize);
         let mut out = Vec::new();
         for v in [
             MAGIC,
@@ -700,7 +721,7 @@ mod tests {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out.extend_from_slice(&bpe.to_bytes());
-        let mut s = 0x1234_5678u32;
+        let mut s = seed;
         let mut nf = || {
             s ^= s << 13;
             s ^= s >> 17;
@@ -742,7 +763,13 @@ mod tests {
             push_tern(&mut out, ffn, d, &mut nf); // ff1
             push_tern(&mut out, d, ffn, &mut nf); // ff2
         }
-        (out, vocab)
+        out
+    }
+
+    fn tiny_blob() -> (Vec<u8>, usize) {
+        let bpe = crate::bpe::Bpe::learn(&corpus(), 288);
+        let vocab = bpe.vocab_size();
+        (build_blob(&bpe, 8, 2, 2, 16, 32, 0x1234_5678), vocab)
     }
 
     #[test]
@@ -780,5 +807,45 @@ mod tests {
                 assert!((a - b).abs() < 1e-5, "cache diverged: {a} vs {b}");
             }
         }
+    }
+
+    /// Integration check on real data: a (reproducible) random point ≥ 1 MB from
+    /// either end of enwik8, online-BPE up to that point, then the CPU codec
+    /// encodes→decodes 1000 tokens of the following held-out bytes byte-for-byte.
+    /// Skips cleanly if `assets/enwik8` is absent (e.g. fresh CI checkout).
+    #[test]
+    fn enwik8_random_point_roundtrip() {
+        let Ok(data) = std::fs::read("assets/enwik8") else {
+            eprintln!("skip enwik8_random_point_roundtrip: assets/enwik8 absent");
+            return;
+        };
+        let mb = 1 << 20;
+        assert!(data.len() > 4 * mb);
+        // reproducible "random" point in [1 MB, len-1 MB]
+        let mut state = 0x9E37_79B9u32;
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let p = mb + (state as usize) % (data.len() - 2 * mb);
+
+        let win = 256 * 1024; // bounded online-BPE window up to the point
+        let bpe = crate::bpe::Bpe::learn(&data[p - win..p], 2048);
+        let after = bpe.encode(&data[p..p + 16 * 1024]);
+        assert!(after.len() >= 1000);
+        let toks = &after[..1000];
+        let mut bytes = Vec::new();
+        for &t in toks {
+            bytes.extend_from_slice(bpe.expand(t));
+        }
+
+        // random-init model over this fresh vocab (round-trip is weight-independent)
+        let blob = build_blob(&bpe, 64, 2, 4, 128, 256, 0xABCD_1234);
+        let model = Model::from_blob(&blob);
+        let arc = model.compress(&bytes, 0);
+        let dec = model.decompress(&arc, bytes.len(), 0);
+        assert_eq!(
+            dec, bytes,
+            "CPU codec must round-trip 1000 tokens from a random enwik8 point"
+        );
     }
 }

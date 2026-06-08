@@ -156,10 +156,8 @@ fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
     let slice = &bytes[offset..offset + len];
     let model = model();
     let (bin_bytes, ld) = ld_bpb();
-    eprintln!(
-        "v8 weights: {} bytes embedded; binary {bin_bytes} bytes",
-        V8_WEIGHTS.len()
-    );
+    let (vocab, d, layers, heads, ffn, ctx) = model.dims();
+    let params = model.num_params();
 
     let start = Instant::now();
     let archive = model.compress(slice, BOS);
@@ -170,17 +168,33 @@ fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
 
     let ok = decoded == slice;
     let lc = 8.0 * archive.len() as f64 / slice.len() as f64;
+    let enc_ms_byte = encode.as_secs_f64() * 1e3 / len as f64;
+    let dec_ms_byte = decode.as_secs_f64() * 1e3 / len as f64;
+    let eta_h = |ms_byte: f64| ms_byte * 1e9 / 1e3 / 3600.0;
+
     println!();
-    println!("Slice:        {len} bytes  [{offset}, {})", offset + len);
-    println!("Archive:      {} bytes", archive.len());
-    println!("L(C):         {lc:.4} bpb  (this slice)");
-    println!("L(D):         {ld:.4} bpb  ({bin_bytes} B binary × 2 penalty / enwik9)");
+    println!("Architecture: ternary BitNet transformer (KV-cached, CPU/auto-vec)");
+    println!(
+        "              d={d} layers={layers} heads={heads} ffn={ffn} ctx={ctx}  vocab={vocab}  ~{:.2}M params",
+        params as f64 / 1e6,
+    );
+    println!(
+        "Weights:      {} B blob, {bin_bytes} B binary",
+        V8_WEIGHTS.len()
+    );
+    println!(
+        "Eval slice:   {len} bytes  [{offset}, {})  -> {} archive bytes",
+        offset + len,
+        archive.len()
+    );
+    println!("L(C):         {lc:.4} bpb  (enwik8 slice)");
+    println!("L(D):         {ld:.4} bpb  (binary × 2 penalty / enwik9)");
     println!("Net:          {:.4} bpb", lc + ld);
     println!("Round-trip:   {}", if ok { "OK" } else { "MISMATCH" });
     println!(
-        "Throughput:   {:.3} ms/byte encode, {:.3} ms/byte decode",
-        encode.as_secs_f64() * 1e3 / len as f64,
-        decode.as_secs_f64() * 1e3 / len as f64,
+        "CPU speed:    enc {enc_ms_byte:.4} ms/byte (enwik9 ~{:.1} h), dec {dec_ms_byte:.4} ms/byte (~{:.1} h)",
+        eta_h(enc_ms_byte),
+        eta_h(dec_ms_byte),
     );
     if !ok {
         bail!("v8 round-trip mismatch");

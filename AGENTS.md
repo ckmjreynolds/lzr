@@ -30,14 +30,25 @@ Always build via `./build.sh`, not a bare `cargo build`. The script runs fmt, cl
 
 ## v8 design principles (current branch)
 
-The v8 codec is a **pre-trained BitNet transformer** driving an arithmetic coder. The split that makes it shippable:
+The v8 codec is a **pre-trained BitNet transformer over online-BPE tokens** driving an arithmetic coder. The split that makes it shippable:
 
 - **Train on GPU, ship pure Rust.** Training (`examples/neural.rs`, behind the `neural` feature) uses `burn` on the wgpu/Metal GPU as an autodiff tensor engine — `burn` is heavy and threaded, so it is **never** in the submission build. It produces a weight blob. The submission side (`src/v8.rs`, default/submission build, **no `burn`, no threads**) `include_bytes!`s the blob and runs a hand-rolled scalar forward + range coder. Same binary compresses and decompresses.
-- **Ternary BitNet, QAT not post-hoc.** Weights are ternary (`{-1,0,1}` + per-tensor absmean scale) trained with quantization-aware training (fake-quant + straight-through estimator). Post-hoc quantization does not survive (v5: 1.25→3.04 bpb) — it must be trained in. The blob packs ternary at 2 bits/weight (1.6 b/w trit-packing is a known tightening); embeddings/norms are f32 in the blob but need not be — quantize them once a large BPE vocab makes the embedding table dominant.
-- **Determinism is the correctness backbone.** Encode and decode share the *identical* per-position forward and the same CDF construction, so the codec round-trips by construction regardless of float-order differences against the trainer. The pure-Rust forward is checked to reproduce the trainer's ternary CPU bpb, and an in-binary round-trip is unit-tested.
+- **GPU is for training and batched bpb estimation only — not the codec.** The autoregressive codec is single-stream (batch 1, one token at a time). On that workload the CPU `v8` path (KV-cache + auto-vec, no per-call launch overhead) **beats burn-GPU ~45×** — measured 2026-06-08: GPU ~3.8 ms/byte vs CPU ~0.085 ms/byte (enwik9 ETA ~1050 h vs ~24 h). burn-GPU's win (~12×) is on *batched* matmul, i.e. training and a teacher-forced single-pass bpb estimate. So: **run the actual codec, authoritative bpb, throughput, and the submission on the CPU `v8` path; use GPU for training and quick batched bpb estimates.** There is no reason to test or report GPU codec speed.
+- **Backends are not bit-identical → no cross-backend AC.** burn (GPU) and `v8` (CPU) are different float implementations; per-step CDFs diverge, so a GPU-encoded archive does **not** decode on the CPU codec (and vice versa) — verified false. Each backend is internally deterministic and round-trips with itself; that self-consistency is the only guarantee the AC needs (the shipped binary encodes and decodes on the same CPU path).
+- **Online-BPE tokenizer (`src/bpe.rs`).** Deterministic incremental BPE: sweep the data in 1% passes, merging top pairs up to a quota ramping to the target vocab (8K). It is a learning *curriculum*, fixed for the run — the merge list tokenizes the training data and ships in the blob so the decoder tokenizes identically. Shared verbatim with the trainer via `#[path]`. Caps to respect before scaling: the range coder's `CDF_TOTAL = 1<<16` floors each symbol at 1, so **vocab ≤ 65536**; `Bpe::encode` is O(merges × len), needing a near-linear tokenizer before enwik9-scale compress.
+- **Ternary BitNet, QAT not post-hoc.** Weights are ternary (`{-1,0,1}` + per-tensor absmean scale) trained with quantization-aware training (fake-quant + straight-through estimator). Post-hoc quantization does not survive (v5: 1.25→3.04 bpb) — it must be trained in. The blob packs ternary at 2 bits/weight (1.6 b/w trit-packing is a known tightening). The **tied token embedding is ternary too** (it is the dominant parameter table at a large BPE vocab, and it trains fine — tracks fp); pos and the LayerNorm affines stay f32 (small).
 - **Incremental KV-cache forward.** `step` processes one token, appending its K/V; past tokens' K/V are finalized by causality, making the per-byte cost linear, not O(t²). Learned **absolute** positions cannot slide (it would invalidate the cache), so the context **block-resets** at the `ctx` boundary — matches training's contiguous-from-0 windows. True sliding needs relative positions (ALiBi/RoPE), a deliberate future change.
 - **Auto-vec kernels (see kernel strategy above).** The ternary matvec is a multi-accumulator f32 `dot` (`LANES=16`, `mul_add` → NEON `fmla.4s`) over weights unpacked to f32 in RAM (the on-disk blob stays 2-bit, so `L(D)` is unaffected). Reusable `Scratch` buffers avoid per-byte allocation. An int8 `sdot` matvec (~4×) is the next kernel lever but departs from pure-auto-vec f32.
-- **Eval via `lzr nn-test`.** Quick self-check: compress a corpus slice with the embedded weights, verify the round-trip, report `L(C)`, `L(D)` (from the real binary), and net bpb. The training run prints the held-out bpb on both GPU and CPU backends.
+
+### Per-turn reporting
+
+When a turn changes the codec (and there is no test failure), report — `lzr nn-test` prints all of it:
+
+- **Codec parameters and architecture**: model type/size, `d_model`/layers/heads/ffn/ctx, BPE vocab size, parameter count.
+- **Encoder bpb on enwik8** — `L(C)` on a held-out slice (and `L(D)` / net).
+- **CPU encode/decode throughput as an enwik9 ETA** (hours). CPU only — GPU codec speed is not reported (see above).
+
+`v8.rs` also carries an integration test (`enwik8_random_point_roundtrip`): a reproducible random point ≥ 1 MB from either end of enwik8, online-BPE up to it, then a CPU encode→decode of 1000 tokens of the following bytes, byte-for-byte. It is pure-Rust (runs in `build.sh`) and skips cleanly if `assets/enwik8` is absent.
 
 ## Dependencies
 
