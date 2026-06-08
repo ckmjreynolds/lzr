@@ -175,7 +175,11 @@ struct Config {
 
 struct TernLinear {
     scale: f32,
-    w: Vec<i8>, // out*in values in {-1,0,1}, row-major [out, in]
+    // out*in ternary values {-1,0,1} as f32, row-major [out, in]. f32 (not i8)
+    // so the dot-product inner loop is a pure-f32 reduction the compiler can
+    // auto-vectorize — costs 4× RAM, but the on-disk blob stays 2-bit (L(D)
+    // unchanged), and it is unpacked here once at load.
+    w: Vec<f32>,
     out_f: usize,
     in_f: usize,
 }
@@ -237,9 +241,9 @@ impl Reader<'_> {
                 }
                 let code = (byte >> (2 * k)) & 0b11;
                 w.push(match code {
-                    0 => -1i8,
-                    1 => 0,
-                    _ => 1,
+                    0 => -1.0f32,
+                    1 => 0.0,
+                    _ => 1.0,
                 });
             }
         }
@@ -332,6 +336,36 @@ fn layernorm(x: &[f32], t: usize, d: usize, ln: &LayerNorm) -> Vec<f32> {
     out
 }
 
+/// Auto-vectorizable f32 dot product. The `LANES`-wide accumulator array makes
+/// the reduction associative-by-construction (each lane is an independent sum),
+/// which is what lets LLVM emit SIMD FMAs — a single scalar accumulator cannot
+/// vectorize without `-ffast-math`. `chunks_exact` keeps the hot loop
+/// bounds-check-free. `a` and `b` must be the same length.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    const LANES: usize = 8;
+    let mut acc = [0f32; LANES];
+    let mut ac = a.chunks_exact(LANES);
+    let mut bc = b.chunks_exact(LANES);
+    for (av, bv) in ac.by_ref().zip(bc.by_ref()) {
+        for l in 0..LANES {
+            acc[l] += av[l] * bv[l];
+        }
+    }
+    let mut sum: f32 = acc.iter().sum();
+    for (av, bv) in ac.remainder().iter().zip(bc.remainder()) {
+        sum += av * bv;
+    }
+    sum
+}
+
+/// `dst += a * src` over equal-length slices — the contiguous form lets the
+/// attention value-mixing vectorize (the strided gather form does not).
+fn saxpy(dst: &mut [f32], a: f32, src: &[f32]) {
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d += a * *s;
+    }
+}
+
 /// BitLinear forward: per-token int8-quantized activations × ternary weights.
 /// `x` is [t, in_f]; returns [t, out_f]. Replicates the trainer's inference math.
 fn bitlinear(x: &[f32], t: usize, lin: &TernLinear) -> Vec<f32> {
@@ -347,11 +381,7 @@ fn bitlinear(x: &[f32], t: usize, lin: &TernLinear) -> Vec<f32> {
         }
         for o in 0..out_f {
             let w = &lin.w[o * in_f..o * in_f + in_f];
-            let mut acc = 0f32;
-            for i in 0..in_f {
-                acc += xq[i] * f32::from(w[i]);
-            }
-            out[r * out_f + o] = acc * lin.scale;
+            out[r * out_f + o] = dot(&xq, w) * lin.scale;
         }
     }
     out
@@ -432,19 +462,13 @@ impl Model {
                 let off = head * dk;
                 let mut scores = vec![0f32; clen];
                 for (p, sc) in scores.iter_mut().enumerate() {
-                    let mut dot = 0f32;
-                    for c in 0..dk {
-                        dot += q[off + c] * cache.k[l][p * d + off + c];
-                    }
-                    *sc = dot * scale;
+                    let kp = &cache.k[l][p * d + off..p * d + off + dk];
+                    *sc = dot(&q[off..off + dk], kp) * scale;
                 }
                 softmax_inplace(&mut scores);
-                for c in 0..dk {
-                    let mut acc = 0f32;
-                    for (p, &w) in scores.iter().enumerate() {
-                        acc += w * cache.v[l][p * d + off + c];
-                    }
-                    ctx[off + c] = acc;
+                let dst = &mut ctx[off..off + dk];
+                for (p, &w) in scores.iter().enumerate() {
+                    saxpy(dst, w, &cache.v[l][p * d + off..p * d + off + dk]);
                 }
             }
             let o = bitlinear(&ctx, 1, &blk.wo);
@@ -466,12 +490,7 @@ impl Model {
         let xf = layernorm(&x, 1, d, &self.norm_f);
         let mut logits = vec![0f32; cfg.vocab];
         for (vix, lg) in logits.iter_mut().enumerate() {
-            let w = &self.tok[vix * d..vix * d + d];
-            let mut acc = 0f32;
-            for i in 0..d {
-                acc += xf[i] * w[i];
-            }
-            *lg = acc;
+            *lg = dot(&xf, &self.tok[vix * d..vix * d + d]);
         }
         softmax_inplace(&mut logits);
         logits
@@ -505,19 +524,14 @@ impl Model {
                 for r1 in 0..t {
                     let mut scores = vec![0f32; r1 + 1];
                     for (r2, sc) in scores.iter_mut().enumerate() {
-                        let mut dot = 0f32;
-                        for c in 0..dk {
-                            dot += q[r1 * d + off + c] * k[r2 * d + off + c];
-                        }
-                        *sc = dot * scale;
+                        let qh = &q[r1 * d + off..r1 * d + off + dk];
+                        let kh = &k[r2 * d + off..r2 * d + off + dk];
+                        *sc = dot(qh, kh) * scale;
                     }
                     softmax_inplace(&mut scores);
-                    for c in 0..dk {
-                        let mut acc = 0f32;
-                        for (r2, &w) in scores.iter().enumerate() {
-                            acc += w * v[r2 * d + off + c];
-                        }
-                        ctx[r1 * d + off + c] = acc;
+                    let dst = &mut ctx[r1 * d + off..r1 * d + off + dk];
+                    for (r2, &w) in scores.iter().enumerate() {
+                        saxpy(dst, w, &v[r2 * d + off..r2 * d + off + dk]);
                     }
                 }
             }
@@ -541,12 +555,7 @@ impl Model {
         let last = &xf[(t - 1) * d..t * d];
         let mut logits = vec![0f32; cfg.vocab];
         for (vix, lg) in logits.iter_mut().enumerate() {
-            let w = &self.tok[vix * d..vix * d + d];
-            let mut acc = 0f32;
-            for i in 0..d {
-                acc += last[i] * w[i];
-            }
-            *lg = acc;
+            *lg = dot(last, &self.tok[vix * d..vix * d + d]);
         }
         softmax_inplace(&mut logits);
         logits
