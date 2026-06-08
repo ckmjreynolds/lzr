@@ -4,6 +4,7 @@ target/
 .DS_Store
 assets/*
 !assets/struct_mask.bin
+!assets/v8weights.bin
 checkpoints/
 lcov.info
 src/.DS_Store

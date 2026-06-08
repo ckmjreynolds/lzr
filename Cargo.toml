@@ -77,6 +77,18 @@ panic = "abort"
 lto = "fat"
 codegen-units = 1
 
+# Final-submission build: optimize for *binary size* (counted 2× in Hutter's
+# score), not throughput. UPX is applied on top at submission time. Build with
+# `cargo build --profile submission`. Keeps the plain `release` profile fast for
+# day-to-day v7/codec iteration.
+[profile.submission]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+
 [profile.bench]
 strip = true
 panic = "abort"

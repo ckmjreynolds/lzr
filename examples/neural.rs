@@ -15,14 +15,11 @@ use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, NdArray, Wgpu};
 use burn::module::{AutodiffModule, Module};
-use burn::nn::attention::{
-    MhaInput, MultiHeadAttention, MultiHeadAttentionConfig, generate_autoregressive_mask,
-};
 use burn::nn::loss::CrossEntropyLossConfig;
-use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
+use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::Distribution;
 use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::backend::AutodiffBackend;
@@ -210,13 +207,46 @@ impl<B: Backend> BitLinear<B> {
     }
 }
 
+// Hand-built causal multi-head attention with BitLinear Q/K/V/O projections.
+// Replaces burn's MHA so (a) every projection weight is accessible for packing,
+// (b) the whole model is ternary.
+fn causal_mask<B: Backend>(t: usize, device: &B::Device) -> Tensor<B, 4> {
+    let mut m = vec![0f32; t * t];
+    for i in 0..t {
+        for j in (i + 1)..t {
+            m[i * t + j] = -1e9;
+        }
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(m, [t, t]), device).reshape([1, 1, t, t])
+}
+
 #[derive(Module, Debug)]
 struct Block<B: Backend> {
     norm1: LayerNorm<B>,
-    attn: MultiHeadAttention<B>,
+    wq: BitLinear<B>,
+    wk: BitLinear<B>,
+    wv: BitLinear<B>,
+    wo: BitLinear<B>,
     norm2: LayerNorm<B>,
     ff1: BitLinear<B>,
     ff2: BitLinear<B>,
+    n_heads: usize,
+}
+
+impl<B: Backend> Block<B> {
+    fn attn(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [b, t, d] = x.dims();
+        let dk = d / self.n_heads;
+        let to_heads = |z: Tensor<B, 3>| z.reshape([b, t, self.n_heads, dk]).swap_dims(1, 2);
+        let q = to_heads(self.wq.forward(x.clone())); // [b,h,t,dk]
+        let k = to_heads(self.wk.forward(x.clone()));
+        let v = to_heads(self.wv.forward(x.clone()));
+        let scores = q.matmul(k.swap_dims(2, 3)).div_scalar((dk as f64).sqrt()); // [b,h,t,t]
+        let scores = scores + causal_mask::<B>(t, &x.device());
+        let ctx = softmax(scores, 3).matmul(v); // [b,h,t,dk]
+        let ctx = ctx.swap_dims(1, 2).reshape([b, t, d]);
+        self.wo.forward(ctx)
+    }
 }
 
 #[derive(Module, Debug)]
@@ -241,15 +271,18 @@ struct GptConfig {
 
 impl GptConfig {
     fn init<B: Backend>(&self, device: &B::Device) -> Gpt<B> {
+        let d = self.d_model;
         let blocks = (0..self.n_layers)
             .map(|_| Block {
-                norm1: LayerNormConfig::new(self.d_model).init(device),
-                attn: MultiHeadAttentionConfig::new(self.d_model, self.n_heads)
-                    .with_dropout(0.0)
-                    .init(device),
-                norm2: LayerNormConfig::new(self.d_model).init(device),
-                ff1: BitLinear::new(self.d_model, self.ffn, self.bit, device),
-                ff2: BitLinear::new(self.ffn, self.d_model, self.bit, device),
+                norm1: LayerNormConfig::new(d).init(device),
+                wq: BitLinear::new(d, d, self.bit, device),
+                wk: BitLinear::new(d, d, self.bit, device),
+                wv: BitLinear::new(d, d, self.bit, device),
+                wo: BitLinear::new(d, d, self.bit, device),
+                norm2: LayerNormConfig::new(d).init(device),
+                ff1: BitLinear::new(d, self.ffn, self.bit, device),
+                ff2: BitLinear::new(self.ffn, d, self.bit, device),
+                n_heads: self.n_heads,
             })
             .collect();
         Gpt {
@@ -264,19 +297,13 @@ impl GptConfig {
 impl<B: Backend> Gpt<B> {
     /// tokens [batch, seq] Int -> logits [batch, seq, vocab].
     fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let [b, t] = tokens.dims();
+        let [_b, t] = tokens.dims();
         let device = tokens.device();
         let mut x = self.tok.forward(tokens); // [b, t, d]
         let pos_ids = Tensor::<B, 1, Int>::arange(0..t as i64, &device).reshape([1, t]);
         x = x + self.pos.forward(pos_ids); // broadcast [1,t,d] over batch
-        let mask = generate_autoregressive_mask::<B>(b, t, &device); // [b,t,t] bool, true=block
         for blk in &self.blocks {
-            let normed = blk.norm1.forward(x.clone());
-            let attn = blk
-                .attn
-                .forward(MhaInput::self_attn(normed).mask_attn(mask.clone()))
-                .context;
-            x = x + attn;
+            x = x.clone() + blk.attn(blk.norm1.forward(x.clone()));
             let n2 = blk.norm2.forward(x.clone());
             x = x + blk.ff2.forward(gelu(blk.ff1.forward(n2)));
         }
@@ -437,6 +464,85 @@ fn nn_decode<B: Backend>(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Weight packing — produce the submission blob the pure-Rust codec consumes.
+// Must replicate BitLinear's quantization exactly: scale = mean(|w|)+1e-5,
+// ternary = round(w/scale).clamp(-1,1). Format mirrors `src/v8.rs::Model`.
+// ---------------------------------------------------------------------------
+const BLOB_MAGIC: u32 = 0x3852_5A4C; // "LZR8" little-endian
+const BLOB_VERSION: u32 = 1;
+
+fn push_f32s(out: &mut Vec<u8>, vals: &[f32]) {
+    for &v in vals {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+fn tensor_vec<B: Backend, const R: usize>(t: Tensor<B, R>) -> Vec<f32> {
+    t.into_data().to_vec::<f32>().unwrap()
+}
+
+/// Pack one BitLinear `[out,in]` latent weight as scale f32 + 2-bit ternary.
+fn pack_bitlinear<B: Backend>(out: &mut Vec<u8>, lin: &BitLinear<B>) {
+    let w = tensor_vec(lin.weight.val()); // row-major [out, in]
+    let scale = (w.iter().map(|v| v.abs()).sum::<f32>() / w.len() as f32) + 1e-5;
+    out.extend_from_slice(&scale.to_le_bytes());
+    let mut byte = 0u8;
+    let mut k = 0u32;
+    for &v in &w {
+        let code: u8 = match (v / scale).round().clamp(-1.0, 1.0) as i32 {
+            -1 => 0,
+            0 => 1,
+            _ => 2,
+        };
+        byte |= code << (2 * k);
+        k += 1;
+        if k == 4 {
+            out.push(byte);
+            byte = 0;
+            k = 0;
+        }
+    }
+    if k > 0 {
+        out.push(byte);
+    }
+}
+
+fn push_layernorm<B: Backend>(out: &mut Vec<u8>, ln: &LayerNorm<B>) {
+    push_f32s(out, &tensor_vec(ln.gamma.val()));
+    push_f32s(out, &tensor_vec(ln.beta.clone().unwrap().val()));
+}
+
+fn pack_model<B: Backend>(model: &Gpt<B>, cfg: &GptConfig) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in [
+        BLOB_MAGIC,
+        BLOB_VERSION,
+        cfg.vocab as u32,
+        cfg.d_model as u32,
+        cfg.n_layers as u32,
+        cfg.n_heads as u32,
+        cfg.ffn as u32,
+        cfg.ctx as u32,
+    ] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    push_f32s(&mut out, &tensor_vec(model.tok.weight.val()));
+    push_f32s(&mut out, &tensor_vec(model.pos.weight.val()));
+    push_layernorm(&mut out, &model.norm_f);
+    for blk in &model.blocks {
+        push_layernorm(&mut out, &blk.norm1);
+        pack_bitlinear(&mut out, &blk.wq);
+        pack_bitlinear(&mut out, &blk.wk);
+        pack_bitlinear(&mut out, &blk.wv);
+        pack_bitlinear(&mut out, &blk.wo);
+        push_layernorm(&mut out, &blk.norm2);
+        pack_bitlinear(&mut out, &blk.ff1);
+        pack_bitlinear(&mut out, &blk.ff2);
+    }
+    out
+}
+
 fn train_and_eval(data: &[u8], test: &[u8], cfg: &GptConfig, label: &str) {
     type GpuAd = Autodiff<Wgpu<f32, i32>>;
     let gdev = WgpuDevice::default();
@@ -471,14 +577,28 @@ fn train_and_eval(data: &[u8], test: &[u8], cfg: &GptConfig, label: &str) {
         dec_c == test,
         8.0 * arc_c.len() as f64 / test.len() as f64
     );
+
+    // Pack the trained model into the submission blob (bitnet only — the
+    // ternary path is what ships). L(D) projection: shipped bytes count 2×.
+    if cfg.bit {
+        let blob = pack_model(&cpu_model, cfg);
+        std::fs::write("assets/v8weights.bin", &blob).expect("write blob");
+        let ld_bpb = 2.0 * blob.len() as f64 / 1e9;
+        println!(
+            "[{label}] packed blob: {} bytes ({:.2} KiB)  →  L(D) ≈ {:.4} bpb on enwik9",
+            blob.len(),
+            blob.len() as f64 / 1024.0,
+            ld_bpb,
+        );
+    }
 }
 
 fn main() {
     test_coder();
     let data = std::fs::read("assets/enwik8").expect("read enwik8");
     let test = &data[256 * 1024..256 * 1024 + 240]; // held-out slice
-    let fp = GptConfig::new(VOCAB, 128, 4, 4, 512, 256).with_bit(false);
-    let bit = GptConfig::new(VOCAB, 128, 4, 4, 512, 256).with_bit(true);
+    let fp = GptConfig::new(VOCAB, 256, 4, 8, 1024, 256).with_bit(false);
+    let bit = GptConfig::new(VOCAB, 256, 4, 8, 1024, 256).with_bit(true);
     train_and_eval(&data, test, &fp, "fp");
     train_and_eval(&data, test, &bit, "bitnet");
 }

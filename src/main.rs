@@ -20,6 +20,7 @@ mod dict;
 mod eval;
 mod lmix;
 mod null;
+mod v8;
 
 use std::fs;
 use std::path::PathBuf;
@@ -66,6 +67,20 @@ enum Command {
         skip_verify: bool,
     },
 
+    /// v8 neural codec: compress a slice of a corpus with the embedded `BitNet`
+    /// weights (pure-Rust forward, no burn), verifying the round-trip. The
+    /// weight blob is baked into the binary via `include_bytes!`.
+    NnTest {
+        #[arg(long, default_value = "assets/enwik8")]
+        corpus: PathBuf,
+        /// Byte offset into the corpus to start the test slice.
+        #[arg(long, default_value_t = 256 * 1024)]
+        offset: usize,
+        /// Length of the test slice in bytes (kept ≤ ctx until KV-cache lands).
+        #[arg(long, default_value_t = 240)]
+        len: usize,
+    },
+
     /// Attribute a codec's coding cost by byte class, to see where the bits go.
     /// Warms on the first `--warm-mb` MiB, then measures the next `--measure-mb`.
     Analyze {
@@ -96,6 +111,11 @@ fn main() -> Result<()> {
             out,
             skip_verify,
         } => run_compress(&corpus, &codec, &out, skip_verify),
+        Command::NnTest {
+            corpus,
+            offset,
+            len,
+        } => run_nn_test(&corpus, offset, len),
         Command::Analyze {
             corpus,
             codec,
@@ -103,6 +123,55 @@ fn main() -> Result<()> {
             measure_mb,
         } => run_analyze(&corpus, &codec, warm_mb, measure_mb),
     }
+}
+
+/// Weight blob produced offline by `examples/neural.rs` (the training side),
+/// baked into the submission binary. This is the `2×`-counted `L(D)` payload.
+static V8_WEIGHTS: &[u8] = include_bytes!("../assets/v8weights.bin");
+
+#[allow(clippy::cast_precision_loss)]
+fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
+    let bytes = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
+    if offset + len > bytes.len() {
+        bail!(
+            "slice [{offset}, {}) exceeds corpus length {}",
+            offset + len,
+            bytes.len()
+        );
+    }
+    let slice = &bytes[offset..offset + len];
+
+    let model = v8::Model::from_blob(V8_WEIGHTS);
+    eprintln!(
+        "v8 weights: {} bytes embedded  (L(D) ≈ {:.4} bpb on enwik9)",
+        V8_WEIGHTS.len(),
+        2.0 * V8_WEIGHTS.len() as f64 / 1e9,
+    );
+
+    let start = Instant::now();
+    let archive = model.compress(slice, 0);
+    let encode_elapsed = start.elapsed();
+    let dstart = Instant::now();
+    let decoded = model.decompress(&archive, slice.len(), 0);
+    let decode_elapsed = dstart.elapsed();
+
+    let ok = decoded == slice;
+    let bpb = 8.0 * archive.len() as f64 / slice.len() as f64;
+    println!();
+    println!(
+        "Corpus:        {}  [{offset}, {})",
+        corpus.display(),
+        offset + len
+    );
+    println!("Slice bytes:   {len}");
+    println!("Archive bytes: {}", archive.len());
+    println!("L(C) bpb:      {bpb:.4}");
+    println!("Round-trip:    {}", if ok { "OK" } else { "MISMATCH" });
+    println!("Encode:        {encode_elapsed:?}   Decode: {decode_elapsed:?}");
+    if !ok {
+        bail!("v8 round-trip mismatch");
+    }
+    Ok(())
 }
 
 #[allow(clippy::cast_precision_loss)]
