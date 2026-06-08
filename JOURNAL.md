@@ -13,6 +13,14 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-08 — xmatch scales with order count: new best lallx 1.4267 (−0.0094), and the enwik9-memory reckoning
+
+The xmatch arm shipped with three orders [6,8,12]. A tuning sweep found two small, additive wins — recency-weighting the gathered followers (weight `0.85^k` by recency rank, −0.0011 base; decay knee ~0.85, 0.70 was worse) and K 16→32 (−0.0008; combo −0.0014) — but the dominant lever by far is the *number* of exact-match orders. Base reads on lindcasex (+rec+k32): [6,8,12] 1.4856 → [4,6,8,12,16] 1.4809 (−0.0061) → [3,4,6,8,10,12,16,20] 1.4745 (−0.0125) → 13 orders [2..24] 1.4700 (−0.0170), weakly diminishing. Each exact follower-distribution at a new order adds decorrelated signal; the original three orders left ~0.017 bpb (base) unclaimed.
+
+Banked the 8-order config (orders [3,4,6,8,10,12,16,20] + recency 0.85 + K=32) as a balanced point — 73% of the 13-order win at far less memory: full stack lallx 1.4361 → **1.4267 (−0.0094)**, ~75% of the base gain carrying, the session's second-biggest single step.
+
+*The reckoning.* This deepens the enwik9 memory wall. xmatch position chains are O(N × orders): 8 orders ≈ 15 GB at enwik8, ≈ 32 GB at enwik9 — and the committed best already could not fit enwik9's 10 GB cap (even the 3-order chains were ≈ 12 GB). So the order-scaling is *achievable on enwik8, not yet shippable on enwik9*. Capturing it within 10 GB is now the project's central open problem, and it is not trivially "build a suffix automaton": an online (causal, decoder-reconstructable) suffix automaton is O(N) states but with a constant factor that likely also blows the cap, while suffix arrays are smaller but batch (can't be built left-to-right by the decoder). The memory-feasible directions — a single longest-order match-chain with suffix-link sharing, or more fixed-size hashed models accepting the collision tax the exact version avoids — need a deliberate design session. New best lallx 1.4267; config in `XMATCH_ORDERS` / `XMATCH_K` / `XMATCH_DECAY`.
+
 ## 2026-06-07 — rare-byte escaping doubles the single-byte dictionary: new best lallx 1.4361, and ~2% faster
 
 CDR's observation: enwik holds many byte values that appear but rarely — 101 values occur fewer than 10k times each, together only 0.39% of the stream (almost all high bytes / UTF-8 fragments, plus a few rare punctuation like `@`, `` ` ``, `~`). Each one locks up a byte value that could instead be a single-byte dictionary code. The escape machinery already existed: `ESC_LIT` precedes any literal occurrence of a code byte, so freeing a rare byte costs only its (rare) literal occurrences. Widening the generator's code set from "never-seen" bytes to "rare" bytes (`count < 10_000` on the case-transformed corpus) grew the single-byte dictionary from 72 to 173 words; transform/untransform are unchanged and round-trip on all 256 byte values.
