@@ -147,8 +147,9 @@ fn probs_to_cdf(probs: &[f32]) -> Vec<u32> {
 // Layout (all little-endian; header is u32s, payload is f32 / packed-ternary):
 //   magic = "LZR8" (0x385258_4C as LE bytes), version u32
 //   vocab, d_model, n_layers, n_heads, ffn, ctx     (u32 each)
-//   tok      : vocab*d   f32
-//   pos      : ctx*d     f32
+//   bpe      : merge list (`crate::bpe::Bpe::to_bytes`)
+//   tok      : ternary linear [vocab, d]   (the tied embedding / unembedding)
+//   pos      : ctx*d   f32
 //   norm_f   : gamma[d] f32, beta[d] f32
 //   blocks[n_layers], each:
 //     norm1  : gamma[d] f32, beta[d] f32
@@ -158,10 +159,14 @@ fn probs_to_cdf(probs: &[f32]) -> Vec<u32> {
 //     ff2    : ternary linear (d x ffn)
 //   a ternary linear is: scale f32, then ceil(out*in/4) packed bytes
 //   (2 bits/weight: 0b00=-1, 0b01=0, 0b10=+1).
+//
+// The token embedding is ternary (a vocab×d table is the dominant parameter
+// count once the BPE vocab is large); pos and the LayerNorm affines stay f32
+// (small). The embedding is tied: the same ternary table is the unembedding.
 // ---------------------------------------------------------------------------
 
 pub(crate) const MAGIC: u32 = 0x3852_5A4C; // "LZR8" little-endian
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct Config {
@@ -202,8 +207,9 @@ struct Block {
 
 pub(crate) struct Model {
     cfg: Config,
-    tok: Vec<f32>, // vocab*d
-    pos: Vec<f32>, // ctx*d
+    bpe: crate::bpe::Bpe,
+    tok: TernLinear, // [vocab, d] ternary; tied embedding + unembedding
+    pos: Vec<f32>,   // ctx*d f32
     norm_f: LayerNorm,
     blocks: Vec<Block>,
 }
@@ -277,7 +283,9 @@ impl Model {
             ctx: r.u32() as usize,
         };
         let (d, ffn) = (cfg.d_model, cfg.ffn);
-        let tok = r.f32s(cfg.vocab * d);
+        let (bpe, used) = crate::bpe::Bpe::from_bytes(&blob[r.p..]);
+        r.p += used;
+        let tok = r.tern(cfg.vocab, d);
         let pos = r.f32s(cfg.ctx * d);
         let norm_f = r.ln(d);
         let blocks = (0..cfg.n_layers)
@@ -294,6 +302,7 @@ impl Model {
             .collect();
         Self {
             cfg,
+            bpe,
             tok,
             pos,
             norm_f,
@@ -500,8 +509,9 @@ impl Model {
         }
         let pos = cache.len;
         let id = token as usize;
+        let trow = &self.tok.w[id * d..id * d + d];
         for i in 0..d {
-            s.x[i] = self.tok[id * d + i] + self.pos[pos * d + i];
+            s.x[i] = self.tok.scale * trow[i] + self.pos[pos * d + i];
         }
         let scale = 1.0 / (dk as f32).sqrt();
         for (l, blk) in self.blocks.iter().enumerate() {
@@ -545,7 +555,7 @@ impl Model {
         cache.len += 1;
         layernorm_row(&mut s.nrm, &s.x, &self.norm_f);
         for (vix, lg) in s.logits.iter_mut().enumerate() {
-            *lg = dot(&s.nrm, &self.tok[vix * d..vix * d + d]);
+            *lg = self.tok.scale * dot(&s.nrm, &self.tok.w[vix * d..vix * d + d]);
         }
         softmax_inplace(&mut s.logits);
     }
@@ -561,8 +571,9 @@ impl Model {
         let mut x = vec![0f32; t * d];
         for r in 0..t {
             let id = ids[r] as usize;
+            let trow = &self.tok.w[id * d..id * d + d];
             for i in 0..d {
-                x[r * d + i] = self.tok[id * d + i] + self.pos[r * d + i];
+                x[r * d + i] = self.tok.scale * trow[i] + self.pos[r * d + i];
             }
         }
         for blk in &self.blocks {
@@ -609,38 +620,40 @@ impl Model {
         let last = &xf[(t - 1) * d..t * d];
         let mut logits = vec![0f32; cfg.vocab];
         for (vix, lg) in logits.iter_mut().enumerate() {
-            *lg = dot(last, &self.tok[vix * d..vix * d + d]);
+            *lg = self.tok.scale * dot(last, &self.tok.w[vix * d..vix * d + d]);
         }
         softmax_inplace(&mut logits);
         logits
     }
 
-    /// Compress `bytes`; BOS-seeded, incremental KV-cached forward. Identical
-    /// per-byte forward as decode, so the codec round-trips by construction.
+    /// Compress `bytes`: BPE-tokenize, then code each token id through the
+    /// BOS-seeded incremental forward. Decode runs the identical forward, so
+    /// the codec round-trips by construction.
     pub(crate) fn compress(&self, bytes: &[u8], bos: i32) -> Vec<u8> {
+        let ids = self.bpe.encode(bytes);
         let mut enc = RangeEncoder::new();
         let mut cache = self.new_cache();
         let mut s = self.new_scratch();
         self.step(&mut cache, &mut s, bos);
-        for &byte in bytes {
+        for &id in &ids {
             let cdf = probs_to_cdf(&s.logits);
-            enc.encode(
-                cdf[byte as usize],
-                cdf[byte as usize + 1] - cdf[byte as usize],
-                CDF_TOTAL,
-            );
-            self.step(&mut cache, &mut s, i32::from(byte));
+            let id = id as usize;
+            enc.encode(cdf[id], cdf[id + 1] - cdf[id], CDF_TOTAL);
+            self.step(&mut cache, &mut s, id as i32);
         }
         enc.finish()
     }
 
+    /// Decompress to exactly `n` bytes. Decodes token ids and expands each to
+    /// its byte span until the byte count is reached — token boundaries align
+    /// with `n` because the encoder tokenized exactly those `n` bytes.
     pub(crate) fn decompress(&self, archive: &[u8], n: usize, bos: i32) -> Vec<u8> {
         let mut dec = RangeDecoder::new(archive);
         let mut out = Vec::with_capacity(n);
         let mut cache = self.new_cache();
         let mut s = self.new_scratch();
         self.step(&mut cache, &mut s, bos);
-        for _ in 0..n {
+        while out.len() < n {
             let cdf = probs_to_cdf(&s.logits);
             let f = dec.freq(CDF_TOTAL);
             let mut sym = cdf.partition_point(|&c| c <= f) - 1;
@@ -648,9 +661,10 @@ impl Model {
                 sym = cdf.len() - 2;
             }
             dec.update(cdf[sym], cdf[sym + 1] - cdf[sym], CDF_TOTAL);
-            out.push(sym as u8);
+            out.extend_from_slice(self.bpe.expand(sym as u32));
             self.step(&mut cache, &mut s, sym as i32);
         }
+        out.truncate(n);
         out
     }
 }
@@ -659,11 +673,19 @@ impl Model {
 mod tests {
     use super::*;
 
-    /// Build a minimal valid blob (tiny model, deterministic pseudo-random
-    /// weights) so the reader + forward + coder are exercised end-to-end.
-    fn tiny_blob() -> Vec<u8> {
-        let (vocab, d, layers, heads, ffn, ctx) =
-            (8usize, 8usize, 2usize, 2usize, 16usize, 32usize);
+    fn corpus() -> Vec<u8> {
+        "the quick brown fox the lazy dog the the the quick fox jumps over "
+            .repeat(60)
+            .into_bytes()
+    }
+
+    /// Build a minimal valid v2 blob (real tiny BPE + tiny model with
+    /// deterministic pseudo-random ternary/f32 weights) — exercises the reader,
+    /// tokenizer, forward, and coder end-to-end without the GPU trainer.
+    fn tiny_blob() -> (Vec<u8>, usize) {
+        let bpe = crate::bpe::Bpe::learn(&corpus(), 288);
+        let vocab = bpe.vocab_size();
+        let (d, layers, heads, ffn, ctx) = (8usize, 2usize, 2usize, 16usize, 32usize);
         let mut out = Vec::new();
         for v in [
             MAGIC,
@@ -677,7 +699,7 @@ mod tests {
         ] {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        // deterministic small f32s in [-0.5, 0.5)
+        out.extend_from_slice(&bpe.to_bytes());
         let mut s = 0x1234_5678u32;
         let mut nf = || {
             s ^= s << 13;
@@ -705,8 +727,8 @@ mod tests {
                 out.push(byte);
             }
         };
-        push_f(&mut out, vocab * d, &mut nf); // tok
-        push_f(&mut out, ctx * d, &mut nf); // pos
+        push_tern(&mut out, vocab, d, &mut nf); // ternary tok embedding
+        push_f(&mut out, ctx * d, &mut nf); // f32 pos
         push_f(&mut out, d, &mut nf); // norm_f gamma
         push_f(&mut out, d, &mut nf); // norm_f beta
         for _ in 0..layers {
@@ -720,23 +742,23 @@ mod tests {
             push_tern(&mut out, ffn, d, &mut nf); // ff1
             push_tern(&mut out, d, ffn, &mut nf); // ff2
         }
-        out
+        (out, vocab)
     }
 
     #[test]
     fn roundtrips_tiny_model() {
-        let model = Model::from_blob(&tiny_blob());
-        let msg: Vec<u8> = (0..40u8).map(|i| i % 8).collect(); // bytes < vocab
+        let model = Model::from_blob(&tiny_blob().0);
+        let msg = corpus()[..400].to_vec();
         let arc = model.compress(&msg, 0);
         let dec = model.decompress(&arc, msg.len(), 0);
         assert_eq!(dec, msg, "v8 codec must round-trip");
     }
 
     #[test]
-    fn roundtrips_past_ctx_window() {
-        // length > ctx exercises the block-reset path on both sides
-        let model = Model::from_blob(&tiny_blob());
-        let msg: Vec<u8> = (0..50u8).map(|i| (i * 3) % 8).collect();
+    fn roundtrips_arbitrary_bytes() {
+        // every byte value is a base token, so non-corpus input still round-trips
+        let model = Model::from_blob(&tiny_blob().0);
+        let msg: Vec<u8> = (0..=255u8).chain((0..=255u8).rev()).collect();
         let arc = model.compress(&msg, 0);
         let dec = model.decompress(&arc, msg.len(), 0);
         assert_eq!(dec, msg);
@@ -746,8 +768,9 @@ mod tests {
     fn cached_step_matches_full_recompute() {
         // Within the context window, incremental `step` must equal the O(t²)
         // reference `predict` to float tolerance — that is the cache's contract.
-        let model = Model::from_blob(&tiny_blob());
-        let toks: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 1, 2, 3]; // 11 < ctx=32
+        let (blob, vocab) = tiny_blob();
+        let model = Model::from_blob(&blob);
+        let toks: Vec<i32> = (0..11).map(|i| (i * 7 % vocab) as i32).collect(); // < ctx=32
         let mut cache = model.new_cache();
         let mut s = model.new_scratch();
         for end in 1..=toks.len() {

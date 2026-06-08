@@ -12,6 +12,7 @@
 #![allow(clippy::redundant_pub_crate)]
 #![allow(clippy::module_name_repetitions)]
 
+mod bpe;
 mod v8;
 
 use std::fs;

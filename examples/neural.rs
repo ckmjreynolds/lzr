@@ -11,18 +11,21 @@
 )]
 #![allow(elided_lifetimes_in_paths)]
 
-use burn::backend::ndarray::NdArrayDevice;
 use burn::backend::wgpu::WgpuDevice;
-use burn::backend::{Autodiff, NdArray, Wgpu};
+use burn::backend::{Autodiff, Wgpu};
 use burn::module::{AutodiffModule, Module};
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
 use burn::tensor::Distribution;
 use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::backend::AutodiffBackend;
+
+// The submission tokenizer, shared verbatim so train and decode tokenize
+// identically. Compiled into this example crate via `#[path]`.
+#[path = "../src/bpe.rs"]
+mod bpe;
 
 // ---------------------------------------------------------------------------
 // Carryless range coder (Subbotin style). Multi-symbol via cumulative-freq CDF.
@@ -249,12 +252,23 @@ impl<B: Backend> Block<B> {
     }
 }
 
+/// Ternary absmean quantization with a straight-through estimator (matches
+/// `BitLinear`'s weight path). Used for the tied token embedding so it ships at
+/// ~2 b/w like every other weight; `detach` is a no-op off-autodiff.
+fn ternary_ste<B: Backend>(w: Tensor<B, 2>) -> Tensor<B, 2> {
+    let gamma = w.clone().abs().mean().reshape([1, 1]).add_scalar(1e-5);
+    let w_t = w.clone().div(gamma.clone()).round().clamp(-1.0, 1.0);
+    let w_q = w_t.mul(gamma);
+    w.clone() + (w_q - w).detach()
+}
+
 #[derive(Module, Debug)]
 struct Gpt<B: Backend> {
-    tok: Embedding<B>,
+    tok_w: burn::module::Param<Tensor<B, 2>>, // [vocab, d] latent; ternary when bit
     pos: Embedding<B>,
     blocks: Vec<Block<B>>,
     norm_f: LayerNorm<B>,
+    bit: bool,
 }
 
 #[derive(Config, Debug)]
@@ -285,11 +299,17 @@ impl GptConfig {
                 n_heads: self.n_heads,
             })
             .collect();
+        let tok = Tensor::random(
+            [self.vocab, self.d_model],
+            Distribution::Normal(0.0, 0.02),
+            device,
+        );
         Gpt {
-            tok: EmbeddingConfig::new(self.vocab, self.d_model).init(device),
+            tok_w: burn::module::Param::from_tensor(tok),
             pos: EmbeddingConfig::new(self.ctx, self.d_model).init(device),
             blocks,
             norm_f: LayerNormConfig::new(self.d_model).init(device),
+            bit: self.bit,
         }
     }
 }
@@ -297,9 +317,15 @@ impl GptConfig {
 impl<B: Backend> Gpt<B> {
     /// tokens [batch, seq] Int -> logits [batch, seq, vocab].
     fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let [_b, t] = tokens.dims();
+        let [b, t] = tokens.dims();
+        let d = self.tok_w.val().dims()[1];
         let device = tokens.device();
-        let mut x = self.tok.forward(tokens); // [b, t, d]
+        // tied, optionally-ternary embedding table
+        let tok = self.tok_w.val();
+        let wq = if self.bit { ternary_ste(tok) } else { tok };
+        // embedding lookup: gather rows, [b*t, d] -> [b, t, d]
+        let flat = tokens.reshape([b * t]);
+        let mut x = wq.clone().select(0, flat).reshape([b, t, d]);
         let pos_ids = Tensor::<B, 1, Int>::arange(0..t as i64, &device).reshape([1, t]);
         x = x + self.pos.forward(pos_ids); // broadcast [1,t,d] over batch
         for blk in &self.blocks {
@@ -308,9 +334,8 @@ impl<B: Backend> Gpt<B> {
             x = x + blk.ff2.forward(gelu(blk.ff1.forward(n2)));
         }
         x = self.norm_f.forward(x);
-        // tied unembedding: logits = x @ tok_weight^T
-        let wt = self.tok.weight.val().transpose(); // [d, vocab]
-        x.matmul(wt.unsqueeze_dim(0)) // [1,d,vocab] broadcast -> [b,t,vocab]
+        // tied unembedding: logits = x @ wq^T
+        x.matmul(wq.transpose().unsqueeze_dim(0)) // [1,d,vocab] broadcast -> [b,t,vocab]
     }
 }
 
@@ -365,8 +390,6 @@ fn test_coder() {
     assert!(ok, "range coder round-trip failed");
 }
 
-const VOCAB: usize = 256; // byte-level v1
-
 // xorshift for deterministic batch sampling
 struct Rng(u64);
 impl Rng {
@@ -379,7 +402,7 @@ impl Rng {
 }
 
 fn train<B: AutodiffBackend>(
-    data: &[u8],
+    tokens: &[i32],
     cfg: &GptConfig,
     device: &B::Device,
     steps: usize,
@@ -393,10 +416,10 @@ fn train<B: AutodiffBackend>(
         let mut inp = Vec::with_capacity(batch * ctx);
         let mut tgt = Vec::with_capacity(batch * ctx);
         for _ in 0..batch {
-            let s = (rng.next() as usize) % (data.len() - ctx - 1);
+            let s = (rng.next() as usize) % (tokens.len() - ctx - 1);
             for k in 0..ctx {
-                inp.push(i32::from(data[s + k]));
-                tgt.push(i32::from(data[s + k + 1]));
+                inp.push(tokens[s + k]);
+                tgt.push(tokens[s + k + 1]);
             }
         }
         let inp_t = Tensor::<B, 2, Int>::from_data(TensorData::new(inp, [batch, ctx]), device);
@@ -423,23 +446,43 @@ fn train<B: AutodiffBackend>(
 /// One next-token distribution given a context of token ids (last position).
 fn predict<B: Backend>(model: &Gpt<B>, device: &B::Device, ctx_ids: &[i32]) -> Vec<f32> {
     let len = ctx_ids.len();
+    let vocab = model.tok_w.val().dims()[0];
     let t = Tensor::<B, 2, Int>::from_data(TensorData::new(ctx_ids.to_vec(), [1, len]), device);
     let logits = model.forward(t); // [1, len, vocab]
     let last = logits
-        .slice([0..1, len - 1..len, 0..VOCAB])
-        .reshape([VOCAB]);
+        .slice([0..1, len - 1..len, 0..vocab])
+        .reshape([vocab]);
     softmax(last, 0).into_data().to_vec::<f32>().unwrap()
 }
 
-/// Encode `bytes` autoregressively (BOS-prefixed context). Same forward path as decode.
-fn nn_encode<B: Backend>(model: &Gpt<B>, device: &B::Device, bytes: &[u8], bos: i32) -> Vec<u8> {
+/// Block-reset context feed matching `src/v8.rs::step`: keep ≤ `ctx` tokens;
+/// when the window fills, clear it and let the incoming token become position 0.
+/// Returns the next-token distribution after processing `tok`.
+fn feed<B: Backend>(
+    model: &Gpt<B>,
+    device: &B::Device,
+    block: &mut Vec<i32>,
+    ctx: usize,
+    tok: i32,
+) -> Vec<f32> {
+    if block.len() == ctx {
+        block.clear();
+    }
+    block.push(tok);
+    predict(model, device, block)
+}
+
+/// Encode token ids autoregressively (BOS-seeded, block-reset context — same
+/// behavior as the submission codec, so the bpb matches and it round-trips).
+fn nn_encode<B: Backend>(model: &Gpt<B>, device: &B::Device, toks: &[i32], bos: i32) -> Vec<u8> {
+    let ctx = model.pos.weight.val().dims()[0];
     let mut enc = RangeEncoder::new();
-    let mut ctx_ids = vec![bos];
-    for &byte in bytes {
-        let probs = predict(model, device, &ctx_ids);
+    let mut block = Vec::new();
+    let mut probs = feed(model, device, &mut block, ctx, bos);
+    for &id in toks {
         let cdf = probs_to_cdf(&probs);
-        ac_encode_symbol(&mut enc, &cdf, byte as usize);
-        ctx_ids.push(i32::from(byte));
+        ac_encode_symbol(&mut enc, &cdf, id as usize);
+        probs = feed(model, device, &mut block, ctx, id);
     }
     enc.finish()
 }
@@ -450,16 +493,17 @@ fn nn_decode<B: Backend>(
     archive: &[u8],
     n: usize,
     bos: i32,
-) -> Vec<u8> {
+) -> Vec<i32> {
+    let ctx = model.pos.weight.val().dims()[0];
     let mut dec = RangeDecoder::new(archive);
     let mut out = Vec::with_capacity(n);
-    let mut ctx_ids = vec![bos];
+    let mut block = Vec::new();
+    let mut probs = feed(model, device, &mut block, ctx, bos);
     for _ in 0..n {
-        let probs = predict(model, device, &ctx_ids);
         let cdf = probs_to_cdf(&probs);
-        let sym = ac_decode_symbol(&mut dec, &cdf);
-        out.push(sym as u8);
-        ctx_ids.push(sym as i32);
+        let sym = ac_decode_symbol(&mut dec, &cdf) as i32;
+        out.push(sym);
+        probs = feed(model, device, &mut block, ctx, sym);
     }
     out
 }
@@ -470,7 +514,7 @@ fn nn_decode<B: Backend>(
 // ternary = round(w/scale).clamp(-1,1). Format mirrors `src/v8.rs::Model`.
 // ---------------------------------------------------------------------------
 const BLOB_MAGIC: u32 = 0x3852_5A4C; // "LZR8" little-endian
-const BLOB_VERSION: u32 = 1;
+const BLOB_VERSION: u32 = 2;
 
 fn push_f32s(out: &mut Vec<u8>, vals: &[f32]) {
     for &v in vals {
@@ -482,14 +526,14 @@ fn tensor_vec<B: Backend, const R: usize>(t: Tensor<B, R>) -> Vec<f32> {
     t.into_data().to_vec::<f32>().unwrap()
 }
 
-/// Pack one BitLinear `[out,in]` latent weight as scale f32 + 2-bit ternary.
-fn pack_bitlinear<B: Backend>(out: &mut Vec<u8>, lin: &BitLinear<B>) {
-    let w = tensor_vec(lin.weight.val()); // row-major [out, in]
+/// Pack a row-major weight as scale f32 + 2-bit ternary, replicating
+/// `ternary_ste`'s quantization exactly (scale = mean(|w|)+1e-5).
+fn pack_ternary(out: &mut Vec<u8>, w: &[f32]) {
     let scale = (w.iter().map(|v| v.abs()).sum::<f32>() / w.len() as f32) + 1e-5;
     out.extend_from_slice(&scale.to_le_bytes());
     let mut byte = 0u8;
     let mut k = 0u32;
-    for &v in &w {
+    for &v in w {
         let code: u8 = match (v / scale).round().clamp(-1.0, 1.0) as i32 {
             -1 => 0,
             0 => 1,
@@ -508,12 +552,16 @@ fn pack_bitlinear<B: Backend>(out: &mut Vec<u8>, lin: &BitLinear<B>) {
     }
 }
 
+fn pack_bitlinear<B: Backend>(out: &mut Vec<u8>, lin: &BitLinear<B>) {
+    pack_ternary(out, &tensor_vec(lin.weight.val()));
+}
+
 fn push_layernorm<B: Backend>(out: &mut Vec<u8>, ln: &LayerNorm<B>) {
     push_f32s(out, &tensor_vec(ln.gamma.val()));
     push_f32s(out, &tensor_vec(ln.beta.clone().unwrap().val()));
 }
 
-fn pack_model<B: Backend>(model: &Gpt<B>, cfg: &GptConfig) -> Vec<u8> {
+fn pack_model<B: Backend>(model: &Gpt<B>, cfg: &GptConfig, bpe: &bpe::Bpe) -> Vec<u8> {
     let mut out = Vec::new();
     for v in [
         BLOB_MAGIC,
@@ -527,8 +575,9 @@ fn pack_model<B: Backend>(model: &Gpt<B>, cfg: &GptConfig) -> Vec<u8> {
     ] {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    push_f32s(&mut out, &tensor_vec(model.tok.weight.val()));
-    push_f32s(&mut out, &tensor_vec(model.pos.weight.val()));
+    out.extend_from_slice(&bpe.to_bytes());
+    pack_ternary(&mut out, &tensor_vec(model.tok_w.val())); // ternary tied embedding
+    push_f32s(&mut out, &tensor_vec(model.pos.weight.val())); // f32 pos
     push_layernorm(&mut out, &model.norm_f);
     for blk in &model.blocks {
         push_layernorm(&mut out, &blk.norm1);
@@ -543,48 +592,44 @@ fn pack_model<B: Backend>(model: &Gpt<B>, cfg: &GptConfig) -> Vec<u8> {
     out
 }
 
-fn train_and_eval(data: &[u8], test: &[u8], cfg: &GptConfig, label: &str) {
+/// Train on GPU and evaluate the round-trip + bpb there (GPU is the faster
+/// inference path; the pure-Rust CPU codec is exercised separately via
+/// `lzr nn-test`). `test_toks` is `bpe.encode(test_bytes)`; bpb is bits per
+/// original *byte* so it stays comparable across tokenizations.
+fn train_and_eval(
+    train_toks: &[i32],
+    test_bytes: &[u8],
+    test_toks: &[i32],
+    cfg: &GptConfig,
+    bpe: &bpe::Bpe,
+    label: &str,
+) {
     type GpuAd = Autodiff<Wgpu<f32, i32>>;
     let gdev = WgpuDevice::default();
     let nparams = cfg.init::<Wgpu<f32, i32>>(&gdev).num_params();
-    println!("[{label}] training on GPU ({nparams} params)...");
-    let model = train::<GpuAd>(&data[..256 * 1024], cfg, &gdev, 300);
-
-    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-    let path = format!("/tmp/v8model_{label}");
-    model.clone().save_file(&path, &recorder).expect("save");
+    println!(
+        "[{label}] training on GPU ({nparams} params, vocab {})...",
+        cfg.vocab
+    );
+    let model = train::<GpuAd>(train_toks, cfg, &gdev, 300);
 
     let gpu_model = model.valid();
-    let arc = nn_encode::<Wgpu<f32, i32>>(&gpu_model, &gdev, test, 0);
-    let dec = nn_decode::<Wgpu<f32, i32>>(&gpu_model, &gdev, &arc, test.len(), 0);
+    let arc = nn_encode::<Wgpu<f32, i32>>(&gpu_model, &gdev, test_toks, 0);
+    let dec = nn_decode::<Wgpu<f32, i32>>(&gpu_model, &gdev, &arc, test_toks.len(), 0);
     println!(
-        "[{label}] GPU: roundtrip {}  bpb {:.3}  ({} -> {} bytes)",
-        dec == test,
-        8.0 * arc.len() as f64 / test.len() as f64,
-        test.len(),
+        "[{label}] GPU: roundtrip {}  bpb {:.3}  ({} bytes / {} tokens -> {} bytes)",
+        dec == test_toks,
+        8.0 * arc.len() as f64 / test_bytes.len() as f64,
+        test_bytes.len(),
+        test_toks.len(),
         arc.len()
     );
 
-    let cdev = NdArrayDevice::Cpu;
-    let cpu_model = cfg
-        .init::<NdArray<f32, i32>>(&cdev)
-        .load_file(&path, &recorder, &cdev)
-        .expect("load");
-    let arc_c = nn_encode::<NdArray<f32, i32>>(&cpu_model, &cdev, test, 0);
-    let dec_c = nn_decode::<NdArray<f32, i32>>(&cpu_model, &cdev, &arc_c, test.len(), 0);
-    println!(
-        "[{label}] CPU: roundtrip {}  bpb {:.3}",
-        dec_c == test,
-        8.0 * arc_c.len() as f64 / test.len() as f64
-    );
-
     // Pack the trained model into the submission blob (bitnet only — the
-    // ternary path is what ships). L(D) projection: shipped bytes count 2×.
+    // ternary path is what ships). Packed directly from the GPU model.
     if cfg.bit {
-        let blob = pack_model(&cpu_model, cfg);
+        let blob = pack_model(&gpu_model, cfg, bpe);
         std::fs::write("assets/v8weights.bin", &blob).expect("write blob");
-        // weights-only floor; the shipped binary adds code, so the true L(D) is
-        // larger — run `lzr nn-test` for it. bpb = 8 bits × 2 penalty / 1 GB.
         let ld_floor = 16.0 * blob.len() as f64 / 1e9;
         println!(
             "[{label}] packed blob: {} bytes ({:.2} KiB)  →  weights-only L(D) ≥ {:.4} bpb on enwik9",
@@ -598,9 +643,25 @@ fn train_and_eval(data: &[u8], test: &[u8], cfg: &GptConfig, label: &str) {
 fn main() {
     test_coder();
     let data = std::fs::read("assets/enwik8").expect("read enwik8");
-    let test = &data[256 * 1024..256 * 1024 + 240]; // held-out slice
-    let fp = GptConfig::new(VOCAB, 256, 4, 8, 1024, 256).with_bit(false);
-    let bit = GptConfig::new(VOCAB, 256, 4, 8, 1024, 256).with_bit(true);
-    train_and_eval(&data, test, &fp, "fp");
-    train_and_eval(&data, test, &bit, "bitnet");
+    let train_bytes = &data[..256 * 1024];
+
+    // online-BPE: grow the vocab to 8K, then tokenize train + held-out test
+    let bpe = bpe::Bpe::learn(train_bytes, 8192);
+    let vocab = bpe.vocab_size();
+    let train_toks: Vec<i32> = bpe.encode(train_bytes).iter().map(|&t| t as i32).collect();
+    let test_bytes = &data[256 * 1024..256 * 1024 + 4096];
+    let test_toks: Vec<i32> = bpe.encode(test_bytes).iter().map(|&t| t as i32).collect();
+    println!(
+        "BPE: vocab {vocab}; train {} bytes -> {} tokens ({:.2} bytes/token); test {} bytes -> {} tokens",
+        train_bytes.len(),
+        train_toks.len(),
+        train_bytes.len() as f64 / train_toks.len() as f64,
+        test_bytes.len(),
+        test_toks.len(),
+    );
+
+    let fp = GptConfig::new(vocab, 256, 4, 8, 1024, 256).with_bit(false);
+    let bit = GptConfig::new(vocab, 256, 4, 8, 1024, 256).with_bit(true);
+    train_and_eval(&train_toks, test_bytes, &test_toks, &fp, &bpe, "fp");
+    train_and_eval(&train_toks, test_bytes, &test_toks, &bit, &bpe, "bitnet");
 }
