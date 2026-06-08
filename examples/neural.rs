@@ -643,17 +643,19 @@ fn train_and_eval(
 fn main() {
     test_coder();
     let data = std::fs::read("assets/enwik8").expect("read enwik8");
-    let train_bytes = &data[..256 * 1024];
+    let mb = 1024 * 1024;
 
-    // online-BPE: grow the vocab to 8K, then tokenize train + held-out test
-    let bpe = bpe::Bpe::learn(train_bytes, 8192);
+    // online-BPE (1K merges / MB) to the 16K target — sweeps ~16 MB of enwik8,
+    // then tokenize a held-out training span and a disjoint test slice.
+    let bpe = bpe::Bpe::learn(&data, 16384);
     let vocab = bpe.vocab_size();
+    let train_bytes = &data[..4 * mb];
     let train_toks: Vec<i32> = bpe.encode(train_bytes).iter().map(|&t| t as i32).collect();
-    let test_bytes = &data[256 * 1024..256 * 1024 + 4096];
+    let test_bytes = &data[20 * mb..20 * mb + 4096];
     let test_toks: Vec<i32> = bpe.encode(test_bytes).iter().map(|&t| t as i32).collect();
     println!(
-        "BPE: vocab {vocab}; train {} bytes -> {} tokens ({:.2} bytes/token); test {} bytes -> {} tokens",
-        train_bytes.len(),
+        "BPE: vocab {vocab}; train {} MB -> {} tokens ({:.2} bytes/token); test {} bytes -> {} tokens",
+        train_bytes.len() / mb,
         train_toks.len(),
         train_bytes.len() as f64 / train_toks.len() as f64,
         test_bytes.len(),

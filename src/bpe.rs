@@ -1,69 +1,54 @@
 //! Deterministic online byte-pair encoding.
 //!
-//! The vocabulary is grown *incrementally*: the input is swept in `CHUNKS`
-//! passes (1% of the data each), and after each pass the most-frequent adjacent
-//! pairs are merged until the vocab reaches a per-pass quota, ramping linearly
-//! to `target_vocab`. This is a learning *curriculum* (early data shapes the
-//! first merges), not a submission-time adaptation: the learned merge list is
-//! fixed, used to tokenize the training data, and shipped in the weight blob so
-//! the decoder tokenizes identically. Determinism is the whole point — the
-//! neural net sees the same token stream at train and at submission.
+//! Schedule: the first 1 MB of data establishes byte statistics with no merges;
+//! then at each 1 MB boundary `MERGES_PER_MB` most-frequent pairs are merged,
+//! until the vocab reaches `target` (or the data runs out). Merges are tied to
+//! absolute data volume, and the first merges are chosen from a full 1 MB rather
+//! than a sliver — a steadier curriculum than ramping over a fixed corpus. It is
+//! a *learning* schedule, fixed for the run: the merge list is shipped in the
+//! weight blob and the decoder replays it, so determinism is all that matters.
 //!
-//! Tokens `0..256` are the raw bytes; merge `i` creates token id `256 + i` from
-//! an ordered pair of existing tokens. Encoding applies the merges in learned
-//! order (each a single left-to-right non-overlapping pass), which is the same
-//! procedure the learner uses to build its running sequence — so encoding any
-//! byte string reproduces the learner's tokenization exactly.
+//! Both learning and encoding are near-linear. Encoding is rank-greedy over a
+//! linked list with a min-rank heap; the learner maintains adjacent-pair counts
+//! and per-pair occurrence lists incrementally so each merge costs only its
+//! occurrences, not a full pass. The two agree: greedily applying the
+//! lowest-rank (then leftmost) adjacent merge is equivalent to applying merges
+//! in rank order as full left-to-right passes, because a merge only ever creates
+//! pairs of strictly higher rank than the one just applied.
+//!
+//! Tokens `0..256` are the raw bytes; merge `i` creates token id `256 + i`.
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(clippy::many_single_char_names, clippy::similar_names)]
 // Shared verbatim between the submission codec (read path: from_bytes/encode/
 // expand) and the trainer example (learn/to_bytes via #[path]); each consumer
 // leaves the other's entry points unused.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 pub(crate) const BASE: usize = 256;
-/// 1% passes.
-const CHUNKS: usize = 100;
-/// Don't create a merge for a pair seen fewer than this many times.
-const MIN_FREQ: u32 = 2;
+const MB: usize = 1 << 20;
+const MERGES_PER_MB: usize = 1000;
+const MIN_FREQ: i64 = 2;
+const NONE: usize = usize::MAX;
 
 pub(crate) struct Bpe {
     /// merge `i` (→ token id `256+i`) combines this ordered pair of token ids.
     merges: Vec<(u32, u32)>,
+    /// pair → merge index (= rank = `id - 256`); the encoder's priority.
+    rank: HashMap<(u32, u32), u32>,
     /// token id → its byte expansion (built once at construction).
     expand: Vec<Vec<u8>>,
 }
 
-/// Merge every non-overlapping `pair` occurrence into `id`, left to right.
-fn apply_merge(seq: &mut Vec<u32>, pair: (u32, u32), id: u32) {
-    let (mut w, mut r) = (0usize, 0usize);
-    while r < seq.len() {
-        if r + 1 < seq.len() && seq[r] == pair.0 && seq[r + 1] == pair.1 {
-            seq[w] = id;
-            r += 2;
-        } else {
-            seq[w] = seq[r];
-            r += 1;
-        }
-        w += 1;
-    }
-    seq.truncate(w);
-}
-
-/// Most-frequent adjacent pair, ties broken by smallest `(a,b)` for determinism.
-fn best_pair(seq: &[u32]) -> Option<((u32, u32), u32)> {
-    if seq.len() < 2 {
-        return None;
-    }
-    let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
-    for w in seq.windows(2) {
-        *counts.entry((w[0], w[1])).or_insert(0) += 1;
-    }
-    counts
-        .into_iter()
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+fn build_rank(merges: &[(u32, u32)]) -> HashMap<(u32, u32), u32> {
+    merges
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (p, i as u32))
+        .collect()
 }
 
 fn build_expand(merges: &[(u32, u32)]) -> Vec<Vec<u8>> {
@@ -76,53 +61,192 @@ fn build_expand(merges: &[(u32, u32)]) -> Vec<Vec<u8>> {
     expand
 }
 
-impl Bpe {
-    /// Learn merges from `data`, growing the vocab to (at most) `target_vocab`.
-    pub(crate) fn learn(data: &[u8], target_vocab: usize) -> Self {
-        let mut merges: Vec<(u32, u32)> = Vec::new();
-        let mut seq: Vec<u32> = Vec::new();
-        let mut prev_w = 0usize;
-        for c in 0..CHUNKS {
-            let w = (((c + 1) * data.len()) / CHUNKS).max(prev_w);
-            // tokenize the new bytes under the current merges, then append
-            let mut chunk: Vec<u32> = data[prev_w..w].iter().map(|&b| u32::from(b)).collect();
-            for (mi, &pair) in merges.iter().enumerate() {
-                apply_merge(&mut chunk, pair, (BASE + mi) as u32);
-            }
-            seq.extend_from_slice(&chunk);
-            prev_w = w;
-
-            let quota = (BASE + (target_vocab - BASE) * (c + 1) / CHUNKS).min(target_vocab);
-            while BASE + merges.len() < quota {
-                let Some((pair, cnt)) = best_pair(&seq) else {
-                    break;
-                };
-                if cnt < MIN_FREQ {
-                    break;
-                }
-                let id = (BASE + merges.len()) as u32;
-                merges.push(pair);
-                apply_merge(&mut seq, pair, id);
-            }
-            if BASE + merges.len() >= target_vocab {
-                break;
+/// Near-linear rank-greedy tokenizer: repeatedly merge the lowest-rank (then
+/// leftmost) adjacent pair. `O(n + applied·log n)`.
+fn encode_with(rank: &HashMap<(u32, u32), u32>, bytes: &[u8]) -> Vec<u32> {
+    let n = bytes.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut tok: Vec<u32> = bytes.iter().map(|&b| u32::from(b)).collect();
+    let mut next: Vec<usize> = (1..=n).collect();
+    next[n - 1] = NONE;
+    let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect(); // prev[0] = NONE
+    let mut alive = vec![true; n];
+    let mut heap: BinaryHeap<(Reverse<u32>, Reverse<usize>)> = BinaryHeap::new();
+    for i in 0..n - 1 {
+        if let Some(&r) = rank.get(&(tok[i], tok[i + 1])) {
+            heap.push((Reverse(r), Reverse(i)));
+        }
+    }
+    while let Some((Reverse(r), Reverse(i))) = heap.pop() {
+        if !alive[i] {
+            continue;
+        }
+        let j = next[i];
+        if j == NONE || rank.get(&(tok[i], tok[j])) != Some(&r) {
+            continue; // stale: neighbor changed under us
+        }
+        let id = BASE as u32 + r;
+        let (h, k) = (prev[i], next[j]);
+        tok[i] = id;
+        alive[j] = false;
+        next[i] = k;
+        if k != NONE {
+            prev[k] = i;
+        }
+        if h != NONE {
+            if let Some(&r2) = rank.get(&(tok[h], id)) {
+                heap.push((Reverse(r2), Reverse(h)));
             }
         }
+        if k != NONE {
+            if let Some(&r2) = rank.get(&(id, tok[k])) {
+                heap.push((Reverse(r2), Reverse(i)));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut i = 0usize; // index 0 is never deleted (merges keep the left token)
+    loop {
+        out.push(tok[i]);
+        let nx = next[i];
+        if nx == NONE {
+            break;
+        }
+        i = nx;
+    }
+    out
+}
+
+/// Perform up to `quota` merge rounds on `seq`, appending each to `merges`/`rank`.
+/// Stops early at `target` vocab or when the best pair falls below `MIN_FREQ`.
+/// Incremental: per-pair counts and occurrence lists are updated per merge, so a
+/// merge costs only its occurrences. Best pair = max count, ties → smallest pair.
+fn run_rounds(
+    seq: Vec<u32>,
+    merges: &mut Vec<(u32, u32)>,
+    rank: &mut HashMap<(u32, u32), u32>,
+    quota: usize,
+    target: usize,
+) {
+    let n = seq.len();
+    if n < 2 {
+        return;
+    }
+    let mut tok = seq;
+    let mut next: Vec<usize> = (1..=n).collect();
+    next[n - 1] = NONE;
+    let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
+    let mut alive = vec![true; n];
+    let mut counts: HashMap<(u32, u32), i64> = HashMap::new();
+    let mut occ: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    let mut heap: BinaryHeap<(i64, Reverse<(u32, u32)>)> = BinaryHeap::new();
+    for i in 0..n - 1 {
+        let p = (tok[i], tok[i + 1]);
+        *counts.entry(p).or_insert(0) += 1;
+        occ.entry(p).or_default().push(i);
+    }
+    for (&p, &c) in &counts {
+        heap.push((c, Reverse(p)));
+    }
+
+    let mut done = 0;
+    while done < quota && BASE + merges.len() < target {
+        let pair = loop {
+            let Some((c, Reverse(p))) = heap.pop() else {
+                return;
+            };
+            match counts.get(&p) {
+                Some(&cur) if cur == c => {
+                    if c < MIN_FREQ {
+                        return; // true max is below the floor — nothing left worth merging
+                    }
+                    break p;
+                }
+                _ => {} // stale snapshot, keep popping
+            }
+        };
+        let id = (BASE + merges.len()) as u32;
+        rank.insert(pair, merges.len() as u32);
+        merges.push(pair);
+        done += 1;
+
+        counts.remove(&pair);
+        for i in occ.remove(&pair).unwrap_or_default() {
+            if !alive[i] {
+                continue;
+            }
+            let j = next[i];
+            if j == NONE || !alive[j] || tok[i] != pair.0 || tok[j] != pair.1 {
+                continue; // stale occurrence
+            }
+            let (h, k) = (prev[i], next[j]);
+            if h != NONE {
+                if let Some(c) = counts.get_mut(&(tok[h], tok[i])) {
+                    *c -= 1;
+                }
+            }
+            if k != NONE {
+                if let Some(c) = counts.get_mut(&(tok[j], tok[k])) {
+                    *c -= 1;
+                }
+            }
+            tok[i] = id;
+            alive[j] = false;
+            next[i] = k;
+            if k != NONE {
+                prev[k] = i;
+            }
+            if h != NONE {
+                let np = (tok[h], id);
+                let c = counts.entry(np).or_insert(0);
+                *c += 1;
+                heap.push((*c, Reverse(np)));
+                occ.entry(np).or_default().push(h);
+            }
+            if k != NONE {
+                let np = (id, tok[k]);
+                let c = counts.entry(np).or_insert(0);
+                *c += 1;
+                heap.push((*c, Reverse(np)));
+                occ.entry(np).or_default().push(i);
+            }
+        }
+    }
+}
+
+impl Bpe {
+    /// Learn merges from `data` on the 1 MB / `MERGES_PER_MB` schedule, growing
+    /// the vocab to (at most) `target_vocab`.
+    pub(crate) fn learn(data: &[u8], target_vocab: usize) -> Self {
+        let mut merges: Vec<(u32, u32)> = Vec::new();
+        let mut rank: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut b = 1;
+        while BASE + merges.len() < target_vocab {
+            let end = (b * MB).min(data.len());
+            let seq = encode_with(&rank, &data[..end]);
+            run_rounds(seq, &mut merges, &mut rank, MERGES_PER_MB, target_vocab);
+            if end == data.len() {
+                break;
+            }
+            b += 1;
+        }
         let expand = build_expand(&merges);
-        Self { merges, expand }
+        Self {
+            merges,
+            rank,
+            expand,
+        }
     }
 
     pub(crate) fn vocab_size(&self) -> usize {
         BASE + self.merges.len()
     }
 
-    /// Tokenize bytes → token ids by applying the merges in learned order.
+    /// Tokenize bytes → token ids (near-linear).
     pub(crate) fn encode(&self, bytes: &[u8]) -> Vec<u32> {
-        let mut ids: Vec<u32> = bytes.iter().map(|&b| u32::from(b)).collect();
-        for (mi, &pair) in self.merges.iter().enumerate() {
-            apply_merge(&mut ids, pair, (BASE + mi) as u32);
-        }
-        ids
+        encode_with(&self.rank, bytes)
     }
 
     /// Byte expansion of one token id.
@@ -152,8 +276,16 @@ impl Bpe {
             merges.push((a, b));
             p += 8;
         }
+        let rank = build_rank(&merges);
         let expand = build_expand(&merges);
-        (Self { merges, expand }, p)
+        (
+            Self {
+                merges,
+                rank,
+                expand,
+            },
+            p,
+        )
     }
 }
 
@@ -162,27 +294,56 @@ mod tests {
     use super::*;
 
     fn corpus() -> Vec<u8> {
-        // repetitive text so merges actually form
         "the quick brown fox the lazy dog the the the quick fox jumps "
-            .repeat(200)
+            .repeat(2000)
             .into_bytes()
+    }
+
+    /// Reference tokenizer: apply merges in rank order as full left-to-right
+    /// non-overlapping passes. The near-linear `encode` must match this.
+    fn encode_reference(merges: &[(u32, u32)], bytes: &[u8]) -> Vec<u32> {
+        let mut ids: Vec<u32> = bytes.iter().map(|&b| u32::from(b)).collect();
+        for (mi, &pair) in merges.iter().enumerate() {
+            let id = (BASE + mi) as u32;
+            let (mut w, mut r) = (0usize, 0usize);
+            while r < ids.len() {
+                if r + 1 < ids.len() && ids[r] == pair.0 && ids[r + 1] == pair.1 {
+                    ids[w] = id;
+                    r += 2;
+                } else {
+                    ids[w] = ids[r];
+                    r += 1;
+                }
+                w += 1;
+            }
+            ids.truncate(w);
+        }
+        ids
     }
 
     #[test]
     fn roundtrips_and_grows() {
         let data = corpus();
         let bpe = Bpe::learn(&data, 512);
-        assert!(bpe.vocab_size() > BASE, "vocab should grow past raw bytes");
+        assert!(bpe.vocab_size() > BASE);
         assert!(bpe.vocab_size() <= 512);
-        // encode → expand reproduces the input exactly
         let ids = bpe.encode(&data);
         let mut back = Vec::new();
         for id in &ids {
             back.extend_from_slice(bpe.expand(*id));
         }
         assert_eq!(back, data, "encode∘expand must be identity");
-        // tokenization actually shortens the stream
         assert!(ids.len() < data.len());
+    }
+
+    #[test]
+    fn encode_matches_in_order_reference() {
+        let data = corpus();
+        let bpe = Bpe::learn(&data, 400);
+        // on the training data and on novel bytes
+        assert_eq!(bpe.encode(&data), encode_reference(&bpe.merges, &data));
+        let novel = b"the lazy quick fox\x00\xff jumps the the dog brown".repeat(7);
+        assert_eq!(bpe.encode(&novel), encode_reference(&bpe.merges, &novel));
     }
 
     #[test]
@@ -190,7 +351,7 @@ mod tests {
         let data = corpus();
         let a = Bpe::learn(&data, 400);
         let b = Bpe::learn(&data, 400);
-        assert_eq!(a.merges, b.merges, "learning must be deterministic");
+        assert_eq!(a.merges, b.merges);
         assert_eq!(a.encode(&data), b.encode(&data));
     }
 
@@ -207,7 +368,6 @@ mod tests {
 
     #[test]
     fn encodes_unseen_bytes() {
-        // every byte value is a base token, so arbitrary input always encodes
         let bpe = Bpe::learn(&corpus(), 400);
         let novel: Vec<u8> = (0..=255u8).collect();
         let ids = bpe.encode(&novel);
