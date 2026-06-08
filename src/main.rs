@@ -83,6 +83,19 @@ fn model() -> v8::Model {
     v8::Model::from_blob(V8_WEIGHTS)
 }
 
+/// `L(D)` in bpb on enwik9: the shipped binary is paid `2×` (compressor +
+/// reduced-multiplier decompressor) and bpb is bits per byte, so the cost is
+/// `8 × 2 × binary_bytes / 1e9 = 16 × binary_bytes / 1e9`. Uses the *actual*
+/// running executable (code + embedded weights), not just the weight blob.
+#[allow(clippy::cast_precision_loss)]
+fn ld_bpb() -> (u64, f64) {
+    let bytes = std::env::current_exe()
+        .ok()
+        .and_then(|p| fs::metadata(p).ok())
+        .map_or(0, |m| m.len());
+    (bytes, 16.0 * bytes as f64 / 1e9)
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn run_compress(input: &PathBuf, output: &PathBuf, skip_verify: bool) -> Result<()> {
     let bytes = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
@@ -97,12 +110,13 @@ fn run_compress(input: &PathBuf, output: &PathBuf, skip_verify: bool) -> Result<
     out.extend_from_slice(&archive);
     fs::write(output, &out).with_context(|| format!("writing {}", output.display()))?;
 
+    let lc = 8.0 * archive.len() as f64 / n as f64;
+    let (bin_bytes, ld) = ld_bpb();
     println!("Input:    {n} bytes");
-    println!(
-        "Archive:  {} bytes ({:.4} bpb)",
-        out.len(),
-        8.0 * archive.len() as f64 / n as f64
-    );
+    println!("Archive:  {} bytes", out.len());
+    println!("L(C):     {lc:.4} bpb");
+    println!("L(D):     {ld:.4} bpb  ({bin_bytes} B binary × 2 penalty / enwik9)");
+    println!("Net:      {:.4} bpb", lc + ld);
     println!("Encode:   {elapsed:?}");
 
     if !skip_verify {
@@ -140,10 +154,10 @@ fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
     }
     let slice = &bytes[offset..offset + len];
     let model = model();
+    let (bin_bytes, ld) = ld_bpb();
     eprintln!(
-        "v8 weights: {} bytes embedded  (L(D) ≈ {:.4} bpb on enwik9)",
-        V8_WEIGHTS.len(),
-        2.0 * V8_WEIGHTS.len() as f64 / 1e9,
+        "v8 weights: {} bytes embedded; binary {bin_bytes} bytes",
+        V8_WEIGHTS.len()
     );
 
     let start = Instant::now();
@@ -154,13 +168,13 @@ fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
     let decode = dstart.elapsed();
 
     let ok = decoded == slice;
+    let lc = 8.0 * archive.len() as f64 / slice.len() as f64;
     println!();
     println!("Slice:        {len} bytes  [{offset}, {})", offset + len);
     println!("Archive:      {} bytes", archive.len());
-    println!(
-        "L(C) bpb:     {:.4}",
-        8.0 * archive.len() as f64 / slice.len() as f64
-    );
+    println!("L(C):         {lc:.4} bpb  (this slice)");
+    println!("L(D):         {ld:.4} bpb  ({bin_bytes} B binary × 2 penalty / enwik9)");
+    println!("Net:          {:.4} bpb", lc + ld);
     println!("Round-trip:   {}", if ok { "OK" } else { "MISMATCH" });
     println!(
         "Throughput:   {:.3} ms/byte encode, {:.3} ms/byte decode",

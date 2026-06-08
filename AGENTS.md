@@ -11,15 +11,11 @@ A Hutter Prize attempt: a single Rust binary that compresses `enwik9` below the 
 - *Default (self-extracting archive)*: `S = length(comp9.exe) + length(archive9.exe)`. The compressor and the self-extracting archive both contain a copy of the model weights, so weights are paid for `2×`.
 - *Relaxation (split compressor + bare archive)*: `S = length(comp9a.exe) + 2 × length(decomp9.exe) + length(archive9.bhm)`. **If `comp9a.exe == decomp9.exe`** (same binary used for both directions), the `2×` reduces to `1×`, giving `S = 2 × length(binary) + length(archive)`.
 
-The favorable shape for us is **one binary serving both directions**: the binary appears twice in `S` (once as the compressor, once as the reduced-multiplier decompressor), so its bytes count `2×`. There is no submission shape where `L(D)` is counted only `1×`. Split binaries (`comp9a != decomp9`) are strictly worse (`3×` the binary cost). When projecting `L(D)` bpb in code or journal entries, always multiply shipped-binary-bytes by 2 before dividing by 1 GB.
+The favorable shape for us is **one binary serving both directions**: the binary appears twice in `S` (once as the compressor, once as the reduced-multiplier decompressor), so its bytes count `2×`. There is no submission shape where `L(D)` is counted only `1×`. Split binaries (`comp9a != decomp9`) are strictly worse (`3×` the binary cost).
 
-Two branches:
-- **`hutter`** — v1, ensemble of LZ77 + cross-stream PPM-D + 4M-param RWKV byte-level neural arm. Best result: **1.985 bpb on enwik8** (249 MB extrapolated to enwik9). Architecture: byte-class-routed (Lower/Upper/NonLetter), monolithic codec, ad-hoc bit accounting. **Saturated** — see 2026-05-10 journal entry.
-- **`v2`** — clean-slate rewrite, mode-routed codec with eval-first discipline and per-component bit decomposition. Best deterministic result so far: **2.608 bpb on enwik8** (xml-lz-cp). No neural arm yet.
-- **`v3`** — adds neural-arm integration onto the v2 mode-routed codec. Best result: 1.811 bpb on enwik9 with `nano_plus` AR transformer mixed on `token_oov_sep` (Phase 27).
-- **`v4`** — neural-first pure-MoE codec. Sparse `n_experts=32` AR transformer + AC + uniform fallback; no LZ/PPM/classifier/tokenizer. Best result (E=32 at 60 K steps, int8ch-quantized at load): **L(C) 1.6098 + 2×L(D) 0.0524 = 1.6622 combined bpb on 1 MB enwik9.** Current development branch.
+**`L(D)` in bpb** = `8 × 2 × shipped-binary-bytes / 1e9` = `16 × binary-bytes / 1e9` (×8 bits/byte, ×2 penalty, over enwik9's 1 GB). Use the **actual built binary size** — code *and* embedded weights — not just the weight blob; the binary is the thing scored. The `lzr nn-test` / `compress` subcommands read `current_exe()` and report this. (Historical note: code prior to 2026-06-08 used `2 × bytes / 1e9`, which dropped the ×8 and counted only the blob, under-reporting `L(D)` ~11×.)
 
-Current history and rationale live in [JOURNAL.md](JOURNAL.md). The retired Python+MLX predecessor lives at `/Users/creynolds/Programming/lzr-train/`.
+**Current branch is `v8-neural`** — a neural-first codec (below). Every earlier line is preserved on its own branch and is not carried here: `hutter` (v1 LZ77+PPM-D+RWKV, 1.985 bpb enwik8), `v2`–`v6` (mode-routed deterministic + neural-integration experiments), and **`v7`** (the deterministic cmix/PAQ stack, the standing best at **1.4267 bpb enwik8**, `L(D)≈0`). Their history and rationale live in [JOURNAL.md](JOURNAL.md); pull code from those branches when needed rather than keeping it here. The retired Python+MLX predecessor lives at `/Users/creynolds/Programming/lzr-train/`.
 
 ## Build
 
@@ -32,20 +28,24 @@ Always build via `./build.sh`, not a bare `cargo build`. The script runs fmt, cl
 - **Submission binary is strictly single-threaded.** No `std::thread`, no rayon, no parallel iterators.
 - **Kernel strategy: architecture-neutral first.** Write clean scalar code and trust LLVM auto-vectorization with `RUSTFLAGS=-C target-cpu=native` (configured in `.cargo/config.toml`). v1's Python-side experiments showed clean scalar code reaching ~75 GOPS on Apple NEON where explicit `wide::i16x8` SIMD gave 2.9 GOPS — auto-vec is almost always the right tool. If a measurement justifies it, add an architecture-specific kernel behind a runtime dispatch (`is_x86_feature_detected!`) and keep the neutral path as the fallback.
 
-## v2 design principles (current branch)
+## v8 design principles (current branch)
 
-- **Eval infrastructure first.** Per-component bit decomposition (`src/eval.rs`) is the substrate for every architectural decision. Every codec implements `crate::codec::Codec` and reports a `Decomposition` whose components must sum to `8 * archive_bytes` exactly — caught at panel time.
-- **Bit-budget discipline.** Before adding any predictor or codec component, predict in writing which decomposition cells move and by how much. Measure. If the prediction is wrong, the architecture is wrong, not the predictor.
-- **Mode-routed codec.** A streaming `Classifier` (`src/classifier.rs`) is a Moore FSM tagging each byte as `Content`/`TagStructure`/`AttrValue`. Encoder and decoder run the same classifier deterministically — no signaling, zero bits overhead. Per-mode codecs handle the bytes their classifier reports.
-- **Per-phase codec layering.** Each new architectural step lands as a new codec (`xml`, `xml-ppm`, `xml-lz-ppm`, `xml-lz-word`, `xml-lz-ord3`, `xml-lz-cp`, `xml-lz-ppmc`). They sit side by side and can be A/B-tested via `--codec <name>`. Old codecs stay shippable for regression checks.
-- **Sub-8-bit AC framing.** A bit-level arithmetic coder (`src/ac.rs`) with chunked uniform-CDF emission for >8-bit raw-bit values. All codec components share one AC stream so framing is consistent. Two latent AC bugs found and fixed under v2's varied bench conditions (see 2026-05-11 entry); both would surface in v1 too if exercised the same way.
+The v8 codec is a **pre-trained BitNet transformer** driving an arithmetic coder. The split that makes it shippable:
+
+- **Train on GPU, ship pure Rust.** Training (`examples/neural.rs`, behind the `neural` feature) uses `burn` on the wgpu/Metal GPU as an autodiff tensor engine — `burn` is heavy and threaded, so it is **never** in the submission build. It produces a weight blob. The submission side (`src/v8.rs`, default/submission build, **no `burn`, no threads**) `include_bytes!`s the blob and runs a hand-rolled scalar forward + range coder. Same binary compresses and decompresses.
+- **Ternary BitNet, QAT not post-hoc.** Weights are ternary (`{-1,0,1}` + per-tensor absmean scale) trained with quantization-aware training (fake-quant + straight-through estimator). Post-hoc quantization does not survive (v5: 1.25→3.04 bpb) — it must be trained in. The blob packs ternary at 2 bits/weight (1.6 b/w trit-packing is a known tightening); embeddings/norms are f32 in the blob but need not be — quantize them once a large BPE vocab makes the embedding table dominant.
+- **Determinism is the correctness backbone.** Encode and decode share the *identical* per-position forward and the same CDF construction, so the codec round-trips by construction regardless of float-order differences against the trainer. The pure-Rust forward is checked to reproduce the trainer's ternary CPU bpb, and an in-binary round-trip is unit-tested.
+- **Incremental KV-cache forward.** `step` processes one token, appending its K/V; past tokens' K/V are finalized by causality, making the per-byte cost linear, not O(t²). Learned **absolute** positions cannot slide (it would invalidate the cache), so the context **block-resets** at the `ctx` boundary — matches training's contiguous-from-0 windows. True sliding needs relative positions (ALiBi/RoPE), a deliberate future change.
+- **Auto-vec kernels (see kernel strategy above).** The ternary matvec is a multi-accumulator f32 `dot` (`LANES=16`, `mul_add` → NEON `fmla.4s`) over weights unpacked to f32 in RAM (the on-disk blob stays 2-bit, so `L(D)` is unaffected). Reusable `Scratch` buffers avoid per-byte allocation. An int8 `sdot` matvec (~4×) is the next kernel lever but departs from pure-auto-vec f32.
+- **Eval via `lzr nn-test`.** Quick self-check: compress a corpus slice with the embedded weights, verify the round-trip, report `L(C)`, `L(D)` (from the real binary), and net bpb. The training run prints the held-out bpb on both GPU and CPU backends.
 
 ## Dependencies
 
 - Pin runtime deps with `=` exact versions.
-- **Submission binary deps stay minimal.** v2 currently runs on `anyhow` and `clap`. Anything that pulls in threading is forbidden in the submission path.
+- **Submission binary deps stay minimal** — currently `anyhow` and `clap`. Anything that pulls in threading is forbidden in the submission path (the `build.sh` `cargo tree` gate enforces it).
+- **`burn` is training-only**, gated behind the `neural` feature (`burn = { optional = true, default-features = false, features = ["std","wgpu","ndarray","autodiff"] }` — defaults pull 600+ image/video/web packages, always trim). It must never enter the default/submission build.
 - **Do not add `safetensors`, `mlx-rs`, `bitnet-*` from crates.io.** The bitnet crates are stubs; mlx is Apple-only and the Python MLX work is retired; safetensors duplicates raw-binary functionality.
-- Optional / training-only deps go behind a feature flag, never plain `[dependencies]`. v2 currently has no such deps; when a neural arm is added, gate it.
+- Optional / training-only deps go behind a feature flag, never plain `[dependencies]`.
 
 ## Code style
 

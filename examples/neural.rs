@@ -583,12 +583,14 @@ fn train_and_eval(data: &[u8], test: &[u8], cfg: &GptConfig, label: &str) {
     if cfg.bit {
         let blob = pack_model(&cpu_model, cfg);
         std::fs::write("assets/v8weights.bin", &blob).expect("write blob");
-        let ld_bpb = 2.0 * blob.len() as f64 / 1e9;
+        // weights-only floor; the shipped binary adds code, so the true L(D) is
+        // larger — run `lzr nn-test` for it. bpb = 8 bits × 2 penalty / 1 GB.
+        let ld_floor = 16.0 * blob.len() as f64 / 1e9;
         println!(
-            "[{label}] packed blob: {} bytes ({:.2} KiB)  →  L(D) ≈ {:.4} bpb on enwik9",
+            "[{label}] packed blob: {} bytes ({:.2} KiB)  →  weights-only L(D) ≥ {:.4} bpb on enwik9",
             blob.len(),
             blob.len() as f64 / 1024.0,
-            ld_bpb,
+            ld_floor,
         );
     }
 }
