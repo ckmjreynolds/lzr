@@ -2,7 +2,13 @@
 //! Stage A: a multi-symbol range coder, verified by an inline round-trip test.
 //! Run: cargo run --release --example neural --features neural
 #![recursion_limit = "256"]
-#![allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs, dead_code)]
+#![allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    missing_docs,
+    dead_code
+)]
 #![allow(elided_lifetimes_in_paths)]
 
 use burn::backend::ndarray::NdArrayDevice;
@@ -10,16 +16,16 @@ use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, NdArray, Wgpu};
 use burn::module::{AutodiffModule, Module};
 use burn::nn::attention::{
-    generate_autoregressive_mask, MhaInput, MultiHeadAttention, MultiHeadAttentionConfig,
+    MhaInput, MultiHeadAttention, MultiHeadAttentionConfig, generate_autoregressive_mask,
 };
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
+use burn::tensor::Distribution;
 use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::Distribution;
 
 // ---------------------------------------------------------------------------
 // Carryless range coder (Subbotin style). Multi-symbol via cumulative-freq CDF.
@@ -36,7 +42,11 @@ struct RangeEncoder {
 }
 impl RangeEncoder {
     fn new() -> Self {
-        Self { low: 0, range: u32::MAX, out: Vec::new() }
+        Self {
+            low: 0,
+            range: u32::MAX,
+            out: Vec::new(),
+        }
     }
     fn encode(&mut self, cum: u32, freq: u32, tot: u32) {
         let r = self.range / tot;
@@ -73,7 +83,13 @@ struct RangeDecoder<'a> {
 }
 impl<'a> RangeDecoder<'a> {
     fn new(inp: &'a [u8]) -> Self {
-        let mut d = Self { low: 0, range: u32::MAX, code: 0, inp, pos: 0 };
+        let mut d = Self {
+            low: 0,
+            range: u32::MAX,
+            code: 0,
+            inp,
+            pos: 0,
+        };
         for _ in 0..4 {
             d.code = (d.code << 8) | d.next();
         }
@@ -125,7 +141,9 @@ fn probs_to_cdf(probs: &[f32]) -> Vec<u32> {
     }
     // dump rounding remainder onto the argmax (deterministic)
     let leftover = remaining - used;
-    let argmax = (0..n).max_by(|&a, &b| probs[a].total_cmp(&probs[b])).unwrap();
+    let argmax = (0..n)
+        .max_by(|&a, &b| probs[a].total_cmp(&probs[b]))
+        .unwrap();
     freqs[argmax] += leftover;
     // build CDF
     let mut cdf = vec![0u32; n + 1];
@@ -168,7 +186,10 @@ impl<B: Backend> BitLinear<B> {
     fn new(in_f: usize, out_f: usize, bit: bool, device: &B::Device) -> Self {
         let std = (1.0 / in_f as f64).sqrt();
         let weight = Tensor::random([out_f, in_f], Distribution::Normal(0.0, std), device);
-        Self { weight: burn::module::Param::from_tensor(weight), bit }
+        Self {
+            weight: burn::module::Param::from_tensor(weight),
+            bit,
+        }
     }
 
     fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
