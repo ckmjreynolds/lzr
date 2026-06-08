@@ -15,9 +15,9 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 #![allow(clippy::many_single_char_names, clippy::similar_names)]
-// Scalar inner loops are written for auto-vec clarity; `mul_add` would obscure
-// them and is not faster here. Doc header names types (BitNet/LayerNorm/LZR8)
-// in prose. Both scoped to this file only.
+// The hot kernels use `mul_add` (emits NEON `fmla.4s`); some non-hot scalar
+// expressions don't, so `suboptimal_flops` is allowed file-wide rather than
+// rewritten everywhere. Doc header names types (BitNet/LayerNorm/LZR8) in prose.
 #![allow(clippy::suboptimal_flops, clippy::doc_markdown)]
 #![allow(clippy::cast_lossless, clippy::needless_lifetimes)]
 #![allow(clippy::missing_const_for_fn, clippy::needless_range_loop)]
@@ -321,17 +321,23 @@ fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + erf(x * std::f32::consts::FRAC_1_SQRT_2))
 }
 
-/// In-place LayerNorm of each length-`d` row of `x` ([t, d]).
+/// LayerNorm one row (`row` and `out` both length `d`).
+fn layernorm_row(out: &mut [f32], row: &[f32], ln: &LayerNorm) {
+    let d = row.len();
+    let mean = row.iter().sum::<f32>() / d as f32;
+    let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+    let inv = 1.0 / (var + 1e-5).sqrt();
+    for i in 0..d {
+        out[i] = (row[i] - mean) * inv * ln.gamma[i] + ln.beta[i];
+    }
+}
+
+/// Test-only [t, d] wrapper over `layernorm_row` (the `predict` oracle uses it).
+#[cfg(test)]
 fn layernorm(x: &[f32], t: usize, d: usize, ln: &LayerNorm) -> Vec<f32> {
     let mut out = vec![0f32; t * d];
     for r in 0..t {
-        let row = &x[r * d..r * d + d];
-        let mean = row.iter().sum::<f32>() / d as f32;
-        let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
-        let inv = 1.0 / (var + 1e-5).sqrt();
-        for i in 0..d {
-            out[r * d + i] = (row[i] - mean) * inv * ln.gamma[i] + ln.beta[i];
-        }
+        layernorm_row(&mut out[r * d..(r + 1) * d], &x[r * d..(r + 1) * d], ln);
     }
     out
 }
@@ -342,18 +348,18 @@ fn layernorm(x: &[f32], t: usize, d: usize, ln: &LayerNorm) -> Vec<f32> {
 /// vectorize without `-ffast-math`. `chunks_exact` keeps the hot loop
 /// bounds-check-free. `a` and `b` must be the same length.
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    const LANES: usize = 8;
+    const LANES: usize = 16;
     let mut acc = [0f32; LANES];
     let mut ac = a.chunks_exact(LANES);
     let mut bc = b.chunks_exact(LANES);
     for (av, bv) in ac.by_ref().zip(bc.by_ref()) {
         for l in 0..LANES {
-            acc[l] += av[l] * bv[l];
+            acc[l] = av[l].mul_add(bv[l], acc[l]);
         }
     }
     let mut sum: f32 = acc.iter().sum();
     for (av, bv) in ac.remainder().iter().zip(bc.remainder()) {
-        sum += av * bv;
+        sum = av.mul_add(*bv, sum);
     }
     sum
 }
@@ -362,27 +368,38 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// attention value-mixing vectorize (the strided gather form does not).
 fn saxpy(dst: &mut [f32], a: f32, src: &[f32]) {
     for (d, s) in dst.iter_mut().zip(src) {
-        *d += a * *s;
+        *d = a.mul_add(*s, *d);
     }
 }
 
-/// BitLinear forward: per-token int8-quantized activations × ternary weights.
-/// `x` is [t, in_f]; returns [t, out_f]. Replicates the trainer's inference math.
+/// BitLinear one row: int8-quantize `row` (into `xq` scratch, len ≥ in_f) and
+/// matvec against the ternary weights into `out` (len out_f). Replicates the
+/// trainer's inference math.
+fn bitlinear_row(out: &mut [f32], row: &[f32], lin: &TernLinear, xq: &mut [f32]) {
+    let in_f = lin.in_f;
+    let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let s = (amax / 127.0).max(1e-5);
+    for i in 0..in_f {
+        xq[i] = (row[i] / s).round().clamp(-127.0, 127.0) * s;
+    }
+    for o in 0..lin.out_f {
+        out[o] = dot(&xq[..in_f], &lin.w[o * in_f..o * in_f + in_f]) * lin.scale;
+    }
+}
+
+/// Test-only [t, *] wrapper over `bitlinear_row` (the `predict` oracle uses it).
+#[cfg(test)]
 fn bitlinear(x: &[f32], t: usize, lin: &TernLinear) -> Vec<f32> {
     let (in_f, out_f) = (lin.in_f, lin.out_f);
     let mut out = vec![0f32; t * out_f];
     let mut xq = vec![0f32; in_f];
     for r in 0..t {
-        let row = &x[r * in_f..r * in_f + in_f];
-        let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let s = (amax / 127.0).max(1e-5);
-        for i in 0..in_f {
-            xq[i] = (row[i] / s).round().clamp(-127.0, 127.0) * s;
-        }
-        for o in 0..out_f {
-            let w = &lin.w[o * in_f..o * in_f + in_f];
-            out[r * out_f + o] = dot(&xq, w) * lin.scale;
-        }
+        bitlinear_row(
+            &mut out[r * out_f..(r + 1) * out_f],
+            &x[r * in_f..(r + 1) * in_f],
+            lin,
+            &mut xq,
+        );
     }
     out
 }
@@ -410,25 +427,65 @@ pub(crate) struct Cache {
     len: usize,
 }
 
+/// Per-step scratch buffers, allocated once and reused across every byte —
+/// `step` would otherwise heap-allocate ~70 short-lived `Vec`s per byte. All
+/// are length `d_model` except `ff`/`xq` (`ffn`), `scores` (`ctx`), `logits`
+/// (`vocab`).
+pub(crate) struct Scratch {
+    x: Vec<f32>,
+    nrm: Vec<f32>, // layernorm output (norm1 / norm2 / final, used then consumed)
+    q: Vec<f32>,
+    kbuf: Vec<f32>,
+    vbuf: Vec<f32>,
+    ctx: Vec<f32>,
+    tmp: Vec<f32>, // attn-out / ff-out
+    ff: Vec<f32>,  // ff1 hidden
+    xq: Vec<f32>,  // activation-quant scratch (sized to max in_f = ffn)
+    scores: Vec<f32>,
+    logits: Vec<f32>,
+}
+
 impl Model {
     pub(crate) fn new_cache(&self) -> Cache {
+        let cap = self.cfg.ctx * self.cfg.d_model;
         Cache {
-            k: vec![Vec::new(); self.cfg.n_layers],
-            v: vec![Vec::new(); self.cfg.n_layers],
+            k: (0..self.cfg.n_layers)
+                .map(|_| Vec::with_capacity(cap))
+                .collect(),
+            v: (0..self.cfg.n_layers)
+                .map(|_| Vec::with_capacity(cap))
+                .collect(),
             len: 0,
         }
     }
 
+    pub(crate) fn new_scratch(&self) -> Scratch {
+        let (d, ffn) = (self.cfg.d_model, self.cfg.ffn);
+        Scratch {
+            x: vec![0f32; d],
+            nrm: vec![0f32; d],
+            q: vec![0f32; d],
+            kbuf: vec![0f32; d],
+            vbuf: vec![0f32; d],
+            ctx: vec![0f32; d],
+            tmp: vec![0f32; d],
+            ff: vec![0f32; ffn],
+            xq: vec![0f32; ffn],
+            scores: vec![0f32; self.cfg.ctx],
+            logits: vec![0f32; self.cfg.vocab],
+        }
+    }
+
     /// Process one token through the stack, appending its K/V to `cache`, and
-    /// return the next-token distribution. Exact (within float tolerance) to a
-    /// from-scratch forward over the same context.
+    /// write the next-token distribution into `s.logits`. Exact (within float
+    /// tolerance) to a from-scratch forward over the same context.
     ///
     /// Learned absolute positions cannot slide without invalidating every cached
     /// token's K/V, so when the window fills (`len == ctx`) the cache is reset and
     /// the incoming token becomes position 0 — a fresh block, matching how the
     /// model trained (contiguous windows from position 0). The just-fed token
     /// seeds the new block, so there is no synthetic boundary token.
-    pub(crate) fn step(&self, cache: &mut Cache, token: i32) -> Vec<f32> {
+    pub(crate) fn step(&self, cache: &mut Cache, s: &mut Scratch, token: i32) {
         let cfg = self.cfg;
         let (d, h) = (cfg.d_model, cfg.n_heads);
         let dk = d / h;
@@ -443,57 +500,54 @@ impl Model {
         }
         let pos = cache.len;
         let id = token as usize;
-        let mut x = vec![0f32; d];
         for i in 0..d {
-            x[i] = self.tok[id * d + i] + self.pos[pos * d + i];
+            s.x[i] = self.tok[id * d + i] + self.pos[pos * d + i];
         }
         let scale = 1.0 / (dk as f32).sqrt();
         for (l, blk) in self.blocks.iter().enumerate() {
             // attention: project the new token, append to cache, attend to all
-            let hn = layernorm(&x, 1, d, &blk.norm1);
-            let q = bitlinear(&hn, 1, &blk.wq);
-            let knew = bitlinear(&hn, 1, &blk.wk);
-            let vnew = bitlinear(&hn, 1, &blk.wv);
-            cache.k[l].extend_from_slice(&knew);
-            cache.v[l].extend_from_slice(&vnew);
+            layernorm_row(&mut s.nrm, &s.x, &blk.norm1);
+            bitlinear_row(&mut s.q, &s.nrm, &blk.wq, &mut s.xq);
+            bitlinear_row(&mut s.kbuf, &s.nrm, &blk.wk, &mut s.xq);
+            bitlinear_row(&mut s.vbuf, &s.nrm, &blk.wv, &mut s.xq);
+            cache.k[l].extend_from_slice(&s.kbuf);
+            cache.v[l].extend_from_slice(&s.vbuf);
             let clen = cache.len + 1; // cached positions, including the new token
-            let mut ctx = vec![0f32; d];
+            s.ctx.iter_mut().for_each(|c| *c = 0.0);
+            let scores = &mut s.scores[..clen];
             for head in 0..h {
                 let off = head * dk;
-                let mut scores = vec![0f32; clen];
                 for (p, sc) in scores.iter_mut().enumerate() {
                     let kp = &cache.k[l][p * d + off..p * d + off + dk];
-                    *sc = dot(&q[off..off + dk], kp) * scale;
+                    *sc = dot(&s.q[off..off + dk], kp) * scale;
                 }
-                softmax_inplace(&mut scores);
-                let dst = &mut ctx[off..off + dk];
+                softmax_inplace(scores);
+                let dst = &mut s.ctx[off..off + dk];
                 for (p, &w) in scores.iter().enumerate() {
                     saxpy(dst, w, &cache.v[l][p * d + off..p * d + off + dk]);
                 }
             }
-            let o = bitlinear(&ctx, 1, &blk.wo);
+            bitlinear_row(&mut s.tmp, &s.ctx, &blk.wo, &mut s.xq);
             for i in 0..d {
-                x[i] += o[i];
+                s.x[i] += s.tmp[i];
             }
             // feed-forward
-            let hn2 = layernorm(&x, 1, d, &blk.norm2);
-            let mut f = bitlinear(&hn2, 1, &blk.ff1);
-            for v in &mut f {
+            layernorm_row(&mut s.nrm, &s.x, &blk.norm2);
+            bitlinear_row(&mut s.ff, &s.nrm, &blk.ff1, &mut s.xq);
+            for v in &mut s.ff {
                 *v = gelu(*v);
             }
-            let f2 = bitlinear(&f, 1, &blk.ff2);
+            bitlinear_row(&mut s.tmp, &s.ff, &blk.ff2, &mut s.xq);
             for i in 0..d {
-                x[i] += f2[i];
+                s.x[i] += s.tmp[i];
             }
         }
         cache.len += 1;
-        let xf = layernorm(&x, 1, d, &self.norm_f);
-        let mut logits = vec![0f32; cfg.vocab];
-        for (vix, lg) in logits.iter_mut().enumerate() {
-            *lg = dot(&xf, &self.tok[vix * d..vix * d + d]);
+        layernorm_row(&mut s.nrm, &s.x, &self.norm_f);
+        for (vix, lg) in s.logits.iter_mut().enumerate() {
+            *lg = dot(&s.nrm, &self.tok[vix * d..vix * d + d]);
         }
-        softmax_inplace(&mut logits);
-        logits
+        softmax_inplace(&mut s.logits);
     }
 
     /// Next-byte probability distribution given a context of token ids.
@@ -566,15 +620,16 @@ impl Model {
     pub(crate) fn compress(&self, bytes: &[u8], bos: i32) -> Vec<u8> {
         let mut enc = RangeEncoder::new();
         let mut cache = self.new_cache();
-        let mut probs = self.step(&mut cache, bos);
+        let mut s = self.new_scratch();
+        self.step(&mut cache, &mut s, bos);
         for &byte in bytes {
-            let cdf = probs_to_cdf(&probs);
+            let cdf = probs_to_cdf(&s.logits);
             enc.encode(
                 cdf[byte as usize],
                 cdf[byte as usize + 1] - cdf[byte as usize],
                 CDF_TOTAL,
             );
-            probs = self.step(&mut cache, i32::from(byte));
+            self.step(&mut cache, &mut s, i32::from(byte));
         }
         enc.finish()
     }
@@ -583,9 +638,10 @@ impl Model {
         let mut dec = RangeDecoder::new(archive);
         let mut out = Vec::with_capacity(n);
         let mut cache = self.new_cache();
-        let mut probs = self.step(&mut cache, bos);
+        let mut s = self.new_scratch();
+        self.step(&mut cache, &mut s, bos);
         for _ in 0..n {
-            let cdf = probs_to_cdf(&probs);
+            let cdf = probs_to_cdf(&s.logits);
             let f = dec.freq(CDF_TOTAL);
             let mut sym = cdf.partition_point(|&c| c <= f) - 1;
             if sym + 1 >= cdf.len() {
@@ -593,7 +649,7 @@ impl Model {
             }
             dec.update(cdf[sym], cdf[sym + 1] - cdf[sym], CDF_TOTAL);
             out.push(sym as u8);
-            probs = self.step(&mut cache, sym as i32);
+            self.step(&mut cache, &mut s, sym as i32);
         }
         out
     }
@@ -693,10 +749,11 @@ mod tests {
         let model = Model::from_blob(&tiny_blob());
         let toks: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 1, 2, 3]; // 11 < ctx=32
         let mut cache = model.new_cache();
+        let mut s = model.new_scratch();
         for end in 1..=toks.len() {
-            let cached = model.step(&mut cache, toks[end - 1]);
+            model.step(&mut cache, &mut s, toks[end - 1]);
             let reference = model.predict(&toks[..end]);
-            for (a, b) in cached.iter().zip(&reference) {
+            for (a, b) in s.logits.iter().zip(&reference) {
                 assert!((a - b).abs() < 1e-5, "cache diverged: {a} vs {b}");
             }
         }

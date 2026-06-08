@@ -28,11 +28,6 @@ anyhow      = "=1.0.102"
 clap        = { version = "=4.6.1", features = ["derive"] }
 burn        = { version = "0.21", optional = true, default-features = false, features = ["std", "wgpu", "ndarray", "autodiff"] }
 
-[dev-dependencies]
-assert_cmd        = "=2.2.2"
-pretty_assertions = "=1.4.1"
-proptest          = "=1.11.0"
-
 [[example]]
 name = "burnbench"
 required-features = ["neural"]

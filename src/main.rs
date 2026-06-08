@@ -1,25 +1,17 @@
-//! LZR v7 — clean-slate context-mixing compressor (Hutter Prize attempt).
+//! LZR v8 — neural-first compressor (Hutter Prize attempt).
 //!
-//! The codec is a single online multi-order context-mixing model over the
-//! shared arithmetic coder (`cmix`), plus the `null` pass-through floor used
-//! to sanity-check the eval harness. Everything else from earlier branches —
-//! the neural network arm, the dictionary and context arms, the tokenizer,
-//! the classifier — is gone. This branch rebuilds a deterministic, fast base
-//! to extend deliberately.
+//! Single binary, single-threaded, no `burn`: the trained `BitNet` transformer
+//! weights are baked in via `include_bytes!` and run through a hand-rolled
+//! scalar forward (`v8`) driving a range coder. The same binary compresses and
+//! decompresses (the `comp9a == decomp9` relaxation). The training side —
+//! `burn`/GPU, behind the `neural` feature — lives in `examples/neural.rs` and
+//! produces the weight blob this binary embeds.
 
 #![deny(unsafe_code)]
 #![allow(clippy::missing_docs_in_private_items)]
 #![allow(clippy::redundant_pub_crate)]
 #![allow(clippy::module_name_repetitions)]
 
-mod ac;
-mod bits;
-mod cmix;
-mod codec;
-mod dict;
-mod eval;
-mod lmix;
-mod null;
 mod v8;
 
 use std::fs;
@@ -28,6 +20,14 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+
+/// Trained `BitNet` weights (ternary, 2-bit packed), produced offline by
+/// `examples/neural.rs` and baked into the binary. This is the `2×`-counted
+/// `L(D)` payload of the Hutter score.
+static V8_WEIGHTS: &[u8] = include_bytes!("../assets/v8weights.bin");
+
+/// Container BOS seed for the autoregressive context.
+const BOS: i32 = 0;
 
 #[derive(Parser, Debug)]
 #[command(name = "lzr", version, about)]
@@ -38,96 +38,95 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Multi-offset eval panel with per-window bpb. 20 windows × 256 KiB by
-    /// default, or `--quick` for 5 × 64 KiB.
-    Bench {
-        #[arg(long, default_value = "assets/enwik8")]
-        corpus: PathBuf,
-        /// Codec name. v7 knows: `null`, `cmix`, `lmix`, `lmatch`, `lsse`, `lword`, `lhi`, `ldict`, `lnn`, `lnndict`, `lrnn`, `lrnndict`, `lgru`, `lgrudict`, `lind`, `linddict`, `lall`, `lindcase`, `linddictcase`, `lindcasemode`, `lallmode`, `lindcasex`, `lallx`.
-        #[arg(long, default_value = "cmix")]
-        codec: String,
-        /// Reduce panel to 5 windows × 64 KiB for tight iteration.
-        #[arg(long, default_value_t = false)]
-        quick: bool,
-        /// Dump per-component bit decomposition to CSV.
-        #[arg(long)]
-        decompose: Option<PathBuf>,
-    },
-
-    /// Compress a whole corpus end-to-end. Verifies the encode → decode
-    /// round-trip unless `--skip-verify` is set.
+    /// Compress a file to an archive (`u64` original length prefix + coded bytes).
     Compress {
-        #[arg(long, default_value = "assets/enwik9")]
-        corpus: PathBuf,
-        #[arg(long, default_value = "cmix")]
-        codec: String,
-        #[arg(long, default_value = "/tmp/lzr.archive")]
-        out: PathBuf,
+        input: PathBuf,
+        output: PathBuf,
+        /// Skip the in-process decode round-trip check.
         #[arg(long, default_value_t = false)]
         skip_verify: bool,
     },
 
-    /// v8 neural codec: compress a slice of a corpus with the embedded `BitNet`
-    /// weights (pure-Rust forward, no burn), verifying the round-trip. The
-    /// weight blob is baked into the binary via `include_bytes!`.
+    /// Decompress an archive produced by `compress`.
+    Decompress { input: PathBuf, output: PathBuf },
+
+    /// Quick self-check: compress a slice of a corpus with the embedded weights
+    /// and verify the round-trip, reporting bpb and per-byte timing.
     NnTest {
         #[arg(long, default_value = "assets/enwik8")]
         corpus: PathBuf,
-        /// Byte offset into the corpus to start the test slice.
         #[arg(long, default_value_t = 256 * 1024)]
         offset: usize,
-        /// Length of the test slice in bytes (kept ≤ ctx until KV-cache lands).
         #[arg(long, default_value_t = 240)]
         len: usize,
-    },
-
-    /// Attribute a codec's coding cost by byte class, to see where the bits go.
-    /// Warms on the first `--warm-mb` MiB, then measures the next `--measure-mb`.
-    Analyze {
-        #[arg(long, default_value = "assets/enwik8")]
-        corpus: PathBuf,
-        /// Codec whose model to analyze (one of the `l*` codecs).
-        #[arg(long, default_value = "lhi")]
-        codec: String,
-        #[arg(long, default_value_t = 4)]
-        warm_mb: usize,
-        #[arg(long, default_value_t = 4)]
-        measure_mb: usize,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Bench {
-            corpus,
-            codec,
-            quick,
-            decompose,
-        } => eval::run_bench(&corpus, &codec, quick, decompose.as_deref()),
         Command::Compress {
-            corpus,
-            codec,
-            out,
+            input,
+            output,
             skip_verify,
-        } => run_compress(&corpus, &codec, &out, skip_verify),
+        } => run_compress(&input, &output, skip_verify),
+        Command::Decompress { input, output } => run_decompress(&input, &output),
         Command::NnTest {
             corpus,
             offset,
             len,
         } => run_nn_test(&corpus, offset, len),
-        Command::Analyze {
-            corpus,
-            codec,
-            warm_mb,
-            measure_mb,
-        } => run_analyze(&corpus, &codec, warm_mb, measure_mb),
     }
 }
 
-/// Weight blob produced offline by `examples/neural.rs` (the training side),
-/// baked into the submission binary. This is the `2×`-counted `L(D)` payload.
-static V8_WEIGHTS: &[u8] = include_bytes!("../assets/v8weights.bin");
+fn model() -> v8::Model {
+    v8::Model::from_blob(V8_WEIGHTS)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn run_compress(input: &PathBuf, output: &PathBuf, skip_verify: bool) -> Result<()> {
+    let bytes = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    let n = bytes.len();
+    let model = model();
+
+    let start = Instant::now();
+    let archive = model.compress(&bytes, BOS);
+    let elapsed = start.elapsed();
+
+    let mut out = (n as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&archive);
+    fs::write(output, &out).with_context(|| format!("writing {}", output.display()))?;
+
+    println!("Input:    {n} bytes");
+    println!(
+        "Archive:  {} bytes ({:.4} bpb)",
+        out.len(),
+        8.0 * archive.len() as f64 / n as f64
+    );
+    println!("Encode:   {elapsed:?}");
+
+    if !skip_verify {
+        let decoded = model.decompress(&archive, n, BOS);
+        if decoded != bytes {
+            bail!("round-trip verification failed");
+        }
+        println!("Verify:   round-trip OK");
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation)] // judging machine is 64-bit
+fn run_decompress(input: &PathBuf, output: &PathBuf) -> Result<()> {
+    let blob = fs::read(input).with_context(|| format!("reading {}", input.display()))?;
+    if blob.len() < 8 {
+        bail!("archive too short to hold a length prefix");
+    }
+    let n = u64::from_le_bytes(blob[..8].try_into().unwrap()) as usize;
+    let decoded = model().decompress(&blob[8..], n, BOS);
+    fs::write(output, &decoded).with_context(|| format!("writing {}", output.display()))?;
+    println!("Decoded:  {n} bytes -> {}", output.display());
+    Ok(())
+}
 
 #[allow(clippy::cast_precision_loss)]
 fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
@@ -140,8 +139,7 @@ fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
         );
     }
     let slice = &bytes[offset..offset + len];
-
-    let model = v8::Model::from_blob(V8_WEIGHTS);
+    let model = model();
     eprintln!(
         "v8 weights: {} bytes embedded  (L(D) ≈ {:.4} bpb on enwik9)",
         V8_WEIGHTS.len(),
@@ -149,175 +147,28 @@ fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
     );
 
     let start = Instant::now();
-    let archive = model.compress(slice, 0);
-    let encode_elapsed = start.elapsed();
+    let archive = model.compress(slice, BOS);
+    let encode = start.elapsed();
     let dstart = Instant::now();
-    let decoded = model.decompress(&archive, slice.len(), 0);
-    let decode_elapsed = dstart.elapsed();
+    let decoded = model.decompress(&archive, slice.len(), BOS);
+    let decode = dstart.elapsed();
 
     let ok = decoded == slice;
-    let bpb = 8.0 * archive.len() as f64 / slice.len() as f64;
     println!();
+    println!("Slice:        {len} bytes  [{offset}, {})", offset + len);
+    println!("Archive:      {} bytes", archive.len());
     println!(
-        "Corpus:        {}  [{offset}, {})",
-        corpus.display(),
-        offset + len
+        "L(C) bpb:     {:.4}",
+        8.0 * archive.len() as f64 / slice.len() as f64
     );
-    println!("Slice bytes:   {len}");
-    println!("Archive bytes: {}", archive.len());
-    println!("L(C) bpb:      {bpb:.4}");
-    println!("Round-trip:    {}", if ok { "OK" } else { "MISMATCH" });
-    println!("Encode:        {encode_elapsed:?}   Decode: {decode_elapsed:?}");
+    println!("Round-trip:   {}", if ok { "OK" } else { "MISMATCH" });
+    println!(
+        "Throughput:   {:.3} ms/byte encode, {:.3} ms/byte decode",
+        encode.as_secs_f64() * 1e3 / len as f64,
+        decode.as_secs_f64() * 1e3 / len as f64,
+    );
     if !ok {
         bail!("v8 round-trip mismatch");
     }
-    Ok(())
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn run_compress(
-    corpus: &PathBuf,
-    codec_name: &str,
-    out: &PathBuf,
-    skip_verify: bool,
-) -> Result<()> {
-    let codec = eval::make_codec_public(codec_name)?;
-
-    eprintln!("Reading {} ...", corpus.display());
-    let bytes = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
-    let n = bytes.len();
-    eprintln!(
-        "Input:  {n} bytes ({:.2} MiB)",
-        n as f64 / (1024.0 * 1024.0)
-    );
-
-    let codec_ref: &dyn codec::Codec = codec.as_ref();
-    eprintln!("Encoding through codec `{}` ...", codec_ref.name());
-    let start = Instant::now();
-    let (archive, _decomp) = codec_ref
-        .encode_window(b"", &bytes)
-        .context("encode_window failed")?;
-    let encode_elapsed = start.elapsed();
-
-    eprintln!("Writing archive to {} ...", out.display());
-    fs::write(out, &archive).with_context(|| format!("writing archive to {}", out.display()))?;
-
-    let archive_bytes = archive.len();
-    let bpb = 8.0 * archive_bytes as f64 / n as f64;
-
-    println!();
-    println!("Codec:           {}", codec_ref.name());
-    println!("Corpus:          {}", corpus.display());
-    println!("Input bytes:     {n}");
-    println!(
-        "Archive bytes:   {archive_bytes}  ({:.2} MiB)",
-        archive_bytes as f64 / (1024.0 * 1024.0),
-    );
-    println!("Compressed bpb:  {bpb:.4}");
-    println!("Encode time:     {encode_elapsed:?}");
-    if encode_elapsed.as_secs_f64() > 0.0 {
-        println!(
-            "Encode rate:     {:.2} MiB/s",
-            n as f64 / (1024.0 * 1024.0) / encode_elapsed.as_secs_f64(),
-        );
-    }
-
-    if skip_verify {
-        println!("Verify:          skipped");
-        return Ok(());
-    }
-
-    eprintln!("Decoding for round-trip verification ...");
-    let decode_start = Instant::now();
-    let decoded = codec_ref
-        .decode_window(b"", &archive)
-        .context("decode_window failed")?;
-    let decode_elapsed = decode_start.elapsed();
-
-    if decoded.len() != n {
-        bail!("decode produced {} bytes; expected {n}", decoded.len());
-    }
-    if decoded != bytes {
-        let mismatch = bytes
-            .iter()
-            .zip(decoded.iter())
-            .position(|(a, b)| a != b)
-            .unwrap_or(0);
-        bail!(
-            "decode byte mismatch at offset {mismatch}: orig {:#04x} vs decoded {:#04x}",
-            bytes[mismatch],
-            decoded[mismatch]
-        );
-    }
-
-    println!("Decode time:     {decode_elapsed:?}");
-    println!("Round-trip:      OK");
-    Ok(())
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn run_analyze(corpus: &PathBuf, codec: &str, warm_mb: usize, measure_mb: usize) -> Result<()> {
-    let flags = lmix::flags_for(codec).with_context(|| {
-        format!("'{codec}' is not an analyzable codec (use one of the l* codecs)")
-    })?;
-
-    let warm_len = warm_mb * 1024 * 1024;
-    let measure_len = measure_mb * 1024 * 1024;
-    let bytes = fs::read(corpus).with_context(|| format!("reading {}", corpus.display()))?;
-    if bytes.len() < warm_len + measure_len {
-        bail!(
-            "corpus {} has {} bytes; need {} (warm {warm_mb} MiB + measure {measure_mb} MiB)",
-            corpus.display(),
-            bytes.len(),
-            warm_len + measure_len,
-        );
-    }
-    let warm = &bytes[..warm_len];
-    let measure = &bytes[warm_len..warm_len + measure_len];
-
-    eprintln!(
-        "Analyzing `{codec}` on {} (warm {warm_mb} MiB, measure {measure_mb} MiB) ...",
-        corpus.display()
-    );
-    let report = lmix::residual_report(flags, warm, measure);
-
-    let total_bits = report.total_bits();
-    let total_count = report.total_count();
-    let mut order: Vec<usize> = (0..lmix::CLASS_NAMES.len()).collect();
-    order.sort_by(|&a, &b| report.bits[b].total_cmp(&report.bits[a]));
-
-    println!();
-    println!("Codec:  {codec}");
-    println!("Corpus: {}  (measure {measure_mb} MiB)", corpus.display());
-    println!();
-    println!("  class      bytes    %bytes      bits    %bits     bpb");
-    println!("  -------  ---------  ------  ----------  ------  ------");
-    for &c in &order {
-        let cnt = report.count[c];
-        if cnt == 0 {
-            continue;
-        }
-        let bits = report.bits[c];
-        println!(
-            "  {:<7}  {:>9}  {:>5.1}%  {:>10.0}  {:>5.1}%  {:>6.3}",
-            lmix::CLASS_NAMES[c],
-            cnt,
-            100.0 * cnt as f64 / total_count as f64,
-            bits,
-            100.0 * bits / total_bits,
-            bits / cnt as f64,
-        );
-    }
-    println!("  -------  ---------  ------  ----------  ------  ------");
-    println!(
-        "  {:<7}  {:>9}  {:>5}   {:>10.0}  {:>5}   {:>6.3}",
-        "total",
-        total_count,
-        "",
-        total_bits,
-        "",
-        total_bits / total_count as f64,
-    );
-    println!();
     Ok(())
 }
