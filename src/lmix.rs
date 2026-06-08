@@ -109,18 +109,22 @@ const XMATCH_IN: usize = N_ORDERS + 4 + N_HI + N_SPARSE + 3 + N_IND;
 /// verified occurrences of its order-`o` context directly from the data and
 /// predicts from the empirical follower distribution — zero collision tax,
 /// unlike the hashed high-order tables.
-const XMATCH_ORDERS: [usize; 3] = [6, 8, 12];
+const XMATCH_ORDERS: [usize; 8] = [3, 4, 6, 8, 10, 12, 16, 20];
 /// Number of exact match models.
 const N_XMATCH: usize = XMATCH_ORDERS.len();
 /// Log2 size of each exact-match head table (context-hash → last position).
 const XMATCH_BITS: u32 = 24;
 /// Occurrences gathered per exact-match context (the follower-distribution size).
-const XMATCH_K: usize = 16;
+const XMATCH_K: usize = 32;
 /// Cap on chain entries visited per context per byte. Without it, a rare context
 /// in a popular hash bucket walks a chain that grows with the data — quadratic
 /// total cost. Recent occurrences sit at the chain head, so a small cap keeps
 /// the gather O(1) while still collecting the most relevant followers.
-const XMATCH_MAX_WALK: usize = 64;
+const XMATCH_MAX_WALK: usize = 128;
+/// Recency decay applied to gathered followers (most-recent first): follower `k`
+/// is weighted `XMATCH_DECAY.powi(k)`, so recent occurrences dominate the
+/// empirical distribution (captures non-stationarity).
+const XMATCH_DECAY: f64 = 0.85;
 /// Log2 size of each per-context bit-predictor table. The tables are fixed-size
 /// and direct-mapped (hash the key, tolerate collisions), so memory is bounded
 /// regardless of input length — unlike a growing `HashMap`, which is unbounded
@@ -2039,18 +2043,22 @@ impl Model {
         }
         let j = node.ilog2();
         let prefix = node & ((1usize << j) - 1);
-        let mut ones = 0u32;
-        let mut tot = 0u32;
+        let mut ones = 0.0f64;
+        let mut tot = 0.0f64;
+        let mut w = 1.0f64;
         for &b in &self.xcand[oi][..n] {
             if usize::from(b) >> (8 - j) == prefix {
-                tot += 1;
-                ones += u32::from((b >> (7 - j)) & 1);
+                tot += w;
+                if (b >> (7 - j)) & 1 == 1 {
+                    ones += w;
+                }
             }
+            w *= XMATCH_DECAY;
         }
-        if tot == 0 {
+        if tot == 0.0 {
             return 0.0;
         }
-        let p1 = (f64::from(ones) + 0.2) / (f64::from(tot) + 0.4);
+        let p1 = (ones + 0.2) / (tot + 0.4);
         stretch(p1)
     }
 
