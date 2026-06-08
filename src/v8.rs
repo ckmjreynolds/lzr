@@ -20,7 +20,7 @@
 // in prose. Both scoped to this file only.
 #![allow(clippy::suboptimal_flops, clippy::doc_markdown)]
 #![allow(clippy::cast_lossless, clippy::needless_lifetimes)]
-#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::missing_const_for_fn, clippy::needless_range_loop)]
 
 // ---------------------------------------------------------------------------
 // Carryless range coder (Subbotin style) — identical to the trainer's coder so
@@ -370,9 +370,116 @@ fn softmax_inplace(v: &mut [f32]) {
     }
 }
 
+/// Incremental decode state: per-layer K and V for the tokens currently in the
+/// context window, row-major `[len, d_model]`. Past tokens' K/V are finalized by
+/// causality, so they never change once written — that is what the cache
+/// exploits to turn the per-byte forward from O(t²) into O(t).
+pub(crate) struct Cache {
+    k: Vec<Vec<f32>>, // k[layer]: len*d
+    v: Vec<Vec<f32>>, // v[layer]: len*d
+    len: usize,
+}
+
 impl Model {
+    pub(crate) fn new_cache(&self) -> Cache {
+        Cache {
+            k: vec![Vec::new(); self.cfg.n_layers],
+            v: vec![Vec::new(); self.cfg.n_layers],
+            len: 0,
+        }
+    }
+
+    /// Process one token through the stack, appending its K/V to `cache`, and
+    /// return the next-token distribution. Exact (within float tolerance) to a
+    /// from-scratch forward over the same context.
+    ///
+    /// Learned absolute positions cannot slide without invalidating every cached
+    /// token's K/V, so when the window fills (`len == ctx`) the cache is reset and
+    /// the incoming token becomes position 0 — a fresh block, matching how the
+    /// model trained (contiguous windows from position 0). The just-fed token
+    /// seeds the new block, so there is no synthetic boundary token.
+    pub(crate) fn step(&self, cache: &mut Cache, token: i32) -> Vec<f32> {
+        let cfg = self.cfg;
+        let (d, h) = (cfg.d_model, cfg.n_heads);
+        let dk = d / h;
+        if cache.len == cfg.ctx {
+            for kk in &mut cache.k {
+                kk.clear();
+            }
+            for vv in &mut cache.v {
+                vv.clear();
+            }
+            cache.len = 0;
+        }
+        let pos = cache.len;
+        let id = token as usize;
+        let mut x = vec![0f32; d];
+        for i in 0..d {
+            x[i] = self.tok[id * d + i] + self.pos[pos * d + i];
+        }
+        let scale = 1.0 / (dk as f32).sqrt();
+        for (l, blk) in self.blocks.iter().enumerate() {
+            // attention: project the new token, append to cache, attend to all
+            let hn = layernorm(&x, 1, d, &blk.norm1);
+            let q = bitlinear(&hn, 1, &blk.wq);
+            let knew = bitlinear(&hn, 1, &blk.wk);
+            let vnew = bitlinear(&hn, 1, &blk.wv);
+            cache.k[l].extend_from_slice(&knew);
+            cache.v[l].extend_from_slice(&vnew);
+            let clen = cache.len + 1; // cached positions, including the new token
+            let mut ctx = vec![0f32; d];
+            for head in 0..h {
+                let off = head * dk;
+                let mut scores = vec![0f32; clen];
+                for (p, sc) in scores.iter_mut().enumerate() {
+                    let mut dot = 0f32;
+                    for c in 0..dk {
+                        dot += q[off + c] * cache.k[l][p * d + off + c];
+                    }
+                    *sc = dot * scale;
+                }
+                softmax_inplace(&mut scores);
+                for c in 0..dk {
+                    let mut acc = 0f32;
+                    for (p, &w) in scores.iter().enumerate() {
+                        acc += w * cache.v[l][p * d + off + c];
+                    }
+                    ctx[off + c] = acc;
+                }
+            }
+            let o = bitlinear(&ctx, 1, &blk.wo);
+            for i in 0..d {
+                x[i] += o[i];
+            }
+            // feed-forward
+            let hn2 = layernorm(&x, 1, d, &blk.norm2);
+            let mut f = bitlinear(&hn2, 1, &blk.ff1);
+            for v in &mut f {
+                *v = gelu(*v);
+            }
+            let f2 = bitlinear(&f, 1, &blk.ff2);
+            for i in 0..d {
+                x[i] += f2[i];
+            }
+        }
+        cache.len += 1;
+        let xf = layernorm(&x, 1, d, &self.norm_f);
+        let mut logits = vec![0f32; cfg.vocab];
+        for (vix, lg) in logits.iter_mut().enumerate() {
+            let w = &self.tok[vix * d..vix * d + d];
+            let mut acc = 0f32;
+            for i in 0..d {
+                acc += xf[i] * w[i];
+            }
+            *lg = acc;
+        }
+        softmax_inplace(&mut logits);
+        logits
+    }
+
     /// Next-byte probability distribution given a context of token ids.
-    /// Full O(t²) recompute (no KV cache yet) — fine for correctness/validation.
+    /// Full O(t²) recompute — the reference the cached `step` is checked against.
+    #[cfg(test)]
     fn predict(&self, ids: &[i32]) -> Vec<f32> {
         let cfg = self.cfg;
         let (d, t, h) = (cfg.d_model, ids.len(), cfg.n_heads);
@@ -445,22 +552,20 @@ impl Model {
         logits
     }
 
-    /// Compress `bytes`; BOS-prefixed context, same forward as decode.
+    /// Compress `bytes`; BOS-seeded, incremental KV-cached forward. Identical
+    /// per-byte forward as decode, so the codec round-trips by construction.
     pub(crate) fn compress(&self, bytes: &[u8], bos: i32) -> Vec<u8> {
         let mut enc = RangeEncoder::new();
-        let mut ids = vec![bos];
+        let mut cache = self.new_cache();
+        let mut probs = self.step(&mut cache, bos);
         for &byte in bytes {
-            let probs = self.predict(&ids);
             let cdf = probs_to_cdf(&probs);
             enc.encode(
                 cdf[byte as usize],
                 cdf[byte as usize + 1] - cdf[byte as usize],
                 CDF_TOTAL,
             );
-            ids.push(i32::from(byte));
-            if ids.len() > self.cfg.ctx {
-                ids.remove(1); // keep BOS, slide the window
-            }
+            probs = self.step(&mut cache, i32::from(byte));
         }
         enc.finish()
     }
@@ -468,9 +573,9 @@ impl Model {
     pub(crate) fn decompress(&self, archive: &[u8], n: usize, bos: i32) -> Vec<u8> {
         let mut dec = RangeDecoder::new(archive);
         let mut out = Vec::with_capacity(n);
-        let mut ids = vec![bos];
+        let mut cache = self.new_cache();
+        let mut probs = self.step(&mut cache, bos);
         for _ in 0..n {
-            let probs = self.predict(&ids);
             let cdf = probs_to_cdf(&probs);
             let f = dec.freq(CDF_TOTAL);
             let mut sym = cdf.partition_point(|&c| c <= f) - 1;
@@ -479,10 +584,7 @@ impl Model {
             }
             dec.update(cdf[sym], cdf[sym + 1] - cdf[sym], CDF_TOTAL);
             out.push(sym as u8);
-            ids.push(sym as i32);
-            if ids.len() > self.cfg.ctx {
-                ids.remove(1);
-            }
+            probs = self.step(&mut cache, sym as i32);
         }
         out
     }
@@ -567,11 +669,27 @@ mod tests {
 
     #[test]
     fn roundtrips_past_ctx_window() {
-        // length > ctx exercises the sliding-window path on both sides
+        // length > ctx exercises the block-reset path on both sides
         let model = Model::from_blob(&tiny_blob());
         let msg: Vec<u8> = (0..50u8).map(|i| (i * 3) % 8).collect();
         let arc = model.compress(&msg, 0);
         let dec = model.decompress(&arc, msg.len(), 0);
         assert_eq!(dec, msg);
+    }
+
+    #[test]
+    fn cached_step_matches_full_recompute() {
+        // Within the context window, incremental `step` must equal the O(t²)
+        // reference `predict` to float tolerance — that is the cache's contract.
+        let model = Model::from_blob(&tiny_blob());
+        let toks: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 6, 7, 1, 2, 3]; // 11 < ctx=32
+        let mut cache = model.new_cache();
+        for end in 1..=toks.len() {
+            let cached = model.step(&mut cache, toks[end - 1]);
+            let reference = model.predict(&toks[..end]);
+            for (a, b) in cached.iter().zip(&reference) {
+                assert!((a - b).abs() < 1e-5, "cache diverged: {a} vs {b}");
+            }
+        }
     }
 }
