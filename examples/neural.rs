@@ -224,6 +224,12 @@ fn causal_mask<B: Backend>(t: usize, device: &B::Device) -> Tensor<B, 4> {
 }
 
 #[derive(Module, Debug)]
+struct Expert<B: Backend> {
+    ff1: BitLinear<B>,
+    ff2: BitLinear<B>,
+}
+
+#[derive(Module, Debug)]
 struct Block<B: Backend> {
     norm1: LayerNorm<B>,
     wq: BitLinear<B>,
@@ -231,8 +237,8 @@ struct Block<B: Backend> {
     wv: BitLinear<B>,
     wo: BitLinear<B>,
     norm2: LayerNorm<B>,
-    ff1: BitLinear<B>,
-    ff2: BitLinear<B>,
+    router: burn::module::Param<Tensor<B, 2>>, // [n_experts, d], full precision
+    experts: Vec<Expert<B>>,
     n_heads: usize,
 }
 
@@ -249,6 +255,34 @@ impl<B: Backend> Block<B> {
         let ctx = softmax(scores, 3).matmul(v); // [b,h,t,dk]
         let ctx = ctx.swap_dims(1, 2).reshape([b, t, d]);
         self.wo.forward(ctx)
+    }
+
+    /// Top-2 mixture-of-experts FFN. Training computes all experts densely and
+    /// masks to the top-2 (simple + correct; the codec does the sparse gather).
+    /// Gate = softmax over router logits, renormalized over the chosen experts.
+    fn moe(&self, n2: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [b, t, d] = n2.dims();
+        let rlogits = n2
+            .clone()
+            .matmul(self.router.val().transpose().unsqueeze_dim(0)); // [b,t,ne]
+        let gate = softmax(rlogits, 2);
+        // 2nd-largest gate (topk is unimplemented for autodiff): take the max,
+        // mask it out, take the max again. Then keep experts ≥ that threshold.
+        let max1 = gate.clone().max_dim(2); // [b,t,1]
+        let is_max = gate.clone().equal(max1); // [b,t,ne] bool
+        let without_max = gate.clone().mask_fill(is_max, f32::NEG_INFINITY);
+        let kth = without_max.max_dim(2); // [b,t,1] = 2nd-largest gate
+        let mask = gate.clone().greater_equal(kth).float(); // [b,t,ne]
+        let masked = gate * mask;
+        let denom = masked.clone().sum_dim(2); // [b,t,1]
+        let gnorm = masked / denom;
+        let mut out = Tensor::<B, 3>::zeros([b, t, d], &n2.device());
+        for (e, exp) in self.experts.iter().enumerate() {
+            let oe = exp.ff2.forward(gelu(exp.ff1.forward(n2.clone()))); // [b,t,d]
+            let ge = gnorm.clone().slice([0..b, 0..t, e..e + 1]); // [b,t,1]
+            out = out + oe * ge;
+        }
+        out
     }
 }
 
@@ -277,8 +311,9 @@ struct GptConfig {
     d_model: usize,
     n_layers: usize,
     n_heads: usize,
-    ffn: usize,
+    ffn: usize, // per-expert hidden size
     ctx: usize,
+    n_experts: usize,
     #[config(default = false)]
     bit: bool,
 }
@@ -294,8 +329,17 @@ impl GptConfig {
                 wv: BitLinear::new(d, d, self.bit, device),
                 wo: BitLinear::new(d, d, self.bit, device),
                 norm2: LayerNormConfig::new(d).init(device),
-                ff1: BitLinear::new(d, self.ffn, self.bit, device),
-                ff2: BitLinear::new(self.ffn, d, self.bit, device),
+                router: burn::module::Param::from_tensor(Tensor::random(
+                    [self.n_experts, d],
+                    Distribution::Normal(0.0, 0.02),
+                    device,
+                )),
+                experts: (0..self.n_experts)
+                    .map(|_| Expert {
+                        ff1: BitLinear::new(d, self.ffn, self.bit, device),
+                        ff2: BitLinear::new(self.ffn, d, self.bit, device),
+                    })
+                    .collect(),
                 n_heads: self.n_heads,
             })
             .collect();
@@ -331,7 +375,7 @@ impl<B: Backend> Gpt<B> {
         for blk in &self.blocks {
             x = x.clone() + blk.attn(blk.norm1.forward(x.clone()));
             let n2 = blk.norm2.forward(x.clone());
-            x = x + blk.ff2.forward(gelu(blk.ff1.forward(n2)));
+            x = x + blk.moe(n2);
         }
         x = self.norm_f.forward(x);
         // tied unembedding: logits = x @ wq^T
@@ -514,7 +558,7 @@ fn nn_decode<B: Backend>(
 // ternary = round(w/scale).clamp(-1,1). Format mirrors `src/v8.rs::Model`.
 // ---------------------------------------------------------------------------
 const BLOB_MAGIC: u32 = 0x3852_5A4C; // "LZR8" little-endian
-const BLOB_VERSION: u32 = 2;
+const BLOB_VERSION: u32 = 3;
 
 fn push_f32s(out: &mut Vec<u8>, vals: &[f32]) {
     for &v in vals {
@@ -572,6 +616,7 @@ fn pack_model<B: Backend>(model: &Gpt<B>, cfg: &GptConfig, bpe: &bpe::Bpe) -> Ve
         cfg.n_heads as u32,
         cfg.ffn as u32,
         cfg.ctx as u32,
+        cfg.n_experts as u32,
     ] {
         out.extend_from_slice(&v.to_le_bytes());
     }
@@ -586,8 +631,11 @@ fn pack_model<B: Backend>(model: &Gpt<B>, cfg: &GptConfig, bpe: &bpe::Bpe) -> Ve
         pack_bitlinear(&mut out, &blk.wv);
         pack_bitlinear(&mut out, &blk.wo);
         push_layernorm(&mut out, &blk.norm2);
-        pack_bitlinear(&mut out, &blk.ff1);
-        pack_bitlinear(&mut out, &blk.ff2);
+        push_f32s(&mut out, &tensor_vec(blk.router.val())); // router (f32)
+        for exp in &blk.experts {
+            pack_bitlinear(&mut out, &exp.ff1);
+            pack_bitlinear(&mut out, &exp.ff2);
+        }
     }
     out
 }
@@ -611,7 +659,7 @@ fn train_and_eval(
         "[{label}] training on GPU ({nparams} params, vocab {})...",
         cfg.vocab
     );
-    let model = train::<GpuAd>(train_toks, cfg, &gdev, 300);
+    let model = train::<GpuAd>(train_toks, cfg, &gdev, 1000);
 
     let gpu_model = model.valid();
     let arc = nn_encode::<Wgpu<f32, i32>>(&gpu_model, &gdev, test_toks, 0);
@@ -645,13 +693,13 @@ fn main() {
     let data = std::fs::read("assets/enwik8").expect("read enwik8");
     let mb = 1024 * 1024;
 
-    // online-BPE (1K merges / MB) to the 16K target — sweeps ~16 MB of enwik8.
-    let bpe = bpe::Bpe::learn(&data, 16384);
+    // online-BPE (1K merges / MB), 2K vocab to keep this ~1M MoE test in budget.
+    let bpe = bpe::Bpe::learn(&data, 2048);
     let vocab = bpe.vocab_size();
     // Train on enwik8 and evaluate on it — for Hutter the model is trained on the
     // exact data it compresses (weights ship as L(D)), so memorization is the
     // regime, not overfitting. eval slice is a prefix of the training span.
-    let train_bytes = &data[..8 * mb];
+    let train_bytes = &data[..4 * mb];
     let train_toks: Vec<i32> = bpe.encode(train_bytes).iter().map(|&t| t as i32).collect();
     let eval_bytes = &data[..4096];
     let eval_toks: Vec<i32> = bpe.encode(eval_bytes).iter().map(|&t| t as i32).collect();
@@ -662,9 +710,9 @@ fn main() {
         train_bytes.len() as f64 / train_toks.len() as f64,
     );
 
-    // ~10M-parameter model: d=320, 4 layers, 8 heads, ffn=1280.
-    let fp = GptConfig::new(vocab, 320, 4, 8, 1280, 256).with_bit(false);
-    let bit = GptConfig::new(vocab, 320, 4, 8, 1280, 256).with_bit(true);
+    // ~1M-param MoE test: d=128, 2 layers, 4 heads, expert-ffn 48, 24 experts (top-2).
+    let fp = GptConfig::new(vocab, 128, 2, 4, 48, 256, 24).with_bit(false);
+    let bit = GptConfig::new(vocab, 128, 2, 4, 48, 256, 24).with_bit(true);
     train_and_eval(&train_toks, eval_bytes, &eval_toks, &fp, &bpe, "fp");
     train_and_eval(&train_toks, eval_bytes, &eval_toks, &bit, &bpe, "bitnet");
 }

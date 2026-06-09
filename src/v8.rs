@@ -151,22 +151,26 @@ fn probs_to_cdf(probs: &[f32]) -> Vec<u32> {
 //   tok      : ternary linear [vocab, d]   (the tied embedding / unembedding)
 //   pos      : ctx*d   f32
 //   norm_f   : gamma[d] f32, beta[d] f32
+//   header also carries n_experts (u32) after ctx.
 //   blocks[n_layers], each:
 //     norm1  : gamma[d] f32, beta[d] f32
 //     wq,wk,wv,wo : each ternary linear (d x d)
 //     norm2  : gamma[d] f32, beta[d] f32
-//     ff1    : ternary linear (ffn x d)
-//     ff2    : ternary linear (d x ffn)
+//     router : f32 [n_experts, d]   (kept full precision; routing is sensitive)
+//     experts[n_experts], each: ff1 ternary (ffn x d), ff2 ternary (d x ffn)
 //   a ternary linear is: scale f32, then ceil(out*in/4) packed bytes
 //   (2 bits/weight: 0b00=-1, 0b01=0, 0b10=+1).
 //
-// The token embedding is ternary (a vocab×d table is the dominant parameter
-// count once the BPE vocab is large); pos and the LayerNorm affines stay f32
-// (small). The embedding is tied: the same ternary table is the unembedding.
+// Mixture-of-experts FFN: each token routes to the TOP_K of n_experts (by a
+// softmax over the router logits, gates renormalized over the chosen experts),
+// so per-token compute is k experts, not all of them — that decouples capacity
+// (which ships in L(D)) from inference cost. `ffn` is the per-expert hidden size.
+// The token embedding is ternary, tied (the same table is the unembedding).
 // ---------------------------------------------------------------------------
 
 pub(crate) const MAGIC: u32 = 0x3852_5A4C; // "LZR8" little-endian
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
+const TOP_K: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct Config {
@@ -174,8 +178,9 @@ struct Config {
     d_model: usize,
     n_layers: usize,
     n_heads: usize,
-    ffn: usize,
+    ffn: usize, // per-expert hidden size
     ctx: usize,
+    n_experts: usize,
 }
 
 struct TernLinear {
@@ -202,6 +207,11 @@ struct LayerNorm {
     beta: Vec<f32>,
 }
 
+struct Expert {
+    ff1: TernLinear,
+    ff2: TernLinear,
+}
+
 struct Block {
     norm1: LayerNorm,
     wq: TernLinear,
@@ -209,8 +219,8 @@ struct Block {
     wv: TernLinear,
     wo: TernLinear,
     norm2: LayerNorm,
-    ff1: TernLinear,
-    ff2: TernLinear,
+    router: Vec<f32>, // [n_experts, d]
+    experts: Vec<Expert>,
 }
 
 pub(crate) struct Model {
@@ -310,6 +320,7 @@ impl Model {
             n_heads: r.u32() as usize,
             ffn: r.u32() as usize,
             ctx: r.u32() as usize,
+            n_experts: r.u32() as usize,
         };
         let (d, ffn) = (cfg.d_model, cfg.ffn);
         let (bpe, used) = crate::bpe::Bpe::from_bytes(&blob[r.p..]);
@@ -325,8 +336,13 @@ impl Model {
                 wv: r.tern(d, d),
                 wo: r.tern(d, d),
                 norm2: r.ln(d),
-                ff1: r.tern(ffn, d),
-                ff2: r.tern(d, ffn),
+                router: r.f32s(cfg.n_experts * d),
+                experts: (0..cfg.n_experts)
+                    .map(|_| Expert {
+                        ff1: r.tern(ffn, d),
+                        ff2: r.tern(d, ffn),
+                    })
+                    .collect(),
             })
             .collect();
         Self {
@@ -339,18 +355,32 @@ impl Model {
         }
     }
 
-    /// `(vocab, d_model, n_layers, n_heads, ffn, ctx)` for reporting.
-    pub(crate) const fn dims(&self) -> (usize, usize, usize, usize, usize, usize) {
+    /// `(vocab, d_model, n_layers, n_heads, ffn, ctx, n_experts)` for reporting.
+    pub(crate) const fn dims(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
         let c = self.cfg;
-        (c.vocab, c.d_model, c.n_layers, c.n_heads, c.ffn, c.ctx)
+        (
+            c.vocab,
+            c.d_model,
+            c.n_layers,
+            c.n_heads,
+            c.ffn,
+            c.ctx,
+            c.n_experts,
+        )
     }
 
-    /// Total parameter count (ternary weights counted as 1 each).
-    pub(crate) const fn num_params(&self) -> usize {
+    /// `(total params, params active per token)`. MoE: only `TOP_K` experts run
+    /// per token, so active ≪ total — that gap is the inference-speed win.
+    pub(crate) const fn num_params(&self) -> (usize, usize) {
         let c = self.cfg;
         let (d, ffn) = (c.d_model, c.ffn);
-        let per_block = 2 * d /* norm1 */ + 4 * d * d /* qkvo */ + 2 * d /* norm2 */ + 2 * d * ffn;
-        c.vocab * d /* tok */ + c.ctx * d /* pos */ + 2 * d /* norm_f */ + c.n_layers * per_block
+        let attn = 2 * d + 4 * d * d + 2 * d; // norms + qkvo
+        let router = c.n_experts * d;
+        let expert = 2 * d * ffn;
+        let common = c.vocab * d + c.ctx * d + 2 * d;
+        let total = common + c.n_layers * (attn + router + c.n_experts * expert);
+        let active = common + c.n_layers * (attn + router + TOP_K * expert);
+        (total, active)
     }
 }
 
@@ -471,6 +501,20 @@ fn bitlinear(x: &[f32], t: usize, lin: &TernLinear) -> Vec<f32> {
     out
 }
 
+/// Indices of the two largest elements (`a` ≥ `b`), deterministic on ties.
+fn top2(v: &[f32]) -> (usize, usize) {
+    let (mut a, mut b) = if v[0] >= v[1] { (0, 1) } else { (1, 0) };
+    for i in 2..v.len() {
+        if v[i] > v[a] {
+            b = a;
+            a = i;
+        } else if v[i] > v[b] {
+            b = i;
+        }
+    }
+    (a, b)
+}
+
 fn softmax_inplace(v: &mut [f32]) {
     let m = v.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let mut s = 0f32;
@@ -505,9 +549,11 @@ pub(crate) struct Scratch {
     kbuf: Vec<f32>,
     vbuf: Vec<f32>,
     ctx: Vec<f32>,
-    tmp: Vec<f32>, // attn-out / ff-out
-    ff: Vec<f32>,  // ff1 hidden
-    xq: Vec<i8>,   // int8 activation-quant scratch (sized to max in_f = ffn)
+    tmp: Vec<f32>,     // attn-out / ff-out
+    ff: Vec<f32>,      // expert ff1 hidden (ffn)
+    xq: Vec<i8>,       // int8 activation-quant scratch (sized to max in_f)
+    rlogits: Vec<f32>, // router logits (n_experts)
+    eacc: Vec<f32>,    // weighted expert-output accumulator (d)
     scores: Vec<f32>,
     logits: Vec<f32>,
 }
@@ -537,7 +583,9 @@ impl Model {
             ctx: vec![0f32; d],
             tmp: vec![0f32; d],
             ff: vec![0f32; ffn],
-            xq: vec![0i8; ffn],
+            xq: vec![0i8; ffn.max(d)],
+            rlogits: vec![0f32; self.cfg.n_experts],
+            eacc: vec![0f32; d],
             scores: vec![0f32; self.cfg.ctx],
             logits: vec![0f32; self.cfg.vocab],
         }
@@ -599,15 +647,29 @@ impl Model {
             for i in 0..d {
                 s.x[i] += s.tmp[i];
             }
-            // feed-forward
+            // MoE feed-forward: route the token to its TOP_K experts
             layernorm_row(&mut s.nrm, &s.x, &blk.norm2);
-            bitlinear_row(&mut s.ff, &s.nrm, &blk.ff1, &mut s.xq);
-            for v in &mut s.ff {
-                *v = gelu(*v);
+            let ne = self.cfg.n_experts;
+            for (e, lg) in s.rlogits[..ne].iter_mut().enumerate() {
+                *lg = dot(&s.nrm, &blk.router[e * d..e * d + d]);
             }
-            bitlinear_row(&mut s.tmp, &s.ff, &blk.ff2, &mut s.xq);
+            softmax_inplace(&mut s.rlogits[..ne]);
+            let (ea, eb) = top2(&s.rlogits[..ne]);
+            let denom = s.rlogits[ea] + s.rlogits[eb];
+            s.eacc.iter_mut().for_each(|c| *c = 0.0);
+            for (e, g) in [(ea, s.rlogits[ea] / denom), (eb, s.rlogits[eb] / denom)] {
+                let exp = &blk.experts[e];
+                bitlinear_row(&mut s.ff, &s.nrm, &exp.ff1, &mut s.xq);
+                for v in &mut s.ff {
+                    *v = gelu(*v);
+                }
+                bitlinear_row(&mut s.tmp, &s.ff, &exp.ff2, &mut s.xq);
+                for i in 0..d {
+                    s.eacc[i] += g * s.tmp[i];
+                }
+            }
             for i in 0..d {
-                s.x[i] += s.tmp[i];
+                s.x[i] += s.eacc[i];
             }
         }
         cache.len += 1;
@@ -662,15 +724,32 @@ impl Model {
             for i in 0..t * d {
                 x[i] += o[i];
             }
-            // --- feed-forward ---
-            let hn2 = layernorm(&x, t, d, &blk.norm2);
-            let mut f = bitlinear(&hn2, t, &blk.ff1);
-            for v in &mut f {
-                *v = gelu(*v);
-            }
-            let f2 = bitlinear(&f, t, &blk.ff2);
-            for i in 0..t * d {
-                x[i] += f2[i];
+            // --- MoE feed-forward (per token) ---
+            let (ne, ffn) = (self.cfg.n_experts, self.cfg.ffn);
+            let mut hn2 = vec![0f32; d];
+            let mut ff = vec![0f32; ffn];
+            let mut tmp = vec![0f32; d];
+            let mut xq = vec![0i8; ffn.max(d)];
+            let mut rlogits = vec![0f32; ne];
+            for r in 0..t {
+                layernorm_row(&mut hn2, &x[r * d..r * d + d], &blk.norm2);
+                for (e, lg) in rlogits.iter_mut().enumerate() {
+                    *lg = dot(&hn2, &blk.router[e * d..e * d + d]);
+                }
+                softmax_inplace(&mut rlogits);
+                let (ea, eb) = top2(&rlogits);
+                let denom = rlogits[ea] + rlogits[eb];
+                for (e, g) in [(ea, rlogits[ea] / denom), (eb, rlogits[eb] / denom)] {
+                    let exp = &blk.experts[e];
+                    bitlinear_row(&mut ff, &hn2, &exp.ff1, &mut xq);
+                    for v in &mut ff {
+                        *v = gelu(*v);
+                    }
+                    bitlinear_row(&mut tmp, &ff, &exp.ff2, &mut xq);
+                    for i in 0..d {
+                        x[r * d + i] += g * tmp[i];
+                    }
+                }
             }
         }
         let xf = layernorm(&x, t, d, &self.norm_f);
@@ -741,6 +820,7 @@ mod tests {
     /// ternary/f32 weights — a random-init model that round-trips (round-trip
     /// is weight-independent), exercising reader + tokenizer + forward + coder
     /// without the GPU trainer.
+    #[allow(clippy::too_many_arguments)]
     fn build_blob(
         bpe: &crate::bpe::Bpe,
         d: usize,
@@ -748,6 +828,7 @@ mod tests {
         heads: usize,
         ffn: usize,
         ctx: usize,
+        n_experts: usize,
         seed: u32,
     ) -> Vec<u8> {
         let vocab = bpe.vocab_size();
@@ -761,6 +842,7 @@ mod tests {
             heads as u32,
             ffn as u32,
             ctx as u32,
+            n_experts as u32,
         ] {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -804,8 +886,11 @@ mod tests {
             }
             push_f(&mut out, d, &mut nf);
             push_f(&mut out, d, &mut nf); // norm2
-            push_tern(&mut out, ffn, d, &mut nf); // ff1
-            push_tern(&mut out, d, ffn, &mut nf); // ff2
+            push_f(&mut out, n_experts * d, &mut nf); // router (f32)
+            for _ in 0..n_experts {
+                push_tern(&mut out, ffn, d, &mut nf); // expert ff1
+                push_tern(&mut out, d, ffn, &mut nf); // expert ff2
+            }
         }
         out
     }
@@ -813,7 +898,7 @@ mod tests {
     fn tiny_blob() -> (Vec<u8>, usize) {
         let bpe = crate::bpe::Bpe::learn(&corpus(), 288);
         let vocab = bpe.vocab_size();
-        (build_blob(&bpe, 8, 2, 2, 16, 32, 0x1234_5678), vocab)
+        (build_blob(&bpe, 8, 2, 2, 16, 32, 4, 0x1234_5678), vocab)
     }
 
     #[test]
@@ -883,7 +968,7 @@ mod tests {
         }
 
         // random-init model over this fresh vocab (round-trip is weight-independent)
-        let blob = build_blob(&bpe, 64, 2, 4, 128, 256, 0xABCD_1234);
+        let blob = build_blob(&bpe, 64, 2, 4, 48, 256, 24, 0xABCD_1234);
         let model = Model::from_blob(&blob);
         let arc = model.compress(&bytes, 0);
         let dec = model.decompress(&arc, bytes.len(), 0);

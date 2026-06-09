@@ -156,8 +156,8 @@ fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
     let slice = &bytes[offset..offset + len];
     let model = model();
     let (bin_bytes, ld) = ld_bpb();
-    let (vocab, d, layers, heads, ffn, ctx) = model.dims();
-    let params = model.num_params();
+    let (vocab, d, layers, heads, ffn, ctx, n_experts) = model.dims();
+    let (params, active) = model.num_params();
 
     let start = Instant::now();
     let archive = model.compress(slice, BOS);
@@ -173,10 +173,14 @@ fn run_nn_test(corpus: &PathBuf, offset: usize, len: usize) -> Result<()> {
     let eta_h = |ms_byte: f64| ms_byte * 1e9 / 1e3 / 3600.0;
 
     println!();
-    println!("Architecture: ternary BitNet transformer (KV-cached, CPU/auto-vec)");
+    println!("Architecture: ternary BitNet MoE transformer (int8 sdot, KV-cached, CPU)");
     println!(
-        "              d={d} layers={layers} heads={heads} ffn={ffn} ctx={ctx}  vocab={vocab}  ~{:.2}M params",
+        "              d={d} layers={layers} heads={heads} expert-ffn={ffn} ctx={ctx}  vocab={vocab}",
+    );
+    println!(
+        "              {n_experts} experts (top-2)  ~{:.2}M params total / ~{:.2}M active/token",
         params as f64 / 1e6,
+        active as f64 / 1e6,
     );
     println!(
         "Weights:      {} B blob, {bin_bytes} B binary",
