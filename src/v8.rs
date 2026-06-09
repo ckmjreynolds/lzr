@@ -180,13 +180,21 @@ struct Config {
 
 struct TernLinear {
     scale: f32,
-    // out*in ternary values {-1,0,1} as f32, row-major [out, in]. f32 (not i8)
-    // so the dot-product inner loop is a pure-f32 reduction the compiler can
-    // auto-vectorize — costs 4× RAM, but the on-disk blob stays 2-bit (L(D)
-    // unchanged), and it is unpacked here once at load.
-    w: Vec<f32>,
+    // out*in ternary values {-1,0,1} as i8, row-major [out, in]. Activations are
+    // int8-quantized too, so the matvec is an integer i8×i8→i32 dot that
+    // auto-vectorizes to NEON `sdot` (and the AVX2/VNNI equivalents on x86). The
+    // on-disk blob stays 2-bit (L(D) unchanged); this is the in-RAM copy.
+    w: Vec<i8>,
     out_f: usize,
     in_f: usize,
+}
+
+/// Tied token embedding, ternary but kept as f32: it is used as a gather (the
+/// lookup) and as the unembedding matvec over *un-quantized* activations, so the
+/// int8 path would only add an i8→f32 widening with no `sdot` to pay for it.
+struct Embed {
+    scale: f32,
+    w: Vec<f32>, // [vocab, d] ternary {-1,0,1}
 }
 
 struct LayerNorm {
@@ -208,8 +216,8 @@ struct Block {
 pub(crate) struct Model {
     cfg: Config,
     bpe: crate::bpe::Bpe,
-    tok: TernLinear, // [vocab, d] ternary; tied embedding + unembedding
-    pos: Vec<f32>,   // ctx*d f32
+    tok: Embed,    // [vocab, d] ternary f32; tied embedding + unembedding
+    pos: Vec<f32>, // ctx*d f32
     norm_f: LayerNorm,
     blocks: Vec<Block>,
 }
@@ -247,9 +255,9 @@ impl Reader<'_> {
                 }
                 let code = (byte >> (2 * k)) & 0b11;
                 w.push(match code {
-                    0 => -1.0f32,
-                    1 => 0.0,
-                    _ => 1.0,
+                    0 => -1i8,
+                    1 => 0,
+                    _ => 1,
                 });
             }
         }
@@ -260,6 +268,27 @@ impl Reader<'_> {
             out_f,
             in_f,
         }
+    }
+    fn tern_embed(&mut self, vocab: usize, d: usize) -> Embed {
+        let scale = self.f32();
+        let n = vocab * d;
+        let nbytes = n.div_ceil(4);
+        let mut w = Vec::with_capacity(n);
+        for bi in 0..nbytes {
+            let byte = self.b[self.p + bi];
+            for k in 0..4 {
+                if w.len() == n {
+                    break;
+                }
+                w.push(match (byte >> (2 * k)) & 0b11 {
+                    0 => -1.0f32,
+                    1 => 0.0,
+                    _ => 1.0,
+                });
+            }
+        }
+        self.p += nbytes;
+        Embed { scale, w }
     }
     fn ln(&mut self, d: usize) -> LayerNorm {
         LayerNorm {
@@ -285,7 +314,7 @@ impl Model {
         let (d, ffn) = (cfg.d_model, cfg.ffn);
         let (bpe, used) = crate::bpe::Bpe::from_bytes(&blob[r.p..]);
         r.p += used;
-        let tok = r.tern(cfg.vocab, d);
+        let tok = r.tern_embed(cfg.vocab, d);
         let pos = r.f32s(cfg.ctx * d);
         let norm_f = r.ln(d);
         let blocks = (0..cfg.n_layers)
@@ -387,6 +416,20 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Integer dot of int8 activations × ternary i8 weights → i32. Integer addition
+/// is associative, so the multi-accumulator form is exact (not just `-ffast-math`
+/// fast) and auto-vectorizes to NEON `sdot` (AVX2 `pmaddubsw` / VNNI `vpdpbusd`
+/// on x86). No overflow: `|acc| ≤ in_f·127 ≪ i32::MAX` for any realistic `in_f`.
+fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    // Single-accumulator reduction: integer add IS associative, so LLVM may
+    // both vectorize it and pattern-match the `i32 += sext(i8)·sext(i8)` idiom to
+    // `sdot`. (A multi-accumulator array, needed for f32, instead blocks it.)
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| i32::from(x) * i32::from(y))
+        .sum()
+}
+
 /// `dst += a * src` over equal-length slices — the contiguous form lets the
 /// attention value-mixing vectorize (the strided gather form does not).
 fn saxpy(dst: &mut [f32], a: f32, src: &[f32]) {
@@ -395,18 +438,19 @@ fn saxpy(dst: &mut [f32], a: f32, src: &[f32]) {
     }
 }
 
-/// BitLinear one row: int8-quantize `row` (into `xq` scratch, len ≥ in_f) and
-/// matvec against the ternary weights into `out` (len out_f). Replicates the
-/// trainer's inference math.
-fn bitlinear_row(out: &mut [f32], row: &[f32], lin: &TernLinear, xq: &mut [f32]) {
+/// BitLinear one row: int8-quantize `row` (codes into `xq` scratch, len ≥ in_f)
+/// and integer-matvec against the ternary weights into `out` (len out_f).
+/// `out[o] = (Σ xq·w) · s · scale` reproduces the trainer's dequantized math.
+fn bitlinear_row(out: &mut [f32], row: &[f32], lin: &TernLinear, xq: &mut [i8]) {
     let in_f = lin.in_f;
     let amax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
     let s = (amax / 127.0).max(1e-5);
     for i in 0..in_f {
-        xq[i] = (row[i] / s).round().clamp(-127.0, 127.0) * s;
+        xq[i] = (row[i] / s).round().clamp(-127.0, 127.0) as i8;
     }
+    let f = s * lin.scale;
     for o in 0..lin.out_f {
-        out[o] = dot(&xq[..in_f], &lin.w[o * in_f..o * in_f + in_f]) * lin.scale;
+        out[o] = dot_i8(&xq[..in_f], &lin.w[o * in_f..o * in_f + in_f]) as f32 * f;
     }
 }
 
@@ -415,7 +459,7 @@ fn bitlinear_row(out: &mut [f32], row: &[f32], lin: &TernLinear, xq: &mut [f32])
 fn bitlinear(x: &[f32], t: usize, lin: &TernLinear) -> Vec<f32> {
     let (in_f, out_f) = (lin.in_f, lin.out_f);
     let mut out = vec![0f32; t * out_f];
-    let mut xq = vec![0f32; in_f];
+    let mut xq = vec![0i8; in_f];
     for r in 0..t {
         bitlinear_row(
             &mut out[r * out_f..(r + 1) * out_f],
@@ -463,7 +507,7 @@ pub(crate) struct Scratch {
     ctx: Vec<f32>,
     tmp: Vec<f32>, // attn-out / ff-out
     ff: Vec<f32>,  // ff1 hidden
-    xq: Vec<f32>,  // activation-quant scratch (sized to max in_f = ffn)
+    xq: Vec<i8>,   // int8 activation-quant scratch (sized to max in_f = ffn)
     scores: Vec<f32>,
     logits: Vec<f32>,
 }
@@ -493,7 +537,7 @@ impl Model {
             ctx: vec![0f32; d],
             tmp: vec![0f32; d],
             ff: vec![0f32; ffn],
-            xq: vec![0f32; ffn],
+            xq: vec![0i8; ffn],
             scores: vec![0f32; self.cfg.ctx],
             logits: vec![0f32; self.cfg.vocab],
         }
