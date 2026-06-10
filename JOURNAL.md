@@ -13,6 +13,22 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-09 → 2026-06-10 — v8 first real enwik9 run: sparse-MoE training (×2), the dispatch wall, and inference is 85% unembed
+
+CDR's first full-scale run on the v8-neural stack: train the ternary top-2 MoE on the *entire* enwik9 in the memorization regime, monitoring memory and health hourly. Model: vocab 16384, d=256, 4 layers, 8 heads, 24 experts at ffn 384/expert, ctx 256, ternary — **~24 M params total / ~6.8 M active per token** (top-2 routing). enwik9 tokenized at ≈4.49 bytes/token (~223 M tokens). The run reached ~37.8 K steps over ~3 epochs in ~26 h, loss 14 → ~4.8 nats (≈6.9 bits/token), checkpointing the v3 blob every 1 K steps; memory stayed healthy throughout. CDR stopped it here to free the machine — this entry captures the findings, not a final bpb.
+
+*Sparse-MoE training, the unblock (×2).* The MoE arm landed (2026-06-08 entry) computing **all** 24 experts densely and masking to top-2 — correct, but per-token compute is all experts, so dense-MoE training was ~19 h/epoch, a compute wall at enwik9 scale. Reworked the trainer's `moe_sparse` to do a true sparse dispatch: per expert, `argwhere` the tokens whose top-2 gate selected it, `select`-gather them into a packed batch, run the expert FFN, and `select_assign(IndexingUpdateOp::Add)` scatter the gated outputs back. burn 0.21 backs `argwhere`/`select`/`select_assign` through autodiff, so the backward graph is intact. Validated against the dense path: forward is bit-exact (max abs diff 0.000e0) and the gradients match. Result: **2.5 → 1.2 s/step, ~19 → ~9.1 h/epoch.** The top-2/2nd-largest gate is still found by max / mask-the-max / max because `topk` remains unimplemented for burn's autodiff backend.
+
+*Sparse is dispatch-bound, not utilization-bound.* Bigger batches do not help it — each expert is a separate gather/FFN/scatter dispatch, and the cost is the per-dispatch overhead, not arithmetic. Measured: batch 32, 64, 128 all give the same *per-token* time (~0.147 ms/token); batch 128 only raised memory pressure (CDR watched it in Activity Monitor) for no throughput gain. Settled on batch 64. This is the opposite of the dense regime, where batch amortizes the one big matmul.
+
+*A false memory-leak alarm — a correction to my own monitoring.* Early in the run I called a leak: sysfree fell 87 → 51 → 41%. It was decelerating, then reversed (41 → 47 → 52 → …) and stabilized — wgpu's allocation-pool warmup, not a leak. The lesson for the monitoring protocol: a monotone-looking first derivative over three samples is not a trend; wait for the second derivative or a reversal before raising an alarm.
+
+*Inference is ~85% the unembed — the key inference lever.* Profiling the CPU codec's per-token cost: the tied-embedding unembedding (a `vocab × d` f32 matvec over un-quantized activations, by design — see 2026-06-08 int8 entry) dominates, ~85% of the forward. Consequence: **depth and expert count are nearly free on inference, while `d` and `vocab` are expensive**, and the single biggest remaining inference win is int8-quantizing the unembed (~2.5–2.7× projected). This reframes scaling — grow capacity via depth/experts (cheap on the binding inference-ETA constraint), not width/vocab.
+
+*bpb-equiv caveat.* The training log's "bpb-equiv" = bits/token ÷ 4.49 bytes/token is an **L(C)-only, optimistic proxy**: it is teacher-forced cross-entropy (below the real autoregressive archive) and excludes L(D) (~0.11 bpb for this binary). Real net bpb comes only from `nn-test`'s CPU codec round-trip, not the training curve.
+
+*Next (deferred, not this turn).* int8-quantize the unembed; LR warmup + cosine anneal (CDR confirmed annealing was important in prior MoE runs, and this run held LR flat); burn-recorder f32 checkpointing for resumability (the v3 blob is ternary-quantized, so a run can ship but not resume cleanly); then scale via depth.
+
 ## 2026-06-08 — v8 the two compute levers, both landed: int8 `sdot` kernel (×1.5) and a top-2 MoE arm
 
 After the 10M dense run put the enwik9 ETA (~41 h) near the budget edge, CDR called for both throughput levers in one turn — and they compose (int8 makes each matmul faster, MoE runs fewer of them).

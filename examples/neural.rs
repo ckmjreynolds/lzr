@@ -19,6 +19,7 @@ use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
 use burn::tensor::Distribution;
+use burn::tensor::IndexingUpdateOp;
 use burn::tensor::activation::{gelu, softmax};
 use burn::tensor::backend::AutodiffBackend;
 
@@ -284,6 +285,39 @@ impl<B: Backend> Block<B> {
         }
         out
     }
+
+    /// Sparse top-2 MoE: identical math to `moe`, but each expert runs only on
+    /// the tokens routed to it (gathered via `argwhere`/`select`) and its output
+    /// is scattered back — ~`n_experts/TOP_K`× less compute *and* retained
+    /// activation than computing all experts densely.
+    fn moe_sparse(&self, n2: Tensor<B, 3>) -> Tensor<B, 3> {
+        let [b, t, d] = n2.dims();
+        let nn = b * t;
+        let x = n2.reshape([nn, d]); // [N, d]
+        let rlogits = x.clone().matmul(self.router.val().transpose()); // [N, ne]
+        let gate = softmax(rlogits, 1);
+        let max1 = gate.clone().max_dim(1);
+        let is_max = gate.clone().equal(max1.clone());
+        let without = gate.clone().mask_fill(is_max, f32::NEG_INFINITY);
+        let kth = without.max_dim(1);
+        let masked = gate.clone() * gate.greater_equal(kth).float();
+        let gnorm = masked.clone() / masked.sum_dim(1); // [N, ne]; 0 except top-2
+        let mut out = Tensor::<B, 2>::zeros([nn, d], &x.device());
+        for (e, exp) in self.experts.iter().enumerate() {
+            let col = gnorm.clone().slice([0..nn, e..e + 1]).reshape([nn]); // [N] gate (0 if unused)
+            let aw = col.clone().greater_elem(0.0).argwhere(); // [n_e, 1]
+            let ne = aw.dims()[0];
+            if ne == 0 {
+                continue;
+            }
+            let idx = aw.reshape([ne]); // [n_e] token indices
+            let x_e = x.clone().select(0, idx.clone()).reshape([1, ne, d]); // [1,n_e,d]
+            let oe = exp.ff2.forward(gelu(exp.ff1.forward(x_e))).reshape([ne, d]); // [n_e,d]
+            let g_e = col.select(0, idx.clone()).reshape([ne, 1]); // [n_e,1]
+            out = out.select_assign(0, idx, oe * g_e, IndexingUpdateOp::Add);
+        }
+        out.reshape([b, t, d])
+    }
 }
 
 /// Ternary absmean quantization with a straight-through estimator (matches
@@ -375,7 +409,7 @@ impl<B: Backend> Gpt<B> {
         for blk in &self.blocks {
             x = x.clone() + blk.attn(blk.norm1.forward(x.clone()));
             let n2 = blk.norm2.forward(x.clone());
-            x = x + blk.moe(n2);
+            x = x + blk.moe_sparse(n2);
         }
         x = self.norm_f.forward(x);
         // tied unembedding: logits = x @ wq^T
@@ -450,11 +484,12 @@ fn train<B: AutodiffBackend>(
     cfg: &GptConfig,
     device: &B::Device,
     steps: usize,
+    bpe: &bpe::Bpe,
 ) -> Gpt<B> {
     let mut model = cfg.init::<B>(device);
     let mut optim = AdamConfig::new().init();
     let lr = 3e-4;
-    let (batch, ctx) = (32usize, cfg.ctx);
+    let (batch, ctx) = (64usize, cfg.ctx);
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     for step in 0..steps {
         let mut inp = Vec::with_capacity(batch * ctx);
@@ -479,8 +514,16 @@ fn train<B: AutodiffBackend>(
         model = optim.step(lr, model, gp);
         if step % 50 == 0 || step + 1 == steps {
             println!(
-                "  step {step:4} loss {lval:.4}  ({:.3} bpb)",
+                "  step {step:5} loss {lval:.4}  ({:.3} bits/token)",
                 f64::from(lval) / std::f64::consts::LN_2
+            );
+        }
+        if step > 0 && step % 1000 == 0 {
+            let blob = pack_model(&model, cfg, bpe);
+            std::fs::write("assets/v8weights.bin", &blob).expect("checkpoint write");
+            println!(
+                "  [checkpoint] step {step}: {} KiB blob written",
+                blob.len() / 1024
             );
         }
     }
@@ -650,16 +693,17 @@ fn train_and_eval(
     test_toks: &[i32],
     cfg: &GptConfig,
     bpe: &bpe::Bpe,
+    steps: usize,
     label: &str,
 ) {
     type GpuAd = Autodiff<Wgpu<f32, i32>>;
     let gdev = WgpuDevice::default();
     let nparams = cfg.init::<Wgpu<f32, i32>>(&gdev).num_params();
     println!(
-        "[{label}] training on GPU ({nparams} params, vocab {})...",
+        "[{label}] training {steps} steps on GPU ({nparams} params, vocab {})...",
         cfg.vocab
     );
-    let model = train::<GpuAd>(train_toks, cfg, &gdev, 1000);
+    let model = train::<GpuAd>(train_toks, cfg, &gdev, steps, bpe);
 
     let gpu_model = model.valid();
     let arc = nn_encode::<Wgpu<f32, i32>>(&gpu_model, &gdev, test_toks, 0);
@@ -688,31 +732,70 @@ fn train_and_eval(
     }
 }
 
+/// Verify the sparse MoE equals the dense MoE (same top-2 math) AND that its
+/// autodiff backward runs (the `select_assign` gradient is the real unknown).
+/// Aborts before any expensive training if either fails.
+fn validate_moe() {
+    type B = Autodiff<Wgpu<f32, i32>>;
+    let dev = WgpuDevice::default();
+    let cfg = GptConfig::new(2048, 64, 1, 4, 48, 16, 24).with_bit(true);
+    let model = cfg.init::<B>(&dev);
+    let blk = &model.blocks[0];
+    let x = Tensor::<B, 3>::random([2, 8, 64], Distribution::Normal(0.0, 1.0), &dev);
+    let dense = blk.moe(x.clone());
+    let sparse = blk.moe_sparse(x.clone());
+    let diff = (dense - sparse.clone())
+        .abs()
+        .max()
+        .into_scalar()
+        .elem::<f32>();
+    println!("MoE validation: max|dense - sparse| = {diff:.3e}");
+    assert!(diff < 1e-3, "sparse MoE diverges from dense ({diff})");
+    let _ = sparse.sum().backward(); // panics if select_assign has no backward
+    println!("MoE validation: sparse forward matches dense, backward OK.");
+}
+
 fn main() {
     test_coder();
-    let data = std::fs::read("assets/enwik8").expect("read enwik8");
+    // validate_moe() already confirmed sparse == dense + backward; skip its
+    // ~6 min one-time shader compile on relaunches (training compiles anyway).
+    let data = std::fs::read("assets/enwik9").expect("read enwik9");
+    let n = data.len();
     let mb = 1024 * 1024;
 
-    // online-BPE (1K merges / MB), 2K vocab to keep this ~1M MoE test in budget.
-    let bpe = bpe::Bpe::learn(&data, 2048);
+    // First real run on the FULL enwik9. online-BPE (1K merges / MB) to 16K vocab,
+    // then tokenize all of enwik9 in 16 MB chunks (a whole-file encode would need
+    // >10 GB for the linked-list structures; chunked is ~hundreds of MB and the
+    // boundary tokens are negligible). Memorization regime; eval on a prefix.
+    let bpe = bpe::Bpe::learn(&data, 16384);
     let vocab = bpe.vocab_size();
-    // Train on enwik8 and evaluate on it — for Hutter the model is trained on the
-    // exact data it compresses (weights ship as L(D)), so memorization is the
-    // regime, not overfitting. eval slice is a prefix of the training span.
-    let train_bytes = &data[..4 * mb];
-    let train_toks: Vec<i32> = bpe.encode(train_bytes).iter().map(|&t| t as i32).collect();
-    let eval_bytes = &data[..4096];
-    let eval_toks: Vec<i32> = bpe.encode(eval_bytes).iter().map(|&t| t as i32).collect();
+    let mut train_toks: Vec<i32> = Vec::with_capacity(n / 3);
+    let mut off = 0;
+    while off < n {
+        let end = (off + 16 * mb).min(n);
+        train_toks.extend(bpe.encode(&data[off..end]).iter().map(|&t| t as i32));
+        off = end;
+    }
+    let eval_bytes: Vec<u8> = data[..4096].to_vec();
+    let eval_toks: Vec<i32> = bpe.encode(&eval_bytes).iter().map(|&t| t as i32).collect();
+    drop(data); // free the 1 GB; only the token array is needed from here
     println!(
-        "BPE: vocab {vocab}; train {} MB -> {} tokens ({:.2} bytes/token)",
-        train_bytes.len() / mb,
+        "BPE: vocab {vocab}; enwik9 -> {} tokens ({:.2} bytes/token)",
         train_toks.len(),
-        train_bytes.len() as f64 / train_toks.len() as f64,
+        n as f64 / train_toks.len() as f64,
     );
 
-    // ~1M-param MoE test: d=128, 2 layers, 4 heads, expert-ffn 48, 24 experts (top-2).
-    let fp = GptConfig::new(vocab, 128, 2, 4, 48, 256, 24).with_bit(false);
-    let bit = GptConfig::new(vocab, 128, 2, 4, 48, 256, 24).with_bit(true);
-    train_and_eval(&train_toks, eval_bytes, &eval_toks, &fp, &bpe, "fp");
-    train_and_eval(&train_toks, eval_bytes, &eval_toks, &bit, &bpe, "bitnet");
+    // ~24M MoE (top-2): d=256, 4 layers, 8 heads, 24 experts, expert-ffn 384.
+    let bit = GptConfig::new(vocab, 256, 4, 8, 384, 256, 24).with_bit(true);
+    // High cap; we run until the loss curve plateaus and stop manually (the
+    // checkpoint-every-1K means no progress is ever lost).
+    train_and_eval(
+        &train_toks,
+        &eval_bytes,
+        &eval_toks,
+        &bit,
+        &bpe,
+        200000,
+        "bitnet",
+    );
 }
