@@ -11,6 +11,8 @@
 )]
 #![allow(elided_lifetimes_in_paths)]
 
+use std::time::Instant;
+
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::{AutodiffModule, Module};
@@ -344,6 +346,62 @@ impl<B: Backend> Block<B> {
             out = out.select_assign(0, idx, oe * g_e, IndexingUpdateOp::Add);
         }
         (out.reshape([b, t, d]), aux)
+    }
+
+    /// Dense **batched** MoE: every expert's FFN runs as a single batched matmul
+    /// over a stacked `[e, …]` weight tensor, so the dispatch count is O(1) in
+    /// the expert count instead of `moe_sparse`'s per-expert gather/FFN/scatter
+    /// (whose `argwhere` forces a GPU→CPU sync per expert — the suspected
+    /// dispatch wall). Numerically identical to `moe` (all experts, gated by the
+    /// top-2 mask); the trade is E× activation memory for the dense `[e,N,ffn]`
+    /// hidden. Returns `(output, aux)`.
+    fn moe_batched(&self, n2: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 1>) {
+        let [b, t, d] = n2.dims();
+        let nn = b * t;
+        let e = self.experts.len();
+        let x = n2.reshape([nn, d]); // [N, d]
+        let rlogits = x.clone().matmul(self.router.val().transpose()); // [N, e]
+        let gate = softmax(rlogits, 1);
+        let max1 = gate.clone().max_dim(1);
+        let is_max = gate.clone().equal(max1);
+        let without = gate.clone().mask_fill(is_max, f32::NEG_INFINITY);
+        let kth = without.max_dim(1);
+        let mask = gate.clone().greater_equal(kth).float();
+        let aux = Self::balance_aux(&gate, &mask);
+        let masked = gate.clone() * mask;
+        let gnorm = masked.clone() / masked.sum_dim(1); // [N, e], 0 except top-2
+
+        // stack expert weights -> [e, out, in], per-expert ternary STE
+        let w1 = Tensor::stack::<3>(self.experts.iter().map(|x| x.ff1.weight.val()).collect(), 0);
+        let w2 = Tensor::stack::<3>(self.experts.iter().map(|x| x.ff2.weight.val()).collect(), 0);
+        let tern3 = |w: Tensor<B, 3>| {
+            let [e, _, _] = w.dims();
+            let g = w
+                .clone()
+                .abs()
+                .mean_dim(2)
+                .mean_dim(1)
+                .reshape([e, 1, 1])
+                .add_scalar(1e-5);
+            let wq = w.clone().div(g.clone()).round().clamp(-1.0, 1.0).mul(g);
+            w.clone() + (wq - w).detach()
+        };
+        let w1q = tern3(w1); // [e, ffn, d]
+        let w2q = tern3(w2); // [e, d, ffn]
+
+        // int8 activation STE on x (per token), broadcast to all experts
+        let act = |z: Tensor<B, 3>| {
+            let s = z.clone().abs().max_dim(2).div_scalar(127.0).clamp_min(1e-5);
+            let zq = z.clone().div(s.clone()).round().clamp(-127.0, 127.0).mul(s);
+            z.clone() + (zq - z).detach()
+        };
+        let xe = act(x.reshape([1, nn, d])).repeat_dim(0, e); // [e, N, d]
+        let h = gelu(xe.matmul(w1q.swap_dims(1, 2))); // [e,N,d]@[e,d,ffn]=[e,N,ffn]
+        let o = act(h).matmul(w2q.swap_dims(1, 2)); // [e,N,ffn]@[e,ffn,d]=[e,N,d]
+
+        let w = gnorm.swap_dims(0, 1).reshape([e, nn, 1]); // [e, N, 1]
+        let out = (o * w).sum_dim(0).reshape([b, t, d]);
+        (out, aux)
     }
 }
 
@@ -892,6 +950,68 @@ fn validate_moe() {
     println!("MoE validation: sparse forward matches dense, backward OK.");
 }
 
+/// Benchmark the MoE FFN implementations on wgpu: the per-expert sparse path
+/// (`moe_sparse`, one `argwhere`+gather+FFN+scatter per expert) vs the dense
+/// batched path (`moe_batched`, all experts in O(1)-in-E bmm dispatches). Times
+/// forward and forward+backward at realistic token counts across expert counts,
+/// so we can see whether the dispatch wall is real on this backend and whether
+/// batching breaks it (and at what activation-memory cost). Verifies the two
+/// agree numerically first.
+fn moebench() {
+    type B = Autodiff<Wgpu<f32, i32>>;
+    let dev = WgpuDevice::default();
+    let (d, ffn, batch, ctx) = (256usize, 384usize, 64usize, 256usize);
+    println!(
+        "MoE bench (wgpu): d={d} ffn={ffn} tokens={} (batch {batch} × ctx {ctx}), fwd+bwd, 20 iters",
+        batch * ctx
+    );
+    let flush = |z: Tensor<B, 3>| {
+        let _ = z.sum().into_scalar();
+    };
+    for e in [16usize, 32, 64] {
+        let cfg = GptConfig::new(16384, d, 1, 8, ffn, ctx, e).with_bit(true);
+        let model = cfg.init::<B>(&dev);
+        let blk = &model.blocks[0];
+        let x = Tensor::<B, 3>::random([batch, ctx, d], Distribution::Normal(0.0, 1.0), &dev);
+
+        let (od, _) = blk.moe(x.clone());
+        let (ob, _) = blk.moe_batched(x.clone());
+        let diff = (od - ob).abs().max().into_scalar().elem::<f32>();
+
+        let bench = |sparse: bool| -> f64 {
+            for _ in 0..3 {
+                let (o, a) = if sparse {
+                    blk.moe_sparse(x.clone())
+                } else {
+                    blk.moe_batched(x.clone())
+                };
+                let _ = (o.sum() + a.sum()).backward();
+            }
+            let t = Instant::now();
+            let mut last = None;
+            for _ in 0..20 {
+                let (o, a) = if sparse {
+                    blk.moe_sparse(x.clone())
+                } else {
+                    blk.moe_batched(x.clone())
+                };
+                let g = (o.sum() + a.sum()).backward();
+                last = Some(blk.router.grad(&g).unwrap());
+            }
+            let _ = last.unwrap().into_data(); // force queue completion
+            t.elapsed().as_secs_f64() * 1000.0 / 20.0
+        };
+
+        let sp = bench(true);
+        let ba = bench(false);
+        flush(blk.moe_batched(x).0);
+        println!(
+            "  E={e:3}  |dense−batched|={diff:.1e}  sparse {sp:7.1} ms  batched {ba:7.1} ms  speedup {:.2}×",
+            sp / ba
+        );
+    }
+}
+
 /// Exercise train → checkpoint → resume end-to-end on a tiny model (~2 min)
 /// before trusting it for a multi-day run. In-process resume is the same disk
 /// round-trip a fresh process would do.
@@ -954,6 +1074,10 @@ fn main() {
     let resume = std::env::args().any(|a| a == "resume");
     if std::env::args().any(|a| a == "smoke") {
         smoke();
+        return;
+    }
+    if std::env::args().any(|a| a == "moebench") {
+        moebench();
         return;
     }
     test_coder();

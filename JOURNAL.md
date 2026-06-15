@@ -13,6 +13,20 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-15 — negative: batching the MoE experts is slower, not faster — and the sparse path already scales sub-linearly in expert count
+
+To "fix the dispatch-bound trainer," added a dense **batched** MoE (`Block::moe_batched`): stack the expert weights into `[E, …]` and run every expert as one batched `bmm`, so the dispatch count is O(1) in E instead of `moe_sparse`'s per-expert `argwhere`+gather+FFN+scatter. Benchmarked it against the sparse path on wgpu (forward+backward, one MoE layer, 16384 tokens = batch 64 × ctx 256, d 256, ffn 384), via `cargo run --example neural --features neural -- moebench`:
+
+| E | sparse | batched | result |
+| --- | --- | --- | --- |
+| 16 | 185 ms | 701 ms | batched 3.8× slower |
+| 32 | 221 ms | 1380 ms | batched 6.3× slower |
+| 64 | 295 ms | 2626 ms | batched 8.9× slower |
+
+(The two agree numerically to ~1e-6 — same exact top-2 math.) The dense batch does E× the FFN FLOPs (every token through every expert) and materializes a `[E, N, ffn]` hidden, so it scales *linearly* in E — the wrong direction. No dense implementation can win when only 2 of E experts are needed; only a capacity-grouped GEMM (active-only FLOPs) could, and the next point shows why even that is low-value.
+
+The useful correction is to the training-cost model. Fitting the sparse numbers gives **~149 ms fixed per-layer overhead + ~2.25 ms per expert**: 4× the experts (16 → 64) costs only +59%, not the +300% a "time ∝ L×E dispatches" model (assumed in the 2026-06-15 sizing analysis) predicted. The dispatch overhead is real but it is a fixed per-layer floor (autodiff graph + gather/scatter + router/mask ops), not an expert-count problem — and at ~98% of the 221 ms being non-arithmetic, the floor is launch/overhead-bound, not FLOP-bound. A grouped-GEMM would only attack the ~2.25 ms/expert term (~72 ms of 221 ms at E32, ~13% of a step) at high complexity and token-drop fidelity risk. So: **no MoE kernel change is warranted**, and the happier finding is that scaling capacity via experts is far cheaper to train than estimated — reopening the experts axis for the next run. `moe_batched`/`moebench` are kept as the documenting benchmark (example-only, never shipped).
+
 ## 2026-06-15 — expert-count ablation: the 32 experts are all load-bearing; the v5-era "24 is the ceiling" result does not transfer to ternary + aux-loss
 
 CDR raised reducing experts 32 → 24, citing the v5/v6 finding that beyond ~20-24 experts went unused (and the 95M teacher's small count). Tested it directly on the 43.6M checkpoint with a new offline probe (`expert_ablation`, an `#[ignore]` test): rank experts per layer by usage on a calibration slice, reconstruct an E_K model keeping the top-K experts and their router rows, and measure L(C) on held slices. The probe touches no shipped code — it prunes a freshly-loaded `Model` in the test.
