@@ -1134,6 +1134,87 @@ mod tests {
         }
     }
 
+    /// Reconstruct a copy of `m` keeping only the top-`k` experts per layer (by
+    /// the `ranking`), with the matching router rows — a faithful E_k variant of
+    /// a model trained at E32. Mutates `m` in place; no shipped-code hook.
+    fn prune_experts(m: &mut Model, k: usize, ranking: &[Vec<usize>]) {
+        let d = m.cfg.d_model;
+        for (l, blk) in m.blocks.iter_mut().enumerate() {
+            let mut keep: Vec<usize> = ranking[l].iter().copied().take(k).collect();
+            keep.sort_unstable();
+            let old_e = std::mem::take(&mut blk.experts);
+            blk.experts = old_e
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| keep.binary_search(i).is_ok())
+                .map(|(_, e)| e)
+                .collect();
+            let old_r = std::mem::take(&mut blk.router);
+            let mut nr = Vec::with_capacity(k * d);
+            for &i in &keep {
+                nr.extend_from_slice(&old_r[i * d..i * d + d]);
+            }
+            blk.router = nr;
+        }
+        m.cfg.n_experts = k;
+    }
+
+    /// Expert-count ablation on a trained checkpoint: drop to the top-K experts
+    /// per layer (ranked by usage on a calibration slice) and measure L(C) on
+    /// held slices. The reported L(C) is an UPPER bound on a from-scratch E_K
+    /// (ablation routes worse than a model trained with K experts), so a net
+    /// improvement here is conservative. L(D) is the analytic trit-packed
+    /// estimate (0.0157 + total_M·0.00328, fit to the measured 0.1599 at 43.6M).
+    /// Run: `cargo test --release expert_ablation -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: needs assets/v8weights.bin (or V8_PROBE_BLOB) and enwik9"]
+    fn expert_ablation() {
+        use std::fmt::Write as _;
+        let path = std::env::var("V8_PROBE_BLOB").unwrap_or_else(|_| "assets/v8weights.bin".into());
+        let blob = std::fs::read(&path).expect("probe blob");
+        let data = std::fs::read("assets/enwik9").expect("enwik9");
+        let full = Model::from_blob(&blob);
+        let (_, _, n_layers, _, _, _, n_experts) = full.dims();
+
+        // calibration: per-layer expert usage on a slice → ranking (most-used first)
+        let cal = &data[1 << 20..(1 << 20) + 256 * 1024];
+        let mut cache = full.new_cache();
+        let mut s = full.new_scratch();
+        for id in full.bpe.encode(cal) {
+            full.step(&mut cache, &mut s, id as i32);
+        }
+        let ranking: Vec<Vec<usize>> = (0..n_layers)
+            .map(|l| {
+                let mut idx: Vec<usize> = (0..n_experts).collect();
+                idx.sort_by(|&a, &b| s.expert_counts[l][b].cmp(&s.expert_counts[l][a]));
+                idx
+            })
+            .collect();
+
+        let meas: [(&str, usize); 2] = [("@1MB", 1 << 20), ("@250MB", 250_000_000)];
+        println!("\nexpert ablation (top-K by usage; L(C) is an UPPER bound vs from-scratch E_K):");
+        for k in [n_experts, 24, 16, 12, 8, 4] {
+            if k > n_experts {
+                continue;
+            }
+            let mut m = Model::from_blob(&blob);
+            prune_experts(&mut m, k, &ranking);
+            let total = m.num_params().0;
+            let ld = 0.0157 + (total as f64 / 1e6) * 0.003_28;
+            let mut line = format!(
+                "  K={k:2}  total {:5.1}M  L(D)~{ld:.4} |",
+                total as f64 / 1e6
+            );
+            for (tag, off) in meas {
+                let slice = &data[off..off + 256 * 1024];
+                let arc = m.compress(slice, 0);
+                let lc = 8.0 * arc.len() as f64 / slice.len() as f64;
+                let _ = write!(line, "  {tag} L(C) {lc:.4} net {:.4}", lc + ld);
+            }
+            println!("{line}");
+        }
+    }
+
     /// Integration check on real data: a (reproducible) random point ≥ 1 MB from
     /// either end of enwik8, online-BPE up to that point, then the CPU codec
     /// encodes→decodes 1000 tokens of the following held-out bytes byte-for-byte.

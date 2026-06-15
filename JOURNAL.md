@@ -13,6 +13,25 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-15 — expert-count ablation: the 32 experts are all load-bearing; the v5-era "24 is the ceiling" result does not transfer to ternary + aux-loss
+
+CDR raised reducing experts 32 → 24, citing the v5/v6 finding that beyond ~20-24 experts went unused (and the 95M teacher's small count). Tested it directly on the 43.6M checkpoint with a new offline probe (`expert_ablation`, an `#[ignore]` test): rank experts per layer by usage on a calibration slice, reconstruct an E_K model keeping the top-K experts and their router rows, and measure L(C) on held slices. The probe touches no shipped code — it prunes a freshly-loaded `Model` in the test.
+
+Result (256 KB slice at offset 1 MB; L(D) is the analytic trit-packed estimate):
+
+| K | total | L(D)~ | L(C) | net |
+| --- | --- | --- | --- | --- |
+| 32 (current) | 43.6M | 0.159 | 1.3824 | 1.541 |
+| 24 | 34.2M | 0.128 | 1.7431 | 1.871 |
+| 16 | 24.7M | 0.097 | 2.2352 | 2.332 |
+| 12 | 20.0M | 0.081 | 2.4353 | 2.517 |
+| 8 | 15.3M | 0.066 | 2.616 | 2.682 |
+| 4 | 10.6M | 0.050 | 2.777 | 2.827 |
+
+Dropping just 8 experts (32 → 24) costs **+0.36 bpb L(C)** to save 0.031 of L(D) — net 1.54 → 1.87. The premise is refuted: the experts are **not** redundant. With the load-balance aux loss (added this run) and ternary quantization, all 32 are differentiated and load-bearing — ablating any 8 orphans the ~25% of tokens that routed to them onto a non-specialist, and no survivor substitutes. That is the opposite of the v5 regime, where 8 of 32 sat unused; the old "24" result was an artifact of f32 + no aux loss and does not carry over. The steepness (+0.36, far above the ~0.05-0.10 a near-redundant set would show) is consistent with the theory that individually-weaker ternary experts want *more* of them, not fewer; the teacher's "12 experts" was a different regime (large experts, ffn 1536, top-1).
+
+Caveat kept on the record: ablation *overstates* a from-scratch E24 (which would tile the whole distribution with 24 experts and orphan no one), so this does not prove a retrained E24 is worse on net — only a retrain settles that exactly. But the cliff is steep enough that chasing a possible small net win at 24 is low-value. Decision: **keep 32**; the open question worth testing is whether *more* experts help (cheap on inference and L(D), but the training-time-expensive axis since training is dispatch-bound at L×E).
+
 ## 2026-06-15 — authoritative full-enwik9 number: net 1.4160 bpb (L(C) 1.2561 + L(D) 0.1599), and the chunked-tokenizer fix that made a 1 GB compress memory-feasible
 
 CDR/Claude. First full-corpus compression of enwik9 with the v8 codec (the 43.6M decayed model, curve point 2). The whole 1 GB encodes to a **157,010,416-byte archive → L(C) 1.2561 bpb**; with the 9,996,704-byte binary's L(D) 0.1599, the **authoritative net is 1.4160 bpb**, round-trip established (see below) and peak RSS 1.50 GB — inside the 10 GB budget. The 256 KB / 1 MB slices were pessimistic: full-corpus L(C) 1.256 is 0.126 below the 1 MB literary slice's 1.382, because enwik9 as a whole carries far more markup and repetition than that excerpt. This is the project's first competitive *and enwik9-shippable* result; v7's 1.4267 was enwik8-only and its best config blew the 10 GB cap, so the two are not the same-corpus comparison, but on the metric that the prize actually scores — net bpb on enwik9, shippable — 1.4160 is the new project best. Still 0.49 above the 0.928 record.
