@@ -18,6 +18,7 @@ use burn::nn::loss::CrossEntropyLossConfig;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
+use burn::record::{BinFileRecorder, FullPrecisionSettings};
 use burn::tensor::Distribution;
 use burn::tensor::IndexingUpdateOp;
 use burn::tensor::activation::{gelu, softmax};
@@ -224,6 +225,9 @@ fn causal_mask<B: Backend>(t: usize, device: &B::Device) -> Tensor<B, 4> {
     Tensor::<B, 2>::from_data(TensorData::new(m, [t, t]), device).reshape([1, 1, t, t])
 }
 
+/// Experts per token (the max/mask-the-max/max gate selection hardcodes 2).
+const TOP_K: usize = 2;
+
 #[derive(Module, Debug)]
 struct Expert<B: Backend> {
     ff1: BitLinear<B>,
@@ -258,10 +262,26 @@ impl<B: Backend> Block<B> {
         self.wo.forward(ctx)
     }
 
+    /// Switch-style load-balance auxiliary loss from the full softmax `gate`
+    /// and the top-k selection `mask` (both `[N, ne]`): `ne · Σ_e f_e · P_e`,
+    /// where `f_e` is the fraction of routing slots expert `e` won and `P_e`
+    /// its mean gate probability. Equals 1.0 at perfect balance, `ne/k` at
+    /// full collapse. Without it the router collapses — measured 2026-06-10 on
+    /// the L6/32-expert run: layers 4–5 routed every token to the same 2
+    /// experts (usage entropy 1.0 bit) and the loss stalled at the unigram
+    /// floor, while the L4/24-expert run (no aux loss, lucky) stayed alive.
+    fn balance_aux(gate: &Tensor<B, 2>, mask: &Tensor<B, 2>) -> Tensor<B, 1> {
+        let [nn, ne] = gate.dims();
+        let f = mask.clone().sum_dim(0) / (nn * TOP_K) as f32; // [1, ne]
+        let p = gate.clone().mean_dim(0); // [1, ne]
+        (f * p).sum() * ne as f32
+    }
+
     /// Top-2 mixture-of-experts FFN. Training computes all experts densely and
     /// masks to the top-2 (simple + correct; the codec does the sparse gather).
     /// Gate = softmax over router logits, renormalized over the chosen experts.
-    fn moe(&self, n2: Tensor<B, 3>) -> Tensor<B, 3> {
+    /// Returns `(output, balance_aux)`.
+    fn moe(&self, n2: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 1>) {
         let [b, t, d] = n2.dims();
         let rlogits = n2
             .clone()
@@ -274,6 +294,11 @@ impl<B: Backend> Block<B> {
         let without_max = gate.clone().mask_fill(is_max, f32::NEG_INFINITY);
         let kth = without_max.max_dim(2); // [b,t,1] = 2nd-largest gate
         let mask = gate.clone().greater_equal(kth).float(); // [b,t,ne]
+        let ne = self.experts.len();
+        let aux = Self::balance_aux(
+            &gate.clone().reshape([b * t, ne]),
+            &mask.clone().reshape([b * t, ne]),
+        );
         let masked = gate * mask;
         let denom = masked.clone().sum_dim(2); // [b,t,1]
         let gnorm = masked / denom;
@@ -283,14 +308,14 @@ impl<B: Backend> Block<B> {
             let ge = gnorm.clone().slice([0..b, 0..t, e..e + 1]); // [b,t,1]
             out = out + oe * ge;
         }
-        out
+        (out, aux)
     }
 
     /// Sparse top-2 MoE: identical math to `moe`, but each expert runs only on
     /// the tokens routed to it (gathered via `argwhere`/`select`) and its output
     /// is scattered back — ~`n_experts/TOP_K`× less compute *and* retained
-    /// activation than computing all experts densely.
-    fn moe_sparse(&self, n2: Tensor<B, 3>) -> Tensor<B, 3> {
+    /// activation than computing all experts densely. Returns `(output, aux)`.
+    fn moe_sparse(&self, n2: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 1>) {
         let [b, t, d] = n2.dims();
         let nn = b * t;
         let x = n2.reshape([nn, d]); // [N, d]
@@ -300,7 +325,9 @@ impl<B: Backend> Block<B> {
         let is_max = gate.clone().equal(max1.clone());
         let without = gate.clone().mask_fill(is_max, f32::NEG_INFINITY);
         let kth = without.max_dim(1);
-        let masked = gate.clone() * gate.greater_equal(kth).float();
+        let mask = gate.clone().greater_equal(kth).float();
+        let aux = Self::balance_aux(&gate, &mask);
+        let masked = gate.clone() * mask;
         let gnorm = masked.clone() / masked.sum_dim(1); // [N, ne]; 0 except top-2
         let mut out = Tensor::<B, 2>::zeros([nn, d], &x.device());
         for (e, exp) in self.experts.iter().enumerate() {
@@ -316,7 +343,7 @@ impl<B: Backend> Block<B> {
             let g_e = col.select(0, idx.clone()).reshape([ne, 1]); // [n_e,1]
             out = out.select_assign(0, idx, oe * g_e, IndexingUpdateOp::Add);
         }
-        out.reshape([b, t, d])
+        (out.reshape([b, t, d]), aux)
     }
 }
 
@@ -393,8 +420,10 @@ impl GptConfig {
 }
 
 impl<B: Backend> Gpt<B> {
-    /// tokens [batch, seq] Int -> logits [batch, seq, vocab].
-    fn forward(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+    /// tokens [batch, seq] Int -> (logits [batch, seq, vocab], summed MoE
+    /// balance aux across blocks — add `λ·aux` to the training loss, ignore at
+    /// eval).
+    fn forward(&self, tokens: Tensor<B, 2, Int>) -> (Tensor<B, 3>, Tensor<B, 1>) {
         let [b, t] = tokens.dims();
         let d = self.tok_w.val().dims()[1];
         let device = tokens.device();
@@ -406,14 +435,17 @@ impl<B: Backend> Gpt<B> {
         let mut x = wq.clone().select(0, flat).reshape([b, t, d]);
         let pos_ids = Tensor::<B, 1, Int>::arange(0..t as i64, &device).reshape([1, t]);
         x = x + self.pos.forward(pos_ids); // broadcast [1,t,d] over batch
+        let mut aux = Tensor::<B, 1>::zeros([1], &device);
         for blk in &self.blocks {
             x = x.clone() + blk.attn(blk.norm1.forward(x.clone()));
             let n2 = blk.norm2.forward(x.clone());
-            x = x + blk.moe_sparse(n2);
+            let (mo, a) = blk.moe_sparse(n2);
+            x = x + mo;
+            aux = aux + a;
         }
         x = self.norm_f.forward(x);
         // tied unembedding: logits = x @ wq^T
-        x.matmul(wq.transpose().unsqueeze_dim(0)) // [1,d,vocab] broadcast -> [b,t,vocab]
+        (x.matmul(wq.transpose().unsqueeze_dim(0)), aux) // [1,d,vocab] broadcast -> [b,t,vocab]
     }
 }
 
@@ -479,19 +511,102 @@ impl Rng {
     }
 }
 
+// Checkpoint trio written every 1K steps: the shippable ternary blob, an f32
+// record (resumable, unlike the quantized blob), and a step sidecar so the LR
+// schedule continues where it left off. Adam moments are not saved; they
+// rebuild within ~100 steps of a resume. Smoke mode gets its own paths so it
+// can never clobber a real run's artifacts.
+struct CkptPaths {
+    blob: &'static str,
+    f32_rec: &'static str, // BinFileRecorder appends ".bin"
+    step: &'static str,
+}
+const RUN_CKPT: CkptPaths = CkptPaths {
+    blob: "assets/v8weights.bin",
+    f32_rec: "checkpoints/v8_train_f32",
+    step: "checkpoints/v8_train_step.txt",
+};
+const SMOKE_CKPT: CkptPaths = CkptPaths {
+    blob: "checkpoints/smoke_weights.bin",
+    f32_rec: "checkpoints/smoke_f32",
+    step: "checkpoints/smoke_step.txt",
+};
+
+/// Warmup-stable-decay: 1K-step linear warmup to the peak, hold flat, then a
+/// cosine decay to peak/10 over the final `DECAY` steps of the horizon. The
+/// flat region's trajectory is horizon-independent, so the decay can be
+/// triggered on demand when the loss curve plateaus: stop the run, set `steps`
+/// to current+`DECAY`, and `-- resume` — the schedule stays continuous. (A
+/// plain cosine locks the horizon at launch; changing it mid-run reshapes the
+/// whole curve. The first enwik9 run held LR flat throughout; annealing
+/// mattered in the prior v4/v5 MoE runs.)
+/// Peak LR, overridable via `PEAK_LR` env for stall diagnosis (default 3e-4).
+fn peak_lr() -> f64 {
+    static PEAK: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *PEAK.get_or_init(|| {
+        std::env::var("PEAK_LR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3e-4)
+    })
+}
+
+/// Warmup length, overridable via `WARMUP_STEPS` env (default 1000; 0 means
+/// flat peak from step 0 — the regime the successful 24M enwik9 run used).
+fn warmup_steps() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("WARMUP_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000)
+    })
+}
+
+fn lr_at(step: usize, steps: usize) -> f64 {
+    let peak = peak_lr();
+    let warmup = warmup_steps();
+    const DECAY: usize = 10_000;
+    let min = peak / 10.0;
+    if step < warmup {
+        return peak * (step + 1) as f64 / warmup as f64;
+    }
+    let decay_start = steps.saturating_sub(DECAY).max(warmup);
+    if step < decay_start {
+        return peak;
+    }
+    let t = (step - decay_start) as f64 / (steps - decay_start).max(1) as f64;
+    min + 0.5 * (peak - min) * (1.0 + (std::f64::consts::PI * t.min(1.0)).cos())
+}
+
 fn train<B: AutodiffBackend>(
     tokens: &[i32],
     cfg: &GptConfig,
     device: &B::Device,
     steps: usize,
     bpe: &bpe::Bpe,
+    resume: bool,
+    ckpt: &CkptPaths,
 ) -> Gpt<B> {
     let mut model = cfg.init::<B>(device);
+    let mut start_step = 0usize;
+    if resume {
+        let rec = BinFileRecorder::<FullPrecisionSettings>::new();
+        model = model
+            .load_file(ckpt.f32_rec, &rec, device)
+            .expect("resume: load f32 checkpoint");
+        start_step = std::fs::read_to_string(ckpt.step)
+            .expect("resume: read step sidecar")
+            .trim()
+            .parse()
+            .expect("resume: parse step");
+        println!("  resumed from step {start_step} ({}.bin)", ckpt.f32_rec);
+    }
     let mut optim = AdamConfig::new().init();
-    let lr = 3e-4;
     let (batch, ctx) = (64usize, cfg.ctx);
-    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
-    for step in 0..steps {
+    // re-seed per resume point so a resumed run samples fresh batches
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D ^ (start_step as u64).wrapping_mul(0x9E37_79B9));
+    for step in start_step..steps {
         let mut inp = Vec::with_capacity(batch * ctx);
         let mut tgt = Vec::with_capacity(batch * ctx);
         for _ in 0..batch {
@@ -503,26 +618,41 @@ fn train<B: AutodiffBackend>(
         }
         let inp_t = Tensor::<B, 2, Int>::from_data(TensorData::new(inp, [batch, ctx]), device);
         let tgt_t = Tensor::<B, 2, Int>::from_data(TensorData::new(tgt, [batch, ctx]), device);
-        let logits = model.forward(inp_t);
+        let (logits, aux) = model.forward(inp_t);
         let [bb, tt, vv] = logits.dims();
-        let loss = CrossEntropyLossConfig::new()
+        let ce = CrossEntropyLossConfig::new()
             .init(device)
             .forward(logits.reshape([bb * tt, vv]), tgt_t.reshape([bb * tt]));
-        let lval = loss.clone().into_scalar().elem::<f32>();
+        // λ·aux keeps the routers load-balanced (each block contributes 1.0 at
+        // perfect balance; the step log prints aux/n_layers so balanced ≈ 1.00)
+        const LAMBDA: f32 = 0.01;
+        let lval = ce.clone().into_scalar().elem::<f32>();
+        let aval = aux.clone().into_scalar().elem::<f32>();
+        let loss = ce + aux.mul_scalar(LAMBDA);
         let grads = loss.backward();
         let gp = GradientsParams::from_grads(grads, &model);
+        let lr = lr_at(step, steps);
         model = optim.step(lr, model, gp);
         if step % 50 == 0 || step + 1 == steps {
             println!(
-                "  step {step:5} loss {lval:.4}  ({:.3} bits/token)",
-                f64::from(lval) / std::f64::consts::LN_2
+                "  step {step:5} loss {lval:.4}  ({:.3} bits/token, lr {lr:.2e}, aux {:.2})",
+                f64::from(lval) / std::f64::consts::LN_2,
+                aval / cfg.n_layers as f32,
             );
         }
         if step > 0 && step % 1000 == 0 {
             let blob = pack_model(&model, cfg, bpe);
-            std::fs::write("assets/v8weights.bin", &blob).expect("checkpoint write");
+            std::fs::write(ckpt.blob, &blob).expect("checkpoint write");
+            let rec = BinFileRecorder::<FullPrecisionSettings>::new();
+            std::fs::create_dir_all("checkpoints").expect("checkpoints dir");
+            model
+                .clone()
+                .save_file(ckpt.f32_rec, &rec)
+                .expect("f32 checkpoint save");
+            // sidecar holds *completed* steps, so a resume starts at the next one
+            std::fs::write(ckpt.step, format!("{}\n", step + 1)).expect("step sidecar write");
             println!(
-                "  [checkpoint] step {step}: {} KiB blob written",
+                "  [checkpoint] step {step}: {} KiB blob + f32 record written",
                 blob.len() / 1024
             );
         }
@@ -535,7 +665,7 @@ fn predict<B: Backend>(model: &Gpt<B>, device: &B::Device, ctx_ids: &[i32]) -> V
     let len = ctx_ids.len();
     let vocab = model.tok_w.val().dims()[0];
     let t = Tensor::<B, 2, Int>::from_data(TensorData::new(ctx_ids.to_vec(), [1, len]), device);
-    let logits = model.forward(t); // [1, len, vocab]
+    let (logits, _aux) = model.forward(t); // [1, len, vocab]
     let last = logits
         .slice([0..1, len - 1..len, 0..vocab])
         .reshape([vocab]);
@@ -601,7 +731,7 @@ fn nn_decode<B: Backend>(
 // ternary = round(w/scale).clamp(-1,1). Format mirrors `src/v8.rs::Model`.
 // ---------------------------------------------------------------------------
 const BLOB_MAGIC: u32 = 0x3852_5A4C; // "LZR8" little-endian
-const BLOB_VERSION: u32 = 3;
+const BLOB_VERSION: u32 = 4; // trit-packed: 5 trits/byte ≈ 1.6 bits/weight
 
 fn push_f32s(out: &mut Vec<u8>, vals: &[f32]) {
     for &v in vals {
@@ -613,25 +743,26 @@ fn tensor_vec<B: Backend, const R: usize>(t: Tensor<B, R>) -> Vec<f32> {
     t.into_data().to_vec::<f32>().unwrap()
 }
 
-/// Pack a row-major weight as scale f32 + 2-bit ternary, replicating
-/// `ternary_ste`'s quantization exactly (scale = mean(|w|)+1e-5).
+/// Pack a row-major weight as scale f32 + trit-packed ternary (v4: 5 trits per
+/// byte as little-endian base-3 digits, digit = trit + 1 — ~1.6 bits/weight),
+/// replicating `ternary_ste`'s quantization exactly (scale = mean(|w|)+1e-5).
 fn pack_ternary(out: &mut Vec<u8>, w: &[f32]) {
     let scale = (w.iter().map(|v| v.abs()).sum::<f32>() / w.len() as f32) + 1e-5;
     out.extend_from_slice(&scale.to_le_bytes());
     let mut byte = 0u8;
+    let mut pow = 1u8;
     let mut k = 0u32;
     for &v in w {
-        let code: u8 = match (v / scale).round().clamp(-1.0, 1.0) as i32 {
-            -1 => 0,
-            0 => 1,
-            _ => 2,
-        };
-        byte |= code << (2 * k);
+        let digit = ((v / scale).round().clamp(-1.0, 1.0) as i8 + 1) as u8;
+        byte += digit * pow;
         k += 1;
-        if k == 4 {
+        if k == 5 {
             out.push(byte);
             byte = 0;
+            pow = 1;
             k = 0;
+        } else {
+            pow *= 3;
         }
     }
     if k > 0 {
@@ -695,6 +826,7 @@ fn train_and_eval(
     bpe: &bpe::Bpe,
     steps: usize,
     label: &str,
+    resume: bool,
 ) {
     type GpuAd = Autodiff<Wgpu<f32, i32>>;
     let gdev = WgpuDevice::default();
@@ -703,7 +835,7 @@ fn train_and_eval(
         "[{label}] training {steps} steps on GPU ({nparams} params, vocab {})...",
         cfg.vocab
     );
-    let model = train::<GpuAd>(train_toks, cfg, &gdev, steps, bpe);
+    let model = train::<GpuAd>(train_toks, cfg, &gdev, steps, bpe, resume, &RUN_CKPT);
 
     let gpu_model = model.valid();
     let arc = nn_encode::<Wgpu<f32, i32>>(&gpu_model, &gdev, test_toks, 0);
@@ -742,20 +874,88 @@ fn validate_moe() {
     let model = cfg.init::<B>(&dev);
     let blk = &model.blocks[0];
     let x = Tensor::<B, 3>::random([2, 8, 64], Distribution::Normal(0.0, 1.0), &dev);
-    let dense = blk.moe(x.clone());
-    let sparse = blk.moe_sparse(x.clone());
+    let (dense, daux) = blk.moe(x.clone());
+    let (sparse, saux) = blk.moe_sparse(x.clone());
     let diff = (dense - sparse.clone())
         .abs()
         .max()
         .into_scalar()
         .elem::<f32>();
-    println!("MoE validation: max|dense - sparse| = {diff:.3e}");
+    let adiff = (daux.into_scalar().elem::<f32>() - saux.clone().into_scalar().elem::<f32>()).abs();
+    println!("MoE validation: max|dense - sparse| = {diff:.3e}, |aux Δ| = {adiff:.3e}");
     assert!(diff < 1e-3, "sparse MoE diverges from dense ({diff})");
-    let _ = sparse.sum().backward(); // panics if select_assign has no backward
+    assert!(
+        adiff < 1e-4,
+        "aux diverges between dense and sparse ({adiff})"
+    );
+    let _ = (sparse.sum() + saux).backward(); // panics if select_assign/aux have no backward
     println!("MoE validation: sparse forward matches dense, backward OK.");
 }
 
+/// Exercise train → checkpoint → resume end-to-end on a tiny model (~2 min)
+/// before trusting it for a multi-day run. In-process resume is the same disk
+/// round-trip a fresh process would do.
+fn smoke() {
+    type GpuAd = Autodiff<Wgpu<f32, i32>>;
+    let gdev = WgpuDevice::default();
+    let data = std::fs::read("assets/enwik8").expect("read enwik8");
+    let slice = &data[..2 * 1024 * 1024];
+    let bpe = bpe::Bpe::learn(slice, 512);
+    let toks: Vec<i32> = bpe.encode(slice).iter().map(|&t| t as i32).collect();
+    // Diagnostic knobs (env): depth, width, and a single-phase step count —
+    // used to reproduce the L6 unigram-shelf stall at minutes-scale.
+    let env_us = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (layers, d_model, steps) = (
+        env_us("SMOKE_LAYERS", 2),
+        env_us("SMOKE_D", 64),
+        env_us("SMOKE_STEPS", 0),
+    );
+    let heads = (d_model / 16).max(2);
+    let cfg = GptConfig::new(bpe.vocab_size(), d_model, layers, heads, 48, 64, 4).with_bit(true);
+    if steps > 0 {
+        let mut hist = vec![0u64; bpe.vocab_size()];
+        for &t in &toks {
+            hist[t as usize] += 1;
+        }
+        let n = toks.len() as f64;
+        let unigram: f64 = hist
+            .iter()
+            .filter(|&&c| c > 0)
+            .map(|&c| {
+                let p = c as f64 / n;
+                -p * p.log2()
+            })
+            .sum();
+        println!(
+            "[smoke] diagnostic: L{layers} d{d_model}, {steps} steps, peak {:.1e}, warmup {}; token unigram floor {unigram:.3} bits",
+            peak_lr(),
+            warmup_steps(),
+        );
+        let _ = train::<GpuAd>(&toks, &cfg, &gdev, steps, &bpe, false, &SMOKE_CKPT);
+        return;
+    }
+    validate_moe();
+    println!("[smoke] fresh run, 1100 steps (f32 checkpoint lands at 1000)...");
+    let _ = train::<GpuAd>(&toks, &cfg, &gdev, 1100, &bpe, false, &SMOKE_CKPT);
+    println!("[smoke] resuming from the step-1000 checkpoint, to 1200...");
+    let _ = train::<GpuAd>(&toks, &cfg, &gdev, 1200, &bpe, true, &SMOKE_CKPT);
+    println!("[smoke] resume path OK (loss should continue near its pre-resume level)");
+}
+
 fn main() {
+    // `-- resume` continues from checkpoints/v8_train_f32.bin at the saved step
+    // (same config + data required; shape mismatches fail loudly on load).
+    // `-- smoke` runs the tiny train→checkpoint→resume exercise instead.
+    let resume = std::env::args().any(|a| a == "resume");
+    if std::env::args().any(|a| a == "smoke") {
+        smoke();
+        return;
+    }
     test_coder();
     // validate_moe() already confirmed sparse == dense + backward; skip its
     // ~6 min one-time shader compile on relaunches (training compiles anyway).
@@ -785,17 +985,28 @@ fn main() {
         n as f64 / train_toks.len() as f64,
     );
 
-    // ~24M MoE (top-2): d=256, 4 layers, 8 heads, 24 experts, expert-ffn 384.
-    let bit = GptConfig::new(vocab, 256, 4, 8, 384, 256, 24).with_bit(true);
-    // High cap; we run until the loss curve plateaus and stop manually (the
-    // checkpoint-every-1K means no progress is ever lost).
+    // Scaling point 2 on the bpb-vs-total-params curve (point 1: the 06-09 run,
+    // d=256/L4/24e ≈ 24.2M total / 6.9M active → L(C) ~1.76 on text slices).
+    // Depth and expert count are the cheap axes — inference is unembed-dominated,
+    // so d/vocab stay put: d=256, 6 layers, 32 experts, expert-ffn 384
+    // ≈ 43.6M total / 8.2M active, L(D) ≈ 0.19 bpb at 2 b/w, inference ETA ~14 h.
+    // Training cost is dispatch-bound (∝ layers × experts): 192 vs 96 dispatches
+    // → ~2.4 s/step expected, ~33 h to the horizon (resumable via `-- resume`).
+    let bit = GptConfig::new(vocab, 256, 6, 8, 384, 256, 32).with_bit(true);
+    // `steps` is the WSD horizon — a *maximum* (~8.8 epochs, ~3.3 days at
+    // 2.4 s/step), not a commitment: the LR holds flat after warmup, so when
+    // the loss curve plateaus we stop, set this to current+10K, and `-- resume`
+    // to run just the decay tail. Chosen over 50K because the 24M run was still
+    // improving at 37.8K and this model is 1.8× bigger with slower-converging
+    // ternary-QAT + MoE dynamics.
     train_and_eval(
         &train_toks,
         &eval_bytes,
         &eval_toks,
         &bit,
         &bpe,
-        200000,
+        100_000,
         "bitnet",
+        resume,
     );
 }

@@ -7,10 +7,10 @@
 //! forward, so the codec round-trips by construction — each invocation is
 //! self-consistent regardless of float-order differences against the trainer.
 //!
-//! Weights are ternary BitNet (`{-1,0,1}` + per-tensor scale), so they ship at
-//! ~2 bits/weight (2-bit packing here; 1.6 b/w trit-packing is the next
-//! tightening). Embeddings, positional table, and LayerNorm affine params stay
-//! f32 — they are a small fraction of the parameter count.
+//! Weights are ternary BitNet (`{-1,0,1}` + per-tensor scale), shipped
+//! trit-packed at 5 trits/byte ≈ 1.6 bits/weight (blob v4; v3's 2-bit packing
+//! still reads) — including the tied token embedding. Only the positional table
+//! and LayerNorm affine params stay f32; they are a small fraction of the count.
 
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
@@ -158,8 +158,9 @@ fn probs_to_cdf(probs: &[f32]) -> Vec<u32> {
 //     norm2  : gamma[d] f32, beta[d] f32
 //     router : f32 [n_experts, d]   (kept full precision; routing is sensitive)
 //     experts[n_experts], each: ff1 ternary (ffn x d), ff2 ternary (d x ffn)
-//   a ternary linear is: scale f32, then ceil(out*in/4) packed bytes
-//   (2 bits/weight: 0b00=-1, 0b01=0, 0b10=+1).
+//   a ternary linear is: scale f32, then the packed trits — v3: ceil(out*in/4)
+//   bytes at 2 bits/trit (0b00=-1, 0b01=0, 0b10=+1); v4: ceil(out*in/5) bytes,
+//   5 trits/byte as little-endian base-3 digits (digit = trit + 1).
 //
 // Mixture-of-experts FFN: each token routes to the TOP_K of n_experts (by a
 // softmax over the router logits, gates renormalized over the chosen experts),
@@ -169,8 +170,13 @@ fn probs_to_cdf(probs: &[f32]) -> Vec<u32> {
 // ---------------------------------------------------------------------------
 
 pub(crate) const MAGIC: u32 = 0x3852_5A4C; // "LZR8" little-endian
-pub(crate) const VERSION: u32 = 3;
+// v3: ternary at 2 bits/weight. v4: trit-packed, 5 trits/byte (3^5 = 243 ≤ 256)
+// ≈ 1.6 bits/weight — ~20% smaller ternary tables, ~0.035 bpb off L(D) at 43M
+// params. The reader accepts both so v3 checkpoints stay measurable.
+pub(crate) const VERSION: u32 = 4;
 const TOP_K: usize = 2;
+/// Trits per packed byte in the v4 format.
+const TRITS_PER_BYTE: usize = 5;
 
 #[derive(Clone, Copy, Debug)]
 struct Config {
@@ -188,18 +194,10 @@ struct TernLinear {
     // out*in ternary values {-1,0,1} as i8, row-major [out, in]. Activations are
     // int8-quantized too, so the matvec is an integer i8×i8→i32 dot that
     // auto-vectorizes to NEON `sdot` (and the AVX2/VNNI equivalents on x86). The
-    // on-disk blob stays 2-bit (L(D) unchanged); this is the in-RAM copy.
+    // on-disk blob stays trit-packed (L(D) unaffected); this is the in-RAM copy.
     w: Vec<i8>,
     out_f: usize,
     in_f: usize,
-}
-
-/// Tied token embedding, ternary but kept as f32: it is used as a gather (the
-/// lookup) and as the unembedding matvec over *un-quantized* activations, so the
-/// int8 path would only add an i8→f32 widening with no `sdot` to pay for it.
-struct Embed {
-    scale: f32,
-    w: Vec<f32>, // [vocab, d] ternary {-1,0,1}
 }
 
 struct LayerNorm {
@@ -226,7 +224,13 @@ struct Block {
 pub(crate) struct Model {
     cfg: Config,
     bpe: crate::bpe::Bpe,
-    tok: Embed,    // [vocab, d] ternary f32; tied embedding + unembedding
+    // Tied token embedding [vocab, d]: row-gathered (widened i8→f32, d elements
+    // per token) for the lookup, and run through the int8 `sdot` matvec as the
+    // unembedding — which int8-quantizes the final activations, a deliberate
+    // departure from the trainer's un-quantized unembed. Measured 2026-06-10 on
+    // the 24M enwik9 checkpoint: Δ L(C) ≤ 0.0001 bpb across three 256 KB slices,
+    // throughput 0.085 → 0.044 ms/byte (the unembed was ~85% of the forward).
+    tok: TernLinear,
     pos: Vec<f32>, // ctx*d f32
     norm_f: LayerNorm,
     blocks: Vec<Block>,
@@ -237,6 +241,7 @@ pub(crate) struct Model {
 struct Reader<'a> {
     b: &'a [u8],
     p: usize,
+    version: u32,
 }
 impl Reader<'_> {
     fn u32(&mut self) -> u32 {
@@ -255,50 +260,46 @@ impl Reader<'_> {
     fn tern(&mut self, out_f: usize, in_f: usize) -> TernLinear {
         let scale = self.f32();
         let n = out_f * in_f;
-        let nbytes = n.div_ceil(4);
         let mut w = Vec::with_capacity(n);
-        for bi in 0..nbytes {
-            let byte = self.b[self.p + bi];
-            for k in 0..4 {
-                if w.len() == n {
-                    break;
+        if self.version == 3 {
+            // 2 bits/trit: 0b00=-1, 0b01=0, 0b10=+1
+            let nbytes = n.div_ceil(4);
+            for bi in 0..nbytes {
+                let byte = self.b[self.p + bi];
+                for k in 0..4 {
+                    if w.len() == n {
+                        break;
+                    }
+                    let code = (byte >> (2 * k)) & 0b11;
+                    w.push(match code {
+                        0 => -1i8,
+                        1 => 0,
+                        _ => 1,
+                    });
                 }
-                let code = (byte >> (2 * k)) & 0b11;
-                w.push(match code {
-                    0 => -1i8,
-                    1 => 0,
-                    _ => 1,
-                });
             }
+            self.p += nbytes;
+        } else {
+            // 5 trits/byte, base-3 little-endian digits, digit = trit + 1
+            let nbytes = n.div_ceil(TRITS_PER_BYTE);
+            for bi in 0..nbytes {
+                let mut code = self.b[self.p + bi];
+                for _ in 0..TRITS_PER_BYTE {
+                    if w.len() == n {
+                        break;
+                    }
+                    w.push((code % 3) as i8 - 1);
+                    code /= 3;
+                }
+            }
+            self.p += nbytes;
         }
-        self.p += nbytes;
         TernLinear {
             scale,
             w,
             out_f,
             in_f,
         }
-    }
-    fn tern_embed(&mut self, vocab: usize, d: usize) -> Embed {
-        let scale = self.f32();
-        let n = vocab * d;
-        let nbytes = n.div_ceil(4);
-        let mut w = Vec::with_capacity(n);
-        for bi in 0..nbytes {
-            let byte = self.b[self.p + bi];
-            for k in 0..4 {
-                if w.len() == n {
-                    break;
-                }
-                w.push(match (byte >> (2 * k)) & 0b11 {
-                    0 => -1.0f32,
-                    1 => 0.0,
-                    _ => 1.0,
-                });
-            }
-        }
-        self.p += nbytes;
-        Embed { scale, w }
     }
     fn ln(&mut self, d: usize) -> LayerNorm {
         LayerNorm {
@@ -310,9 +311,18 @@ impl Reader<'_> {
 
 impl Model {
     pub(crate) fn from_blob(blob: &[u8]) -> Self {
-        let mut r = Reader { b: blob, p: 0 };
+        let mut r = Reader {
+            b: blob,
+            p: 0,
+            version: 0,
+        };
         assert_eq!(r.u32(), MAGIC, "v8 weight blob: bad magic");
-        assert_eq!(r.u32(), VERSION, "v8 weight blob: bad version");
+        r.version = r.u32();
+        assert!(
+            r.version == 3 || r.version == VERSION,
+            "v8 weight blob: unsupported version {}",
+            r.version
+        );
         let cfg = Config {
             vocab: r.u32() as usize,
             d_model: r.u32() as usize,
@@ -325,7 +335,7 @@ impl Model {
         let (d, ffn) = (cfg.d_model, cfg.ffn);
         let (bpe, used) = crate::bpe::Bpe::from_bytes(&blob[r.p..]);
         r.p += used;
-        let tok = r.tern_embed(cfg.vocab, d);
+        let tok = r.tern(cfg.vocab, d);
         let pos = r.f32s(cfg.ctx * d);
         let norm_f = r.ln(d);
         let blocks = (0..cfg.n_layers)
@@ -556,6 +566,8 @@ pub(crate) struct Scratch {
     eacc: Vec<f32>,    // weighted expert-output accumulator (d)
     scores: Vec<f32>,
     logits: Vec<f32>,
+    // diagnostic: top-2 routing tally [layer][expert], cheap enough to keep hot
+    expert_counts: Vec<Vec<u64>>,
 }
 
 impl Model {
@@ -588,6 +600,7 @@ impl Model {
             eacc: vec![0f32; d],
             scores: vec![0f32; self.cfg.ctx],
             logits: vec![0f32; self.cfg.vocab],
+            expert_counts: vec![vec![0u64; self.cfg.n_experts]; self.cfg.n_layers],
         }
     }
 
@@ -617,7 +630,7 @@ impl Model {
         let id = token as usize;
         let trow = &self.tok.w[id * d..id * d + d];
         for i in 0..d {
-            s.x[i] = self.tok.scale * trow[i] + self.pos[pos * d + i];
+            s.x[i] = self.tok.scale * f32::from(trow[i]) + self.pos[pos * d + i];
         }
         let scale = 1.0 / (dk as f32).sqrt();
         for (l, blk) in self.blocks.iter().enumerate() {
@@ -655,6 +668,8 @@ impl Model {
             }
             softmax_inplace(&mut s.rlogits[..ne]);
             let (ea, eb) = top2(&s.rlogits[..ne]);
+            s.expert_counts[l][ea] += 1;
+            s.expert_counts[l][eb] += 1;
             let denom = s.rlogits[ea] + s.rlogits[eb];
             s.eacc.iter_mut().for_each(|c| *c = 0.0);
             for (e, g) in [(ea, s.rlogits[ea] / denom), (eb, s.rlogits[eb] / denom)] {
@@ -674,9 +689,7 @@ impl Model {
         }
         cache.len += 1;
         layernorm_row(&mut s.nrm, &s.x, &self.norm_f);
-        for (vix, lg) in s.logits.iter_mut().enumerate() {
-            *lg = self.tok.scale * dot(&s.nrm, &self.tok.w[vix * d..vix * d + d]);
-        }
+        bitlinear_row(&mut s.logits, &s.nrm, &self.tok, &mut s.xq);
         softmax_inplace(&mut s.logits);
     }
 
@@ -693,7 +706,7 @@ impl Model {
             let id = ids[r] as usize;
             let trow = &self.tok.w[id * d..id * d + d];
             for i in 0..d {
-                x[r * d + i] = self.tok.scale * trow[i] + self.pos[r * d + i];
+                x[r * d + i] = self.tok.scale * f32::from(trow[i]) + self.pos[r * d + i];
             }
         }
         for blk in &self.blocks {
@@ -756,9 +769,8 @@ impl Model {
         // tied unembedding for the last position only
         let last = &xf[(t - 1) * d..t * d];
         let mut logits = vec![0f32; cfg.vocab];
-        for (vix, lg) in logits.iter_mut().enumerate() {
-            *lg = self.tok.scale * dot(last, &self.tok.w[vix * d..vix * d + d]);
-        }
+        let mut xq = vec![0i8; d];
+        bitlinear_row(&mut logits, last, &self.tok, &mut xq);
         softmax_inplace(&mut logits);
         logits
     }
@@ -766,17 +778,36 @@ impl Model {
     /// Compress `bytes`: BPE-tokenize, then code each token id through the
     /// BOS-seeded incremental forward. Decode runs the identical forward, so
     /// the codec round-trips by construction.
+    ///
+    /// Tokenization runs in byte chunks (`TOK_CHUNK`) rather than over the whole
+    /// input at once: the tokenizer's working structures are O(chunk), so a
+    /// 1 GB input stays well under the memory budget instead of needing tens of
+    /// GB for one linked list. This is safe for the codec — the decoder expands
+    /// whatever token ids the encoder emitted, so chunking only the *encoder's*
+    /// tokenization cannot affect decodability; the sole cost is that a token
+    /// straddling a chunk seam is split (a few sub-optimal bytes per chunk). The
+    /// range coder and KV-cache stream continuously across chunks, so in-window
+    /// context is unaffected.
     pub(crate) fn compress(&self, bytes: &[u8], bos: i32) -> Vec<u8> {
-        let ids = self.bpe.encode(bytes);
+        const TOK_CHUNK: usize = 8 << 20; // 8 MiB
+        self.compress_chunked(bytes, bos, TOK_CHUNK)
+    }
+
+    fn compress_chunked(&self, bytes: &[u8], bos: i32, chunk: usize) -> Vec<u8> {
         let mut enc = RangeEncoder::new();
         let mut cache = self.new_cache();
         let mut s = self.new_scratch();
         self.step(&mut cache, &mut s, bos);
-        for &id in &ids {
-            let cdf = probs_to_cdf(&s.logits);
-            let id = id as usize;
-            enc.encode(cdf[id], cdf[id + 1] - cdf[id], CDF_TOTAL);
-            self.step(&mut cache, &mut s, id as i32);
+        let mut off = 0;
+        while off < bytes.len() {
+            let end = (off + chunk).min(bytes.len());
+            for id in self.bpe.encode(&bytes[off..end]) {
+                let cdf = probs_to_cdf(&s.logits);
+                let id = id as usize;
+                enc.encode(cdf[id], cdf[id + 1] - cdf[id], CDF_TOTAL);
+                self.step(&mut cache, &mut s, id as i32);
+            }
+            off = end;
         }
         enc.finish()
     }
@@ -862,14 +893,16 @@ mod tests {
         let push_tern = |out: &mut Vec<u8>, of: usize, inf: usize, f: &mut dyn FnMut() -> f32| {
             out.extend_from_slice(&0.3f32.to_le_bytes()); // scale
             let n = of * inf;
-            for chunk in 0..n.div_ceil(4) {
+            for chunk in 0..n.div_ceil(TRITS_PER_BYTE) {
                 let mut byte = 0u8;
-                for k in 0..4 {
-                    if chunk * 4 + k >= n {
+                let mut pow = 1u8;
+                for k in 0..TRITS_PER_BYTE {
+                    if chunk * TRITS_PER_BYTE + k >= n {
                         break;
                     }
-                    let code = (((f() + 0.5) * 3.0) as u8).min(2);
-                    byte |= code << (2 * k);
+                    let digit = (((f() + 0.5) * 3.0) as u8).min(2);
+                    byte += digit * pow;
+                    pow = pow.saturating_mul(3);
                 }
                 out.push(byte);
             }
@@ -901,6 +934,75 @@ mod tests {
         (build_blob(&bpe, 8, 2, 2, 16, 32, 4, 0x1234_5678), vocab)
     }
 
+    /// v3 (2-bit) blobs must keep loading — live-run checkpoints are v3 until
+    /// the trainer relaunches. Builds the same tiny model in both formats and
+    /// asserts identical weights and identical archives.
+    #[test]
+    fn reads_v3_blobs() {
+        let (blob_v4, _) = tiny_blob();
+        let model_v4 = Model::from_blob(&blob_v4);
+        // rebuild the same model as a v3 blob: header, bpe, each section
+        // re-packed at 2 bits/trit from the parsed weights
+        let bpe = crate::bpe::Bpe::learn(&corpus(), 288);
+        let mut out = Vec::new();
+        let c = model_v4.cfg;
+        for v in [
+            MAGIC,
+            3u32,
+            c.vocab as u32,
+            c.d_model as u32,
+            c.n_layers as u32,
+            c.n_heads as u32,
+            c.ffn as u32,
+            c.ctx as u32,
+            c.n_experts as u32,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&bpe.to_bytes());
+        let pack2 = |out: &mut Vec<u8>, lin: &TernLinear| {
+            out.extend_from_slice(&lin.scale.to_le_bytes());
+            for chunk in lin.w.chunks(4) {
+                let mut byte = 0u8;
+                for (k, &t) in chunk.iter().enumerate() {
+                    byte |= ((t + 1) as u8) << (2 * k);
+                }
+                out.push(byte);
+            }
+        };
+        let push_f = |out: &mut Vec<u8>, vals: &[f32]| {
+            for v in vals {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        };
+        pack2(&mut out, &model_v4.tok);
+        push_f(&mut out, &model_v4.pos);
+        push_f(&mut out, &model_v4.norm_f.gamma);
+        push_f(&mut out, &model_v4.norm_f.beta);
+        for blk in &model_v4.blocks {
+            push_f(&mut out, &blk.norm1.gamma);
+            push_f(&mut out, &blk.norm1.beta);
+            for lin in [&blk.wq, &blk.wk, &blk.wv, &blk.wo] {
+                pack2(&mut out, lin);
+            }
+            push_f(&mut out, &blk.norm2.gamma);
+            push_f(&mut out, &blk.norm2.beta);
+            push_f(&mut out, &blk.router);
+            for exp in &blk.experts {
+                pack2(&mut out, &exp.ff1);
+                pack2(&mut out, &exp.ff2);
+            }
+        }
+        let model_v3 = Model::from_blob(&out);
+        assert_eq!(model_v3.tok.w, model_v4.tok.w, "v3/v4 weights must agree");
+        let msg = corpus()[..200].to_vec();
+        assert_eq!(
+            model_v3.compress(&msg, 0),
+            model_v4.compress(&msg, 0),
+            "v3 and v4 readings of the same model must produce identical archives"
+        );
+    }
+
     #[test]
     fn roundtrips_tiny_model() {
         let model = Model::from_blob(&tiny_blob().0);
@@ -908,6 +1010,23 @@ mod tests {
         let arc = model.compress(&msg, 0);
         let dec = model.decompress(&arc, msg.len(), 0);
         assert_eq!(dec, msg, "v8 codec must round-trip");
+    }
+
+    #[test]
+    fn chunked_tokenization_roundtrips_across_seams() {
+        // Tokenizing in small chunks must still decode byte-for-byte (the decoder
+        // expands whatever ids the encoder emitted) — exercise many chunk seams
+        // with a tiny chunk size over a multi-token corpus.
+        let model = Model::from_blob(&tiny_blob().0);
+        let msg = corpus()[..1000].to_vec();
+        for chunk in [3usize, 7, 16, 64] {
+            let arc = model.compress_chunked(&msg, 0, chunk);
+            let dec = model.decompress(&arc, msg.len(), 0);
+            assert_eq!(dec, msg, "chunked compress (chunk={chunk}) must round-trip");
+        }
+        // a chunk ≥ len equals the single-shot path
+        let whole = model.compress_chunked(&msg, 0, msg.len());
+        assert_eq!(model.compress(&msg, 0), whole);
     }
 
     #[test]
@@ -935,6 +1054,83 @@ mod tests {
             for (a, b) in s.logits.iter().zip(&reference) {
                 assert!((a - b).abs() < 1e-5, "cache diverged: {a} vs {b}");
             }
+        }
+    }
+
+    /// Offline router-health probe against a checkpoint blob on disk (default
+    /// `/tmp/v8_step4k.bin`, override via `V8_PROBE_BLOB`): forward an enwik9
+    /// slice and print per-layer expert-usage entropy. Healthy top-2-of-32
+    /// routing should read ≳3.5 bits; ~1 bit means the router collapsed.
+    /// Run: `cargo test --release router_health -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline diagnostic: needs a checkpoint blob and enwik9 on disk"]
+    fn router_health_probe() {
+        let path = std::env::var("V8_PROBE_BLOB").unwrap_or_else(|_| "/tmp/v8_step4k.bin".into());
+        let blob = std::fs::read(&path).expect("probe blob");
+        let data = std::fs::read("assets/enwik9").expect("enwik9");
+        let model = Model::from_blob(&blob);
+        let off = 1 << 20;
+        let ids = model.bpe.encode(&data[off..off + 64 * 1024]);
+        let mut cache = model.new_cache();
+        let mut s = model.new_scratch();
+        for &id in &ids {
+            model.step(&mut cache, &mut s, id as i32);
+        }
+        for (l, counts) in s.expert_counts.iter().enumerate() {
+            let tot: u64 = counts.iter().sum();
+            let h: f64 = counts
+                .iter()
+                .filter(|&&c| c > 0)
+                .map(|&c| {
+                    let p = c as f64 / tot as f64;
+                    -p * p.log2()
+                })
+                .sum();
+            let mut sorted = counts.clone();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            println!(
+                "layer {l}: usage entropy {h:.2} bits (uniform {:.2}), top4 {:?} of {tot}",
+                (model.cfg.n_experts as f64).log2(),
+                &sorted[..4.min(sorted.len())]
+            );
+        }
+    }
+
+    /// Offline context-use probe against a checkpoint blob (same selection as
+    /// `router_health_probe`): per-position-in-window cross-entropy over an
+    /// enwik9 slice. Flat across positions ⟹ the model is using no context
+    /// (unigram regime); falling with position ⟹ in-context circuits forming.
+    /// Run: `cargo test --release position_ce -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline diagnostic: needs a checkpoint blob and enwik9 on disk"]
+    fn position_ce_probe() {
+        let path = std::env::var("V8_PROBE_BLOB").unwrap_or_else(|_| "/tmp/v8_step4k.bin".into());
+        let blob = std::fs::read(&path).expect("probe blob");
+        let data = std::fs::read("assets/enwik9").expect("enwik9");
+        let model = Model::from_blob(&blob);
+        let off = 1 << 20;
+        let ids = model.bpe.encode(&data[off..off + 256 * 1024]);
+        let mut cache = model.new_cache();
+        let mut s = model.new_scratch();
+        let nb = 8;
+        let bucket_w = model.cfg.ctx / nb;
+        let (mut bits, mut count) = (vec![0f64; nb], vec![0u64; nb]);
+        model.step(&mut cache, &mut s, 0);
+        for &id in &ids {
+            // s.logits predicts `id` given the cache.len tokens currently held
+            let b = ((cache.len - 1) / bucket_w).min(nb - 1);
+            bits[b] -= f64::from(s.logits[id as usize].max(1e-12)).log2();
+            count[b] += 1;
+            model.step(&mut cache, &mut s, id as i32);
+        }
+        for i in 0..nb {
+            println!(
+                "ctx pos [{:3}..{:3}): {:.3} bits/token over {}",
+                i * bucket_w,
+                (i + 1) * bucket_w,
+                bits[i] / count[i] as f64,
+                count[i]
+            );
         }
     }
 
