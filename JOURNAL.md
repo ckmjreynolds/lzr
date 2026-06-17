@@ -13,6 +13,22 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-16 → 2026-06-17 — curve point 3 (d256/L6/64e, 81.4M) is net-WORSE than the 43.6M: more experts hit the L(D) wall; 43.6M is at/near the net optimum
+
+Run-3 scaled the experts axis (the 06-15 ablation showed all 32 are load-bearing and hinted ternary wants more; the moebench showed experts train cheaply): d256/L6/**64 experts**/ffn384, top-2 → 81.4M total / 8.25M active. Measured 4.21 s/step (E32's 3.4 +24% for 2× experts — confirms the moebench sub-linear cost model at full scale, *not* the discarded ∝L×E model). It trained cleanly — escaped the unigram shelf at ~5K like the E32 run, all 64 experts balanced at the 10K probe (5.77–5.99 bits usage entropy, uniform 6.0), context-CE gradient 0.58 bits. So the architecture is healthy; the verdict is about value, not training.
+
+The L(C) advantage of E64 over E32 (1 MB slice, both v3/2-bit mid-training) is **flat — it does not grow into the memorization tail**:
+
+| step | E32 L(C) | E64 L(C) | gap |
+| --- | --- | --- | --- |
+| ~20K | 1.7269 | 1.6997 | 0.027 |
+| 30K | 1.5795 | 1.5539 | 0.026 |
+| 40K | 1.5135 | 1.4904 | 0.023 |
+
+Three consistent points at ~0.024, if anything shrinking — and the raw loss curves were near-identical early (E64 8.754 vs E32 8.757 at 10K). That ~0.024 L(C) lead is well below the **+0.06 bpb of trit-packed L(D)** the extra 38M params cost (L(D) 0.16 → 0.22; v3 mid-training it read 0.285), so E64's net was ~0.06 worse throughout (e.g. 30K: net 1.839 vs E32's 1.775) with no sign of crossing over. CDR called it at the 40K trend and stopped the run before the planned 50K confirmation — the signal was unambiguous, and ~4 more days for a near-certain negative was not worth the machine.
+
+Conclusion: **more experts give diminishing L(C) returns that do not cover their L(D) tax — 43.6M (d256/L6/32e, net 1.4160) is at or near the net optimum for this stack.** This is the empirical confirmation of the L(D)-wall sizing analysis (06-15): net = L(C) + ~0.0033·N(M), and we have now bracketed the optimum from above (81M worse) as the 24.2M → 43.6M step bracketed it from below. Scaling parameters further — on any axis — is the wrong direction without a lever that changes the L(C)-per-param slope. The trainer config is reverted to E32; the next levers worth testing are the ones that lower L(C) at ~zero L(D): RoPE (true sliding context vs the 256-token block-reset) and the hybrid arm (v8 net inside a deterministic mixer, the v6 Proposal-1 pattern). A cloud GPU would speed exploration but cannot move the L(D) wall (it is a property of the shipped artifact, not the training hardware).
+
 ## 2026-06-15 — negative: batching the MoE experts is slower, not faster — and the sparse path already scales sub-linearly in expert count
 
 To "fix the dispatch-bound trainer," added a dense **batched** MoE (`Block::moe_batched`): stack the expert weights into `[E, …]` and run every expert as one batched `bmm`, so the dispatch count is O(1) in E instead of `moe_sparse`'s per-expert `argwhere`+gather+FFN+scatter. Benchmarked it against the sparse path on wgpu (forward+backward, one MoE layer, 16384 tokens = batch 64 × ctx 256, d 256, ffn 384), via `cargo run --example neural --features neural -- moebench`:

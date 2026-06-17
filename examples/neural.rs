@@ -1109,13 +1109,15 @@ fn main() {
         n as f64 / train_toks.len() as f64,
     );
 
-    // Scaling point 2 on the bpb-vs-total-params curve (point 1: the 06-09 run,
-    // d=256/L4/24e ≈ 24.2M total / 6.9M active → L(C) ~1.76 on text slices).
-    // Depth and expert count are the cheap axes — inference is unembed-dominated,
-    // so d/vocab stay put: d=256, 6 layers, 32 experts, expert-ffn 384
-    // ≈ 43.6M total / 8.2M active, L(D) ≈ 0.19 bpb at 2 b/w, inference ETA ~14 h.
-    // Training cost is dispatch-bound (∝ layers × experts): 192 vs 96 dispatches
-    // → ~2.4 s/step expected, ~33 h to the horizon (resumable via `-- resume`).
+    // The net-best architecture: d=256, 6 layers, 32 experts, expert-ffn 384
+    // ≈ 43.6M total / 8.25M active → full-enwik9 net 1.4160 (curve point 2).
+    // bpb-vs-params curve (full-enwik9 net): 24.2M → 1.873, 43.6M → 1.4160.
+    // Curve point 3 (d256/L6/64e, ~81.4M) was tested 06-16/17 and came out
+    // net-WORSE: its L(C) lead over E32 stayed flat at ~0.024 (1 MB slice, across
+    // 21/30/40K) — below the +0.06 trit-packed L(D) the extra 38M params cost. So
+    // more experts give diminishing L(C) that does not cover their L(D); 43.6M is
+    // at/near the net optimum for this stack. Keep 32 unless a new lever changes
+    // the L(C) slope (RoPE, hybrid arm).
     let bit = GptConfig::new(vocab, 256, 6, 8, 384, 256, 32).with_bit(true);
     // `steps` is the WSD horizon — a *maximum* (~8.8 epochs, ~3.3 days at
     // 2.4 s/step), not a commitment: the LR holds flat after warmup, so when
@@ -1129,7 +1131,7 @@ fn main() {
         &eval_toks,
         &bit,
         &bpe,
-        100_000,
+        120_000,
         "bitnet",
         resume,
     );
