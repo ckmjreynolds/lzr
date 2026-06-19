@@ -8,6 +8,7 @@
 use crate::coder::{Decoder, Encoder};
 use crate::mixer::Mixer;
 use crate::models::context::ContextModel;
+use crate::models::match_model::MatchModel;
 use crate::models::{Context, Model};
 use crate::preprocessors::Pipeline;
 
@@ -21,6 +22,7 @@ fn models() -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::new(4)),
         Box::new(ContextModel::new(5)),
         Box::new(ContextModel::new(6)),
+        Box::new(MatchModel::new()),
     ]
 }
 
@@ -35,14 +37,14 @@ struct CodecState {
 }
 
 impl CodecState {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         let models = models();
         let stretched = vec![0i32; models.len()];
         let mixer = Mixer::new(models.len());
         Self {
             models,
             mixer,
-            ctx: Context::new(),
+            ctx: Context::with_capacity(capacity),
             stretched,
         }
     }
@@ -106,7 +108,7 @@ pub(crate) fn encode(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, data.len() as u64);
 
-    let mut state = CodecState::new();
+    let mut state = CodecState::new(data.len());
     let mut enc = Encoder::new();
     for &byte in &data {
         for k in (0..8).rev() {
@@ -128,7 +130,7 @@ pub(crate) fn decode(input: &[u8]) -> Vec<u8> {
     let (len, header) = read_varint(input);
     let len = len as usize;
 
-    let mut state = CodecState::new();
+    let mut state = CodecState::new(len);
     let mut dec = Decoder::new(&input[header..]);
     let mut data = Vec::with_capacity(len);
     for _ in 0..len {
@@ -172,6 +174,6 @@ mod tests {
         let coded = encode(slice);
         assert_eq!(decode(&coded), slice);
         let bpb = coded.len() as f64 * 8.0 / slice.len() as f64;
-        println!("order-0..3 mix on enwik8 100 KB slice: {bpb:.4} bpb");
+        println!("order-0..6 + match on enwik8 100 KB slice: {bpb:.4} bpb");
     }
 }

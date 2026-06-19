@@ -1,0 +1,127 @@
+//! Match model: predict the next byte from the longest recent repeat.
+//!
+//! A [`Finder`] maps the last 8 finalized bytes to the position that followed
+//! them last time. While the prediction keeps coming true we ride the match,
+//! growing `len`; a [`StateMap`] keyed on `(match length, predicted bit)` turns
+//! that into a calibrated probability, so the mixer weights it by how reliable
+//! matches of that length have actually been. Reads history from [`Context`];
+//! orders 0–6 already cover short contexts, so the 8-byte key is additive.
+
+use super::finder::{Finder, LruFinder};
+use super::statemap::StateMap;
+use super::{Context, Model};
+
+const KEY_BYTES: u32 = 8; // context length feeding the finder (the u64 key)
+const LEN_CAP: u32 = 63; // match-length bucket cap for the StateMap
+const LRU_CAP: usize = 90_000_000; // ≈0 evictions on enwik9 (~89M distinct 8-grams)
+
+/// Predicts the bits of the matched byte, confidence scaled by match length.
+#[derive(Debug)]
+pub(crate) struct MatchModel {
+    finder: Box<dyn Finder>,
+    last8: u64, // rolling last 8 finalized bytes (the finder key)
+    ptr: usize, // history index of the predicted next byte
+    len: u32,   // current match length
+    sm: StateMap,
+    predicted: bool, // did predict() consult the StateMap this bit?
+    state: usize,    // StateMap state from the last predict()
+    // tuning stats
+    total: u64,
+    covered: u64,
+    lookups: u64,
+    hits: u64,
+}
+
+impl MatchModel {
+    pub(crate) fn new() -> Self {
+        Self {
+            finder: Box::new(LruFinder::new(LRU_CAP)),
+            last8: 0,
+            ptr: 0,
+            len: 0,
+            sm: StateMap::new(2 * (LEN_CAP as usize + 1)),
+            predicted: false,
+            state: 0,
+            total: 0,
+            covered: 0,
+            lookups: 0,
+            hits: 0,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn byte_step(&mut self, ctx: &Context, b: u8) {
+        let n = ctx.history().len(); // b will be appended at index n
+        self.total += 1;
+        if self.len > 0 {
+            self.covered += 1;
+        }
+        let followed = self.len > 0 && self.ptr < n && ctx.history()[self.ptr] == b;
+        if followed {
+            self.ptr += 1;
+            self.len += 1;
+        } else {
+            self.len = 0;
+        }
+        self.last8 = (self.last8 << 8) | u64::from(b);
+        if self.len == 0 {
+            self.lookups += 1;
+            if let Some(q) = self.finder.lookup(self.last8) {
+                self.ptr = q as usize;
+                self.len = 1;
+                self.hits += 1;
+            }
+        }
+        self.finder.insert(self.last8, (n + 1) as u32);
+    }
+}
+
+impl Model for MatchModel {
+    #[allow(clippy::cast_possible_truncation)]
+    fn predict(&mut self, ctx: &Context) -> i32 {
+        self.predicted = false;
+        let hist = ctx.history();
+        if self.len == 0 || self.ptr >= hist.len() {
+            return 0;
+        }
+        let pb = u32::from(hist[self.ptr]);
+        let bpos = u32::from(ctx.bpos);
+        let coded = ctx.c0 & ((1 << bpos) - 1);
+        if coded != pb >> (8 - bpos) {
+            return 0; // the partial byte already diverged from the prediction
+        }
+        let pbit = (pb >> (7 - bpos)) & 1;
+        let bucket = self.len.min(LEN_CAP);
+        self.state = ((bucket << 1) | pbit) as usize;
+        self.predicted = true;
+        self.sm.predict(self.state)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn update(&mut self, ctx: &Context, bit: u8) {
+        if self.predicted {
+            self.sm.update(self.state, bit);
+        }
+        if ctx.bpos == 7 {
+            let b = (((ctx.c0 << 1) | u32::from(bit)) & 0xff) as u8;
+            self.byte_step(ctx, b);
+        }
+    }
+}
+
+impl Drop for MatchModel {
+    #[allow(clippy::cast_precision_loss)]
+    fn drop(&mut self) {
+        if self.total == 0 {
+            return;
+        }
+        eprintln!(
+            "match (key={KEY_BYTES}B): {} | coverage {:.1}%  acquire {}/{} ({:.1}%)",
+            self.finder.report(),
+            100.0 * self.covered as f64 / self.total as f64,
+            self.hits,
+            self.lookups,
+            100.0 * self.hits as f64 / self.lookups.max(1) as f64,
+        );
+    }
+}

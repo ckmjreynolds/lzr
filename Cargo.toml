@@ -17,6 +17,7 @@ include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
 clap        = { version = "=4.6.1", features = ["derive"] }
+lru         = "=0.18.0"
 
 [features]
 # `default == submission`: the shipped, single-threaded build. `build.sh` checks

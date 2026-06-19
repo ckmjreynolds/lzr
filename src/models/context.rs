@@ -14,13 +14,12 @@
 //! collisions) and hashed into a fixed table for sparse high orders (≥ 3, where
 //! a full `256^order` array is infeasible). Same code, chosen by `order`.
 
+use super::statemap::StateMap;
 use super::{Context, Model};
-use crate::mixer::stretch;
 
 const MAX: u16 = 63; // count cap; with the 6-bit packing this bounds a state to 12 bits
 const HASH_BITS: u32 = 22; // hashed-table size for orders ≥ 3: 4M cells × 2 B = 8 MB
 const SM_STATES: usize = 1 << 12; // (n0 << 6) | n1, each ≤ 63
-const SM_LIMIT: usize = 1023; // count cap in the StateMap's adaptive rate
 
 /// One observed bit moves the cell to its next bit-history state: bump the seen
 /// count (capped) and discount the opposite count so the pair tracks drift.
@@ -38,45 +37,6 @@ fn transition(s: u16, bit: u8) -> u16 {
 /// Soft discount of the opposite count when a bit flips the recent trend.
 const fn discount(x: u16) -> u16 {
     if x > 3 { 3 + ((x - 3) >> 1) } else { x }
-}
-
-/// Adaptive map from a bit-history state to a probability, calibrated globally
-/// across all cells of one model. Probability is held in 16-bit precision; the
-/// learning rate decays with the per-state observation count (with a floor, so
-/// it stays responsive to nonstationarity).
-#[derive(Debug)]
-struct StateMap {
-    p: Vec<i32>,  // 16-bit probability per state
-    n: Vec<u16>,  // observation count per state (capped at SM_LIMIT)
-    dt: Vec<i32>, // dt[k] = (1<<16) / (k + 2): the rate after k observations
-}
-
-impl StateMap {
-    fn new() -> Self {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let dt = (0..=SM_LIMIT)
-            .map(|k| (1i32 << 16) / (k as i32 + 2))
-            .collect();
-        Self {
-            p: vec![1 << 15; SM_STATES],
-            n: vec![0; SM_STATES],
-            dt,
-        }
-    }
-
-    fn predict(&self, s: usize) -> i32 {
-        stretch(self.p[s] >> 4)
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn update(&mut self, s: usize, bit: u8) {
-        let target = i32::from(bit) * 65535;
-        let rate = self.dt[(self.n[s] as usize).min(SM_LIMIT)];
-        self.p[s] += ((i64::from(target - self.p[s]) * i64::from(rate)) >> 16) as i32;
-        if (self.n[s] as usize) < SM_LIMIT {
-            self.n[s] += 1;
-        }
-    }
 }
 
 /// Order-`N` context model over bit-history states.
@@ -104,7 +64,7 @@ impl ContextModel {
             direct,
             shift,
             cells: vec![0; size],
-            sm: StateMap::new(),
+            sm: StateMap::new(SM_STATES),
             idx: 0,
         }
     }

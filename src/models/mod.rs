@@ -5,42 +5,47 @@
 //! the mixer can combine them directly.
 
 pub(crate) mod context;
-
-const RING_BITS: usize = 10; // last 1024 finalized bytes
-const RING_SIZE: usize = 1 << RING_BITS;
-const RING_MASK: usize = RING_SIZE - 1;
+pub(crate) mod finder;
+pub(crate) mod match_model;
+pub(crate) mod statemap;
 
 /// Mutable per-stream prediction context shared by every model.
+///
+/// Holds the full finalized-byte history (so long-range models like the match
+/// model can read arbitrarily far back), plus the partial current byte and a
+/// 4-byte rolling window the low-order context models index directly.
 #[derive(Debug)]
 pub(crate) struct Context {
-    ring: [u8; RING_SIZE],
-    head: usize, // index where the next finalized byte is written
+    history: Vec<u8>,
     /// Partial current byte: a leading-1 sentinel followed by the bits coded so far.
     pub(crate) c0: u32,
     /// Number of bits of the current byte already coded (`0..=7`).
     pub(crate) bpos: u8,
     /// The last four finalized bytes; the most recent is in the low 8 bits.
-    /// Read by the order-1 and order-2 context models.
     pub(crate) c4: u32,
 }
 
 impl Context {
-    /// New, empty context.
-    pub(crate) const fn new() -> Self {
+    /// New, empty context with room reserved for `capacity` finalized bytes.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
-            ring: [0; RING_SIZE],
-            head: 0,
+            history: Vec::with_capacity(capacity),
             c0: 1,
             bpos: 0,
             c4: 0,
         }
     }
 
-    /// The finalized byte `i` positions back (`i` in `1..=1024`); `0` before
-    /// that much history exists. Provided for future context models.
-    #[allow(dead_code)]
-    pub(crate) const fn byte_back(&self, i: usize) -> u8 {
-        self.ring[self.head.wrapping_sub(i) & RING_MASK]
+    /// The finalized byte `i` positions back (`i` ≥ 1); `0` before that much
+    /// history exists.
+    pub(crate) fn byte_back(&self, i: usize) -> u8 {
+        let n = self.history.len();
+        if i <= n { self.history[n - i] } else { 0 }
+    }
+
+    /// All finalized bytes so far, in order. The most recent is the last element.
+    pub(crate) fn history(&self) -> &[u8] {
+        &self.history
     }
 
     /// Append one freshly-coded bit to the partial current byte.
@@ -53,8 +58,7 @@ impl Context {
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn push_byte(&mut self) {
         let b = self.c0 as u8; // low 8 bits are the byte; the sentinel is bit 8
-        self.ring[self.head & RING_MASK] = b;
-        self.head = self.head.wrapping_add(1);
+        self.history.push(b);
         self.c4 = (self.c4 << 8) | u32::from(b);
         self.c0 = 1;
         self.bpos = 0;
