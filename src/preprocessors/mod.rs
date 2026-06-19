@@ -27,8 +27,17 @@
 //!
 //! As decimals: 0-8, 11-31, 127, 192, 193, 221, 223, 241-255.
 //! (0xEE / 238 is free in enwik8 only — excluded.)
+//!
+//! ## Codes freed by case folding
+//!
+//! After the case-fold stage runs, every ASCII letter in the stream is
+//! lowercase, so the 26 uppercase codes `0x41..=0x5A` (`A`..=`Z`, decimals
+//! 65-90) are also absent — free for any stage that runs after it (e.g. a
+//! future dictionary transform).
 
-pub(crate) mod null;
+pub(crate) mod casefold;
+#[cfg(debug_assertions)]
+pub(crate) mod guard;
 
 /// A reversible transform applied to the byte stream.
 pub(crate) trait Preprocessor {
@@ -45,11 +54,15 @@ pub(crate) struct Pipeline {
 }
 
 impl Pipeline {
-    /// The default pipeline used by the codec.
+    /// The default pipeline used by the codec. The reserved-byte [`guard`] is
+    /// present only in debug builds; real stages are appended after it.
     pub(crate) fn default_pipeline() -> Self {
-        Self {
-            stages: vec![Box::new(null::Null)],
-        }
+        let stages: Vec<Box<dyn Preprocessor>> = vec![
+            #[cfg(debug_assertions)]
+            Box::new(guard::Guard),
+            Box::new(casefold::CaseFold),
+        ];
+        Self { stages }
     }
 
     /// Apply every stage in order (encode side). The input is copied once (by
