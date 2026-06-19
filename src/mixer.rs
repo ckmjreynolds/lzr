@@ -65,7 +65,9 @@ pub(crate) fn stretch(p: i32) -> i32 {
     stretch_lut()[p as usize]
 }
 
-const NUM_SETS: usize = 8; // one weight set per bit position
+const BIT_POSITIONS: usize = 8;
+const MIX_CTX: usize = 256; // mixer weight-set contexts: the previous byte
+const NUM_SETS: usize = MIX_CTX * BIT_POSITIONS; // a weight set per (prev byte, bit)
 const LR_SHIFT: i32 = 10;
 
 /// Adaptive logistic mixer with one weight set selected per call.
@@ -90,11 +92,12 @@ impl Mixer {
         }
     }
 
-    /// Mix the `stretched` model outputs into a 12-bit probability. `select`
-    /// (taken mod the set count) chooses which weight set to use and adapt.
+    /// Mix the `stretched` model outputs into a 12-bit probability. The weight
+    /// set is selected by `(ctx, bpos)` — a per-(previous-byte, bit-position)
+    /// set, so the blend can differ by local context.
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn mix(&mut self, stretched: &[i32], select: usize) -> i32 {
-        self.set = (select % NUM_SETS) * self.n;
+    pub(crate) fn mix(&mut self, stretched: &[i32], ctx: usize, bpos: usize) -> i32 {
+        self.set = ((ctx % MIX_CTX) * BIT_POSITIONS + bpos) * self.n;
         self.inputs.copy_from_slice(stretched);
         let mut dot: i64 = 0;
         for (w, x) in self.weights[self.set..self.set + self.n]
@@ -115,6 +118,59 @@ impl Mixer {
             .zip(&self.inputs)
         {
             *w += (x * err) >> LR_SHIFT;
+        }
+    }
+}
+
+const APM_KNOTS: usize = 33; // interpolation points across the stretch domain
+const APM_RATE: i32 = 7; // adaptation shift
+
+/// Secondary estimation (SSE): refines a probability through a per-context
+/// adaptive curve over the stretch domain, correcting systematic miscalibration
+/// of the mixer output. Knots start on the identity curve and adapt toward the
+/// observed bits; `refine` interpolates between the two knots bracketing the
+/// input.
+#[derive(Debug)]
+pub(crate) struct Apm {
+    t: Vec<u16>, // [n * APM_KNOTS] knots, 16-bit probability
+    idx: usize,  // lower knot index from the last `refine`
+}
+
+impl Apm {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
+    pub(crate) fn new(n: usize) -> Self {
+        let mut t = vec![0u16; n * APM_KNOTS];
+        for i in 0..n {
+            for (j, slot) in t[i * APM_KNOTS..(i + 1) * APM_KNOTS].iter_mut().enumerate() {
+                let s = (j as i32 - 16) * 128; // stretch value at this knot
+                *slot = (squash(s) << 4) as u16; // 12-bit squash held in 16-bit
+            }
+        }
+        Self { t, idx: 0 }
+    }
+
+    /// Map 12-bit `pr` to a refined 12-bit probability under context `cx`.
+    #[allow(clippy::cast_sign_loss)]
+    pub(crate) fn refine(&mut self, pr: i32, cx: usize) -> i32 {
+        let s = (stretch(pr) + 2048).clamp(0, 4095);
+        let w = s & 127;
+        self.idx = cx * APM_KNOTS + (s >> 7) as usize;
+        let lo = i32::from(self.t[self.idx]);
+        let hi = i32::from(self.t[self.idx + 1]);
+        (lo * (128 - w) + hi * w) >> 11
+    }
+
+    /// Adapt the two bracketing knots toward the observed `bit`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub(crate) fn update(&mut self, bit: u8) {
+        let g = i32::from(bit) * 65535;
+        for k in [self.idx, self.idx + 1] {
+            let cur = i32::from(self.t[k]);
+            self.t[k] = (cur + ((g - cur) >> APM_RATE)) as u16;
         }
     }
 }

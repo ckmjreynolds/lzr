@@ -6,7 +6,7 @@
 //! prefix (the decoder must know how many bytes to emit); there is no header.
 
 use crate::coder::{Decoder, Encoder};
-use crate::mixer::Mixer;
+use crate::mixer::{Apm, Mixer};
 use crate::models::context::ContextModel;
 use crate::models::match_model::MatchModel;
 use crate::models::{Context, Model};
@@ -26,12 +26,15 @@ fn models() -> Vec<Box<dyn Model>> {
     ]
 }
 
+const APM_CTX: usize = 256; // SSE contexts: the partial-byte node `c0`
+
 /// The shared predictor state driven identically by both directions: encode and
 /// decode differ only in where each bit comes from (read from the input vs.
 /// decoded from the stream) and which coder consumes it.
 struct CodecState {
     models: Vec<Box<dyn Model>>,
     mixer: Mixer,
+    apm: Apm,
     ctx: Context,
     stretched: Vec<i32>,
 }
@@ -44,23 +47,31 @@ impl CodecState {
         Self {
             models,
             mixer,
+            apm: Apm::new(APM_CTX),
             ctx: Context::with_capacity(capacity),
             stretched,
         }
     }
 
-    /// Predict the next bit as P(bit == 1) in 12-bit probability form.
+    /// Predict the next bit as P(bit == 1) in 12-bit probability form: mix the
+    /// models, then refine through the SSE stage and blend (SSE-weighted).
     #[allow(clippy::cast_sign_loss)]
     fn predict(&mut self) -> u32 {
         for (m, s) in self.models.iter_mut().zip(&mut self.stretched) {
             *s = m.predict(&self.ctx);
         }
-        self.mixer.mix(&self.stretched, usize::from(self.ctx.bpos)) as u32
+        let mctx = (self.ctx.c4 & 0xff) as usize;
+        let pm = self
+            .mixer
+            .mix(&self.stretched, mctx, usize::from(self.ctx.bpos));
+        let pa = self.apm.refine(pm, (self.ctx.c0 & 0xff) as usize);
+        ((pm + 3 * pa + 2) >> 2) as u32
     }
 
-    /// Commit the actual `bit`: adapt the mixer and models, advance the context.
+    /// Commit the actual `bit`: adapt the mixer, SSE, and models, advance context.
     fn commit(&mut self, bit: u8) {
         self.mixer.update(bit);
+        self.apm.update(bit);
         for m in &mut self.models {
             m.update(&self.ctx, bit);
         }

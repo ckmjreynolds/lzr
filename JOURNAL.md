@@ -13,6 +13,14 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-19 — v9: mixer upgrades — context-selected weights + SSE stage (enwik8 1.8420 → 1.7676)
+
+CDR/Claude added the two standard calibration levers on top of the logistic mixer, measured on enwik8 for iteration speed (a ~90 s encode versus ~15 min for enwik9). First, context-selected mixing: the mixer had kept a single weight set per bit position (8 in all); it now keys the set on (previous byte, bit position) — 2048 sets — so the blend can specialize by local context, leaning on the match model in repetitive regions and on the high orders in prose. Second, an SSE/APM stage after the mix: a per-context adaptive curve over the stretch domain (33 interpolation knots, context the partial-byte node `c0`) that corrects systematic miscalibration of the mixed probability, its refined estimate blended 3:1 with the mixer output.
+
+Results on enwik8 (flat finder, both round-tripping byte-exact at full scale, L(D) ≈ 0): context-selected mixing took 1.8420 → 1.7859 (−0.0561), and the SSE stage 1.7859 → 1.7676 (−0.0183), for a combined −0.0744. The context-mixing gain was the surprise — an order of magnitude above the few-hundredths expected — confirming that a single global blend was leaving a lot on the table; letting the mixer specialize by the previous byte alone is worth ~0.056. Throughput eased to ~1.0 MB/s (more weight sets plus the extra stage; minor). enwik9 was not re-measured this round; the gains should carry (it last stood at 1.5612, pre-mixer).
+
+Both stages are localized to `mixer.rs` plus the `select`/`refine` calls in the codec, and several knobs remain at untuned defaults: the mixer context (previous byte × bpos — coarsening or enriching it trades fragmentation against specialization), the SSE blend weight (3:1), knot count (33), and adaptation rate (shift 7). v9 enwik8 now stands at 1.7676 at L(D) ≈ 0.
+
 ## 2026-06-19 — v9: flat-table finder replaces the LRU baseline — collision cost +0.0037 bpb (enwik9) for ~6× less memory
 
 Following the LRU-baseline finding that recency eviction is nearly free, CDR/Claude built the flat-table `Finder` and made it the default, keeping the exact `LruFinder` live behind a `USE_LRU` const switch for A/B. The flat finder is a fixed `Vec<u32>` of positions indexed by `hash(last 8 bytes)`, with a `u16` check tag per slot so a hash collision on lookup is a clean miss rather than a false match; a different key landing on an occupied slot simply overwrites it (most-recent-wins, no recency protection). 6 bytes per slot versus the LRU node's ~50.
