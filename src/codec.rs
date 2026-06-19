@@ -8,12 +8,18 @@
 use crate::coder::{Decoder, Encoder};
 use crate::mixer::Mixer;
 use crate::models::order0::Order0;
+use crate::models::order1::Order1;
+use crate::models::order2::Order2;
 use crate::models::{Context, Model};
 use crate::preprocessors::Pipeline;
 
 /// The active model set. Adding a model is one line here.
 fn models() -> Vec<Box<dyn Model>> {
-    vec![Box::new(Order0::new())]
+    vec![
+        Box::new(Order0::new()),
+        Box::new(Order1::new()),
+        Box::new(Order2::new()),
+    ]
 }
 
 /// The shared predictor state driven identically by both directions: encode and
@@ -164,6 +170,6 @@ mod tests {
         let coded = encode(slice);
         assert_eq!(decode(&coded), slice);
         let bpb = coded.len() as f64 * 8.0 / slice.len() as f64;
-        println!("order-0 on enwik8 100 KB slice: {bpb:.4} bpb");
+        println!("order-0/1/2 mix on enwik8 100 KB slice: {bpb:.4} bpb");
     }
 }

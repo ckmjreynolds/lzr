@@ -5,6 +5,8 @@
 //! the mixer can combine them directly.
 
 pub(crate) mod order0;
+pub(crate) mod order1;
+pub(crate) mod order2;
 
 const RING_BITS: usize = 10; // last 1024 finalized bytes
 const RING_SIZE: usize = 1 << RING_BITS;
@@ -20,8 +22,7 @@ pub(crate) struct Context {
     /// Number of bits of the current byte already coded (`0..=7`).
     pub(crate) bpos: u8,
     /// The last four finalized bytes; the most recent is in the low 8 bits.
-    /// Maintained for future context models; unused by the order-0 model.
-    #[allow(dead_code)]
+    /// Read by the order-1 and order-2 context models.
     pub(crate) c4: u32,
 }
 
