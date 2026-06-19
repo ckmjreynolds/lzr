@@ -62,3 +62,73 @@ impl Finder for LruFinder {
         )
     }
 }
+
+/// Flat hashed-table finder: `hash(key)` indexes one slot holding the position
+/// plus a check tag. A different key hashing to an occupied slot overwrites it
+/// (most-recent-wins, no recency protection); the tag turns a hash collision on
+/// lookup into a clean miss rather than a false match. Cheaper per entry than
+/// the LRU (6 B/slot vs ~50 B/node) and far faster, at the cost of the matches
+/// lost to collisions — the quantity this measures.
+#[derive(Debug)]
+pub(crate) struct FlatFinder {
+    slots: Vec<u32>, // stored position (0 = empty; the model never stores 0)
+    tags: Vec<u16>,  // collision check tag
+    shift: u32,      // 64 - bits, selecting the high `bits` of the hash as index
+    writes: u64,
+    collisions: u64, // writes that overwrote a different key
+    occupied: u64,   // slots filled for the first time
+}
+
+impl FlatFinder {
+    pub(crate) fn new(bits: u32) -> Self {
+        let size = 1usize << bits;
+        Self {
+            slots: vec![0; size],
+            tags: vec![0; size],
+            shift: 64 - bits,
+            writes: 0,
+            collisions: 0,
+            occupied: 0,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    const fn locate(&self, key: u64) -> (usize, u16) {
+        let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((h >> self.shift) as usize, h as u16)
+    }
+}
+
+impl Finder for FlatFinder {
+    fn insert(&mut self, key: u64, pos: u32) {
+        let (slot, tag) = self.locate(key);
+        self.writes += 1;
+        if self.slots[slot] == 0 {
+            self.occupied += 1;
+        } else if self.tags[slot] != tag {
+            self.collisions += 1;
+        }
+        self.slots[slot] = pos;
+        self.tags[slot] = tag;
+    }
+
+    fn lookup(&mut self, key: u64) -> Option<u32> {
+        let (slot, tag) = self.locate(key);
+        if self.slots[slot] != 0 && self.tags[slot] == tag {
+            Some(self.slots[slot])
+        } else {
+            None
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn report(&self) -> String {
+        let size = self.slots.len();
+        format!(
+            "flat: {size} slots, occupancy {:.1}%, collisions {:.1}% of {} writes",
+            100.0 * self.occupied as f64 / size as f64,
+            100.0 * self.collisions as f64 / self.writes.max(1) as f64,
+            self.writes,
+        )
+    }
+}

@@ -7,13 +7,15 @@
 //! matches of that length have actually been. Reads history from [`Context`];
 //! orders 0–6 already cover short contexts, so the 8-byte key is additive.
 
-use super::finder::{Finder, LruFinder};
+use super::finder::{Finder, FlatFinder, LruFinder};
 use super::statemap::StateMap;
 use super::{Context, Model};
 
 const KEY_BYTES: u32 = 8; // context length feeding the finder (the u64 key)
 const LEN_CAP: u32 = 63; // match-length bucket cap for the StateMap
-const LRU_CAP: usize = 90_000_000; // ≈0 evictions on enwik9 (~89M distinct 8-grams)
+const LRU_CAP: usize = 90_000_000; // exact baseline: ≈0 evictions on enwik9
+const FLAT_BITS: u32 = 27; // flat table: 128M slots, ~768 MB at 6 B/slot
+const USE_LRU: bool = false; // false → flat table; true → LRU exact baseline (kept for A/B)
 
 /// Predicts the bits of the matched byte, confidence scaled by match length.
 #[derive(Debug)]
@@ -34,8 +36,13 @@ pub(crate) struct MatchModel {
 
 impl MatchModel {
     pub(crate) fn new() -> Self {
+        let finder: Box<dyn Finder> = if USE_LRU {
+            Box::new(LruFinder::new(LRU_CAP))
+        } else {
+            Box::new(FlatFinder::new(FLAT_BITS))
+        };
         Self {
-            finder: Box::new(LruFinder::new(LRU_CAP)),
+            finder,
             last8: 0,
             ptr: 0,
             len: 0,
