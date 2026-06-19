@@ -13,7 +13,6 @@
 
 mod codec;
 mod coder;
-mod fenwick;
 mod mixer;
 mod models;
 mod preprocessors;

@@ -4,9 +4,7 @@
 //! bit ([`Model::update`]). Predictions are in the stretched (logit) domain so
 //! the mixer can combine them directly.
 
-pub(crate) mod order0;
-pub(crate) mod order1;
-pub(crate) mod order2;
+pub(crate) mod context;
 
 const RING_BITS: usize = 10; // last 1024 finalized bytes
 const RING_SIZE: usize = 1 << RING_BITS;
