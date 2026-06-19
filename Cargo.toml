@@ -15,31 +15,15 @@ documentation   = "https://docs.rs/lzr"
 
 include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
-[features]
-default     = ["submission"]
-# Submission build: zero threading deps, no training dependencies. This is
-# what ships. The `build.sh` CI gate verifies no threading crate sneaks in.
-submission  = []
-# v8 neural codec: pulls in burn (heavy, threaded) — NOT in the submission set.
-neural      = ["dep:burn"]
-
 [dependencies]
-anyhow      = "=1.0.102"
 clap        = { version = "=4.6.1", features = ["derive"] }
-burn        = { version = "0.21", optional = true, default-features = false, features = ["std", "wgpu", "ndarray", "autodiff"] }
 
-[[example]]
-name = "burnbench"
-required-features = ["neural"]
-
-[[example]]
-name = "neural"
-required-features = ["neural"]
-
-# Optimize dependencies even in dev so neural iteration (CPU matmul etc.) is
-# fair/fast; keep our own crate at dev opt for quick recompiles.
-[profile.dev.package."*"]
-opt-level = 3
+[features]
+# `default == submission`: the shipped, single-threaded build. `build.sh` checks
+# both this and `--no-default-features`, and uses `--features submission` for the
+# zero-threading-dependency `cargo tree` gate.
+default     = ["submission"]
+submission  = []
 
 [lints.rust]
 keyword_idents = { level = "forbid", priority = -1 }
@@ -65,27 +49,3 @@ pedantic = { level = "warn", priority = -1 }
 # Per-lint exceptions live as `#![allow(...)]` at the crate root in
 # `src/main.rs` (and re-exports thereof). The Cargo.toml `[lints]` table
 # has trouble overriding lint-group levels in this toolchain.
-
-[profile.release]
-strip = true
-panic = "abort"
-lto = "fat"
-codegen-units = 1
-
-# Final-submission build: optimize for *binary size* (counted 2× in Hutter's
-# score), not throughput. UPX is applied on top at submission time. Build with
-# `cargo build --profile submission`. Keeps the plain `release` profile fast for
-# day-to-day v7/codec iteration.
-[profile.submission]
-inherits = "release"
-opt-level = "z"
-strip = "symbols"
-lto = "fat"
-panic = "abort"
-codegen-units = 1
-
-[profile.bench]
-strip = true
-panic = "abort"
-lto = "fat"
-codegen-units = 1
