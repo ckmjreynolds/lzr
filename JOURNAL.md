@@ -13,6 +13,10 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-19 — v9: enwik9 confirms the word-model gain — 1.4875 → 1.4574
+
+The word-prefix + previous-word models, tuned on enwik8, carry to enwik9: 1.4875 → 1.4574 (−0.0301), round-trip byte-exact, L(D) ≈ 0, ~0.8 MB/s (encode ~20 min). The gain is a touch smaller than enwik8's −0.0391, as expected since the order and match stack is already stronger at full scale. v9 now stands at enwik8 1.7285 and enwik9 1.4574.
+
 ## 2026-06-19 — v9: word models (word-prefix + previous-word) — enwik8 1.7676 → 1.7285
 
 CDR/Claude added two word-aware context models, reusing the `ContextModel` bit-history + `StateMap` machinery via a new context kind. The word model keys on a rolling hash of the current word's letters so far — a variable-length, boundary-delimited spelling context — and the previous-word model keys on the previous complete word combined with the current word's prefix, capturing word-to-word structure. `Context` now maintains `word_hash` (folded per letter, reset at any non-letter boundary) and `prev_word` (the last complete word). A synergy falls out of the pipeline order: case folding upstream lowercases every letter, so "The" and "the" hash identically — the word models see case-merged words for free.
