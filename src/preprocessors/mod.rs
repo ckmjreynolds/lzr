@@ -36,6 +36,7 @@
 //! future dictionary transform).
 
 pub(crate) mod casefold;
+pub(crate) mod dictionary;
 #[cfg(debug_assertions)]
 pub(crate) mod guard;
 
@@ -61,6 +62,7 @@ impl Pipeline {
             #[cfg(debug_assertions)]
             Box::new(guard::Guard),
             Box::new(casefold::CaseFold),
+            Box::new(dictionary::Dictionary::embedded()),
         ];
         Self { stages }
     }

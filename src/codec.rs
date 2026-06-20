@@ -114,16 +114,16 @@ fn read_varint(input: &[u8]) -> (u64, usize) {
     }
 }
 
-/// Compress `input` into the lzr byte stream.
-pub(crate) fn encode(input: &[u8]) -> Vec<u8> {
-    let data = Pipeline::default_pipeline().forward(input);
-
+/// Arithmetic-code an already-preprocessed byte stream. The codec proper, with
+/// no pipeline — `encode` wraps this after preprocessing; experiments call it
+/// directly on a custom-preprocessed stream.
+fn code_stream(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, data.len() as u64);
 
     let mut state = CodecState::new(data.len());
     let mut enc = Encoder::new();
-    for &byte in &data {
+    for &byte in data {
         for k in (0..8).rev() {
             let bit = (byte >> k) & 1;
             let p = state.predict();
@@ -135,6 +135,11 @@ pub(crate) fn encode(input: &[u8]) -> Vec<u8> {
 
     out.extend_from_slice(&enc.finish());
     out
+}
+
+/// Compress `input` into the lzr byte stream.
+pub(crate) fn encode(input: &[u8]) -> Vec<u8> {
+    code_stream(&Pipeline::default_pipeline().forward(input))
 }
 
 /// Decompress an lzr byte stream back into the original bytes.
@@ -188,5 +193,131 @@ mod tests {
         assert_eq!(decode(&coded), slice);
         let bpb = coded.len() as f64 * 8.0 / slice.len() as f64;
         println!("order-0..6 + match on enwik8 100 KB slice: {bpb:.4} bpb");
+    }
+
+    fn hex(t: &[u8]) -> String {
+        const H: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(t.len() * 2);
+        for &b in t {
+            s.push(char::from(H[(b >> 4) as usize]));
+            s.push(char::from(H[(b & 15) as usize]));
+        }
+        s
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|j| u8::from_str_radix(&s[j..j + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn esc(t: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        for &b in t {
+            if (0x20..0x7f).contains(&b) {
+                s.push(char::from(b));
+            } else {
+                let _ = write!(s, "\\x{b:02x}");
+            }
+        }
+        s
+    }
+
+    /// Stage 1 of dictionary selection: the top-256 tokens (maximal `a..=z` /
+    /// non-`a..=z` runs) by `freq*(len-1)` over case-folded enwik9, written to
+    /// `/tmp/dict_candidates.tsv` as `hex<TAB>freq<TAB>score`. Run once:
+    /// `cargo test --release dict_candidates_gen -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "offline: generate dictionary candidates from enwik9"]
+    fn dict_candidates_gen() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use std::collections::HashMap;
+        use std::fmt::Write as _;
+
+        let Ok(e9) = std::fs::read("assets/enwik9") else {
+            return;
+        };
+        let folded = CaseFold.forward(&e9);
+        drop(e9);
+        let mut counts: HashMap<&[u8], u64> = HashMap::new();
+        let mut i = 0;
+        while i < folded.len() {
+            let letter = folded[i].is_ascii_lowercase();
+            let start = i;
+            while i < folded.len() && folded[i].is_ascii_lowercase() == letter {
+                i += 1;
+            }
+            if i - start >= 2 {
+                *counts.entry(&folded[start..i]).or_default() += 1;
+            }
+        }
+        let mut scored: Vec<(&[u8], u64, u64)> = counts
+            .iter()
+            .map(|(&t, &f)| (t, f, f * (t.len() as u64 - 1)))
+            .collect();
+        scored.sort_by_key(|s| std::cmp::Reverse(s.2));
+        scored.truncate(256);
+        let mut out = String::new();
+        for (t, f, s) in scored {
+            let _ = writeln!(out, "{}\t{f}\t{s}", hex(t));
+        }
+        std::fs::write("/tmp/dict_candidates.tsv", out).unwrap();
+        println!("wrote 256 candidates to /tmp/dict_candidates.tsv");
+    }
+
+    /// Stage 2: the **isolated** compressed-byte saving of each candidate —
+    /// baseline (no dict) minus the full-enwik8 size with just that one token.
+    /// Candidates don't compete for spans (whole-run match), so isolated savings
+    /// rank true standalone power. Processes the index range `LZR_LO..LZR_HI`
+    /// (env, default all) so several runs can cover the 256 in parallel:
+    /// `LZR_LO=0 LZR_HI=64 cargo test --release dict_isolated -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "offline: per-candidate isolated savings; set LZR_LO/LZR_HI"]
+    #[allow(clippy::cast_possible_wrap)]
+    fn dict_isolated() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::dictionary::Dictionary;
+
+        let Ok(text) = std::fs::read_to_string("/tmp/dict_candidates.tsv") else {
+            return;
+        };
+        let cands: Vec<Vec<u8>> = text
+            .lines()
+            .map(|l| unhex(l.split('\t').next().unwrap()))
+            .collect();
+
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let folded8 = CaseFold.forward(&e8);
+        let orig = e8.len() as f64;
+
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let lo = env("LZR_LO", 0);
+        let hi = env("LZR_HI", cands.len()).min(cands.len());
+
+        let baseline = code_stream(&folded8).len();
+        for (idx, tok) in cands
+            .iter()
+            .enumerate()
+            .skip(lo)
+            .take(hi.saturating_sub(lo))
+        {
+            let dict = Dictionary::new(&[tok.as_slice()]);
+            let bytes = code_stream(&dict.forward(&folded8)).len();
+            let savings = baseline as i64 - bytes as i64;
+            let bpb = bytes as f64 * 8.0 / orig;
+            println!("{idx}\t{savings}\t{bpb:.4}\t{}", esc(tok));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
     }
 }

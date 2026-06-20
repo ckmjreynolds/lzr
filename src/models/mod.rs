@@ -24,6 +24,8 @@ pub(crate) struct Context {
     /// The last four finalized bytes; the most recent is in the low 8 bits.
     pub(crate) c4: u32,
     /// Rolling hash of the current word's letters so far (`0` between words).
+    /// A "letter" is `a..=z` only: the stream is post-fold, so `A..=Z` never
+    /// means a letter — those bytes are dictionary codes and act as boundaries.
     pub(crate) word_hash: u64,
     /// Hash of the most recent complete word.
     pub(crate) prev_word: u64,
@@ -69,7 +71,7 @@ impl Context {
         let b = self.c0 as u8; // low 8 bits are the byte; the sentinel is bit 8
         self.history.push(b);
         self.c4 = (self.c4 << 8) | u32::from(b);
-        if b.is_ascii_alphabetic() {
+        if b.is_ascii_lowercase() {
             self.word_hash = self
                 .word_hash
                 .wrapping_mul(WORD_PRIME)
