@@ -13,6 +13,14 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-19 — v9: word models (word-prefix + previous-word) — enwik8 1.7676 → 1.7285
+
+CDR/Claude added two word-aware context models, reusing the `ContextModel` bit-history + `StateMap` machinery via a new context kind. The word model keys on a rolling hash of the current word's letters so far — a variable-length, boundary-delimited spelling context — and the previous-word model keys on the previous complete word combined with the current word's prefix, capturing word-to-word structure. `Context` now maintains `word_hash` (folded per letter, reset at any non-letter boundary) and `prev_word` (the last complete word). A synergy falls out of the pipeline order: case folding upstream lowercases every letter, so "The" and "the" hash identically — the word models see case-merged words for free.
+
+Result on enwik8: 1.7676 → 1.7285 (−0.0391), round-trip byte-exact, L(D) ≈ 0. This beat the modest-gain caveat raised beforehand — despite the match model's 91% byte coverage and the order-0..6 stack, the word models' unique slice (words longer than the 6-byte order ceiling, word-to-word transitions, and boundary awareness that a raw byte window lacks) is real signal. Throughput eased to ~0.77 MB/s (two more models plus the word-hash upkeep; enwik9 ~22 min encode). enwik9 was not re-measured this round; the gain is expected to carry.
+
+Implemented by generalizing `ContextModel` with a `CtxKind` enum (`Order(n)` | `Word` | `PrevWord`): only the context value differs, while the bit-history, `StateMap`, and predict/update paths are shared and unchanged, so the order-0..6 models stay byte-identical. The word models hash into the standard 2^22 table (8 MB each). Untuned levers remain — a longer or second word context, digit handling, and the prev-word combination function. v9 enwik8 now stands at 1.7285.
+
 ## 2026-06-19 — v9: enwik9 confirms the mixer gains — 1.5612 → 1.4875
 
 The mixer upgrades (context-selected weights + SSE), tuned on enwik8 for iteration speed, carry to enwik9 in full: the flat-finder build's 1.5612 drops to 1.4875 (−0.0737, matching enwik8's −0.0744), round-trip byte-exact, L(D) ≈ 0, at ~1.05 MB/s (encode ~16 min). Match-finder stats are unchanged from the flat-finder run, as expected since the mixer sits downstream of the finder: 91.7% coverage, 3.2% collisions at 43.5% table fill. v9 now stands at enwik8 1.7676 and enwik9 1.4875.

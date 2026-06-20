@@ -23,7 +23,14 @@ pub(crate) struct Context {
     pub(crate) bpos: u8,
     /// The last four finalized bytes; the most recent is in the low 8 bits.
     pub(crate) c4: u32,
+    /// Rolling hash of the current word's letters so far (`0` between words).
+    pub(crate) word_hash: u64,
+    /// Hash of the most recent complete word.
+    pub(crate) prev_word: u64,
 }
+
+/// Mixing multiplier for folding a letter into the rolling word hash.
+const WORD_PRIME: u64 = 0x0100_0000_01b3;
 
 impl Context {
     /// New, empty context with room reserved for `capacity` finalized bytes.
@@ -33,6 +40,8 @@ impl Context {
             c0: 1,
             bpos: 0,
             c4: 0,
+            word_hash: 0,
+            prev_word: 0,
         }
     }
 
@@ -60,6 +69,17 @@ impl Context {
         let b = self.c0 as u8; // low 8 bits are the byte; the sentinel is bit 8
         self.history.push(b);
         self.c4 = (self.c4 << 8) | u32::from(b);
+        if b.is_ascii_alphabetic() {
+            self.word_hash = self
+                .word_hash
+                .wrapping_mul(WORD_PRIME)
+                .wrapping_add(u64::from(b) + 1);
+        } else {
+            if self.word_hash != 0 {
+                self.prev_word = self.word_hash;
+            }
+            self.word_hash = 0;
+        }
         self.c0 = 1;
         self.bpos = 0;
     }

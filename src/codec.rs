@@ -22,6 +22,8 @@ fn models() -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::new(4)),
         Box::new(ContextModel::new(5)),
         Box::new(ContextModel::new(6)),
+        Box::new(ContextModel::word()),
+        Box::new(ContextModel::prev_word()),
         Box::new(MatchModel::new()),
     ]
 }
