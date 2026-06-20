@@ -13,6 +13,10 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-19 — v9: enwik9 confirms the mixer gains — 1.5612 → 1.4875
+
+The mixer upgrades (context-selected weights + SSE), tuned on enwik8 for iteration speed, carry to enwik9 in full: the flat-finder build's 1.5612 drops to 1.4875 (−0.0737, matching enwik8's −0.0744), round-trip byte-exact, L(D) ≈ 0, at ~1.05 MB/s (encode ~16 min). Match-finder stats are unchanged from the flat-finder run, as expected since the mixer sits downstream of the finder: 91.7% coverage, 3.2% collisions at 43.5% table fill. v9 now stands at enwik8 1.7676 and enwik9 1.4875.
+
 ## 2026-06-19 — v9: mixer upgrades — context-selected weights + SSE stage (enwik8 1.8420 → 1.7676)
 
 CDR/Claude added the two standard calibration levers on top of the logistic mixer, measured on enwik8 for iteration speed (a ~90 s encode versus ~15 min for enwik9). First, context-selected mixing: the mixer had kept a single weight set per bit position (8 in all); it now keys the set on (previous byte, bit position) — 2048 sets — so the blend can specialize by local context, leaning on the match model in repetitive regions and on the high orders in prose. Second, an SSE/APM stage after the mix: a per-context adaptive curve over the stretch domain (33 interpolation knots, context the partial-byte node `c0`) that corrects systematic miscalibration of the mixed probability, its refined estimate blended 3:1 with the mixer output.
