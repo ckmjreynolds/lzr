@@ -6,6 +6,10 @@
 
 pub(crate) mod context;
 pub(crate) mod finder;
+#[cfg(test)]
+mod lstm_arm;
+#[cfg(test)]
+mod lstm_spike;
 pub(crate) mod match_model;
 pub(crate) mod statemap;
 

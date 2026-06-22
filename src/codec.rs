@@ -141,7 +141,7 @@ fn code_stream(data: &[u8]) -> Vec<u8> {
 
 /// Like [`code_stream`] but with a caller-supplied model set (ablation only).
 #[cfg(test)]
-fn code_stream_models(models: Vec<Box<dyn Model>>, data: &[u8]) -> Vec<u8> {
+pub(crate) fn code_stream_models(models: Vec<Box<dyn Model>>, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, data.len() as u64);
     let mut state = CodecState::with_models(models, data.len());
@@ -157,6 +157,31 @@ fn code_stream_models(models: Vec<Box<dyn Model>>, data: &[u8]) -> Vec<u8> {
     }
     out.extend_from_slice(&enc.finish());
     out
+}
+
+/// Decode counterpart of [`code_stream_models`] (ablation/round-trip only):
+/// decodes a stream produced by `code_stream_models` with the same model set.
+/// Operates on the coded bytes directly (no pipeline inverse).
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn decode_stream_models(models: Vec<Box<dyn Model>>, input: &[u8]) -> Vec<u8> {
+    let (len, header) = read_varint(input);
+    let len = len as usize;
+    let mut state = CodecState::with_models(models, len);
+    let mut dec = Decoder::new(&input[header..]);
+    let mut data = Vec::with_capacity(len);
+    for _ in 0..len {
+        let mut byte = 0u8;
+        for _ in 0..8 {
+            let p = state.predict();
+            let bit = dec.decode(p);
+            state.commit(bit);
+            byte = (byte << 1) | bit;
+        }
+        state.end_symbol();
+        data.push(byte);
+    }
+    data
 }
 
 /// Compress `input` into the lzr byte stream.
