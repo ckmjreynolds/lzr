@@ -26,34 +26,47 @@ use super::Preprocessor;
 /// byte savings on enwik8, comments showing those savings. An empty list is an
 /// identity transform.
 const EMBEDDED: &[&[u8]] = &[
-    b">\x0a      <",   // +21695
-    b"the",            // +21689
-    b"quot",           // +20926
-    b">\x0a    <",     // +11652
-    b">\x0a        <", // +10021
-    b">\x0a      </",  // +5529
-    b"id",             // +4092
-    b"gt",             // +3336
-    b"contributor",    // +3158
-    b">\x0a    </",    // +2741
-    b"http",           // +2042
-    b";/",             // +1898
-    b"www",            // +1577
-    b"amp",            // +1280
-    b"timestamp",      // +1157
-    b" />\x0a      <", // +1127
-    b"preserve",       // +1009
-    b"revision",       // +990
-    b"category",       // +929
-    b"com",            // +861
-    b"lt",             // +851
-    b"align",          // +763
-    b"comment",        // +540
-    b"title",          // +527
-    b"redirect",       // +347
-    b">\x0a  </",      // +326
-    b">\x0a  <",       // +142
-    b"2;).  \x00",     // +21
+    b"he ",                                                              // +50849
+    b">\x0a    ",                                                        // +35796
+    b"uot;",                                                             // +25417
+    b"nd ",                                                              // +21225
+    b"ion",                                                              // +15196
+    b"f ",                                                               // +8677
+    b"t;",                                                               // +6680
+    b"d>\x0a    <revision>\x0a      <id>",                               // +5661
+    b"    ",                                                             // +3869
+    b"\x00category:",                                                    // +3656
+    b"omment>\x0a      <text xml:space=\"preserve\">",                   // +3183
+    b"</\x01timestamp>\x0a      <contributor>\x0a        <",             // +3123
+    b"&gt;",                                                             // +2933
+    b"/id>\x0a    ",                                                     // +2652
+    b"text>\x0a    </revision>\x0a  </page>\x0a  <page>\x0a    <title>", // +2501
+    b"sername>\x0a        <id>",                                         // +2445
+    b">\x0a      <t",                                                    // +1788
+    b"/id>\x0a      </contributor>\x0a      <",                          // +1678
+    b"sion>\x0a      <id>",                                              // +1552
+    b">\x0a        <",                                                   // +1049
+    b"  <",                                                              // +951
+    b"quot;",                                                            // +851
+    b"ext xml:space=\"preserve\">",                                      // +734
+    b">\x0a      <",                                                     // +509
+    b">\x0a      </contributor>\x0a      <minor />\x0a      <comment>",  // +442
+    b">\x0a      </contributor>\x0a      <",                             // +373
+    b"category:",                                                        // +370
+    b">\x0a      ",                                                      // +324
+    b"text xml:space=\"preserve\"",                                      // +241
+    b">\x0a      <text xml:space=\"preserve\">",                         // +232
+    b"ision>\x0a      <id>",                                             // +222
+    b"/comment>\x0a      <text xml:space=\"preserve\"",                  // +209
+    b"(\x01u.s. c\x01ensus)|\x00",                                       // +188
+    b"timestamp>",                                                       // +171
+    b"comment>\x0a      <text xml:space=\"preserve\">",                  // +135
+    b"contrib",                                                          // +122
+    b".s. c\x01ensus)|",                                                 // +101
+    b"uot",                                                              // +93
+    b">\x0a  <page>\x0a    <title>",                                     // +64
+    b">\x0a",                                                            // +39
+    b">\x0a  ",                                                          // +9
 ];
 
 /// The 74 code bytes, **descending** — assigned to entries in order.
@@ -69,24 +82,48 @@ pub(crate) fn code_pool() -> Vec<u8> {
     pool
 }
 
-/// Maps whole tokens to codes (forward) and codes back to tokens (inverse).
+/// One trie node: the code if a dictionary entry ends here, plus byte-keyed
+/// children (arena indices).
+#[derive(Debug, Default)]
+struct Node {
+    code: Option<u8>,
+    next: HashMap<u8, usize>,
+}
+
+/// Longest-match substring dictionary. Entries are arbitrary byte strings (they
+/// may overlap and cross any boundary), so the forward pass walks a trie at each
+/// position and replaces the longest matching entry with its code byte.
 #[derive(Debug)]
 pub(crate) struct Dictionary {
-    map: HashMap<Vec<u8>, u8>,
+    nodes: Vec<Node>, // arena; node 0 is the root
     rev: Vec<Option<Vec<u8>>>,
+    active: bool,
 }
 
 impl Dictionary {
     /// Build from entries in priority order; codes assigned highest byte first.
     pub(crate) fn new(entries: &[&[u8]]) -> Self {
         let pool = code_pool();
-        let mut map = HashMap::with_capacity(entries.len());
+        let mut nodes = vec![Node::default()];
         let mut rev = vec![None; 256];
         for (entry, &code) in entries.iter().zip(&pool) {
-            map.insert((*entry).to_vec(), code);
+            let mut node = 0;
+            for &b in *entry {
+                let nlen = nodes.len();
+                let child = *nodes[node].next.entry(b).or_insert(nlen);
+                if child == nlen {
+                    nodes.push(Node::default());
+                }
+                node = child;
+            }
+            nodes[node].code = Some(code);
             rev[code as usize] = Some((*entry).to_vec());
         }
-        Self { map, rev }
+        Self {
+            nodes,
+            rev,
+            active: !entries.is_empty(),
+        }
     }
 
     /// The shipped dictionary.
@@ -94,34 +131,43 @@ impl Dictionary {
         Self::new(EMBEDDED)
     }
 
-    fn is_empty(&self) -> bool {
-        self.map.is_empty()
+    /// The longest entry matching at `input[i..]`, as `(code, length)`.
+    fn longest_match(&self, input: &[u8], i: usize) -> Option<(u8, usize)> {
+        let mut node = 0;
+        let mut best = None;
+        for (k, &b) in input[i..].iter().enumerate() {
+            let Some(&n) = self.nodes[node].next.get(&b) else {
+                break;
+            };
+            node = n;
+            if let Some(c) = self.nodes[node].code {
+                best = Some((c, k + 1));
+            }
+        }
+        best
     }
 }
 
 impl Preprocessor for Dictionary {
     fn forward(&self, input: &[u8]) -> Vec<u8> {
-        if self.is_empty() {
+        if !self.active {
             return input.to_vec();
         }
         let mut out = Vec::with_capacity(input.len());
         let mut i = 0;
         while i < input.len() {
-            let letter = input[i].is_ascii_lowercase();
-            let start = i;
-            while i < input.len() && input[i].is_ascii_lowercase() == letter {
-                i += 1;
-            }
-            match self.map.get(&input[start..i]) {
-                Some(&code) => out.push(code),
-                None => out.extend_from_slice(&input[start..i]),
-            }
+            let (byte, step) = match self.longest_match(input, i) {
+                Some((code, len)) => (code, len),
+                None => (input[i], 1),
+            };
+            out.push(byte);
+            i += step;
         }
         out
     }
 
     fn inverse(&self, input: &[u8]) -> Vec<u8> {
-        if self.is_empty() {
+        if !self.active {
             return input.to_vec();
         }
         let mut out = Vec::with_capacity(input.len());

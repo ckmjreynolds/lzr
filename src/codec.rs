@@ -225,47 +225,143 @@ mod tests {
         s
     }
 
-    /// Stage 1 of dictionary selection: the top-256 tokens (maximal `a..=z` /
-    /// non-`a..=z` runs) by `freq*(len-1)` over case-folded enwik9, written to
-    /// `/tmp/dict_candidates.tsv` as `hex<TAB>freq<TAB>score`. Run once:
+    /// Stage 1 of dictionary selection: the top-1024 **arbitrary substrings** of
+    /// case-folded enwik9 by `(non-overlapping occurrences)*(len-1)` — no lexical
+    /// structure. A suffix array (offline dev-dep) + LCP (Kasai) + a
+    /// largest-rectangle pass over the LCP array gives each distinct substring's
+    /// occurrence interval; non-overlapping counting (what longest-match can take)
+    /// then suppresses the O(L^2) self-overlap artifact of repeated-char runs.
+    /// Written to `/tmp/dict_candidates.tsv` as `hex<TAB>score`. Run once:
     /// `cargo test --release dict_candidates_gen -- --ignored --nocapture`.
     #[test]
     #[ignore = "offline: generate dictionary candidates from enwik9"]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines,
+        clippy::items_after_statements
+    )]
     fn dict_candidates_gen() {
         use crate::preprocessors::Preprocessor;
         use crate::preprocessors::casefold::CaseFold;
         use std::collections::HashMap;
         use std::fmt::Write as _;
 
+        const T: i64 = 10_000; // min freq*(len-1) of a collected substring
+
         let Ok(e9) = std::fs::read("assets/enwik9") else {
             return;
         };
         let folded = CaseFold.forward(&e9);
         drop(e9);
-        let mut counts: HashMap<&[u8], u64> = HashMap::new();
-        let mut i = 0;
-        while i < folded.len() {
-            let letter = folded[i].is_ascii_lowercase();
-            let start = i;
-            while i < folded.len() && folded[i].is_ascii_lowercase() == letter {
-                i += 1;
-            }
-            if i - start >= 2 {
-                *counts.entry(&folded[start..i]).or_default() += 1;
+        let n = folded.len();
+        if n == 0 {
+            return;
+        }
+
+        // Suffix array, then LCP via Kasai (lcp[k] = LCP(sa[k-1], sa[k])).
+        let sa: Vec<i32> = cdivsufsort::sort(&folded).into_parts().1;
+        let mut rank = vec![0i32; n];
+        for (i, &s) in sa.iter().enumerate() {
+            rank[s as usize] = i as i32;
+        }
+        let mut lcp = vec![0i32; n];
+        let mut h = 0usize;
+        for i in 0..n {
+            let r = rank[i] as usize;
+            if r > 0 {
+                let j = sa[r - 1] as usize;
+                while i + h < n && j + h < n && folded[i + h] == folded[j + h] {
+                    h += 1;
+                }
+                lcp[r] = h as i32;
+                h = h.saturating_sub(1);
+            } else {
+                h = 0;
             }
         }
-        let mut scored: Vec<(&[u8], u64, u64)> = counts
-            .iter()
-            .map(|(&t, &f)| (t, f, f * (t.len() as u64 - 1)))
+        drop(rank);
+
+        // Largest-rectangle over the LCP histogram: popping bar `top` at SA
+        // index `i` exposes a substring of length `height` shared by the suffix
+        // interval `[prev, i-1]` — its (overlapping) occurrence count is `i-prev`.
+        // Dedup by bytes here, keeping the full interval (max raw count).
+        const LMAX: usize = 256; // length cap: an L(D) guard on embedded entries
+        let mut best: HashMap<&[u8], (i64, usize, usize)> = HashMap::new(); // bytes -> (raw, lo, hi)
+        let mut stack: Vec<usize> = Vec::new();
+        for i in 1..=n {
+            let cur = if i < n { i64::from(lcp[i]) } else { -1 };
+            while let Some(&top) = stack.last() {
+                let height = i64::from(lcp[top]) as usize;
+                if i64::from(lcp[top]) <= cur {
+                    break;
+                }
+                stack.pop();
+                let prev = stack.last().copied().unwrap_or(0);
+                let raw = (i - prev) as i64;
+                if (2..=LMAX).contains(&height) && raw * (height as i64 - 1) >= T {
+                    let pos = sa[top] as usize;
+                    let e = best.entry(&folded[pos..pos + height]).or_insert((0, 0, 0));
+                    if raw > e.0 {
+                        *e = (raw, prev, i - 1);
+                    }
+                }
+            }
+            stack.push(i);
+        }
+        drop(stack);
+        drop(lcp);
+
+        // Rescore each distinct substring by NON-OVERLAPPING occurrences (what
+        // longest-match can actually take). A substring self-overlaps only if it
+        // has a proper border, so aperiodic ones keep their raw count for free;
+        // bordered ones get greedy interval scheduling over their SA interval.
+        fn has_border(s: &[u8]) -> bool {
+            let mut lps = [0usize; 256];
+            let mut k = 0;
+            for i in 1..s.len() {
+                while k > 0 && s[i] != s[k] {
+                    k = lps[k - 1];
+                }
+                if s[i] == s[k] {
+                    k += 1;
+                }
+                lps[i] = k;
+            }
+            lps[s.len() - 1] > 0
+        }
+        let mut ranked: Vec<(&[u8], i64)> = best
+            .into_iter()
+            .map(|(s, (raw, lo, hi))| {
+                let len = s.len() as i64;
+                let nonoverlap = if has_border(s) {
+                    let mut pos: Vec<i32> = sa[lo..=hi].to_vec();
+                    pos.sort_unstable();
+                    let mut cnt = 0i64;
+                    let mut last = i64::MIN;
+                    for &p in &pos {
+                        if i64::from(p) >= last + len {
+                            cnt += 1;
+                            last = i64::from(p);
+                        }
+                    }
+                    cnt
+                } else {
+                    raw
+                };
+                (s, nonoverlap * (len - 1))
+            })
             .collect();
-        scored.sort_by_key(|s| std::cmp::Reverse(s.2));
-        scored.truncate(256);
+        drop(sa);
+        ranked.sort_by_key(|x| std::cmp::Reverse(x.1));
+        ranked.truncate(1024);
         let mut out = String::new();
-        for (t, f, s) in scored {
-            let _ = writeln!(out, "{}\t{f}\t{s}", hex(t));
+        for (s, score) in &ranked {
+            let _ = writeln!(out, "{}\t{score}", hex(s));
         }
         std::fs::write("/tmp/dict_candidates.tsv", out).unwrap();
-        println!("wrote 256 candidates to /tmp/dict_candidates.tsv");
+        println!("wrote {} candidates", ranked.len());
     }
 
     /// Stage 2: the **isolated** compressed-byte saving of each candidate —
@@ -318,6 +414,84 @@ mod tests {
             let bpb = bytes as f64 * 8.0 / orig;
             println!("{idx}\t{savings}\t{bpb:.4}\t{}", esc(tok));
             let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+
+    /// Stage 3: overlap-aware greedy selection. Reads priority-ordered candidates
+    /// (hex, one per line) from `/tmp/dict_greedy_in.tsv` — in practice the
+    /// positive-isolated-savings candidates in savings order — and greedily adds
+    /// each to the dictionary, keeping it only if it does not grow full-enwik8.
+    /// Greedy (re-measure given what's accepted) is what correctly resolves the
+    /// overlap between arbitrary substrings. Prints each decision and the final
+    /// embeddable list (savings-descending). Run:
+    /// `cargo test --release dict_greedy -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "offline: overlap-aware greedy dictionary selection"]
+    #[allow(clippy::cast_possible_wrap)]
+    fn dict_greedy() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::dictionary::{Dictionary, code_pool};
+
+        let Ok(text) = std::fs::read_to_string("/tmp/dict_greedy_in.tsv") else {
+            return;
+        };
+        let cands: Vec<Vec<u8>> = text
+            .lines()
+            .map(|l| unhex(l.split('\t').next().unwrap()))
+            .collect();
+
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let folded8 = CaseFold.forward(&e8);
+        let orig = e8.len() as f64;
+
+        let encoded =
+            |accepted: &[&[u8]]| code_stream(&Dictionary::new(accepted).forward(&folded8)).len();
+
+        let max_codes = code_pool().len();
+        let mut accepted: Vec<Vec<u8>> = Vec::new();
+        let mut savings: Vec<i64> = Vec::new();
+        let mut baseline = encoded(&[]);
+        println!(
+            "baseline_bpb={:.4} candidates={}",
+            baseline as f64 * 8.0 / orig,
+            cands.len()
+        );
+
+        for (rank, tok) in cands.iter().enumerate() {
+            if accepted.len() >= max_codes {
+                println!("code pool exhausted ({max_codes})");
+                break;
+            }
+            let mut trial: Vec<&[u8]> = accepted.iter().map(Vec::as_slice).collect();
+            trial.push(tok.as_slice());
+            let bytes = encoded(&trial);
+            let delta = baseline as i64 - bytes as i64;
+            if bytes < baseline {
+                println!(
+                    "#{rank:3} ACCEPT \"{}\" saved={delta} bpb={:.4}",
+                    esc(tok),
+                    bytes as f64 * 8.0 / orig
+                );
+                accepted.push(tok.clone());
+                savings.push(delta);
+                baseline = bytes;
+            } else {
+                println!("#{rank:3} reject \"{}\" delta={delta}", esc(tok));
+            }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+
+        let mut order: Vec<usize> = (0..accepted.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(savings[i]));
+        println!(
+            "=== final dictionary ({} entries, savings-descending) ===",
+            accepted.len()
+        );
+        for &i in &order {
+            println!("    b\"{}\", // +{}", esc(&accepted[i]), savings[i]);
         }
     }
 }
