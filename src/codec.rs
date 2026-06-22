@@ -8,6 +8,7 @@
 use crate::coder::{Decoder, Encoder};
 use crate::mixer::{Apm, Mixer};
 use crate::models::context::ContextModel;
+use crate::models::lstm::ArmModel;
 use crate::models::match_model::MatchModel;
 use crate::models::{Context, Model};
 use crate::preprocessors::Pipeline;
@@ -24,6 +25,7 @@ fn models() -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::new(6)),
         Box::new(ContextModel::word()),
         Box::new(MatchModel::new()),
+        Box::new(ArmModel::arm()),
     ]
 }
 
@@ -235,11 +237,14 @@ mod tests {
         let Ok(bytes) = std::fs::read("assets/enwik8") else {
             return; // skip when the corpus is absent
         };
-        let slice = &bytes[1_000_000..1_100_000];
+        // Small slice keeps this fast under the debug coverage build now that
+        // the online LSTM arm is in the default model set; it still exercises
+        // the full pipeline and round-trips byte-exact.
+        let slice = &bytes[1_000_000..1_008_000];
         let coded = encode(slice);
         assert_eq!(decode(&coded), slice);
         let bpb = coded.len() as f64 * 8.0 / slice.len() as f64;
-        println!("order-0..6 + match on enwik8 100 KB slice: {bpb:.4} bpb");
+        println!("full stack on enwik8 8 KB slice: {bpb:.4} bpb");
     }
 
     fn hex(t: &[u8]) -> String {

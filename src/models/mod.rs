@@ -6,8 +6,7 @@
 
 pub(crate) mod context;
 pub(crate) mod finder;
-#[cfg(test)]
-mod lstm_arm;
+pub(crate) mod lstm;
 #[cfg(test)]
 mod lstm_spike;
 pub(crate) mod match_model;

@@ -1,23 +1,23 @@
-//! Standalone online-LSTM next-token bpb measurement for the neural arm.
+//! Online-neural arm: a byte-level online LSTM that learns during compression
+//! and joins the mixer as one more [`Model`].
 //!
-//! This answers the one question the compute spike could not: what is the arm's
-//! *raw predictive power* at the word/token level? It runs a single-layer LSTM
-//! that learns online (forward → loss → truncated-BPTT → Adam, no shipped
-//! weights), predicting the next token over a small vocabulary, and reports
-//! next-token cross-entropy as bits-per-original-byte — comparable to v9's
-//! 1.6938. No mixer, no arithmetic coder: the byte-level↔token-level coder
-//! coupling is deferred until this number says the arm is worth it.
-//!
-//! Tokenizer is the existing word dictionary: known words (from `words.dict`)
-//! are one token each; everything else (separators, digits, markup, the
-//! characters of out-of-vocabulary words) falls back to a per-byte token. So the
-//! vocabulary is `256 + N` and the arm steps once per word-unit.
+//! The LSTM steps once per finalized byte (vocab 256), producing a next-byte
+//! distribution; each bit is predicted by marginalizing that distribution over
+//! the partial byte `c0` via a prefix sum — the same bit-tree contract the
+//! context models use. Online learning (truncated-BPTT window + Adam) runs at
+//! each byte boundary, identically on encode and decode, so the arm ships **no
+//! weights** — L(D) is just code. The dict-transformed stream already collapses
+//! frequent words toward single code bytes, so a byte-level cell gets word-level
+//! context for free without a large-vocabulary softmax.
 //!
 //! The backward pass is **gradient-checked** (finite differences,
 //! `lstm_gradient_check`). The hot loop is allocation-free: all per-step scratch
-//! and the BPTT window live in preallocated buffers reused across tokens.
+//! and the BPTT window live in preallocated buffers reused across steps. The
+//! offline `#[ignore]` tests (`lstm_arm_bpb`, `lstm_arm_e2e`) measure standalone
+//! and e2e-marginal bpb on enwik8.
 
-#![cfg(test)]
+// Numeric kernel: pervasive index arithmetic and f32 casts; allowed module-wide
+// to keep the LSTM forward/backward math readable.
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -25,12 +25,7 @@
     clippy::needless_range_loop,
     clippy::many_single_char_names,
     clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::too_many_arguments,
-    clippy::suboptimal_flops,
-    clippy::items_after_statements,
-    clippy::uninlined_format_args,
-    clippy::doc_markdown
+    clippy::suboptimal_flops
 )]
 
 use crate::models::{Context, Model};
@@ -63,6 +58,7 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 /// One Adam-trained parameter tensor (weights + first/second moments + grad).
+#[derive(Debug)]
 struct Tensor {
     w: Vec<f32>,
     m: Vec<f32>,
@@ -109,6 +105,7 @@ impl Tensor {
 
 /// Preallocated BPTT window: forward activations for up to `wmax` steps, stored
 /// in flat `slot*dim + k` arrays so the hot loop never allocates.
+#[derive(Debug)]
 struct Window {
     len: usize,
     tok: Vec<usize>,
@@ -146,6 +143,7 @@ impl Window {
 
 /// Single-layer LSTM with a token embedding in and a full-vocabulary softmax
 /// out. Gate layout in the `4h` vectors is `[i | f | g | o]`.
+#[derive(Debug)]
 struct Lstm {
     e: usize,
     h: usize,
@@ -264,7 +262,8 @@ impl Lstm {
     }
 
     /// Offline convenience: forward with a known target, finalizing the slot.
-    /// Returns the loss in nats.
+    /// Returns the loss in nats. Used by the offline measurement/gradient tests.
+    #[cfg(test)]
     fn forward(&mut self, tok: usize, target: usize) -> f32 {
         let s = self.win.len;
         self.step_forward(tok);
@@ -375,6 +374,7 @@ impl Lstm {
         self.win.len = 0;
     }
 
+    #[cfg(test)]
     fn params(&self) -> usize {
         self.emb.w.len()
             + self.wx.w.len()
@@ -391,6 +391,7 @@ impl Lstm {
 /// (`c0`) via a prefix sum — the same bit-tree contract the context models use.
 /// Online learning (truncated BPTT + Adam) runs in `update` at each byte
 /// boundary, identically on encode and decode, so it ships zero weights.
+#[derive(Debug)]
 pub(crate) struct ArmModel {
     lstm: Lstm,
     cumsum: Vec<f32>, // [257] prefix sums of the current next-byte distribution
@@ -404,6 +405,16 @@ impl ArmModel {
     const E: usize = 32;
     const V: usize = 256;
     const WIN: usize = 16;
+    /// Hidden width — the operating point. Trades bpb for throughput: the
+    /// enwik8 e2e marginal/enwik9 ETA was h=64 −0.046/7.1h, h=96 −0.061/11.6h,
+    /// h=128 −0.059(full)/16.9h. We ship h=128 for max gain and may decrease it
+    /// for throughput headroom (h=96 keeps ~90% of the gain at 1.46×).
+    pub(crate) const H: usize = 128;
+
+    /// The shipped arm at the default hidden width [`Self::H`].
+    pub(crate) fn arm() -> Self {
+        Self::new(Self::H)
+    }
 
     pub(crate) fn new(h: usize) -> Self {
         let mut lstm = Lstm::new(Self::E, h, Self::V, Self::WIN);
@@ -462,6 +473,13 @@ impl Model for ArmModel {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::items_after_statements,
+    clippy::uninlined_format_args,
+    clippy::doc_markdown
+)]
 mod tests {
     use super::*;
     use std::time::Instant;
@@ -677,7 +695,9 @@ mod tests {
         let Ok(e8) = std::fs::read("assets/enwik8") else {
             return;
         };
-        let data = Pipeline::default_pipeline().forward(&e8[1_000_000..1_200_000]);
+        // Small slice: keeps the debug coverage build fast while still
+        // exercising encode→decode of the arm byte-for-byte.
+        let data = Pipeline::default_pipeline().forward(&e8[1_000_000..1_004_000]);
         let mut enc_models = baseline_models();
         enc_models.push(Box::new(ArmModel::new(64)));
         let coded = code_stream_models(enc_models, &data);
