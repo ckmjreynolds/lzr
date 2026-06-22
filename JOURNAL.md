@@ -13,6 +13,12 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-22 18:00 — v9: drop the prev_word model (redundant with the word dict) — enwik8 1.6941 → 1.6938
+
+The word-dictionary entry below flagged that coded words no longer feed `word_hash`, so the `word` and `prev_word` models might be redundant on the transformed stream. An ablation (offline `word_model_ablation`, full enwik8, dict active) settles it: the `word` model still earns −0.0317 bpb (it predicts the spelling of the ~74 % of word-bytes that are uncoded long-tail words, rank > 2000), but `prev_word` is net-harmful — dropping it improves enwik8 1.6941 → 1.6938 (−4 KB) while removing a model. Once the top words are single code bytes, the word-to-word transition signal `prev_word` carried is subsumed by the order-N models on the compacted stream (a coded word is one byte, so order-2 ≈ previous-two-words), leaving `prev_word` as noise the mixer pays for. The reference run (case-fold only, no dict) confirms the mechanism: the two word models together give −0.0391 without the dict (matching their 06-19 gain), so the dictionary absorbed `prev_word`'s entire contribution.
+
+Dropped from the model set; its machinery removed (`ContextModel::prev_word`, `CtxKind::PrevWord`, the `Context::prev_word` field and its `push_byte` update). v9 enwik8 now 1.6938, round-trip byte-exact. The ~10 % fewer model-table touches per byte also lifted throughput 0.84 → 0.90 MB/s (enwik9 ETA ~18.5 min/direction) — a small compute win that compounds toward the online-neural arm, where compute is the binding constraint. Lesson reinforced: a preprocessor that canonicalizes can make a model redundant, so re-ablate the model set after a transform lands rather than assuming additivity.
+
 ## 2026-06-22 17:00 — v9: word-canonicalizing dictionary (DRT-style) — enwik8 1.7285 → 1.6941, enwik9 1.4574 → 1.4136
 
 Following the cost-map finding earlier today that substring-removal codes are the wrong form of dictionary, CDR pushed to test the SOTA form directly: a word-canonicalizing transform like Skibinski's DRT (used by phda9/cmix). Claude predicted our existing word, previous-word, and match models had already captured its value; the experiment refuted that cleanly. A dictionary mined from the corpus — the top-N most frequent lowercase words (post-fold), each replaced by a short code — gives a robust, sizable gain on top of the full stack.

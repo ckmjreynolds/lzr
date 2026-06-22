@@ -1,8 +1,8 @@
 //! Generic context model: bit-history states + a `StateMap`.
 //!
-//! Keyed on either the last `n` bytes (order-`n`) or a word-derived hash
-//! (current-word spelling, or previous word + current prefix) — the bit-history
-//! and `StateMap` machinery is shared; only the context value differs.
+//! Keyed on either the last `n` bytes (order-`n`) or the current word's spelling
+//! hash — the bit-history and `StateMap` machinery is shared; only the context
+//! value differs.
 //!
 //! For each context (the last `order` finalized bytes) and each bit-tree node
 //! (the partial byte `c0`), a one-`u16` cell holds a *bit history* — a bounded,
@@ -50,8 +50,6 @@ enum CtxKind {
     Order(usize),
     /// Hash of the current word's letters so far (spelling, variable length).
     Word,
-    /// Previous complete word combined with the current word's prefix.
-    PrevWord,
 }
 
 /// A context model over bit-history states. The context is either the last `n`
@@ -102,11 +100,6 @@ impl ContextModel {
         Self::hashed(CtxKind::Word)
     }
 
-    /// Keyed on the previous word together with the current word's prefix.
-    pub(crate) fn prev_word() -> Self {
-        Self::hashed(CtxKind::PrevWord)
-    }
-
     fn context_value(&self, ctx: &Context) -> u64 {
         match self.kind {
             CtxKind::Order(order) => {
@@ -117,7 +110,6 @@ impl ContextModel {
                 cv
             }
             CtxKind::Word => ctx.word_hash,
-            CtxKind::PrevWord => ctx.prev_word.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ctx.word_hash,
         }
     }
 

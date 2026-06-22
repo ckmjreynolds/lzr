@@ -23,7 +23,6 @@ fn models() -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::new(5)),
         Box::new(ContextModel::new(6)),
         Box::new(ContextModel::word()),
-        Box::new(ContextModel::prev_word()),
         Box::new(MatchModel::new()),
     ]
 }
@@ -43,7 +42,10 @@ struct CodecState {
 
 impl CodecState {
     fn new(capacity: usize) -> Self {
-        let models = models();
+        Self::with_models(models(), capacity)
+    }
+
+    fn with_models(models: Vec<Box<dyn Model>>, capacity: usize) -> Self {
         let stretched = vec![0i32; models.len()];
         let mixer = Mixer::new(models.len());
         Self {
@@ -133,6 +135,26 @@ fn code_stream(data: &[u8]) -> Vec<u8> {
         state.end_symbol();
     }
 
+    out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// Like [`code_stream`] but with a caller-supplied model set (ablation only).
+#[cfg(test)]
+fn code_stream_models(models: Vec<Box<dyn Model>>, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_varint(&mut out, data.len() as u64);
+    let mut state = CodecState::with_models(models, data.len());
+    let mut enc = Encoder::new();
+    for &byte in data {
+        for k in (0..8).rev() {
+            let bit = (byte >> k) & 1;
+            let p = state.predict();
+            enc.encode(bit, p);
+            state.commit(bit);
+        }
+        state.end_symbol();
+    }
     out.extend_from_slice(&enc.finish());
     out
 }
@@ -845,6 +867,58 @@ mod tests {
                 treat_bpb - base_bpb,
                 (treat_bpb - base_bpb) + ld_bpb
             );
+        }
+    }
+
+    /// Word-model contribution ablation: encode an enwik8 slice with the shipped
+    /// pipeline (case-fold + word dict) with and without the `word` model, plus
+    /// the case-fold-only stream (no dict) as a reference. Used to confirm the
+    /// `word` model still earns its place once the dictionary codes the frequent
+    /// words (the `prev_word` model, which it did not, was dropped 2026-06-22).
+    /// Params `LZR_LO`/`LZR_HI` (default 1M..21M). Run:
+    /// `cargo test --release word_model_ablation -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: word model contribution with the dict active"]
+    #[allow(clippy::cast_precision_loss)]
+    fn word_model_ablation() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let slice = &e8[lo..hi];
+        let orig = (hi - lo) as f64;
+
+        let mk = |word: bool| -> Vec<Box<dyn Model>> {
+            let mut v: Vec<Box<dyn Model>> = (0..=6)
+                .map(|n| Box::new(ContextModel::new(n)) as Box<dyn Model>)
+                .collect();
+            if word {
+                v.push(Box::new(ContextModel::word()));
+            }
+            v.push(Box::new(MatchModel::new()));
+            v
+        };
+
+        let with_dict = Pipeline::default_pipeline().forward(slice);
+        let no_dict = CaseFold.forward(slice);
+        for (label, stream) in [("with dict", &with_dict), ("no dict  ", &no_dict)] {
+            for (name, w) in [("full   ", true), ("no_word", false)] {
+                let bytes = code_stream_models(mk(w), stream).len();
+                println!(
+                    "{label}\t{name}\t{:.4} bpb\t{bytes} bytes",
+                    bytes as f64 * 8.0 / orig
+                );
+            }
         }
     }
 }

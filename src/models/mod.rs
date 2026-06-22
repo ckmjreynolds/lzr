@@ -27,8 +27,6 @@ pub(crate) struct Context {
     /// A "letter" is `a..=z` only: the stream is post-fold, so `A..=Z` never
     /// means a letter — those bytes are dictionary codes and act as boundaries.
     pub(crate) word_hash: u64,
-    /// Hash of the most recent complete word.
-    pub(crate) prev_word: u64,
 }
 
 /// Mixing multiplier for folding a letter into the rolling word hash.
@@ -43,7 +41,6 @@ impl Context {
             bpos: 0,
             c4: 0,
             word_hash: 0,
-            prev_word: 0,
         }
     }
 
@@ -77,9 +74,6 @@ impl Context {
                 .wrapping_mul(WORD_PRIME)
                 .wrapping_add(u64::from(b) + 1);
         } else {
-            if self.word_hash != 0 {
-                self.prev_word = self.word_hash;
-            }
             self.word_hash = 0;
         }
         self.c0 = 1;
