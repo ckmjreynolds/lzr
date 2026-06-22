@@ -1,34 +1,21 @@
-//! Dictionary transform: replace frequent tokens with single-byte codes.
+//! Free code-byte pool, plus the (retired) substring dictionary.
 //!
-//! Runs right after case folding. Each entry is a whole *token* — a maximal run
-//! of letters (`a..=z`) or of non-letters — replaced by one reserved code byte.
-//! The win is context extension: a frequent token collapsed to one byte lets the
-//! fixed-order and word models reach further back in tokens.
+//! [`code_pool`] enumerates the 74 byte values absent from the post-fold stream
+//! (48 census-free C0/high, minus the two case-fold markers, plus the 26 `A..=Z`
+//! freed by folding) — the codes any post-fold transform may emit unambiguously.
+//! It is the shared pool now used by [`super::word_dict`].
 //!
-//! Codes are drawn from the bytes absent from the post-fold stream: the 48
-//! census-free C0/high values (minus the two case-fold markers) plus the 26
-//! `A..=Z` freed by folding — 74 in all. They are assigned **highest byte value
-//! first**, so the most useful entry gets `0xFF`; reclaiming a code for another
-//! purpose drops the least useful entry (the lowest assigned byte).
-//!
-//! Reversibility is clean with no escaping: code bytes are absent from the
-//! post-fold stream by construction, so a code in the output is unambiguously a
-//! replacement, never literal data.
+//! The longest-match substring [`Dictionary`] below was the earlier dictionary
+//! form; it is superseded by the word dictionary (see the 2026-06-22 journal
+//! entry) and kept only for the offline `dict_*` selection tests, hence
+//! `#[cfg(test)]`.
 
+#[cfg(test)]
 use std::collections::HashMap;
 
+#[cfg(test)]
 use super::Preprocessor;
 
-/// The shipped dictionary entries, **savings-descending** (most useful first, so
-/// it takes the highest code byte and the least useful is the natural one to drop
-/// for reclamation). An empty list is an identity transform.
-///
-/// Currently empty: the substring dictionary is tabled. The prior 41-entry list
-/// (selected by isolated-savings on enwik8, commit 9527df0) is preserved in git
-/// history and [`JOURNAL.md`]. It was disabled after the cost-map analysis showed
-/// that single-byte substring-removal codes are the wrong form of dictionary for
-/// this stack — see the 2026-06-22 journal entry.
-const EMBEDDED: &[&[u8]] = &[];
 /// The 74 code bytes, **descending** — assigned to entries in order.
 pub(crate) fn code_pool() -> Vec<u8> {
     let mut pool: Vec<u8> = Vec::with_capacity(74);
@@ -44,6 +31,7 @@ pub(crate) fn code_pool() -> Vec<u8> {
 
 /// One trie node: the code if a dictionary entry ends here, plus byte-keyed
 /// children (arena indices).
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct Node {
     code: Option<u8>,
@@ -53,6 +41,7 @@ struct Node {
 /// Longest-match substring dictionary. Entries are arbitrary byte strings (they
 /// may overlap and cross any boundary), so the forward pass walks a trie at each
 /// position and replaces the longest matching entry with its code byte.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct Dictionary {
     nodes: Vec<Node>, // arena; node 0 is the root
@@ -60,6 +49,7 @@ pub(crate) struct Dictionary {
     active: bool,
 }
 
+#[cfg(test)]
 impl Dictionary {
     /// Build from entries in priority order; codes assigned highest byte first.
     pub(crate) fn new(entries: &[&[u8]]) -> Self {
@@ -86,11 +76,6 @@ impl Dictionary {
         }
     }
 
-    /// The shipped dictionary.
-    pub(crate) fn embedded() -> Self {
-        Self::new(EMBEDDED)
-    }
-
     /// The longest entry matching at `input[i..]`, as `(code, length)`.
     fn longest_match(&self, input: &[u8], i: usize) -> Option<(u8, usize)> {
         let mut node = 0;
@@ -108,6 +93,7 @@ impl Dictionary {
     }
 }
 
+#[cfg(test)]
 impl Preprocessor for Dictionary {
     fn forward(&self, input: &[u8]) -> Vec<u8> {
         if !self.active {

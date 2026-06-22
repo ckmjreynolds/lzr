@@ -655,4 +655,196 @@ mod tests {
         std::fs::write(format!("{prefix}_summary.txt"), &s).unwrap();
         print!("{s}");
     }
+
+    /// Fair test of a SOTA-style word-canonicalizing dictionary (DRT-like). A
+    /// real word list is mined from case-folded enwik8 by frequency and assigned
+    /// codes from the 74 free post-fold bytes in three tiers — most-frequent
+    /// words get 1-byte codes, then 2-byte (lead + index), then 3-byte (lead +
+    /// two index bytes), each word taken only if its code is shorter than the
+    /// word — so up to ~1M words fit (enough for the full ~44K SOTA list). The
+    /// reversible transform replaces whole `a..=z` words with their codes; we
+    /// then encode the *same* enwik8 slice with the current full stack,
+    /// transformed vs. not. `L(D)` (the shipped word list) is reported so the
+    /// net is visible. Params: `LZR_NS` (comma list of dictionary sizes, default
+    /// `2000,44000`), `LZR_LO`/`LZR_HI` (slice, default full enwik8). The
+    /// baseline is encoded once and shared across sizes. Run:
+    /// `cargo test --release word_dict_test -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: word-canonicalizing dictionary vs. current stack"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines
+    )]
+    fn word_dict_test() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::dictionary::code_pool;
+        use std::collections::HashMap;
+
+        let corpus = std::env::var("LZR_CORPUS").unwrap_or_else(|_| "assets/enwik8".into());
+        let Ok(e8) = std::fs::read(&corpus) else {
+            return;
+        };
+        let e8_len = e8.len();
+        let folded = CaseFold.forward(&e8);
+        drop(e8);
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let ns: Vec<usize> = std::env::var("LZR_NS")
+            .unwrap_or_else(|_| "2000,44000".into())
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        let lo = env("LZR_LO", 0);
+        let hi = env("LZR_HI", folded.len()).min(folded.len());
+
+        // Word frequency over maximal a..=z runs of the whole folded corpus.
+        let mut freq: HashMap<&[u8], u32> = HashMap::new();
+        let mut i = 0;
+        while i < folded.len() {
+            if folded[i].is_ascii_lowercase() {
+                let s = i;
+                while i < folded.len() && folded[i].is_ascii_lowercase() {
+                    i += 1;
+                }
+                *freq.entry(&folded[s..i]).or_insert(0) += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let mut words: Vec<(&[u8], u32)> = freq.into_iter().collect();
+        words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+        // Code tiers from the 74 free bytes: 24 single, 34 two-byte leads
+        // (34*256), 16 three-byte leads (16*65536).
+        let pool = code_pool();
+        let singles = &pool[..24];
+        let leads2 = &pool[24..58];
+        let leads3 = &pool[58..];
+
+        let slice = &folded[lo..hi];
+        // bpb is per *original* byte; scale the folded-slice length back by the
+        // fold ratio (exact for the full corpus, lo=0..folded.len()).
+        let orig = (hi - lo) as f64 * e8_len as f64 / folded.len() as f64;
+        let base = code_stream(slice).len();
+        let base_bpb = base as f64 * 8.0 / orig;
+        println!("baseline_bpb={base_bpb:.4} (slice {} bytes)", slice.len());
+
+        for &nmax in &ns {
+            let mut code_of: HashMap<&[u8], Vec<u8>> = HashMap::new();
+            let mut is1 = [false; 256];
+            let mut is2 = [false; 256];
+            let mut is3 = [false; 256];
+            let mut rev1: Vec<Option<&[u8]>> = vec![None; 256];
+            let mut rev2: HashMap<u16, &[u8]> = HashMap::new();
+            let mut rev3: HashMap<u32, &[u8]> = HashMap::new();
+            let (mut s1, mut s2, mut s3) = (0usize, 0usize, 0usize);
+            let mut dict_bytes = 0usize;
+            for (w, _f) in &words {
+                if code_of.len() >= nmax {
+                    break;
+                }
+                if s1 < singles.len() && w.len() > 1 {
+                    let c = singles[s1];
+                    is1[c as usize] = true;
+                    rev1[c as usize] = Some(w);
+                    code_of.insert(w, vec![c]);
+                    s1 += 1;
+                } else if s2 < leads2.len() * 256 && w.len() > 2 {
+                    let (lead, idx) = (leads2[s2 / 256], (s2 % 256) as u8);
+                    is2[lead as usize] = true;
+                    rev2.insert((u16::from(lead) << 8) | u16::from(idx), w);
+                    code_of.insert(w, vec![lead, idx]);
+                    s2 += 1;
+                } else if s3 < leads3.len() * 65536 && w.len() > 3 {
+                    let lead = leads3[s3 / 65536];
+                    let (b1, b2) = (((s3 >> 8) & 0xff) as u8, (s3 & 0xff) as u8);
+                    is3[lead as usize] = true;
+                    rev3.insert(
+                        (u32::from(lead) << 16) | (u32::from(b1) << 8) | u32::from(b2),
+                        w,
+                    );
+                    code_of.insert(w, vec![lead, b1, b2]);
+                    s3 += 1;
+                } else if s1 >= singles.len()
+                    && s2 >= leads2.len() * 256
+                    && s3 >= leads3.len() * 65536
+                {
+                    break;
+                } else {
+                    continue;
+                }
+                dict_bytes += w.len();
+            }
+
+            let forward = |data: &[u8]| -> Vec<u8> {
+                let mut out = Vec::with_capacity(data.len());
+                let mut i = 0;
+                while i < data.len() {
+                    if data[i].is_ascii_lowercase() {
+                        let s = i;
+                        while i < data.len() && data[i].is_ascii_lowercase() {
+                            i += 1;
+                        }
+                        if let Some(c) = code_of.get(&data[s..i]) {
+                            out.extend_from_slice(c);
+                        } else {
+                            out.extend_from_slice(&data[s..i]);
+                        }
+                    } else {
+                        out.push(data[i]);
+                        i += 1;
+                    }
+                }
+                out
+            };
+            let inverse = |data: &[u8]| -> Vec<u8> {
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < data.len() {
+                    let b = data[i];
+                    if is1[b as usize] {
+                        out.extend_from_slice(rev1[b as usize].unwrap());
+                        i += 1;
+                    } else if is2[b as usize] {
+                        let key = (u16::from(b) << 8) | u16::from(data[i + 1]);
+                        out.extend_from_slice(rev2[&key]);
+                        i += 2;
+                    } else if is3[b as usize] {
+                        let key = (u32::from(b) << 16)
+                            | (u32::from(data[i + 1]) << 8)
+                            | u32::from(data[i + 2]);
+                        out.extend_from_slice(rev3[&key]);
+                        i += 3;
+                    } else {
+                        out.push(b);
+                        i += 1;
+                    }
+                }
+                out
+            };
+
+            let transformed = forward(slice);
+            assert_eq!(
+                inverse(&transformed),
+                slice,
+                "word transform must round-trip"
+            );
+            let treat = code_stream(&transformed).len();
+            let treat_bpb = treat as f64 * 8.0 / orig;
+            let ld_bpb = 16.0 * dict_bytes as f64 / 1e9; // enwik9 L(D): 2x, 8 bits, /1e9
+            println!(
+                "N={nmax} words_coded={} dict_bytes={dict_bytes} ({:.1}% shorter) treated_bpb={treat_bpb:.4} L(C)_delta={:.4} L(D)_enwik9={ld_bpb:.4} net={:.4}",
+                code_of.len(),
+                100.0 * (slice.len() - transformed.len()) as f64 / slice.len() as f64,
+                treat_bpb - base_bpb,
+                (treat_bpb - base_bpb) + ld_bpb
+            );
+        }
+    }
 }

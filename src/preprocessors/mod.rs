@@ -39,6 +39,7 @@ pub(crate) mod casefold;
 pub(crate) mod dictionary;
 #[cfg(debug_assertions)]
 pub(crate) mod guard;
+pub(crate) mod word_dict;
 
 /// A reversible transform applied to the byte stream.
 pub(crate) trait Preprocessor {
@@ -62,7 +63,7 @@ impl Pipeline {
             #[cfg(debug_assertions)]
             Box::new(guard::Guard),
             Box::new(casefold::CaseFold),
-            Box::new(dictionary::Dictionary::embedded()),
+            Box::new(word_dict::WordDict::embedded()),
         ];
         Self { stages }
     }
