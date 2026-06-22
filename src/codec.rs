@@ -118,16 +118,28 @@ fn read_varint(input: &[u8]) -> (u64, usize) {
     }
 }
 
-/// Arithmetic-code an already-preprocessed byte stream. The codec proper, with
-/// no pipeline — `encode` wraps this after preprocessing; experiments call it
-/// directly on a custom-preprocessed stream.
+/// Arithmetic-code an already-preprocessed byte stream with no pipeline and no
+/// progress — used by the offline preprocessor experiments.
+#[cfg(test)]
 fn code_stream(data: &[u8]) -> Vec<u8> {
+    code_stream_inner(data, data.len(), false)
+}
+
+/// As [`code_stream`], but `orig_len` (the pre-pipeline length, for bpb scaling)
+/// and a `progress` flag enable periodic stderr ETA / running-bpb lines on large
+/// encodes — the binary writes its output only at the end, so this is the only
+/// window into a multi-hour run. Progress never affects the coded output.
+#[allow(clippy::cast_precision_loss)]
+fn code_stream_inner(data: &[u8], orig_len: usize, progress: bool) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, data.len() as u64);
 
     let mut state = CodecState::new(data.len());
     let mut enc = Encoder::new();
-    for &byte in data {
+    let start = std::time::Instant::now();
+    let report = progress && data.len() > 10_000_000;
+    let step = (data.len() / 100).max(1);
+    for (i, &byte) in data.iter().enumerate() {
         for k in (0..8).rev() {
             let bit = (byte >> k) & 1;
             let p = state.predict();
@@ -135,6 +147,21 @@ fn code_stream(data: &[u8]) -> Vec<u8> {
             state.commit(bit);
         }
         state.end_symbol();
+        if report && (i + 1) % step == 0 {
+            let pos = i + 1;
+            let elapsed = start.elapsed().as_secs_f64();
+            let frac = pos as f64 / data.len() as f64;
+            let rate = pos as f64 / elapsed;
+            let eta_h = (data.len() - pos) as f64 / rate / 3600.0;
+            let bpb = enc.output_len() as f64 * 8.0 / (frac * orig_len as f64);
+            eprintln!(
+                "[lzr] {:.1}% | {:.0}/{:.0} MB | {:.1} KB/s | ETA {eta_h:.1}h | bpb~{bpb:.4}",
+                frac * 100.0,
+                pos as f64 / 1e6,
+                data.len() as f64 / 1e6,
+                rate / 1e3,
+            );
+        }
     }
 
     out.extend_from_slice(&enc.finish());
@@ -188,7 +215,8 @@ pub(crate) fn decode_stream_models(models: Vec<Box<dyn Model>>, input: &[u8]) ->
 
 /// Compress `input` into the lzr byte stream.
 pub(crate) fn encode(input: &[u8]) -> Vec<u8> {
-    code_stream(&Pipeline::default_pipeline().forward(input))
+    let data = Pipeline::default_pipeline().forward(input);
+    code_stream_inner(&data, input.len(), true)
 }
 
 /// Decompress an lzr byte stream back into the original bytes.

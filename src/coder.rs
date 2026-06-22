@@ -42,6 +42,12 @@ impl Encoder {
         }
     }
 
+    /// Coded bytes emitted so far (grows as the range renormalizes) — used for
+    /// live progress on long encodes.
+    pub(crate) fn output_len(&self) -> usize {
+        self.out.len()
+    }
+
     /// Flush remaining state and return the coded bytes.
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn finish(mut self) -> Vec<u8> {
