@@ -21,54 +21,14 @@ use super::Preprocessor;
 
 /// The shipped dictionary entries, **savings-descending** (most useful first, so
 /// it takes the highest code byte and the least useful is the natural one to drop
-/// for reclamation). Picked offline by the isolated-savings selection (the
-/// `dict_isolated` `#[ignore]` test): the candidates with positive standalone
-/// byte savings on enwik8, comments showing those savings. An empty list is an
-/// identity transform.
-const EMBEDDED: &[&[u8]] = &[
-    b"he ",                                                              // +50849
-    b">\x0a    ",                                                        // +35796
-    b"uot;",                                                             // +25417
-    b"nd ",                                                              // +21225
-    b"ion",                                                              // +15196
-    b"f ",                                                               // +8677
-    b"t;",                                                               // +6680
-    b"d>\x0a    <revision>\x0a      <id>",                               // +5661
-    b"    ",                                                             // +3869
-    b"\x00category:",                                                    // +3656
-    b"omment>\x0a      <text xml:space=\"preserve\">",                   // +3183
-    b"</\x01timestamp>\x0a      <contributor>\x0a        <",             // +3123
-    b"&gt;",                                                             // +2933
-    b"/id>\x0a    ",                                                     // +2652
-    b"text>\x0a    </revision>\x0a  </page>\x0a  <page>\x0a    <title>", // +2501
-    b"sername>\x0a        <id>",                                         // +2445
-    b">\x0a      <t",                                                    // +1788
-    b"/id>\x0a      </contributor>\x0a      <",                          // +1678
-    b"sion>\x0a      <id>",                                              // +1552
-    b">\x0a        <",                                                   // +1049
-    b"  <",                                                              // +951
-    b"quot;",                                                            // +851
-    b"ext xml:space=\"preserve\">",                                      // +734
-    b">\x0a      <",                                                     // +509
-    b">\x0a      </contributor>\x0a      <minor />\x0a      <comment>",  // +442
-    b">\x0a      </contributor>\x0a      <",                             // +373
-    b"category:",                                                        // +370
-    b">\x0a      ",                                                      // +324
-    b"text xml:space=\"preserve\"",                                      // +241
-    b">\x0a      <text xml:space=\"preserve\">",                         // +232
-    b"ision>\x0a      <id>",                                             // +222
-    b"/comment>\x0a      <text xml:space=\"preserve\"",                  // +209
-    b"(\x01u.s. c\x01ensus)|\x00",                                       // +188
-    b"timestamp>",                                                       // +171
-    b"comment>\x0a      <text xml:space=\"preserve\">",                  // +135
-    b"contrib",                                                          // +122
-    b".s. c\x01ensus)|",                                                 // +101
-    b"uot",                                                              // +93
-    b">\x0a  <page>\x0a    <title>",                                     // +64
-    b">\x0a",                                                            // +39
-    b">\x0a  ",                                                          // +9
-];
-
+/// for reclamation). An empty list is an identity transform.
+///
+/// Currently empty: the substring dictionary is tabled. The prior 41-entry list
+/// (selected by isolated-savings on enwik8, commit 9527df0) is preserved in git
+/// history and [`JOURNAL.md`]. It was disabled after the cost-map analysis showed
+/// that single-byte substring-removal codes are the wrong form of dictionary for
+/// this stack — see the 2026-06-22 journal entry.
+const EMBEDDED: &[&[u8]] = &[];
 /// The 74 code bytes, **descending** — assigned to entries in order.
 pub(crate) fn code_pool() -> Vec<u8> {
     let mut pool: Vec<u8> = Vec::with_capacity(74);

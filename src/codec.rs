@@ -494,4 +494,165 @@ mod tests {
             println!("    b\"{}\", // +{}", esc(&accepted[i]), savings[i]);
         }
     }
+
+    /// Offline diagnostic: a per-byte coding-cost map. Encodes the corpus through
+    /// the real pipeline and records, for every coded byte, the ideal bits the
+    /// coder spends on it (`log2(4096 / p_correct)` summed over its 8 bits) plus
+    /// each model's *standalone* bits (its own squashed logit). Three artifacts
+    /// under the `LZR_OUT` prefix (default `/tmp/cost`):
+    ///   * `<prefix>_byte.f32`  — `[u64 LE count][count x f32 LE]`, bits/coded byte.
+    ///   * `<prefix>_lines.tsv` — one row per line (split on LF, which survives
+    ///     case-fold so lines map to originals): idx, coded offset, coded len,
+    ///     total bits, bpb, per-model bits, escaped 100-byte snippet.
+    ///   * `<prefix>_summary.txt` — overall bpb, per-model standalone bpb, and a
+    ///     per-byte-value table (count, total bits, mean bits) sorted by total —
+    ///     where the bulk of the bits go.
+    ///
+    /// Corpus is `LZR_CORPUS` (default `assets/enwik8`). Run:
+    /// `cargo test --release cost_map -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: per-byte coding-cost map"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
+    fn cost_map() {
+        use crate::mixer::squash;
+        use std::fmt::Write as _;
+        use std::io::{BufWriter, Write as _};
+
+        let corpus = std::env::var("LZR_CORPUS").unwrap_or_else(|_| "assets/enwik8".into());
+        let prefix = std::env::var("LZR_OUT").unwrap_or_else(|_| "/tmp/cost".into());
+        let Ok(raw) = std::fs::read(&corpus) else {
+            return;
+        };
+        let orig_len = raw.len();
+        let data = Pipeline::default_pipeline().forward(&raw);
+        drop(raw);
+        let n = data.len();
+        if n == 0 {
+            return;
+        }
+
+        let mut state = CodecState::new(n);
+        let nm = state.stretched.len();
+
+        let mut byte_f =
+            BufWriter::new(std::fs::File::create(format!("{prefix}_byte.f32")).unwrap());
+        byte_f.write_all(&(n as u64).to_le_bytes()).unwrap();
+        let mut lines =
+            BufWriter::new(std::fs::File::create(format!("{prefix}_lines.tsv")).unwrap());
+        write!(lines, "line\toff\tlen\tbits\tbpb").unwrap();
+        for mi in 0..nm {
+            write!(lines, "\tm{mi}").unwrap();
+        }
+        writeln!(lines, "\tsnippet").unwrap();
+
+        let mut total_bits = 0f64;
+        let mut model_bits = vec![0f64; nm];
+        let mut val_cnt = vec![0u64; 256];
+        let mut val_bits = vec![0f64; 256];
+
+        let mut line_idx = 0u64;
+        let mut line_start = 0usize;
+        let mut line_bits = 0f64;
+        let mut line_model = vec![0f64; nm];
+
+        for (pos, &byte) in data.iter().enumerate() {
+            let mut byte_bits = 0f64;
+            for k in (0..8).rev() {
+                let bit = (byte >> k) & 1;
+                // mirror the coder's clamp (coder.rs): p is forced into 1..=4095.
+                let p = f64::from(state.predict().clamp(1, 4095));
+                let pc = if bit == 1 { p } else { 4096.0 - p };
+                byte_bits += (4096.0 / pc).log2();
+                for (mi, &s) in state.stretched.iter().enumerate() {
+                    let pm = f64::from(squash(s));
+                    let pmc = if bit == 1 { pm } else { 4096.0 - pm };
+                    let b = (4096.0 / pmc).log2();
+                    model_bits[mi] += b;
+                    line_model[mi] += b;
+                }
+                state.commit(bit);
+            }
+            state.end_symbol();
+
+            byte_f.write_all(&(byte_bits as f32).to_le_bytes()).unwrap();
+            total_bits += byte_bits;
+            val_cnt[byte as usize] += 1;
+            val_bits[byte as usize] += byte_bits;
+            line_bits += byte_bits;
+
+            if byte == b'\n' || pos + 1 == n {
+                let len = pos + 1 - line_start;
+                write!(
+                    lines,
+                    "{line_idx}\t{line_start}\t{len}\t{line_bits:.3}\t{:.4}",
+                    line_bits / len as f64
+                )
+                .unwrap();
+                for v in &line_model {
+                    write!(lines, "\t{v:.1}").unwrap();
+                }
+                let end = (line_start + 100).min(pos + 1);
+                writeln!(lines, "\t{}", esc(&data[line_start..end])).unwrap();
+                line_idx += 1;
+                line_start = pos + 1;
+                line_bits = 0.0;
+                line_model.fill(0.0);
+            }
+
+            if pos > 0 && pos % 10_000_000 == 0 {
+                eprintln!(
+                    "  {pos}/{n} coded bytes, {:.4} bpb so far",
+                    total_bits / (pos as f64 + 1.0)
+                );
+            }
+        }
+        byte_f.flush().unwrap();
+        lines.flush().unwrap();
+
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "coded_bytes={n} original_bytes={orig_len} total_bits={total_bits:.0}"
+        );
+        let _ = writeln!(
+            s,
+            "bpb_coded={:.4} bpb_original={:.4}",
+            total_bits / n as f64,
+            total_bits / orig_len as f64
+        );
+        let _ = writeln!(s, "\n=== per-model standalone (bits, bpb_coded) ===");
+        let mut mi_order: Vec<usize> = (0..nm).collect();
+        mi_order.sort_by(|&a, &b| model_bits[b].total_cmp(&model_bits[a]));
+        for mi in mi_order {
+            let _ = writeln!(
+                s,
+                "m{mi}\t{:.0}\t{:.4}",
+                model_bits[mi],
+                model_bits[mi] / n as f64
+            );
+        }
+        let _ = writeln!(
+            s,
+            "\n=== per-byte-value (byte, count, total_bits, mean) ==="
+        );
+        let mut bv: Vec<usize> = (0..256).filter(|&v| val_cnt[v] > 0).collect();
+        bv.sort_by(|&a, &b| val_bits[b].total_cmp(&val_bits[a]));
+        for v in bv {
+            let _ = writeln!(
+                s,
+                "{}\t{}\t{:.0}\t{:.3}",
+                esc(&[v as u8]),
+                val_cnt[v],
+                val_bits[v],
+                val_bits[v] / val_cnt[v] as f64
+            );
+        }
+        std::fs::write(format!("{prefix}_summary.txt"), &s).unwrap();
+        print!("{s}");
+    }
 }
