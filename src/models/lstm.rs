@@ -406,10 +406,10 @@ impl ArmModel {
     const V: usize = 256;
     const WIN: usize = 16;
     /// Hidden width — the operating point. Trades bpb for throughput: the
-    /// enwik8 e2e marginal/enwik9 ETA was h=64 −0.046/7.1h, h=96 −0.061/11.6h,
-    /// h=128 −0.059(full)/16.9h. We ship h=128 for max gain and may decrease it
-    /// for throughput headroom (h=96 keeps ~90% of the gain at 1.46×).
-    pub(crate) const H: usize = 128;
+    /// enwik8 e2e marginal / enwik9 ETA was h=64 −0.046/7.1h, h=96 −0.061/11.6h,
+    /// h=128 −0.068/16.9h (5 MB slice). We ship h=96, the knee: ~90% of h=128's
+    /// gain at 1.46× the speed (the 96→128 step buys only −0.0065 more for +5.3h).
+    pub(crate) const H: usize = 96;
 
     /// The shipped arm at the default hidden width [`Self::H`].
     pub(crate) fn arm() -> Self {
