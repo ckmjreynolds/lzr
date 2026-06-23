@@ -92,10 +92,16 @@ impl CodecState {
         for (m, s) in self.models.iter_mut().zip(&mut self.stretched) {
             *s = m.predict(&self.ctx);
         }
-        let mctx = (self.ctx.c4 & 0xff) as usize;
+        let c4 = self.ctx.c4;
+        let msel = [
+            (c4 & 0xff) as usize,                 // c1
+            ((c4 >> 8) & 0xff) as usize,          // c2
+            ((c4 >> 16) & 0xff) as usize,         // c3
+            (self.ctx.word_hash & 0xff) as usize, // current word
+        ];
         let pm = self
             .mixer
-            .mix(&self.stretched, mctx, usize::from(self.ctx.bpos));
+            .mix(&self.stretched, &msel, usize::from(self.ctx.bpos));
         let pa = self.apm.refine(pm, (self.ctx.c0 & 0xff) as usize);
         ((pm + 3 * pa + 2) >> 2) as u32
     }

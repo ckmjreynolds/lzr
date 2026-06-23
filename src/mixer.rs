@@ -66,58 +66,77 @@ pub(crate) fn stretch(p: i32) -> i32 {
 }
 
 const BIT_POSITIONS: usize = 8;
-const MIX_CTX: usize = 256; // mixer weight-set contexts: the previous byte
-const NUM_SETS: usize = MIX_CTX * BIT_POSITIONS; // a weight set per (prev byte, bit)
 const LR_SHIFT: i32 = 12;
 
-/// Adaptive logistic mixer with one weight set selected per call.
+/// Adaptive logistic mixer: several sub-mixers, each with its own weight set
+/// selected by a *different* local context (previous byte c1/c2/c3 and the
+/// current word hash), all crossed with bit-position. Their logits are averaged
+/// (then squashed once). Averaging decorrelated selectors — rather than learning
+/// one global blend or a second-level meta-mixer over correlated selectors — is
+/// the lever (v7): each selector specializes the blend for a different regime.
 #[derive(Debug)]
 pub(crate) struct Mixer {
     n: usize,
-    weights: Vec<i32>, // [NUM_SETS * n], 16.16 fixed point
+    cards: Vec<usize>, // contexts per sub-mixer (crossed with bit-position)
+    w: Vec<Vec<i32>>,  // per sub-mixer weights, [cards[k] * 8 * n], 16.16 fixed
     inputs: Vec<i32>,  // stretched inputs from the last `mix`
-    set: usize,        // offset into `weights` of the selected set
+    set: Vec<usize>,   // selected offset per sub-mixer from the last `mix`
     pr: i32,           // last squashed prediction (12-bit)
 }
 
 impl Mixer {
-    /// New mixer over `n` model inputs, weights zeroed.
+    /// New mixer over `n` model inputs. Four sub-mixers, selected by c1, c2, c3
+    /// and the word-hash byte respectively (all × bit-position).
     pub(crate) fn new(n: usize) -> Self {
+        let cards = vec![256usize, 256, 256, 256];
+        let w = cards
+            .iter()
+            .map(|&c| vec![0i32; c * BIT_POSITIONS * n])
+            .collect();
+        let set = vec![0usize; cards.len()];
         Self {
             n,
-            weights: vec![0; NUM_SETS * n],
+            cards,
+            w,
             inputs: vec![0; n],
-            set: 0,
+            set,
             pr: PROB_ONE / 2,
         }
     }
 
-    /// Mix the `stretched` model outputs into a 12-bit probability. The weight
-    /// set is selected by `(ctx, bpos)` — a per-(previous-byte, bit-position)
-    /// set, so the blend can differ by local context.
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn mix(&mut self, stretched: &[i32], ctx: usize, bpos: usize) -> i32 {
-        self.set = ((ctx % MIX_CTX) * BIT_POSITIONS + bpos) * self.n;
+    /// Mix the `stretched` model outputs into a 12-bit probability. `sel[k]` is
+    /// the context selecting sub-mixer `k`'s weight set (crossed with `bpos`).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::needless_range_loop
+    )]
+    pub(crate) fn mix(&mut self, stretched: &[i32], sel: &[usize], bpos: usize) -> i32 {
         self.inputs.copy_from_slice(stretched);
-        let mut dot: i64 = 0;
-        for (w, x) in self.weights[self.set..self.set + self.n]
-            .iter()
-            .zip(stretched)
-        {
-            dot += i64::from(*w) * i64::from(*x);
+        let nsub = self.w.len();
+        let mut acc: i64 = 0;
+        for k in 0..nsub {
+            let off = ((sel[k] % self.cards[k]) * BIT_POSITIONS + bpos) * self.n;
+            self.set[k] = off;
+            let mut dot: i64 = 0;
+            for (wt, st) in self.w[k][off..off + self.n].iter().zip(stretched) {
+                dot += i64::from(*wt) * i64::from(*st);
+            }
+            acc += dot >> 16;
         }
-        self.pr = squash((dot >> 16) as i32);
+        self.pr = squash((acc / nsub as i64) as i32);
         self.pr
     }
 
-    /// Adapt the selected weight set toward the observed `bit`.
+    /// Adapt each sub-mixer's selected weight set toward the observed `bit`.
+    #[allow(clippy::needless_range_loop)]
     pub(crate) fn update(&mut self, bit: u8) {
         let err = (i32::from(bit) << PROB_BITS) - self.pr;
-        for (w, x) in self.weights[self.set..self.set + self.n]
-            .iter_mut()
-            .zip(&self.inputs)
-        {
-            *w += (x * err) >> LR_SHIFT;
+        for k in 0..self.w.len() {
+            let off = self.set[k];
+            for (wt, st) in self.w[k][off..off + self.n].iter_mut().zip(&self.inputs) {
+                *wt += (st * err) >> LR_SHIFT;
+            }
         }
     }
 }
