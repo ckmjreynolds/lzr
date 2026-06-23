@@ -6,6 +6,7 @@
 
 pub(crate) mod context;
 pub(crate) mod finder;
+#[cfg(feature = "arm")]
 pub(crate) mod lstm;
 #[cfg(test)]
 mod lstm_spike;

@@ -19,7 +19,11 @@ The favorable shape for us is **one binary serving both directions**: the binary
 
 ## Build
 
-Always build via `./build.sh`, not a bare `cargo build`. The script runs fmt, clippy (default features + no-default-features) with `-Dwarnings`, release tests, and nightly coverage. It also enforces the **zero-threading-dependency** invariant via `cargo tree --features submission` — adding rayon, crossbeam, gemm, tokio, async-std (or anything that pulls them in transitively) is a regression. If `build.sh` fails, fix the root cause — do not bypass with `--no-verify` or `-A warnings`.
+Always build via `./build.sh`, not a bare `cargo build`. The script runs fmt, clippy (default features + no-default-features + `--features arm`) with `-Dwarnings`, release tests (default and `--features arm`), and nightly coverage. It also enforces the **zero-threading-dependency** invariant via `cargo tree --features submission` — adding rayon, crossbeam, gemm, tokio, async-std (or anything that pulls them in transitively) is a regression. If `build.sh` fails, fix the root cause — do not bypass with `--no-verify` or `-A warnings`.
+
+**The `arm` feature is the online-neural LSTM arm — opt-in, NOT shipped.** It is ~50× slower (enwik9 ~12 h) for a modest gain (enwik9 L(C) 1.4032 vs deterministic 1.4136, ~−0.01 net), so `default`/`submission` stay deterministic and fast; the arm lives behind `--features arm` (`src/models/lstm.rs`) for experiments. `default == submission` (both arm-free) still holds. Whether to ship it is a deferred decision pending cheaper levers.
+
+**Do not run any enwik9 encode/test without explicit approval** — a full enwik9 run is hours (≈0.3 h deterministic, ≈12 h with the arm). Iterate and measure on enwik8 or slices; request enwik9 confirmation runs explicitly. No non-`#[ignore]` test reads enwik9.
 
 ## Architecture constraints
 

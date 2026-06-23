@@ -8,14 +8,18 @@
 use crate::coder::{Decoder, Encoder};
 use crate::mixer::{Apm, Mixer};
 use crate::models::context::ContextModel;
+#[cfg(feature = "arm")]
 use crate::models::lstm::ArmModel;
 use crate::models::match_model::MatchModel;
 use crate::models::{Context, Model};
 use crate::preprocessors::Pipeline;
 
-/// The active model set. Adding a model is one line here.
+/// The active model set. Adding a model is one line here. The online-neural arm
+/// is appended only under `--features arm` (opt-in, not shipped — see Cargo.toml).
 fn models() -> Vec<Box<dyn Model>> {
-    vec![
+    // `mut` is only used when the arm feature appends below.
+    #[cfg_attr(not(feature = "arm"), allow(unused_mut))]
+    let mut v: Vec<Box<dyn Model>> = vec![
         Box::new(ContextModel::new(0)),
         Box::new(ContextModel::new(1)),
         Box::new(ContextModel::new(2)),
@@ -25,8 +29,10 @@ fn models() -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::new(6)),
         Box::new(ContextModel::word()),
         Box::new(MatchModel::new()),
-        Box::new(ArmModel::arm()),
-    ]
+    ];
+    #[cfg(feature = "arm")]
+    v.push(Box::new(ArmModel::arm()));
+    v
 }
 
 const APM_CTX: usize = 256; // SSE contexts: the partial-byte node `c0`
@@ -190,8 +196,9 @@ pub(crate) fn code_stream_models(models: Vec<Box<dyn Model>>, data: &[u8]) -> Ve
 
 /// Decode counterpart of [`code_stream_models`] (ablation/round-trip only):
 /// decodes a stream produced by `code_stream_models` with the same model set.
-/// Operates on the coded bytes directly (no pipeline inverse).
-#[cfg(test)]
+/// Operates on the coded bytes directly (no pipeline inverse). Only the arm's
+/// round-trip test uses it, so it is gated to that feature to stay dead-code-free.
+#[cfg(all(test, feature = "arm"))]
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn decode_stream_models(models: Vec<Box<dyn Model>>, input: &[u8]) -> Vec<u8> {
     let (len, header) = read_varint(input);

@@ -18,6 +18,10 @@ cargo $TC clippy --all-targets -- -Dwarnings || exit
 # Bare-bones build (no features) also compiles clippy-clean.
 cargo $TC clippy --no-default-features --all-targets -- -Dwarnings || exit
 
+# Opt-in online-neural arm (`--features arm`): not shipped, but must stay
+# clippy-clean and pass its correctness tests (gradient check + round-trip).
+cargo $TC clippy --features arm --all-targets -- -Dwarnings || exit
+
 # CLAUDE.md invariant: the submission binary must not pull in a threading
 # crate. `cargo tree` splits its output into the main dep tree and a
 # `[dev-dependencies]` section; we only care about the main tree.
@@ -30,8 +34,11 @@ if cargo $TC tree --features submission -e=no-dev 2>/dev/null | \
   exit 1
 fi
 
-# Tests.
+# Tests (default = fast, arm-free).
 cargo $TC test --release -- --nocapture 2>&1 || exit
+
+# Arm correctness: gradient check + byte-exact round-trip (small inputs, fast).
+cargo $TC test --release --features arm -- --nocapture 2>&1 || exit
 
 # Release binary.
 cargo $TC build --release || exit
