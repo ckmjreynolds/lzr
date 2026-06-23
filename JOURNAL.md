@@ -13,6 +13,18 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-23 (autonomous evening session, part 4) — derived-regime mixer selectors are a new vein: enwik8 20 MB slice 1.5929 → 1.5878
+
+After the SSE-blend retune the deterministic stack looked exhausted, but probing the *mixer-selector* axis with **derived run-relative features** — quantities the fixed-offset byte selectors c1/c2/c3 structurally cannot see — reopened it. The mixer gained three more averaged sub-mixers (it was five: c1/c2/c3/word/match-length), each selected by a feature tracked cheaply in `Context`:
+
+- **Word position** (letters into the current word, 0 between words): slice −0.0031 — the standout. Letter prediction depends heavily on depth into the word (a word's first letter vs its fifth are very different regimes), and nothing in the byte selectors encodes it.
+- **Digit-run position** (digits into the current number): slice −0.0013. Same idea for numbers — pairs with the field-aware numeric *model* from part 3.
+- **Column** (bytes since the last newline): slice −0.0007. Line-start (markup/indent) vs mid-line (prose) is a weak but real regime — notably, v7's column *context model* was a negative, but a coarse column *selector* helps, a clean illustration that the selector axis and the context axis behave differently.
+
+Two selector probes were neutral and reverted: a structural-mode FSM (Content/Tag/Attr/Template/Link — v7's −0.0070 as a selector does **not** transfer to this much stronger stack, matching the cost_map's tiny markup-structure ceiling), and a run-length (consecutive-repeat) selector (+0.0002, redundant with column + the position selectors). The lesson: the productive selectors are *token-relative positions* (where am I within the current word/number/line), not structural tags — the regime that matters here is "what kind of token am I in and how far," which is decorrelated from every byte-window selector. The mixer is now eight averaged sub-mixers; the per-bit cost grew modestly (enwik8 20 MB encode ~36 s → ~80 s over the whole session, enwik9 still well under the time budget).
+
+Combined with part 3, the session's cumulative slice is 1.6733 → 1.5878 (−0.0855). Authoritative full-enwik8 headline for the complete stack (eight sub-mixers, all wins): **1.4837 bpb, round-trip byte-exact, peak RSS 5.76 GB** — so the whole evening took full enwik8 **1.5608 → 1.4837 (−0.0771)** at L(D)≈0, enwik9-shippable (~8 GB projected). The selectors alone moved the full corpus 1.4892 → 1.4837 (−0.0055).
+
 ## 2026-06-23 (autonomous evening session, part 3) — a novel field-aware numeric model, an SSE-blend retune, and the session close: full enwik8 → 1.4892 (−0.0716), round-trip verified
 
 The last two wins and the session wrap-up. A `cost_map` probe sized the remaining numeric cost first: digit bytes are 4.79 % of all coded bits at a 2.9 bpb mean (the strong match model did not crush them), so a numeric model has a real ceiling — worth one new-signal attempt.
