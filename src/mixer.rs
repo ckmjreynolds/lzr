@@ -68,7 +68,7 @@ pub(crate) fn stretch(p: i32) -> i32 {
 const BIT_POSITIONS: usize = 8;
 const MIX_CTX: usize = 256; // mixer weight-set contexts: the previous byte
 const NUM_SETS: usize = MIX_CTX * BIT_POSITIONS; // a weight set per (prev byte, bit)
-const LR_SHIFT: i32 = 10;
+const LR_SHIFT: i32 = 12;
 
 /// Adaptive logistic mixer with one weight set selected per call.
 #[derive(Debug)]
