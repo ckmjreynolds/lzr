@@ -22,7 +22,7 @@ use super::statemap::StateMap;
 use super::{Context, Model};
 
 const MAX: u16 = 63; // count cap; with the 6-bit packing this bounds a state to 12 bits
-const HASH_BITS: u32 = 22; // hashed-table size for orders ≥ 3: 4M cells × 2 B = 8 MB
+const HASH_BITS: u32 = 26; // hashed-table size for orders ≥ 3: 64M cells × 2 B = 128 MB
 const SM_STATES: usize = 1 << 12; // (n0 << 6) | n1, each ≤ 63
 
 /// One observed bit moves the cell to its next bit-history state: bump the seen
