@@ -59,6 +59,11 @@ enum CtxKind {
     /// `byte_back(i + 1)`. Captures skip-gram dependencies the contiguous orders
     /// miss (e.g. context one step removed from a noisy delimiter byte).
     Sparse(u32),
+    /// Digit-run context: the field byte that preceded the run, the run-relative
+    /// position, and the last digit — signal the fixed-offset orders lack (a
+    /// digit's distribution depends on which field it's in and how far into the
+    /// number it is, e.g. timestamp/id positions).
+    Number,
 }
 
 /// A context model over bit-history states. The context is either the last `n`
@@ -121,6 +126,7 @@ impl ContextModel {
     fn hashed(kind: CtxKind, capacity: usize) -> Self {
         let bits = match kind {
             CtxKind::Sparse(mask) => hashed_bits(capacity).min(8 * mask.count_ones() + 8),
+            CtxKind::Number => hashed_bits(capacity).min(22), // small context space
             _ => hashed_bits(capacity),
         };
         Self {
@@ -145,6 +151,11 @@ impl ContextModel {
         Self::hashed(CtxKind::Sparse(mask), capacity)
     }
 
+    /// Keyed on the digit-run context (field byte, run position, last digit).
+    pub(crate) fn number(capacity: usize) -> Self {
+        Self::hashed(CtxKind::Number, capacity)
+    }
+
     fn context_value(&self, ctx: &Context) -> u64 {
         match self.kind {
             CtxKind::Order(order) => {
@@ -166,6 +177,11 @@ impl ContextModel {
                     m &= m - 1;
                 }
                 cv
+            }
+            CtxKind::Number => {
+                (u64::from(ctx.num_field) << 16)
+                    | (u64::from(ctx.num_pos.min(31)) << 8)
+                    | u64::from(ctx.byte_back(1))
             }
         }
     }

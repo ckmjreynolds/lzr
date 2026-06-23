@@ -33,6 +33,7 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::sparse(0b1011, capacity)), // bytes back 1, 2 and 4 (skip 3)
         Box::new(ContextModel::sparse(0b1100, capacity)), // bytes back 3 and 4 (skip 1, 2)
         Box::new(ContextModel::sparse(0b10001, capacity)), // bytes back 1 and 5 (skip 2,3,4)
+        Box::new(ContextModel::number(capacity)),        // field-aware digit-run context
         Box::new(MatchModel::new()),
         Box::new(MatchModel::with_key(4)), // shorter-key match: faster acquisition
         // Indirect context models (paq ICM): predict from what historically

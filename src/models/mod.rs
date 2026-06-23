@@ -32,6 +32,11 @@ pub(crate) struct Context {
     /// A "letter" is `a..=z` only: the stream is post-fold, so `A..=Z` never
     /// means a letter — those bytes are dictionary codes and act as boundaries.
     pub(crate) word_hash: u64,
+    /// Digit-run state for the numeric model: `num_pos` = digits seen so far in
+    /// the current run (0 outside a run), `num_field` = the byte that preceded
+    /// the run's first digit (the field tag, e.g. `>` after `<id>`).
+    pub(crate) num_pos: u8,
+    pub(crate) num_field: u8,
 }
 
 /// Mixing multiplier for folding a letter into the rolling word hash.
@@ -46,6 +51,8 @@ impl Context {
             bpos: 0,
             c4: 0,
             word_hash: 0,
+            num_pos: 0,
+            num_field: 0,
         }
     }
 
@@ -73,6 +80,14 @@ impl Context {
         let b = self.c0 as u8; // low 8 bits are the byte; the sentinel is bit 8
         self.history.push(b);
         self.c4 = (self.c4 << 8) | u32::from(b);
+        if b.is_ascii_digit() {
+            if self.num_pos == 0 {
+                self.num_field = self.byte_back(2); // the byte before this run
+            }
+            self.num_pos = self.num_pos.saturating_add(1);
+        } else {
+            self.num_pos = 0;
+        }
         if b.is_ascii_lowercase() {
             self.word_hash = self
                 .word_hash
