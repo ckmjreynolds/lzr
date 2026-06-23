@@ -28,6 +28,7 @@
     clippy::suboptimal_flops
 )]
 
+use crate::models::finder::{Finder, FlatFinder};
 use crate::models::{Context, Model};
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -109,6 +110,7 @@ impl Tensor {
 struct Window {
     len: usize,
     tok: Vec<usize>,
+    mpred: Vec<usize>, // match-predicted next byte (256 = no match) per slot
     tgt: Vec<usize>,
     h_prev: Vec<f32>,
     c_prev: Vec<f32>,
@@ -127,6 +129,7 @@ impl Window {
         Self {
             len: 0,
             tok: vec![0; wmax],
+            mpred: vec![0; wmax],
             tgt: vec![0; wmax],
             h_prev: z(h),
             c_prev: z(h),
@@ -148,12 +151,13 @@ struct Lstm {
     e: usize,
     h: usize,
     v: usize,
-    emb: Tensor, // v * e (input lookup)
-    wx: Tensor,  // 4h * e
-    wh: Tensor,  // 4h * h
-    b: Tensor,   // 4h
-    wo: Tensor,  // v * h
-    bo: Tensor,  // v
+    emb: Tensor,       // v * e (previous-byte input lookup)
+    emb_match: Tensor, // (v + 1) * e (match-predicted-byte lookup; row v = "no match")
+    wx: Tensor,        // 4h * e
+    wh: Tensor,        // 4h * h
+    b: Tensor,         // 4h
+    wo: Tensor,        // v * h
+    bo: Tensor,        // v
     h_prev: Vec<f32>,
     c_prev: Vec<f32>,
     win: Window,
@@ -168,6 +172,7 @@ struct Lstm {
     da: Vec<f32>,
     dx: Vec<f32>,
     dh_prev: Vec<f32>,
+    x: Vec<f32>, // augmented input embedding (emb[tok] + emb_match[mpred])
 }
 
 impl Lstm {
@@ -184,6 +189,7 @@ impl Lstm {
             h,
             v,
             emb: Tensor::new(v * e, &mut rng),
+            emb_match: Tensor::new((v + 1) * e, &mut rng),
             wx: Tensor::new(4 * h * e, &mut rng),
             wh: Tensor::new(4 * h * h, &mut rng),
             b: Tensor::zeros(4 * h),
@@ -202,6 +208,7 @@ impl Lstm {
             da: vec![0.0; 4 * h],
             dx: vec![0.0; e],
             dh_prev: vec![0.0; h],
+            x: vec![0.0; e],
         }
     }
 
@@ -211,14 +218,19 @@ impl Lstm {
     /// slot (`win.len`) and producing its next-token distribution into `win.p`.
     /// Advances the recurrent state but does NOT set a target or grow the window
     /// — `forward` (offline) and `observe` (online) finalize the slot.
-    fn step_forward(&mut self, input: usize) {
+    fn step_forward(&mut self, input: usize, mpred: usize) {
         let (e, h, v) = (self.e, self.h, self.v);
         let s = self.win.len;
-        let x = &self.emb.w[input * e..input * e + e];
+        // Input embedding is the sum of the previous-byte embedding and the
+        // match-predicted-next-byte embedding (mpred == 256 ⇒ "no match"), so the
+        // LSTM conditions on what the LZP match expects and learns the residual.
+        for k in 0..e {
+            self.x[k] = self.emb.w[input * e + k] + self.emb_match.w[mpred * e + k];
+        }
 
         self.a.copy_from_slice(&self.b.w);
         for r in 0..4 * h {
-            self.a[r] += dot(&self.wx.w[r * e..r * e + e], x)
+            self.a[r] += dot(&self.wx.w[r * e..r * e + e], &self.x)
                 + dot(&self.wh.w[r * h..r * h + h], &self.h_prev);
         }
         let (hi, hh) = (h, 2 * h);
@@ -255,6 +267,7 @@ impl Lstm {
             *pv *= inv;
         }
         self.win.tok[s] = input;
+        self.win.mpred[s] = mpred;
         self.win.h_prev[s * h..s * h + h].copy_from_slice(&self.h_prev);
         self.win.c_prev[s * h..s * h + h].copy_from_slice(&self.c_prev);
         self.h_prev.copy_from_slice(&self.win.h[s * h..s * h + h]);
@@ -264,9 +277,9 @@ impl Lstm {
     /// Offline convenience: forward with a known target, finalizing the slot.
     /// Returns the loss in nats. Used by the offline measurement/gradient tests.
     #[cfg(test)]
-    fn forward(&mut self, tok: usize, target: usize) -> f32 {
+    fn forward(&mut self, tok: usize, target: usize, mpred: usize) -> f32 {
         let s = self.win.len;
-        self.step_forward(tok);
+        self.step_forward(tok, mpred);
         let nats = -(self.win.p[s * self.v + target].max(1e-30)).ln();
         self.win.tgt[s] = target;
         self.win.len += 1;
@@ -275,8 +288,8 @@ impl Lstm {
 
     /// Online: write the prediction for the next token into the pending slot
     /// (no target yet, window not grown).
-    fn predict_dist(&mut self, input: usize) {
-        self.step_forward(input);
+    fn predict_dist(&mut self, input: usize, mpred: usize) {
+        self.step_forward(input, mpred);
     }
 
     /// Online: finalize the pending slot with its now-known `target`; flush
@@ -331,15 +344,17 @@ impl Lstm {
             }
             // input / recurrent weights + back-prop to x, h_{t-1}, c_{t-1}
             let tok = self.win.tok[s];
+            let mpred = self.win.mpred[s];
+            // Rebuild the augmented input x = emb[tok] + emb_match[mpred] (the
+            // actual forward input) for the wx gradient.
+            for k in 0..e {
+                self.x[k] = self.emb.w[tok * e + k] + self.emb_match.w[mpred * e + k];
+            }
             self.dx.iter_mut().for_each(|x| *x = 0.0);
             self.dh_prev.iter_mut().for_each(|x| *x = 0.0);
             for r in 0..4 * h {
                 let d = self.da[r];
-                axpy(
-                    &mut self.wx.g[r * e..r * e + e],
-                    &self.emb.w[tok * e..tok * e + e],
-                    d,
-                );
+                axpy(&mut self.wx.g[r * e..r * e + e], &self.x, d);
                 axpy(&mut self.dx, &self.wx.w[r * e..r * e + e], d);
                 axpy(
                     &mut self.wh.g[r * h..r * h + h],
@@ -349,7 +364,13 @@ impl Lstm {
                 axpy(&mut self.dh_prev, &self.wh.w[r * h..r * h + h], d);
                 self.b.g[r] += d;
             }
+            // x = emb[tok] + emb_match[mpred] ⇒ dL/d(both embeddings) = dx.
             axpy(&mut self.emb.g[tok * e..tok * e + e], &self.dx, 1.0);
+            axpy(
+                &mut self.emb_match.g[mpred * e..mpred * e + e],
+                &self.dx,
+                1.0,
+            );
             for k in 0..h {
                 self.dh_next[k] = self.dh_prev[k];
                 self.dc_next[k] = self.dc[k] * self.win.f[s * h + k];
@@ -363,6 +384,7 @@ impl Lstm {
         let bc2 = 1.0 - 0.999f32.powi(self.t);
         for t in [
             &mut self.emb,
+            &mut self.emb_match,
             &mut self.wx,
             &mut self.wh,
             &mut self.b,
@@ -377,6 +399,7 @@ impl Lstm {
     #[cfg(test)]
     fn params(&self) -> usize {
         self.emb.w.len()
+            + self.emb_match.w.len()
             + self.wx.w.len()
             + self.wh.w.len()
             + self.b.w.len()
@@ -399,12 +422,20 @@ pub(crate) struct ArmModel {
     nbits: u8,
     w_win: usize,
     lr: f32,
+    // LZP match tracker (its own finder, mirroring `MatchModel`) feeding the
+    // match-predicted next byte into the LSTM input.
+    finder: FlatFinder,
+    last8: u64,
+    mptr: usize,
+    mlen: u32,
 }
 
 impl ArmModel {
     const E: usize = 32;
     const V: usize = 256;
     const WIN: usize = 16;
+    const NO_MATCH: usize = Self::V; // emb_match row used when no match is active
+    const FINDER_BITS: u32 = 24; // 16M slots ≈ 96 MB; a feature, not the main matcher
     /// Hidden width — the operating point. Trades bpb for throughput: the
     /// enwik8 e2e marginal / enwik9 ETA was h=64 −0.046/7.1h, h=96 −0.061/11.6h,
     /// h=128 −0.068/16.9h (5 MB slice). We ship h=96, the knee: ~90% of h=128's
@@ -418,7 +449,7 @@ impl ArmModel {
 
     pub(crate) fn new(h: usize) -> Self {
         let mut lstm = Lstm::new(Self::E, h, Self::V, Self::WIN);
-        lstm.predict_dist(0); // BOS → distribution for the first byte
+        lstm.predict_dist(0, Self::NO_MATCH); // BOS → distribution for the first byte
         let mut m = Self {
             lstm,
             cumsum: vec![0.0; Self::V + 1],
@@ -426,9 +457,43 @@ impl ArmModel {
             nbits: 0,
             w_win: Self::WIN,
             lr: 1e-3,
+            finder: FlatFinder::new(Self::FINDER_BITS),
+            last8: 0,
+            mptr: 0,
+            mlen: 0,
         };
         m.refresh_cumsum();
         m
+    }
+
+    /// LZP step over the just-finalized byte `b` (mirrors `MatchModel::byte_step`)
+    /// and return the match-predicted *next* byte (or [`Self::NO_MATCH`]). Called
+    /// before `b` is pushed to history, so `mptr == n` resolves to `b` itself.
+    #[allow(clippy::cast_possible_truncation)]
+    fn match_step(&mut self, ctx: &Context, b: u8) -> usize {
+        let n = ctx.history().len(); // b will be appended at index n
+        let followed = self.mlen > 0 && self.mptr < n && ctx.history()[self.mptr] == b;
+        if followed {
+            self.mptr += 1;
+            self.mlen += 1;
+        } else {
+            self.mlen = 0;
+        }
+        self.last8 = (self.last8 << 8) | u64::from(b);
+        if self.mlen == 0 {
+            if let Some(q) = self.finder.lookup(self.last8) {
+                self.mptr = q as usize;
+                self.mlen = 1;
+            }
+        }
+        self.finder.insert(self.last8, (n + 1) as u32);
+        if self.mlen == 0 {
+            Self::NO_MATCH
+        } else if self.mptr < n {
+            ctx.history()[self.mptr] as usize
+        } else {
+            b as usize // mptr == n: the predicted byte is the one just finalized
+        }
     }
 
     /// Prefix-sum the pending slot's next-byte distribution for O(1) bit ranges.
@@ -458,13 +523,15 @@ impl Model for ArmModel {
         crate::mixer::stretch(q)
     }
 
-    fn update(&mut self, _ctx: &Context, bit: u8) {
+    fn update(&mut self, ctx: &Context, bit: u8) {
         self.bitbuf = (self.bitbuf << 1) | u32::from(bit);
         self.nbits += 1;
         if self.nbits == 8 {
             let byte = (self.bitbuf & 0xff) as usize;
             self.lstm.observe(byte, self.w_win, self.lr); // finalize prediction of this byte
-            self.lstm.predict_dist(byte); // predict the next byte
+            #[allow(clippy::cast_possible_truncation)]
+            let mpred = self.match_step(ctx, byte as u8); // LZP guess for the next byte
+            self.lstm.predict_dist(byte, mpred); // predict the next byte
             self.refresh_cumsum();
             self.bitbuf = 0;
             self.nbits = 0;
@@ -494,6 +561,7 @@ mod tests {
         let mut net = Lstm::new(e, h, v, w);
         let inps = [1usize, 4, 0, 3];
         let tgts = [2usize, 5, 1, 4];
+        let mpreds = [2usize, 3, 0, 6]; // exercises emb_match rows (6 = no-match)
         let h0 = vec![0.0f32; h];
         let c0 = vec![0.0f32; h];
 
@@ -503,7 +571,7 @@ mod tests {
             net.win.len = 0;
             let mut nats = 0.0;
             for k in 0..w {
-                nats += net.forward(inps[k], tgts[k]);
+                nats += net.forward(inps[k], tgts[k], mpreds[k]);
             }
             nats
         };
@@ -513,8 +581,9 @@ mod tests {
 
         let eps = 1e-2f32;
         let mut max_rel = 0.0f32;
-        let samples: [(&str, usize); 6] = [
+        let samples: [(&str, usize); 7] = [
             ("emb", net.emb.w.len()),
+            ("emb_match", net.emb_match.w.len()),
             ("wx", net.wx.w.len()),
             ("wh", net.wh.w.len()),
             ("b", net.b.w.len()),
@@ -524,6 +593,7 @@ mod tests {
         fn pick<'a>(net: &'a mut Lstm, name: &str) -> &'a mut Tensor {
             match name {
                 "emb" => &mut net.emb,
+                "emb_match" => &mut net.emb_match,
                 "wx" => &mut net.wx,
                 "wh" => &mut net.wh,
                 "b" => &mut net.b,
@@ -636,7 +706,7 @@ mod tests {
         let mut total_nats = 0.0f64;
         for idx in 0..seq.len() {
             let inp = if idx == 0 { 0 } else { seq[idx - 1] };
-            total_nats += f64::from(net.forward(inp, seq[idx]));
+            total_nats += f64::from(net.forward(inp, seq[idx], v)); // standalone: no match feature
             if net.win.len >= w_win {
                 net.backward();
                 net.adam_step(lr);
