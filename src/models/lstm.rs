@@ -742,23 +742,8 @@ mod tests {
         );
     }
 
-    // Mirrors the non-arm part of `codec::models()` so the e2e test measures the
-    // arm's marginal against the real current baseline (keep in sync).
-    fn baseline_models(capacity: usize) -> Vec<Box<dyn Model>> {
-        use crate::models::context::ContextModel;
-        use crate::models::match_model::MatchModel;
-        let mut v: Vec<Box<dyn Model>> = (0..=6)
-            .map(|n| Box::new(ContextModel::new(n, capacity)) as Box<dyn Model>)
-            .collect();
-        v.push(Box::new(ContextModel::word(capacity)));
-        v.push(Box::new(ContextModel::sparse(0b101, capacity)));
-        v.push(Box::new(ContextModel::sparse(0b110, capacity)));
-        v.push(Box::new(ContextModel::sparse(0b1011, capacity)));
-        v.push(Box::new(ContextModel::sparse(0b1100, capacity)));
-        v.push(Box::new(MatchModel::new()));
-        v.push(Box::new(MatchModel::with_key(4)));
-        v
-    }
+    // The arm's marginal is measured against the real shipped deterministic set.
+    use crate::codec::baseline_models;
 
     /// Round-trip correctness of the byte-level arm inside the real codec:
     /// encode an enwik8 slice (full pipeline) with the 9 baseline models + arm,

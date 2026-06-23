@@ -1,0 +1,111 @@
+//! Indirect context model (the paq/lpaq "ICM").
+//!
+//! Predicts from *what historically followed* a context, not from the context
+//! bytes themselves. For each order-`n` context we remember the last two bytes
+//! that followed it (a `u16` follower-history register). The bit predictor is
+//! keyed on that follower history plus the previous byte `c1` and the bit-tree
+//! node `c0` — so every context that tends to be followed by the same bytes
+//! pools its statistics and generalizes. This is orthogonal to the direct order
+//! models (which key on the context bytes): v7 measured it as the largest
+//! deterministic lever after the recurrent arm.
+
+use super::context::hashed_bits;
+use super::statemap::StateMap;
+use super::{Context, Model};
+
+const MAX: u16 = 63;
+const SM_STATES: usize = 1 << 12;
+const HIST_BITS_CAP: u32 = 24; // follower-history table cap (per order-n context)
+const CELL_BITS_CAP: u32 = 22; // bit-history table cap (per (follower-hist, c1, node))
+
+/// One observed bit moves a bit-history cell to its next state (same shape as the
+/// direct context model: bump the seen count, soft-discount the opposite).
+fn transition(s: u16, bit: u8) -> u16 {
+    let n0 = s >> 6;
+    let n1 = s & 63;
+    let (n0, n1) = if bit == 1 {
+        (discount(n0), (n1 + 1).min(MAX))
+    } else {
+        ((n0 + 1).min(MAX), discount(n1))
+    };
+    (n0 << 6) | n1
+}
+
+const fn discount(x: u16) -> u16 {
+    if x > 3 { 3 + ((x - 3) >> 1) } else { x }
+}
+
+/// Indirect context model over a single order.
+#[derive(Debug)]
+pub(crate) struct IndirectModel {
+    order: usize,
+    hist: Vec<u16>, // follower-history register per order-n context
+    hist_shift: u32,
+    cells: Vec<u16>, // bit-history per (follower-hist, c1, node) key
+    cell_shift: u32,
+    sm: StateMap,
+    hist_idx: usize, // current byte's follower-history slot (refreshed at bpos 0)
+    fh: u16,         // current byte's follower history
+    idx: usize,      // current bit's cells slot
+}
+
+impl IndirectModel {
+    /// Production constructor: tables sized to the input, capped so several
+    /// indirect orders fit the RAM budget (they generalize, so do not need the
+    /// full high-order table size the direct models use).
+    pub(crate) fn new(order: usize, capacity: usize) -> Self {
+        let bits = hashed_bits(capacity);
+        Self::with_bits(order, bits.min(HIST_BITS_CAP), bits.min(CELL_BITS_CAP))
+    }
+
+    /// Explicit-size constructor (ablation sweeps).
+    pub(crate) fn with_bits(order: usize, hist_bits: u32, cell_bits: u32) -> Self {
+        Self {
+            order,
+            hist: vec![0u16; 1usize << hist_bits],
+            hist_shift: 64 - hist_bits,
+            cells: vec![0u16; 1usize << cell_bits],
+            cell_shift: 64 - cell_bits,
+            sm: StateMap::new(SM_STATES),
+            hist_idx: 0,
+            fh: 0,
+            idx: 0,
+        }
+    }
+
+    fn ctx_value(&self, ctx: &Context) -> u64 {
+        let mut cv = 0u64;
+        for i in 1..=self.order {
+            cv = (cv << 8) | u64::from(ctx.byte_back(i));
+        }
+        cv
+    }
+}
+
+const MULT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+impl Model for IndirectModel {
+    #[allow(clippy::cast_possible_truncation)]
+    fn predict(&mut self, ctx: &Context) -> i32 {
+        if ctx.bpos == 0 {
+            let cv = self.ctx_value(ctx);
+            self.hist_idx = (cv.wrapping_mul(MULT) >> self.hist_shift) as usize;
+            self.fh = self.hist[self.hist_idx];
+        }
+        let key =
+            u64::from(self.fh) | (u64::from(ctx.byte_back(1)) << 16) | (u64::from(ctx.c0) << 24);
+        self.idx = (key.wrapping_mul(MULT) >> self.cell_shift) as usize;
+        self.sm.predict(self.cells[self.idx] as usize)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn update(&mut self, ctx: &Context, bit: u8) {
+        let s = self.cells[self.idx];
+        self.sm.update(s as usize, bit);
+        self.cells[self.idx] = transition(s, bit);
+        if ctx.bpos == 7 {
+            let b = (((ctx.c0 << 1) | u32::from(bit)) & 0xff) as u16;
+            self.hist[self.hist_idx] = (self.fh << 8) | b;
+        }
+    }
+}

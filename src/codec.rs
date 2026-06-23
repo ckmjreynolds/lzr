@@ -8,18 +8,18 @@
 use crate::coder::{Decoder, Encoder};
 use crate::mixer::{Apm, Mixer};
 use crate::models::context::ContextModel;
+use crate::models::indirect::IndirectModel;
 #[cfg(feature = "arm")]
 use crate::models::lstm::ArmModel;
 use crate::models::match_model::MatchModel;
 use crate::models::{Context, Model};
 use crate::preprocessors::Pipeline;
 
-/// The active model set. Adding a model is one line here. The online-neural arm
-/// is appended only under `--features arm` (opt-in, not shipped — see Cargo.toml).
-fn models(capacity: usize) -> Vec<Box<dyn Model>> {
-    // `mut` is only used when the arm feature appends below.
-    #[cfg_attr(not(feature = "arm"), allow(unused_mut))]
-    let mut v: Vec<Box<dyn Model>> = vec![
+/// The deterministic model set (no arm). Shared by the production [`models`] and
+/// by the ablation tests, so an ablation measures its variant against the exact
+/// shipped baseline. Adding/removing a deterministic model is one line here.
+pub(crate) fn baseline_models(capacity: usize) -> Vec<Box<dyn Model>> {
+    vec![
         Box::new(ContextModel::new(0, capacity)),
         Box::new(ContextModel::new(1, capacity)),
         Box::new(ContextModel::new(2, capacity)),
@@ -34,7 +34,22 @@ fn models(capacity: usize) -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::sparse(0b1100, capacity)), // bytes back 3 and 4 (skip 1, 2)
         Box::new(MatchModel::new()),
         Box::new(MatchModel::with_key(4)), // shorter-key match: faster acquisition
-    ];
+        // Indirect context models (paq ICM): predict from what historically
+        // followed a context. Orders [1,2,3,4,6] — 5 and 8 add ~nothing.
+        Box::new(IndirectModel::new(1, capacity)),
+        Box::new(IndirectModel::new(2, capacity)),
+        Box::new(IndirectModel::new(3, capacity)),
+        Box::new(IndirectModel::new(4, capacity)),
+        Box::new(IndirectModel::new(6, capacity)),
+    ]
+}
+
+/// The active model set. The online-neural arm is appended only under
+/// `--features arm` (opt-in, not shipped — see Cargo.toml).
+fn models(capacity: usize) -> Vec<Box<dyn Model>> {
+    // `mut` is only used when the arm feature appends below.
+    #[cfg_attr(not(feature = "arm"), allow(unused_mut))]
+    let mut v = baseline_models(capacity);
     #[cfg(feature = "arm")]
     v.push(Box::new(ArmModel::arm()));
     v
@@ -201,9 +216,8 @@ pub(crate) fn code_stream_models(models: Vec<Box<dyn Model>>, data: &[u8]) -> Ve
 
 /// Decode counterpart of [`code_stream_models`] (ablation/round-trip only):
 /// decodes a stream produced by `code_stream_models` with the same model set.
-/// Operates on the coded bytes directly (no pipeline inverse). Only the arm's
-/// round-trip test uses it, so it is gated to that feature to stay dead-code-free.
-#[cfg(all(test, feature = "arm"))]
+/// Operates on the coded bytes directly (no pipeline inverse).
+#[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn decode_stream_models(models: Vec<Box<dyn Model>>, input: &[u8]) -> Vec<u8> {
     let (len, header) = read_varint(input);
@@ -272,6 +286,37 @@ mod tests {
         assert_eq!(decode(&encode(b"")), b"");
     }
 
+    /// Harness sanity / reference baseline: encode an enwik8 slice (full
+    /// pipeline) with the shipped deterministic model set and print bpb. The
+    /// 20 MB slice [1M..21M] should land at ≈ 1.6695 (the journal's 14-model
+    /// baseline). `LZR_LO`/`LZR_HI` override the slice. Run:
+    /// `cargo test --release ablate_baseline -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: reference baseline bpb on an enwik8 slice"]
+    fn ablate_baseline() {
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let t0 = std::time::Instant::now();
+        let n = code_stream_models(baseline_models(data.len()), &data).len();
+        println!(
+            "baseline: {:.4} bpb  ({} bytes, {:.0}s)",
+            n as f64 * 8.0 / orig,
+            n,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
     #[test]
     fn roundtrip_enwik8_slice() {
         let Ok(bytes) = std::fs::read("assets/enwik8") else {
@@ -285,6 +330,77 @@ mod tests {
         assert_eq!(decode(&coded), slice);
         let bpb = coded.len() as f64 * 8.0 / slice.len() as f64;
         println!("full stack on enwik8 8 KB slice: {bpb:.4} bpb");
+    }
+
+    /// Indirect context models must round-trip byte-exact in the codec.
+    #[test]
+    fn indirect_roundtrip() {
+        use crate::models::indirect::IndirectModel;
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let data = Pipeline::default_pipeline().forward(&e8[1_000_000..1_010_000]);
+        let mk = || {
+            let mut v = baseline_models(data.len());
+            v.push(Box::new(IndirectModel::new(2, data.len())) as Box<dyn Model>);
+            v.push(Box::new(IndirectModel::new(4, data.len())) as Box<dyn Model>);
+            v.push(Box::new(IndirectModel::new(6, data.len())) as Box<dyn Model>);
+            v
+        };
+        let coded = code_stream_models(mk(), &data);
+        assert_eq!(decode_stream_models(mk(), &coded), data);
+    }
+
+    /// T1.1 sweep: baseline vs baseline + indirect models over several order
+    /// sets, on an enwik8 slice. `LZR_LO`/`LZR_HI` (default 1M..21M), `LZR_HB`/
+    /// `LZR_CB` (follower-hist / cell table bits, default the production caps).
+    /// Run: `cargo test --release ablate_indirect -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: indirect-context-model marginal on an enwik8 slice"]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn ablate_indirect() {
+        use crate::models::indirect::IndirectModel;
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let cap = data.len();
+        let hb = env("LZR_HB", 0);
+        let cb = env("LZR_CB", 0);
+
+        let base = code_stream_models(baseline_models(cap), &data).len();
+        let base_bpb = base as f64 * 8.0 / orig;
+        println!("baseline: {base_bpb:.4} bpb");
+
+        let order_sets: &[&[usize]] = &[
+            &[2, 3, 4, 6],
+            &[1, 2, 3, 4, 6],
+            &[1, 2, 3, 4, 5, 6],
+            &[1, 2, 3, 4, 5, 6, 8],
+        ];
+        for set in order_sets {
+            let mut v = baseline_models(cap);
+            for &o in *set {
+                let m = if hb > 0 && cb > 0 {
+                    IndirectModel::with_bits(o, hb as u32, cb as u32)
+                } else {
+                    IndirectModel::new(o, cap)
+                };
+                v.push(Box::new(m) as Box<dyn Model>);
+            }
+            let n = code_stream_models(v, &data).len();
+            let bpb = n as f64 * 8.0 / orig;
+            println!("+ indirect {set:?}: {bpb:.4} bpb  ({:+.4})", bpb - base_bpb);
+        }
     }
 
     fn hex(t: &[u8]) -> String {

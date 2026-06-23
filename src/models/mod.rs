@@ -6,6 +6,7 @@
 
 pub(crate) mod context;
 pub(crate) mod finder;
+pub(crate) mod indirect;
 #[cfg(feature = "arm")]
 pub(crate) mod lstm;
 #[cfg(test)]

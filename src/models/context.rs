@@ -80,7 +80,7 @@ pub(crate) struct ContextModel {
 /// round-trips; small inputs and tests get small tables instead of allocating
 /// hundreds of MB per model.
 #[allow(clippy::cast_possible_truncation)]
-fn hashed_bits(capacity: usize) -> u32 {
+pub(crate) fn hashed_bits(capacity: usize) -> u32 {
     let want = (capacity.max(1) as u64)
         .next_power_of_two()
         .trailing_zeros()
