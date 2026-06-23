@@ -16,22 +16,22 @@ use crate::preprocessors::Pipeline;
 
 /// The active model set. Adding a model is one line here. The online-neural arm
 /// is appended only under `--features arm` (opt-in, not shipped — see Cargo.toml).
-fn models() -> Vec<Box<dyn Model>> {
+fn models(capacity: usize) -> Vec<Box<dyn Model>> {
     // `mut` is only used when the arm feature appends below.
     #[cfg_attr(not(feature = "arm"), allow(unused_mut))]
     let mut v: Vec<Box<dyn Model>> = vec![
-        Box::new(ContextModel::new(0)),
-        Box::new(ContextModel::new(1)),
-        Box::new(ContextModel::new(2)),
-        Box::new(ContextModel::new(3)),
-        Box::new(ContextModel::new(4)),
-        Box::new(ContextModel::new(5)),
-        Box::new(ContextModel::new(6)),
-        Box::new(ContextModel::word()),
-        Box::new(ContextModel::sparse(0b101)), // bytes back 1 and 3 (skip 2)
-        Box::new(ContextModel::sparse(0b110)), // bytes back 2 and 3 (skip the last byte)
-        Box::new(ContextModel::sparse(0b1011)), // bytes back 1, 2 and 4 (skip 3)
-        Box::new(ContextModel::sparse(0b1100)), // bytes back 3 and 4 (skip 1, 2)
+        Box::new(ContextModel::new(0, capacity)),
+        Box::new(ContextModel::new(1, capacity)),
+        Box::new(ContextModel::new(2, capacity)),
+        Box::new(ContextModel::new(3, capacity)),
+        Box::new(ContextModel::new(4, capacity)),
+        Box::new(ContextModel::new(5, capacity)),
+        Box::new(ContextModel::new(6, capacity)),
+        Box::new(ContextModel::word(capacity)),
+        Box::new(ContextModel::sparse(0b101, capacity)), // bytes back 1 and 3 (skip 2)
+        Box::new(ContextModel::sparse(0b110, capacity)), // bytes back 2 and 3 (skip the last byte)
+        Box::new(ContextModel::sparse(0b1011, capacity)), // bytes back 1, 2 and 4 (skip 3)
+        Box::new(ContextModel::sparse(0b1100, capacity)), // bytes back 3 and 4 (skip 1, 2)
         Box::new(MatchModel::new()),
         Box::new(MatchModel::with_key(4)), // shorter-key match: faster acquisition
     ];
@@ -55,7 +55,7 @@ struct CodecState {
 
 impl CodecState {
     fn new(capacity: usize) -> Self {
-        Self::with_models(models(), capacity)
+        Self::with_models(models(capacity), capacity)
     }
 
     fn with_models(models: Vec<Box<dyn Model>>, capacity: usize) -> Self {
@@ -968,12 +968,13 @@ mod tests {
         let slice = &e8[lo..hi];
         let orig = (hi - lo) as f64;
 
+        let cap = slice.len();
         let mk = |word: bool| -> Vec<Box<dyn Model>> {
             let mut v: Vec<Box<dyn Model>> = (0..=6)
-                .map(|n| Box::new(ContextModel::new(n)) as Box<dyn Model>)
+                .map(|n| Box::new(ContextModel::new(n, cap)) as Box<dyn Model>)
                 .collect();
             if word {
-                v.push(Box::new(ContextModel::word()));
+                v.push(Box::new(ContextModel::word(cap)));
             }
             v.push(Box::new(MatchModel::new()));
             v

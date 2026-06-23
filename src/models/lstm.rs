@@ -672,13 +672,13 @@ mod tests {
         );
     }
 
-    fn baseline_models() -> Vec<Box<dyn Model>> {
+    fn baseline_models(capacity: usize) -> Vec<Box<dyn Model>> {
         use crate::models::context::ContextModel;
         use crate::models::match_model::MatchModel;
         let mut v: Vec<Box<dyn Model>> = (0..=6)
-            .map(|n| Box::new(ContextModel::new(n)) as Box<dyn Model>)
+            .map(|n| Box::new(ContextModel::new(n, capacity)) as Box<dyn Model>)
             .collect();
-        v.push(Box::new(ContextModel::word()));
+        v.push(Box::new(ContextModel::word(capacity)));
         v.push(Box::new(MatchModel::new()));
         v
     }
@@ -698,10 +698,10 @@ mod tests {
         // Small slice: keeps the debug coverage build fast while still
         // exercising encode→decode of the arm byte-for-byte.
         let data = Pipeline::default_pipeline().forward(&e8[1_000_000..1_004_000]);
-        let mut enc_models = baseline_models();
+        let mut enc_models = baseline_models(data.len());
         enc_models.push(Box::new(ArmModel::new(64)));
         let coded = code_stream_models(enc_models, &data);
-        let mut dec_models = baseline_models();
+        let mut dec_models = baseline_models(data.len());
         dec_models.push(Box::new(ArmModel::new(64)));
         let decoded = decode_stream_models(dec_models, &coded);
         assert_eq!(decoded, data, "arm codec must round-trip byte-exact");
@@ -735,12 +735,12 @@ mod tests {
         let h = env("LZR_H", 128);
 
         let t0 = Instant::now();
-        let base = code_stream_models(baseline_models(), &data).len();
+        let base = code_stream_models(baseline_models(data.len()), &data).len();
         let base_secs = t0.elapsed().as_secs_f64();
         let base_bpb = base as f64 * 8.0 / orig;
         println!("baseline (9 models): {base_bpb:.4} bpb  ({base_secs:.0}s)");
 
-        let mut withv = baseline_models();
+        let mut withv = baseline_models(data.len());
         withv.push(Box::new(ArmModel::new(h)));
         let t1 = Instant::now();
         let arm = code_stream_models(withv, &data).len();

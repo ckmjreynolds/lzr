@@ -13,6 +13,12 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-23 — adaptive high-order table sizing; HASH_BITS cap 26 → 27: enwik8 1.5814 → 1.5731
+
+The nine hashed context tables (orders 3–6, word, four sparse) were a fixed 2^HASH_BITS regardless of input, so raising HASH_BITS past 26 would make *every* codec instantiation allocate GBs — the few-KB round-trip tests included — risking OOM under parallel `cargo test`. Fixed it: the hashed table size now adapts to the input, `hashed_bits(capacity) ≈ next_pow2(capacity) + 1` clamped to `[2^12, 2^HASH_BITS]`. Both directions derive it from the stream's length prefix (encode from `data.len()`, decode from the decoded length), so it round-trips; KB-scale tests now allocate KB-scale tables and the `build.sh` test pass stays ~0.2 s. This is also just better engineering — a small file no longer pays for gigabyte tables.
+
+With the test-OOM blocker gone, raised the cap to 27: enwik8 (capacity ~74 MB → 2^27 tables) 1.5814 → 1.5731 (−0.0083), peak RSS 4.46 GB. enwik9 (capacity ~740 MB → also 2^27) projects to ~5.5 GB RSS — comfortably under the 10 GB cap, so shippable. Cap 28 (enwik8 would use 2^28; enwik9 ~7.8 GB, only ~2 GB margin) is left as a RAM-verified future option. Deterministic v9 enwik8 now 1.5731 — from 1.6938 at the roadmap's start (−0.1207 L(C)).
+
 ## 2026-06-23 — second match model (4-byte key): enwik8 1.5880 → 1.5814 (−0.0066)
 
 Parameterized `MatchModel` by key length (mask the rolling `last8` to the low `key_bytes` bytes before the finder lookup/insert) and added a second match model keyed on the last 4 bytes alongside the 8-byte one. The short key acquires matches from shorter repeats the 8-byte key misses; the length-keyed StateMap discounts the resulting shorter/less-reliable matches, so it is additive rather than noisy. enwik8 1.5880 → 1.5814 (−0.0066, identical on the 20 MB slice). A third model (6-byte key) added only −0.0011 more — not worth a third 768 MB finder, so dropped. Worth recording: the prediction beforehand was that a 4-byte match would be redundant with the order-4/5/6 context models; measuring refuted it cleanly (−0.0066), because the match model contributes long-range repeat tracking with length-calibrated confidence, which is distinct from a fixed-order context's bit-history. Throughput eased 0.85 → 0.51 MB/s (two finders + the four sparse models; enwik9 ~0.55 h, ~3 GB extra RAM, within the 10 GB cap). Deterministic v9 enwik8 now 1.5814 — from 1.6938 at the roadmap's start.

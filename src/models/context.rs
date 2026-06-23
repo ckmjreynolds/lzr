@@ -22,7 +22,9 @@ use super::statemap::StateMap;
 use super::{Context, Model};
 
 const MAX: u16 = 63; // count cap; with the 6-bit packing this bounds a state to 12 bits
-const HASH_BITS: u32 = 26; // hashed-table size for orders ≥ 3: 64M cells × 2 B = 128 MB
+const HASH_BITS: u32 = 27; // CAP on the hashed-table size (orders ≥ 3 / word / sparse);
+// the actual size adapts to the input (see `hashed_bits`) so small inputs and
+// tests stay tiny. At the cap: 128M cells × 2 B = 256 MB/model.
 const SM_STATES: usize = 1 << 12; // (n0 << 6) | n1, each ≤ 63
 
 /// One observed bit moves the cell to its next bit-history state: bump the seen
@@ -68,46 +70,61 @@ pub(crate) struct ContextModel {
     idx: usize,
 }
 
+/// Hashed-table size (in bits) for a corpus of `capacity` preprocessed bytes:
+/// roughly 2× the distinct-context estimate (one context per position), capped
+/// at [`HASH_BITS`] and floored for tiny inputs. Both directions derive it from
+/// the same `capacity` (carried in the stream's length prefix), so it
+/// round-trips; small inputs and tests get small tables instead of allocating
+/// hundreds of MB per model.
+#[allow(clippy::cast_possible_truncation)]
+fn hashed_bits(capacity: usize) -> u32 {
+    let want = (capacity.max(1) as u64)
+        .next_power_of_two()
+        .trailing_zeros()
+        + 1;
+    want.clamp(12, HASH_BITS)
+}
+
 impl ContextModel {
     /// Keyed on the last `order` finalized bytes. Orders ≤ 2 are directly
-    /// indexed (exact); higher orders hash into a fixed table.
-    pub(crate) fn new(order: usize) -> Self {
-        let (direct, shift, size) = if order <= 2 {
-            (true, 0, 1usize << (8 * order + 8))
-        } else {
-            (false, 64 - HASH_BITS, 1usize << HASH_BITS)
-        };
-        Self {
-            kind: CtxKind::Order(order),
-            direct,
-            shift,
-            cells: vec![0; size],
-            sm: StateMap::new(SM_STATES),
-            idx: 0,
+    /// indexed (exact); higher orders hash into an input-sized table.
+    pub(crate) fn new(order: usize, capacity: usize) -> Self {
+        if order <= 2 {
+            return Self {
+                kind: CtxKind::Order(order),
+                direct: true,
+                shift: 0,
+                cells: vec![0; 1usize << (8 * order + 8)],
+                sm: StateMap::new(SM_STATES),
+                idx: 0,
+            };
         }
+        Self::hashed(CtxKind::Order(order), capacity)
     }
 
-    /// A word-keyed model over a hashed table (word contexts are sparse).
-    fn hashed(kind: CtxKind) -> Self {
+    /// A hashed-table model sized to the input (word/sparse/high-order contexts
+    /// are sparse).
+    fn hashed(kind: CtxKind, capacity: usize) -> Self {
+        let bits = hashed_bits(capacity);
         Self {
             kind,
             direct: false,
-            shift: 64 - HASH_BITS,
-            cells: vec![0; 1usize << HASH_BITS],
+            shift: 64 - bits,
+            cells: vec![0; 1usize << bits],
             sm: StateMap::new(SM_STATES),
             idx: 0,
         }
     }
 
     /// Keyed on the current word's letters so far.
-    pub(crate) fn word() -> Self {
-        Self::hashed(CtxKind::Word)
+    pub(crate) fn word(capacity: usize) -> Self {
+        Self::hashed(CtxKind::Word, capacity)
     }
 
     /// Keyed on a non-contiguous set of recent bytes (`mask` bit `i` →
     /// `byte_back(i + 1)`), hashed like the high orders.
-    pub(crate) fn sparse(mask: u32) -> Self {
-        Self::hashed(CtxKind::Sparse(mask))
+    pub(crate) fn sparse(mask: u32, capacity: usize) -> Self {
+        Self::hashed(CtxKind::Sparse(mask), capacity)
     }
 
     fn context_value(&self, ctx: &Context) -> u64 {
