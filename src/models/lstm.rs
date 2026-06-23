@@ -672,6 +672,8 @@ mod tests {
         );
     }
 
+    // Mirrors the non-arm part of `codec::models()` so the e2e test measures the
+    // arm's marginal against the real current baseline (keep in sync).
     fn baseline_models(capacity: usize) -> Vec<Box<dyn Model>> {
         use crate::models::context::ContextModel;
         use crate::models::match_model::MatchModel;
@@ -679,7 +681,12 @@ mod tests {
             .map(|n| Box::new(ContextModel::new(n, capacity)) as Box<dyn Model>)
             .collect();
         v.push(Box::new(ContextModel::word(capacity)));
+        v.push(Box::new(ContextModel::sparse(0b101, capacity)));
+        v.push(Box::new(ContextModel::sparse(0b110, capacity)));
+        v.push(Box::new(ContextModel::sparse(0b1011, capacity)));
+        v.push(Box::new(ContextModel::sparse(0b1100, capacity)));
         v.push(Box::new(MatchModel::new()));
+        v.push(Box::new(MatchModel::with_key(4)));
         v
     }
 
@@ -738,7 +745,7 @@ mod tests {
         let base = code_stream_models(baseline_models(data.len()), &data).len();
         let base_secs = t0.elapsed().as_secs_f64();
         let base_bpb = base as f64 * 8.0 / orig;
-        println!("baseline (9 models): {base_bpb:.4} bpb  ({base_secs:.0}s)");
+        println!("baseline (deterministic models): {base_bpb:.4} bpb  ({base_secs:.0}s)");
 
         let mut withv = baseline_models(data.len());
         withv.push(Box::new(ArmModel::new(h)));
