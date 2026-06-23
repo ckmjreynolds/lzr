@@ -20,25 +20,19 @@ mod preprocessors;
 use std::path::Path;
 use std::time::Instant;
 
-use clap::Parser;
-
-/// Command-line arguments.
-#[derive(Parser, Debug)]
-#[command(version, about)]
-struct Cli {
-    /// Input file. A `.lzr` extension decodes; anything else encodes.
-    input: String,
-    /// Output file.
-    output: String,
-}
-
 fn main() -> std::io::Result<()> {
-    let cli = Cli::parse();
-    let decoding = Path::new(&cli.input)
+    // Hand-rolled arg parsing (no clap): `lzr <input> <output>`. Dropping clap
+    // keeps the shipped binary small — it counts 2x in the Hutter score.
+    let mut args = std::env::args().skip(1);
+    let (Some(in_path), Some(out_path), None) = (args.next(), args.next(), args.next()) else {
+        eprintln!("usage: lzr <input> <output>   (a .lzr input decodes; anything else encodes)");
+        std::process::exit(2);
+    };
+    let decoding = Path::new(&in_path)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("lzr"));
 
-    let input = std::fs::read(&cli.input)?;
+    let input = std::fs::read(&in_path)?;
     let start = Instant::now();
     let output = if decoding {
         codec::decode(&input)
@@ -46,7 +40,7 @@ fn main() -> std::io::Result<()> {
         codec::encode(&input)
     };
     let elapsed = start.elapsed().as_secs_f64();
-    std::fs::write(&cli.output, &output)?;
+    std::fs::write(&out_path, &output)?;
 
     report(decoding, input.len(), output.len(), elapsed);
     Ok(())
