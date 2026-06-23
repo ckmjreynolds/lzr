@@ -41,6 +41,7 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<Box<dyn Model>> {
         Box::new(IndirectModel::new(3, capacity)),
         Box::new(IndirectModel::new(4, capacity)),
         Box::new(IndirectModel::new(6, capacity)),
+        Box::new(IndirectModel::word(capacity)),
     ]
 }
 

@@ -15,8 +15,8 @@ use super::{Context, Model};
 
 const MAX: u16 = 63;
 const SM_STATES: usize = 1 << 12;
-const HIST_BITS_CAP: u32 = 24; // follower-history table cap (per order-n context)
-const CELL_BITS_CAP: u32 = 22; // bit-history table cap (per (follower-hist, c1, node))
+const HIST_BITS_CAP: u32 = 24; // follower-history table cap (per context)
+const CELL_BITS_CAP: u32 = 24; // bit-history table cap (per (follower-hist, c1, node))
 
 /// One observed bit moves a bit-history cell to its next state (same shape as the
 /// direct context model: bump the seen count, soft-discount the opposite).
@@ -35,11 +35,20 @@ const fn discount(x: u16) -> u16 {
     if x > 3 { 3 + ((x - 3) >> 1) } else { x }
 }
 
-/// Indirect context model over a single order.
+/// What context an [`IndirectModel`]'s follower-history table is keyed on.
+#[derive(Debug, Clone, Copy)]
+enum IndKind {
+    /// The last `n` finalized bytes.
+    Order(usize),
+    /// The current word's spelling hash.
+    Word,
+}
+
+/// Indirect context model over a single context kind.
 #[derive(Debug)]
 pub(crate) struct IndirectModel {
-    order: usize,
-    hist: Vec<u16>, // follower-history register per order-n context
+    kind: IndKind,
+    hist: Vec<u16>, // follower-history register per context
     hist_shift: u32,
     cells: Vec<u16>, // bit-history per (follower-hist, c1, node) key
     cell_shift: u32,
@@ -53,16 +62,40 @@ pub(crate) struct IndirectModel {
 impl IndirectModel {
     /// Production constructor: tables sized to the input, capped so several
     /// indirect orders fit the RAM budget (they generalize, so do not need the
-    /// full high-order table size the direct models use).
+    /// full high-order table size the direct models use). `LZR_IHB`/`LZR_ICB`
+    /// override the caps for offline sweeps only (production uses the consts).
     pub(crate) fn new(order: usize, capacity: usize) -> Self {
+        let env = |k: &str, d: u32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
         let bits = hashed_bits(capacity);
-        Self::with_bits(order, bits.min(HIST_BITS_CAP), bits.min(CELL_BITS_CAP))
+        let hcap = env("LZR_IHB", HIST_BITS_CAP);
+        let ccap = env("LZR_ICB", CELL_BITS_CAP);
+        Self::build(IndKind::Order(order), bits.min(hcap), bits.min(ccap))
     }
 
-    /// Explicit-size constructor (ablation sweeps).
+    /// An indirect model keyed on the current word's spelling hash.
+    pub(crate) fn word(capacity: usize) -> Self {
+        let bits = hashed_bits(capacity);
+        Self::build(
+            IndKind::Word,
+            bits.min(HIST_BITS_CAP),
+            bits.min(CELL_BITS_CAP),
+        )
+    }
+
+    /// Explicit-size constructor (ablation sweeps only).
+    #[cfg(test)]
     pub(crate) fn with_bits(order: usize, hist_bits: u32, cell_bits: u32) -> Self {
+        Self::build(IndKind::Order(order), hist_bits, cell_bits)
+    }
+
+    fn build(kind: IndKind, hist_bits: u32, cell_bits: u32) -> Self {
         Self {
-            order,
+            kind,
             hist: vec![0u16; 1usize << hist_bits],
             hist_shift: 64 - hist_bits,
             cells: vec![0u16; 1usize << cell_bits],
@@ -76,11 +109,16 @@ impl IndirectModel {
     }
 
     fn ctx_value(&self, ctx: &Context) -> u64 {
-        let mut cv = 0u64;
-        for i in 1..=self.order {
-            cv = (cv << 8) | u64::from(ctx.byte_back(i));
+        match self.kind {
+            IndKind::Order(order) => {
+                let mut cv = 0u64;
+                for i in 1..=order {
+                    cv = (cv << 8) | u64::from(ctx.byte_back(i));
+                }
+                cv
+            }
+            IndKind::Word => ctx.word_hash,
         }
-        cv
     }
 }
 
