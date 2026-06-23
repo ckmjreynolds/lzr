@@ -59,6 +59,17 @@ fn models(capacity: usize) -> Vec<Box<dyn Model>> {
 }
 
 const APM_CTX: usize = 256; // SSE contexts: the partial-byte node `c0`
+const APM_W: i32 = 2; // SSE blend: refined prob weighted `APM_W`/4 vs the mixer
+// (equal blend; the stronger multi-mixer needs less SSE correction — sweep
+// 1/2/3/4 = 1.5948/1.5929/1.5936/1.5971 on the 20 MB slice).
+
+/// Shipped SSE blend weight, overridable by `LZR_APMW` for offline sweeps only.
+fn apm_w() -> i32 {
+    std::env::var("LZR_APMW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(APM_W)
+}
 
 /// The shared predictor state driven identically by both directions: encode and
 /// decode differ only in where each bit comes from (read from the input vs.
@@ -67,6 +78,7 @@ struct CodecState {
     models: Vec<Box<dyn Model>>,
     mixer: Mixer,
     apm: Apm,
+    apm_w: i32,
     ctx: Context,
     stretched: Vec<i32>,
 }
@@ -83,6 +95,7 @@ impl CodecState {
             models,
             mixer,
             apm: Apm::new(APM_CTX),
+            apm_w: apm_w(),
             ctx: Context::with_capacity(capacity),
             stretched,
         }
@@ -108,7 +121,7 @@ impl CodecState {
             .mixer
             .mix(&self.stretched, &msel, usize::from(self.ctx.bpos));
         let pa = self.apm.refine(pm, (self.ctx.c0 & 0xff) as usize);
-        ((pm + 3 * pa + 2) >> 2) as u32
+        ((pm * (4 - self.apm_w) + pa * self.apm_w + 2) >> 2) as u32
     }
 
     /// Commit the actual `bit`: adapt the mixer, SSE, and models, advance context.
