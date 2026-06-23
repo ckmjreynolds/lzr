@@ -21,7 +21,9 @@ const USE_LRU: bool = false; // false → flat table; true → LRU exact baselin
 #[derive(Debug)]
 pub(crate) struct MatchModel {
     finder: Box<dyn Finder>,
-    last8: u64, // rolling last 8 finalized bytes (the finder key)
+    last8: u64,    // rolling last 8 finalized bytes
+    key_mask: u64, // masks `last8` to the low `key_bytes` bytes for the finder
+    key_bytes: u32,
     ptr: usize, // history index of the predicted next byte
     len: u32,   // current match length
     sm: StateMap,
@@ -36,14 +38,29 @@ pub(crate) struct MatchModel {
 
 impl MatchModel {
     pub(crate) fn new() -> Self {
+        Self::with_key(KEY_BYTES)
+    }
+
+    /// A match model keyed on the last `key_bytes` finalized bytes (`key_bytes`
+    /// ≤ 8). A shorter key acquires matches from shorter repeats; the [`StateMap`]
+    /// (keyed on length) discounts the resulting shorter/less-reliable matches.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn with_key(key_bytes: u32) -> Self {
         let finder: Box<dyn Finder> = if USE_LRU {
             Box::new(LruFinder::new(LRU_CAP))
         } else {
             Box::new(FlatFinder::new(FLAT_BITS))
         };
+        let key_mask = if key_bytes >= 8 {
+            u64::MAX
+        } else {
+            (1u64 << (8 * key_bytes)) - 1
+        };
         Self {
             finder,
             last8: 0,
+            key_mask,
+            key_bytes,
             ptr: 0,
             len: 0,
             sm: StateMap::new(2 * (LEN_CAP as usize + 1)),
@@ -71,15 +88,16 @@ impl MatchModel {
             self.len = 0;
         }
         self.last8 = (self.last8 << 8) | u64::from(b);
+        let key = self.last8 & self.key_mask;
         if self.len == 0 {
             self.lookups += 1;
-            if let Some(q) = self.finder.lookup(self.last8) {
+            if let Some(q) = self.finder.lookup(key) {
                 self.ptr = q as usize;
                 self.len = 1;
                 self.hits += 1;
             }
         }
-        self.finder.insert(self.last8, (n + 1) as u32);
+        self.finder.insert(key, (n + 1) as u32);
     }
 }
 
@@ -123,7 +141,8 @@ impl Drop for MatchModel {
             return;
         }
         eprintln!(
-            "match (key={KEY_BYTES}B): {} | coverage {:.1}%  acquire {}/{} ({:.1}%)",
+            "match (key={}B): {} | coverage {:.1}%  acquire {}/{} ({:.1}%)",
+            self.key_bytes,
             self.finder.report(),
             100.0 * self.covered as f64 / self.total as f64,
             self.hits,

@@ -33,6 +33,7 @@ fn models() -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::sparse(0b1011)), // bytes back 1, 2 and 4 (skip 3)
         Box::new(ContextModel::sparse(0b1100)), // bytes back 3 and 4 (skip 1, 2)
         Box::new(MatchModel::new()),
+        Box::new(MatchModel::with_key(4)), // shorter-key match: faster acquisition
     ];
     #[cfg(feature = "arm")]
     v.push(Box::new(ArmModel::arm()));
