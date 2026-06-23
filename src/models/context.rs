@@ -22,9 +22,12 @@ use super::statemap::StateMap;
 use super::{Context, Model};
 
 const MAX: u16 = 63; // count cap; with the 6-bit packing this bounds a state to 12 bits
-const HASH_BITS: u32 = 27; // CAP on the hashed-table size (orders ≥ 3 / word / sparse);
-// the actual size adapts to the input (see `hashed_bits`) so small inputs and
-// tests stay tiny. At the cap: 128M cells × 2 B = 256 MB/model.
+const HASH_BITS: u32 = 28; // CAP on the hashed-table size (orders ≥ 3 / word / sparse).
+// The actual size adapts to the input (`hashed_bits`) AND to the model's context
+// space (`hashed`), so small inputs/tests stay tiny and a model is never given a
+// table larger than the distinct contexts it can produce. At the cap: 256M cells
+// × 2 B = 512 MB/model — but only the orders and word reach it; the sparse models
+// (2–3 byte contexts) are bounded far below, keeping enwik9 RSS ~6.4 GB.
 const SM_STATES: usize = 1 << 12; // (n0 << 6) | n1, each ≤ 63
 
 /// One observed bit moves the cell to its next bit-history state: bump the seen
@@ -103,9 +106,15 @@ impl ContextModel {
     }
 
     /// A hashed-table model sized to the input (word/sparse/high-order contexts
-    /// are sparse).
+    /// are sparse). A sparse model's distinct contexts are bounded by its byte
+    /// count (`8 * bytes + 8` for the appended `c0`), so it is never allocated a
+    /// table larger than that — a 2-byte sparse context fits exactly in 2^24
+    /// cells, freeing RAM for the high orders to reach the full [`HASH_BITS`] cap.
     fn hashed(kind: CtxKind, capacity: usize) -> Self {
-        let bits = hashed_bits(capacity);
+        let bits = match kind {
+            CtxKind::Sparse(mask) => hashed_bits(capacity).min(8 * mask.count_ones() + 8),
+            _ => hashed_bits(capacity),
+        };
         Self {
             kind,
             direct: false,
