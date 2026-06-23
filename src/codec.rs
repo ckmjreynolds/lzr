@@ -32,6 +32,7 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::sparse(0b110, capacity)), // bytes back 2 and 3 (skip the last byte)
         Box::new(ContextModel::sparse(0b1011, capacity)), // bytes back 1, 2 and 4 (skip 3)
         Box::new(ContextModel::sparse(0b1100, capacity)), // bytes back 3 and 4 (skip 1, 2)
+        Box::new(ContextModel::sparse(0b10001, capacity)), // bytes back 1 and 5 (skip 2,3,4)
         Box::new(MatchModel::new()),
         Box::new(MatchModel::with_key(4)), // shorter-key match: faster acquisition
         // Indirect context models (paq ICM): predict from what historically
@@ -409,6 +410,46 @@ mod tests {
             let n = code_stream_models(v, &data).len();
             let bpb = n as f64 * 8.0 / orig;
             println!("+ indirect {set:?}: {bpb:.4} bpb  ({:+.4})", bpb - base_bpb);
+        }
+    }
+
+    /// Sweep additional sparse context patterns as marginals on the current
+    /// baseline. Run: `cargo test --release ablate_sparse -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: extra sparse-context patterns on an enwik8 slice"]
+    #[allow(clippy::cast_precision_loss)]
+    fn ablate_sparse() {
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let cap = data.len();
+        let base = code_stream_models(baseline_models(cap), &data).len();
+        let base_bpb = base as f64 * 8.0 / orig;
+        println!("baseline: {base_bpb:.4} bpb");
+        // (mask, label): bit i selects byte_back(i+1); avoid contiguous (= orders).
+        let cands: &[(u32, &str)] = &[
+            (0b1001, "{1,4}"),
+            (0b1010, "{2,4}"),
+            (0b1110, "{2,3,4}"),
+            (0b1101, "{1,3,4}"),
+            (0b10001, "{1,5}"),
+        ];
+        for &(mask, label) in cands {
+            let mut v = baseline_models(cap);
+            v.push(Box::new(ContextModel::sparse(mask, cap)) as Box<dyn Model>);
+            let n = code_stream_models(v, &data).len();
+            let bpb = n as f64 * 8.0 / orig;
+            println!("+ sparse {label}: {bpb:.4} bpb  ({:+.4})", bpb - base_bpb);
         }
     }
 
