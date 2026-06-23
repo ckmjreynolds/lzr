@@ -85,10 +85,10 @@ pub(crate) struct Mixer {
 }
 
 impl Mixer {
-    /// New mixer over `n` model inputs. Four sub-mixers, selected by c1, c2, c3
-    /// and the word-hash byte respectively (all × bit-position).
+    /// New mixer over `n` model inputs. Five sub-mixers, selected by c1, c2, c3,
+    /// the word-hash byte, and the match-length bucket (all × bit-position).
     pub(crate) fn new(n: usize) -> Self {
-        let cards = vec![256usize, 256, 256, 256];
+        let cards = vec![256usize, 256, 256, 256, 64];
         let w = cards
             .iter()
             .map(|&c| vec![0i32; c * BIT_POSITIONS * n])

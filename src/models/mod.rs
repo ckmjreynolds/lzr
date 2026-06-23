@@ -93,4 +93,10 @@ pub(crate) trait Model {
     fn predict(&mut self, ctx: &Context) -> i32;
     /// Observe the actual `bit`. `ctx` still reflects the pre-bit state.
     fn update(&mut self, ctx: &Context, bit: u8);
+    /// Optional coarse state this model contributes as a mixer weight-set
+    /// selector (e.g. the match model's current run-length bucket). `None` (the
+    /// default) means the model offers no selector. Constant within a byte.
+    fn selector(&self) -> Option<usize> {
+        None
+    }
 }

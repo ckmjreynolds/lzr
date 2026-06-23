@@ -132,6 +132,13 @@ impl Model for MatchModel {
             self.byte_step(ctx, b);
         }
     }
+
+    /// Current match-length bucket (0 = no active match) — a decorrelated mixer
+    /// selector: the blend can lean on the match in long-repeat regions.
+    #[allow(clippy::cast_possible_truncation)]
+    fn selector(&self) -> Option<usize> {
+        Some(self.len.min(LEN_CAP) as usize)
+    }
 }
 
 impl Drop for MatchModel {

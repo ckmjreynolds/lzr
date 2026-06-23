@@ -93,11 +93,13 @@ impl CodecState {
             *s = m.predict(&self.ctx);
         }
         let c4 = self.ctx.c4;
+        let match_sel = self.models.iter().find_map(|m| m.selector()).unwrap_or(0);
         let msel = [
             (c4 & 0xff) as usize,                 // c1
             ((c4 >> 8) & 0xff) as usize,          // c2
             ((c4 >> 16) & 0xff) as usize,         // c3
             (self.ctx.word_hash & 0xff) as usize, // current word
+            match_sel,                            // match-length bucket
         ];
         let pm = self
             .mixer
