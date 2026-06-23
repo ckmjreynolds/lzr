@@ -66,7 +66,16 @@ pub(crate) fn stretch(p: i32) -> i32 {
 }
 
 const BIT_POSITIONS: usize = 8;
-const LR_SHIFT: i32 = 12;
+const LR_SHIFT: i32 = 13; // re-tuned for the 5 averaged sub-mixers (was 12)
+
+/// Shipped learning-rate shift, overridable by `LZR_LR` for offline sweeps only
+/// (production never sets it, so the deterministic codec uses the const).
+fn lr_shift() -> i32 {
+    std::env::var("LZR_LR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(LR_SHIFT)
+}
 
 /// Adaptive logistic mixer: several sub-mixers, each with its own weight set
 /// selected by a *different* local context (previous byte c1/c2/c3 and the
@@ -82,6 +91,7 @@ pub(crate) struct Mixer {
     inputs: Vec<i32>,  // stretched inputs from the last `mix`
     set: Vec<usize>,   // selected offset per sub-mixer from the last `mix`
     pr: i32,           // last squashed prediction (12-bit)
+    lr: i32,           // learning-rate shift
 }
 
 impl Mixer {
@@ -101,6 +111,7 @@ impl Mixer {
             inputs: vec![0; n],
             set,
             pr: PROB_ONE / 2,
+            lr: lr_shift(),
         }
     }
 
@@ -135,7 +146,7 @@ impl Mixer {
         for k in 0..self.w.len() {
             let off = self.set[k];
             for (wt, st) in self.w[k][off..off + self.n].iter_mut().zip(&self.inputs) {
-                *wt += (st * err) >> LR_SHIFT;
+                *wt += (st * err) >> self.lr;
             }
         }
     }
