@@ -37,6 +37,8 @@ pub(crate) struct Context {
     /// the run's first digit (the field tag, e.g. `>` after `<id>`).
     pub(crate) num_pos: u8,
     pub(crate) num_field: u8,
+    /// Letters in the current word so far (0 between words) — a regime selector.
+    pub(crate) word_pos: u8,
 }
 
 /// Mixing multiplier for folding a letter into the rolling word hash.
@@ -53,6 +55,7 @@ impl Context {
             word_hash: 0,
             num_pos: 0,
             num_field: 0,
+            word_pos: 0,
         }
     }
 
@@ -93,8 +96,10 @@ impl Context {
                 .word_hash
                 .wrapping_mul(WORD_PRIME)
                 .wrapping_add(u64::from(b) + 1);
+            self.word_pos = self.word_pos.saturating_add(1);
         } else {
             self.word_hash = 0;
+            self.word_pos = 0;
         }
         self.c0 = 1;
         self.bpos = 0;
