@@ -63,6 +63,12 @@ enum CtxKind {
 
 /// A context model over bit-history states. The context is either the last `n`
 /// bytes (orders ≤ 2 direct-indexed, ≥ 3 hashed) or a word-derived hash.
+///
+/// Hashed cells carry a **4-bit confirm tag** packed into the spare top bits of
+/// the `u16` (the bit-history state needs only 12 bits, `(n0<<6)|n1 ≤ 4095`). On
+/// a tag mismatch the slot is treated as fresh rather than inheriting a colliding
+/// context's history — converting silent corruption into a clean eviction at
+/// zero extra memory. Direct (order ≤ 2) cells never collide and ignore the tag.
 #[derive(Debug)]
 pub(crate) struct ContextModel {
     kind: CtxKind,
@@ -71,6 +77,7 @@ pub(crate) struct ContextModel {
     cells: Vec<u16>,
     sm: StateMap,
     idx: usize,
+    check: u16, // expected 4-bit tag for the current hashed slot
 }
 
 /// Hashed-table size (in bits) for a corpus of `capacity` preprocessed bytes:
@@ -100,6 +107,7 @@ impl ContextModel {
                 cells: vec![0; 1usize << (8 * order + 8)],
                 sm: StateMap::new(SM_STATES),
                 idx: 0,
+                check: 0,
             };
         }
         Self::hashed(CtxKind::Order(order), capacity)
@@ -122,6 +130,7 @@ impl ContextModel {
             cells: vec![0; 1usize << bits],
             sm: StateMap::new(SM_STATES),
             idx: 0,
+            check: 0,
         }
     }
 
@@ -160,27 +169,45 @@ impl ContextModel {
             }
         }
     }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn slot(&self, ctx: &Context) -> usize {
-        let raw = (self.context_value(ctx) << 8) | u64::from(ctx.c0 & 0xff);
-        if self.direct {
-            raw as usize
-        } else {
-            (raw.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
-        }
-    }
 }
 
+const STATE_MASK: u16 = 0x0FFF; // bit-history state occupies the low 12 bits
+const HASH1: u64 = 0x9E37_79B9_7F4A_7C15; // index hash
+const HASH2: u64 = 0xD1B5_4A32_D192_ED03; // independent tag hash (4-bit confirm)
+
 impl Model for ContextModel {
+    #[allow(clippy::cast_possible_truncation)]
     fn predict(&mut self, ctx: &Context) -> i32 {
-        self.idx = self.slot(ctx);
-        self.sm.predict(self.cells[self.idx] as usize)
+        let raw = (self.context_value(ctx) << 8) | u64::from(ctx.c0 & 0xff);
+        if self.direct {
+            self.idx = raw as usize;
+            return self.sm.predict(self.cells[self.idx] as usize);
+        }
+        self.idx = (raw.wrapping_mul(HASH1) >> self.shift) as usize;
+        self.check = (raw.wrapping_mul(HASH2) >> 60) as u16;
+        let cell = self.cells[self.idx];
+        let state = if cell >> 12 == self.check {
+            cell & STATE_MASK
+        } else {
+            0
+        };
+        self.sm.predict(state as usize)
     }
 
     fn update(&mut self, _ctx: &Context, bit: u8) {
-        let s = self.cells[self.idx];
-        self.sm.update(s as usize, bit);
-        self.cells[self.idx] = transition(s, bit);
+        if self.direct {
+            let s = self.cells[self.idx];
+            self.sm.update(s as usize, bit);
+            self.cells[self.idx] = transition(s, bit);
+            return;
+        }
+        let cell = self.cells[self.idx];
+        let state = if cell >> 12 == self.check {
+            cell & STATE_MASK
+        } else {
+            0
+        };
+        self.sm.update(state as usize, bit);
+        self.cells[self.idx] = (self.check << 12) | transition(state, bit);
     }
 }

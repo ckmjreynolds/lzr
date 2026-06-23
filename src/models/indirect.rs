@@ -47,6 +47,7 @@ pub(crate) struct IndirectModel {
     hist_idx: usize, // current byte's follower-history slot (refreshed at bpos 0)
     fh: u16,         // current byte's follower history
     idx: usize,      // current bit's cells slot
+    check: u16,      // expected 4-bit confirm tag for the current cell
 }
 
 impl IndirectModel {
@@ -70,6 +71,7 @@ impl IndirectModel {
             hist_idx: 0,
             fh: 0,
             idx: 0,
+            check: 0,
         }
     }
 
@@ -83,6 +85,8 @@ impl IndirectModel {
 }
 
 const MULT: u64 = 0x9E37_79B9_7F4A_7C15;
+const MULT2: u64 = 0xD1B5_4A32_D192_ED03; // independent 4-bit confirm-tag hash
+const STATE_MASK: u16 = 0x0FFF; // bit-history state occupies the low 12 bits
 
 impl Model for IndirectModel {
     #[allow(clippy::cast_possible_truncation)]
@@ -95,14 +99,26 @@ impl Model for IndirectModel {
         let key =
             u64::from(self.fh) | (u64::from(ctx.byte_back(1)) << 16) | (u64::from(ctx.c0) << 24);
         self.idx = (key.wrapping_mul(MULT) >> self.cell_shift) as usize;
-        self.sm.predict(self.cells[self.idx] as usize)
+        self.check = (key.wrapping_mul(MULT2) >> 60) as u16;
+        let cell = self.cells[self.idx];
+        let state = if cell >> 12 == self.check {
+            cell & STATE_MASK
+        } else {
+            0
+        };
+        self.sm.predict(state as usize)
     }
 
     #[allow(clippy::cast_possible_truncation)]
     fn update(&mut self, ctx: &Context, bit: u8) {
-        let s = self.cells[self.idx];
-        self.sm.update(s as usize, bit);
-        self.cells[self.idx] = transition(s, bit);
+        let cell = self.cells[self.idx];
+        let state = if cell >> 12 == self.check {
+            cell & STATE_MASK
+        } else {
+            0
+        };
+        self.sm.update(state as usize, bit);
+        self.cells[self.idx] = (self.check << 12) | transition(state, bit);
         if ctx.bpos == 7 {
             let b = (((ctx.c0 << 1) | u32::from(bit)) & 0xff) as u16;
             self.hist[self.hist_idx] = (self.fh << 8) | b;
