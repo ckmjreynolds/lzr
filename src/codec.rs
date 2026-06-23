@@ -118,6 +118,7 @@ impl CodecState {
             match_sel,                              // match-length bucket
             usize::from(self.ctx.num_pos.min(15)),  // digit-run position
             usize::from(self.ctx.word_pos.min(15)), // word position
+            usize::from(self.ctx.col.min(15)),      // column (line position)
         ];
         let pm = self
             .mixer

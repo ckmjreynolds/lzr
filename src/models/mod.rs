@@ -39,6 +39,8 @@ pub(crate) struct Context {
     pub(crate) num_field: u8,
     /// Letters in the current word so far (0 between words) — a regime selector.
     pub(crate) word_pos: u8,
+    /// Bytes since the last newline (column) — a line-position regime selector.
+    pub(crate) col: u16,
 }
 
 /// Mixing multiplier for folding a letter into the rolling word hash.
@@ -56,6 +58,7 @@ impl Context {
             num_pos: 0,
             num_field: 0,
             word_pos: 0,
+            col: 0,
         }
     }
 
@@ -83,6 +86,11 @@ impl Context {
         let b = self.c0 as u8; // low 8 bits are the byte; the sentinel is bit 8
         self.history.push(b);
         self.c4 = (self.c4 << 8) | u32::from(b);
+        self.col = if b == b'\n' {
+            0
+        } else {
+            self.col.saturating_add(1)
+        };
         if b.is_ascii_digit() {
             if self.num_pos == 0 {
                 self.num_field = self.byte_back(2); // the byte before this run
