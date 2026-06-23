@@ -28,6 +28,10 @@ fn models() -> Vec<Box<dyn Model>> {
         Box::new(ContextModel::new(5)),
         Box::new(ContextModel::new(6)),
         Box::new(ContextModel::word()),
+        Box::new(ContextModel::sparse(0b101)), // bytes back 1 and 3 (skip 2)
+        Box::new(ContextModel::sparse(0b110)), // bytes back 2 and 3 (skip the last byte)
+        Box::new(ContextModel::sparse(0b1011)), // bytes back 1, 2 and 4 (skip 3)
+        Box::new(ContextModel::sparse(0b1100)), // bytes back 3 and 4 (skip 1, 2)
         Box::new(MatchModel::new()),
     ];
     #[cfg(feature = "arm")]

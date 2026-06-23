@@ -13,6 +13,10 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-23 — sparse/skip context models + mixer LR: enwik8 1.6117 → 1.5880
+
+Two further deterministic levers on the post-arm roadmap. (1) Mixer learning rate: `LR_SHIFT` was 10 (too high); sweeping on a 20 MB slice (10→1.6997, 11→1.6868, 12→1.6819, 13→1.6820) put the knee at 12, confirmed on full enwik8 (1.6117 → 1.5931, −0.0186). `APM_RATE=8` gave no gain (kept 7). (2) Sparse/skip context models: added a `CtxKind::Sparse(mask)` variant (mask bit i selects `byte_back(i+1)`, mask mixed into the hash to avoid cross-model collisions) and four sparse models — bytes {1,3}, {2,3}, {1,2,4}, {3,4} — covering both include-last and skip-the-last patterns the contiguous orders miss. enwik8 1.5931 → 1.5880 (−0.0051; −0.0084 on the 20 MB slice, smaller at full scale because the enlarged HASH_BITS=26 tables already capture more). L(D)≈0. Throughput eased 0.85 → 0.57 MB/s (four more per-bit models; enwik9 ~0.5 h, well within budget). Deterministic v9 enwik8 now 1.5880 — from 1.6938 at the start of the roadmap, a −0.106 L(C) gain plus the −0.0079 net from the binary shrink, all at L(D)≈0.
+
 ## 2026-06-23 — high-order context tables were badly undersized: HASH_BITS 22 → 26 gives enwik8 1.6938 → 1.6117 (−0.082) at L(D)≈0
 
 Working the post-arm bpb roadmap on the fast deterministic build, the first structural lever after the binary shrink was the per-order table size, flagged as untuned since the 2026-06-19 bit-history rebuild. The hashed table for orders ≥ 3 (and the word model) was a fixed 2^22 (4M cells, 8 MB/model) — the 06-19 note guessed it was "not saturating catastrophically." It was, badly. Sweeping `HASH_BITS` on full enwik8: 22 → 1.6938, 24 → 1.6433 (−0.0505), 26 → 1.6117 (−0.0821), 28 → 1.5962 (−0.0976, peak RSS 3.6 GB). Each step roughly halves collisions; the gain is monotone and only mildly diminishing through 26. This is the largest single deterministic lever found on v9 outside the match model, and it is pure L(C) at L(D)≈0 (more RAM, no shipped bytes) — collisions in the high-order tables were silently capping every prediction.

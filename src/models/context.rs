@@ -50,6 +50,10 @@ enum CtxKind {
     Order(usize),
     /// Hash of the current word's letters so far (spelling, variable length).
     Word,
+    /// A non-contiguous set of finalized bytes: `mask` bit `i` selects
+    /// `byte_back(i + 1)`. Captures skip-gram dependencies the contiguous orders
+    /// miss (e.g. context one step removed from a noisy delimiter byte).
+    Sparse(u32),
 }
 
 /// A context model over bit-history states. The context is either the last `n`
@@ -100,6 +104,12 @@ impl ContextModel {
         Self::hashed(CtxKind::Word)
     }
 
+    /// Keyed on a non-contiguous set of recent bytes (`mask` bit `i` →
+    /// `byte_back(i + 1)`), hashed like the high orders.
+    pub(crate) fn sparse(mask: u32) -> Self {
+        Self::hashed(CtxKind::Sparse(mask))
+    }
+
     fn context_value(&self, ctx: &Context) -> u64 {
         match self.kind {
             CtxKind::Order(order) => {
@@ -110,6 +120,18 @@ impl ContextModel {
                 cv
             }
             CtxKind::Word => ctx.word_hash,
+            CtxKind::Sparse(mask) => {
+                // Seed with the mask so different sparse models don't collide in
+                // the shared hash space when they read the same bytes.
+                let mut cv = u64::from(mask);
+                let mut m = mask;
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize + 1;
+                    cv = (cv << 8) | u64::from(ctx.byte_back(i));
+                    m &= m - 1;
+                }
+                cv
+            }
         }
     }
 
