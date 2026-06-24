@@ -35,26 +35,29 @@ submission  = []
 # deterministic and fast. Enable for arm work: `cargo test --features arm`.
 arm         = []
 
-# The shipped binary counts 2x in the Hutter score (L(D) = 16 x bytes / 1e9), so
-# the release profile optimizes for size: `opt-level="s"` + fat LTO + a single
-# codegen unit + symbol stripping. `panic="abort"` is intentionally NOT set — it
-# breaks the libtest harness under `cargo test --release` (build.sh).
+# `release` is the iteration-speed default (CDR, 2026-06-24): `opt-level = 3` for
+# the fastest encode/decode while we iterate — iteration speed currently outweighs
+# the tiny L(D) cost of a slightly larger binary, and we switch to `ship` only when
+# something is submission-worthy. It keeps fat LTO + a single codegen unit + symbol
+# stripping, so the binary stays small (~419 KB) anyway. `panic="abort"` is
+# intentionally NOT set — it breaks the libtest harness under `cargo test --release`
+# (build.sh).
 [profile.release]
-opt-level     = "s"
+opt-level     = 3
 lto           = true
 codegen-units = 1
 strip         = true
 panic         = "unwind"
 
-# `fast`: dev/experiment-iteration profile — NOT shipped. Identical to `release`
-# except `opt-level = 3`, which trades binary size (irrelevant off the submission
-# path) for ~10-20% faster encode/decode. The shipped artifact is still built with
-# `--release` (size-optimized for L(D)); use `--profile fast` only for timing runs
-# and ablations. Output is byte-identical to `release` (opt-level is bound by the
-# as-if rule over the all-integer hot path; verified same archive SHA).
-[profile.fast]
+# `ship`: the size-optimized SUBMISSION build — `opt-level = "s"` to minimize the
+# binary, which counts 2x in the Hutter score (L(D) = 16 x bytes / 1e9). Versus
+# `release` it is ~16 KB smaller (−0.00026 bpb L(D)) for 0 bpb of L(C): the output
+# is byte-identical (Rust preserves IEEE FP across opt-levels — verified same
+# archive SHA with the f32 neural mixer in the path). Build the actual submission
+# with `cargo build --profile ship`; until then `release` (opt-3) is the default.
+[profile.ship]
 inherits      = "release"
-opt-level     = 3
+opt-level     = "s"
 
 [lints.rust]
 keyword_idents = { level = "forbid", priority = -1 }
