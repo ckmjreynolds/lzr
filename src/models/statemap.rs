@@ -49,7 +49,10 @@ impl StateMap {
     #[allow(clippy::cast_possible_truncation)]
     pub(crate) fn update(&mut self, s: usize, bit: u8) {
         let target = i32::from(bit) * 65535;
-        let rate = self.dt[(self.n[s] as usize).min(self.limit)];
+        // n[s] is incremented only while < limit, so n[s] <= limit always and the
+        // dt index (table length limit+1) is in bounds without a redundant clamp.
+        debug_assert!(self.n[s] as usize <= self.limit);
+        let rate = self.dt[self.n[s] as usize];
         self.p[s] += ((i64::from(target - self.p[s]) * i64::from(rate)) >> 16) as i32;
         if (self.n[s] as usize) < self.limit {
             self.n[s] += 1;

@@ -83,6 +83,7 @@ pub(crate) struct ContextModel {
     sm: StateMap,
     idx: usize,
     check: u16, // expected 4-bit tag for the current hashed slot
+    cv: u64,    // context value cached at bpos==0 (byte-constant; only c0 varies per bit)
 }
 
 /// Hashed-table size (in bits) for a corpus of `capacity` preprocessed bytes:
@@ -113,6 +114,7 @@ impl ContextModel {
                 sm: StateMap::new(SM_STATES),
                 idx: 0,
                 check: 0,
+                cv: 0,
             };
         }
         Self::hashed(CtxKind::Order(order), capacity)
@@ -137,6 +139,7 @@ impl ContextModel {
             sm: StateMap::new(SM_STATES),
             idx: 0,
             check: 0,
+            cv: 0,
         }
     }
 
@@ -194,7 +197,14 @@ const HASH2: u64 = 0xD1B5_4A32_D192_ED03; // independent tag hash (4-bit confirm
 impl Model for ContextModel {
     #[allow(clippy::cast_possible_truncation)]
     fn predict(&mut self, ctx: &Context) -> i32 {
-        let raw = (self.context_value(ctx) << 8) | u64::from(ctx.c0 & 0xff);
+        // context_value reads only byte-constant state (finalized history,
+        // word_hash, num_*), never c0/bpos — so it is identical across the 8
+        // bits of a byte. Compute it once at bpos==0 and reuse; only the c0 term
+        // below varies per bit. (Same per-byte caching IndirectModel already uses.)
+        if ctx.bpos == 0 {
+            self.cv = self.context_value(ctx);
+        }
+        let raw = (self.cv << 8) | u64::from(ctx.c0 & 0xff);
         if self.direct {
             self.idx = raw as usize;
             return self.sm.predict(self.cells[self.idx] as usize);

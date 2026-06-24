@@ -16,12 +16,15 @@ pub(crate) struct Encoder {
 }
 
 impl Encoder {
-    /// New encoder with the full `[0, 2^32)` range.
-    pub(crate) const fn new() -> Self {
+    /// New encoder with the full `[0, 2^32)` range, pre-reserving `cap` output
+    /// bytes so the renorm `push` never reallocates mid-stream (the coded output
+    /// is well under one byte per input byte at the operating bpb). Capacity is
+    /// invisible to the coded bytes.
+    pub(crate) fn with_capacity(cap: usize) -> Self {
         Self {
             x1: 0,
             x2: 0xffff_ffff,
-            out: Vec::new(),
+            out: Vec::with_capacity(cap),
         }
     }
 
@@ -131,7 +134,7 @@ mod tests {
             probs.push(((state >> 20) as u32 % PROB_MAX).max(1));
         }
 
-        let mut enc = Encoder::new();
+        let mut enc = Encoder::with_capacity(0);
         for (&b, &p) in bits.iter().zip(&probs) {
             enc.encode(b, p);
         }

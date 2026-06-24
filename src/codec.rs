@@ -12,49 +12,49 @@ use crate::models::indirect::IndirectModel;
 #[cfg(feature = "arm")]
 use crate::models::lstm::ArmModel;
 use crate::models::match_model::MatchModel;
-use crate::models::{Context, Model};
+use crate::models::{AnyModel, Context, Model};
 use crate::preprocessors::Pipeline;
 
 /// The deterministic model set (no arm). Shared by the production [`models`] and
 /// by the ablation tests, so an ablation measures its variant against the exact
 /// shipped baseline. Adding/removing a deterministic model is one line here.
-pub(crate) fn baseline_models(capacity: usize) -> Vec<Box<dyn Model>> {
+pub(crate) fn baseline_models(capacity: usize) -> Vec<AnyModel> {
     vec![
-        Box::new(ContextModel::new(0, capacity)),
-        Box::new(ContextModel::new(1, capacity)),
-        Box::new(ContextModel::new(2, capacity)),
-        Box::new(ContextModel::new(3, capacity)),
-        Box::new(ContextModel::new(4, capacity)),
-        Box::new(ContextModel::new(5, capacity)),
-        Box::new(ContextModel::new(6, capacity)),
-        Box::new(ContextModel::word(capacity)),
-        Box::new(ContextModel::sparse(0b101, capacity)), // bytes back 1 and 3 (skip 2)
-        Box::new(ContextModel::sparse(0b110, capacity)), // bytes back 2 and 3 (skip the last byte)
-        Box::new(ContextModel::sparse(0b1011, capacity)), // bytes back 1, 2 and 4 (skip 3)
-        Box::new(ContextModel::sparse(0b1100, capacity)), // bytes back 3 and 4 (skip 1, 2)
-        Box::new(ContextModel::sparse(0b10001, capacity)), // bytes back 1 and 5 (skip 2,3,4)
-        Box::new(ContextModel::number(capacity)),        // field-aware digit-run context
-        Box::new(MatchModel::new()),
-        Box::new(MatchModel::with_key(4)), // shorter-key match: faster acquisition
+        ContextModel::new(0, capacity).into(),
+        ContextModel::new(1, capacity).into(),
+        ContextModel::new(2, capacity).into(),
+        ContextModel::new(3, capacity).into(),
+        ContextModel::new(4, capacity).into(),
+        ContextModel::new(5, capacity).into(),
+        ContextModel::new(6, capacity).into(),
+        ContextModel::word(capacity).into(),
+        ContextModel::sparse(0b101, capacity).into(), // bytes back 1 and 3 (skip 2)
+        ContextModel::sparse(0b110, capacity).into(), // bytes back 2 and 3 (skip the last byte)
+        ContextModel::sparse(0b1011, capacity).into(), // bytes back 1, 2 and 4 (skip 3)
+        ContextModel::sparse(0b1100, capacity).into(), // bytes back 3 and 4 (skip 1, 2)
+        ContextModel::sparse(0b10001, capacity).into(), // bytes back 1 and 5 (skip 2,3,4)
+        ContextModel::number(capacity).into(),        // field-aware digit-run context
+        MatchModel::new().into(),
+        MatchModel::with_key(4).into(), // shorter-key match: faster acquisition
         // Indirect context models (paq ICM): predict from what historically
         // followed a context. Orders [1,2,3,4,6] — 5 and 8 add ~nothing.
-        Box::new(IndirectModel::new(1, capacity)),
-        Box::new(IndirectModel::new(2, capacity)),
-        Box::new(IndirectModel::new(3, capacity)),
-        Box::new(IndirectModel::new(4, capacity)),
-        Box::new(IndirectModel::new(6, capacity)),
-        Box::new(IndirectModel::word(capacity)),
+        IndirectModel::new(1, capacity).into(),
+        IndirectModel::new(2, capacity).into(),
+        IndirectModel::new(3, capacity).into(),
+        IndirectModel::new(4, capacity).into(),
+        IndirectModel::new(6, capacity).into(),
+        IndirectModel::word(capacity).into(),
     ]
 }
 
 /// The active model set. The online-neural arm is appended only under
 /// `--features arm` (opt-in, not shipped — see Cargo.toml).
-fn models(capacity: usize) -> Vec<Box<dyn Model>> {
+fn models(capacity: usize) -> Vec<AnyModel> {
     // `mut` is only used when the arm feature appends below.
     #[cfg_attr(not(feature = "arm"), allow(unused_mut))]
     let mut v = baseline_models(capacity);
     #[cfg(feature = "arm")]
-    v.push(Box::new(ArmModel::arm()));
+    v.push(ArmModel::arm().into());
     v
 }
 
@@ -75,12 +75,13 @@ fn apm_w() -> i32 {
 /// decode differ only in where each bit comes from (read from the input vs.
 /// decoded from the stream) and which coder consumes it.
 struct CodecState {
-    models: Vec<Box<dyn Model>>,
+    models: Vec<AnyModel>,
     mixer: Mixer,
     apm: Apm,
     apm_w: i32,
     ctx: Context,
     stretched: Vec<i32>,
+    msel: [usize; 8], // mixer weight-set selectors, recomputed once per byte (bpos==0)
 }
 
 impl CodecState {
@@ -88,7 +89,7 @@ impl CodecState {
         Self::with_models(models(capacity), capacity)
     }
 
-    fn with_models(models: Vec<Box<dyn Model>>, capacity: usize) -> Self {
+    fn with_models(models: Vec<AnyModel>, capacity: usize) -> Self {
         let stretched = vec![0i32; models.len()];
         let mixer = Mixer::new(models.len());
         Self {
@@ -98,6 +99,7 @@ impl CodecState {
             apm_w: apm_w(),
             ctx: Context::with_capacity(capacity),
             stretched,
+            msel: [0usize; 8],
         }
     }
 
@@ -105,24 +107,32 @@ impl CodecState {
     /// models, then refine through the SSE stage and blend (SSE-weighted).
     #[allow(clippy::cast_sign_loss)]
     fn predict(&mut self) -> u32 {
+        // Every mixer selector (c1/c2/c3 from c4, word hash, match-length bucket,
+        // digit-run/word/column positions) is byte-constant — none change until
+        // push_byte. The model predict loop below never mutates them or the match
+        // length, so recomputing the selector array once at bpos==0 and reusing it
+        // for all 8 bits is identical to the per-bit computation, and drops 7/8 of
+        // the find_map selector scans.
+        if self.ctx.bpos == 0 {
+            let c4 = self.ctx.c4;
+            let match_sel = self.models.iter().find_map(AnyModel::selector).unwrap_or(0);
+            self.msel = [
+                (c4 & 0xff) as usize,                   // c1
+                ((c4 >> 8) & 0xff) as usize,            // c2
+                ((c4 >> 16) & 0xff) as usize,           // c3
+                (self.ctx.word_hash & 0xff) as usize,   // current word
+                match_sel,                              // match-length bucket
+                usize::from(self.ctx.num_pos.min(15)),  // digit-run position
+                usize::from(self.ctx.word_pos.min(15)), // word position
+                usize::from(self.ctx.col.min(15)),      // column (line position)
+            ];
+        }
         for (m, s) in self.models.iter_mut().zip(&mut self.stretched) {
             *s = m.predict(&self.ctx);
         }
-        let c4 = self.ctx.c4;
-        let match_sel = self.models.iter().find_map(|m| m.selector()).unwrap_or(0);
-        let msel = [
-            (c4 & 0xff) as usize,                   // c1
-            ((c4 >> 8) & 0xff) as usize,            // c2
-            ((c4 >> 16) & 0xff) as usize,           // c3
-            (self.ctx.word_hash & 0xff) as usize,   // current word
-            match_sel,                              // match-length bucket
-            usize::from(self.ctx.num_pos.min(15)),  // digit-run position
-            usize::from(self.ctx.word_pos.min(15)), // word position
-            usize::from(self.ctx.col.min(15)),      // column (line position)
-        ];
         let pm = self
             .mixer
-            .mix(&self.stretched, &msel, usize::from(self.ctx.bpos));
+            .mix(&self.stretched, &self.msel, usize::from(self.ctx.bpos));
         let pa = self.apm.refine(pm, (self.ctx.c0 & 0xff) as usize);
         ((pm * (4 - self.apm_w) + pa * self.apm_w + 2) >> 2) as u32
     }
@@ -188,7 +198,7 @@ fn code_stream_inner(data: &[u8], orig_len: usize, progress: bool) -> Vec<u8> {
     write_varint(&mut out, data.len() as u64);
 
     let mut state = CodecState::new(data.len());
-    let mut enc = Encoder::new();
+    let mut enc = Encoder::with_capacity(data.len());
     let start = std::time::Instant::now();
     let report = progress && data.len() > 10_000_000;
     let step = (data.len() / 100).max(1);
@@ -223,11 +233,11 @@ fn code_stream_inner(data: &[u8], orig_len: usize, progress: bool) -> Vec<u8> {
 
 /// Like [`code_stream`] but with a caller-supplied model set (ablation only).
 #[cfg(test)]
-pub(crate) fn code_stream_models(models: Vec<Box<dyn Model>>, data: &[u8]) -> Vec<u8> {
+pub(crate) fn code_stream_models(models: Vec<AnyModel>, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, data.len() as u64);
     let mut state = CodecState::with_models(models, data.len());
-    let mut enc = Encoder::new();
+    let mut enc = Encoder::with_capacity(data.len());
     for &byte in data {
         for k in (0..8).rev() {
             let bit = (byte >> k) & 1;
@@ -246,7 +256,7 @@ pub(crate) fn code_stream_models(models: Vec<Box<dyn Model>>, data: &[u8]) -> Ve
 /// Operates on the coded bytes directly (no pipeline inverse).
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn decode_stream_models(models: Vec<Box<dyn Model>>, input: &[u8]) -> Vec<u8> {
+pub(crate) fn decode_stream_models(models: Vec<AnyModel>, input: &[u8]) -> Vec<u8> {
     let (len, header) = read_varint(input);
     let len = len as usize;
     let mut state = CodecState::with_models(models, len);
@@ -433,9 +443,9 @@ mod tests {
         let data = Pipeline::default_pipeline().forward(&e8[1_000_000..1_010_000]);
         let mk = || {
             let mut v = baseline_models(data.len());
-            v.push(Box::new(IndirectModel::new(2, data.len())) as Box<dyn Model>);
-            v.push(Box::new(IndirectModel::new(4, data.len())) as Box<dyn Model>);
-            v.push(Box::new(IndirectModel::new(6, data.len())) as Box<dyn Model>);
+            v.push(IndirectModel::new(2, data.len()).into());
+            v.push(IndirectModel::new(4, data.len()).into());
+            v.push(IndirectModel::new(6, data.len()).into());
             v
         };
         let coded = code_stream_models(mk(), &data);
@@ -486,7 +496,7 @@ mod tests {
                 } else {
                     IndirectModel::new(o, cap)
                 };
-                v.push(Box::new(m) as Box<dyn Model>);
+                v.push(m.into());
             }
             let n = code_stream_models(v, &data).len();
             let bpb = n as f64 * 8.0 / orig;
@@ -527,7 +537,7 @@ mod tests {
         ];
         for &(mask, label) in cands {
             let mut v = baseline_models(cap);
-            v.push(Box::new(ContextModel::sparse(mask, cap)) as Box<dyn Model>);
+            v.push(ContextModel::sparse(mask, cap).into());
             let n = code_stream_models(v, &data).len();
             let bpb = n as f64 * 8.0 / orig;
             println!("+ sparse {label}: {bpb:.4} bpb  ({:+.4})", bpb - base_bpb);
@@ -1216,14 +1226,12 @@ mod tests {
         let orig = (hi - lo) as f64;
 
         let cap = slice.len();
-        let mk = |word: bool| -> Vec<Box<dyn Model>> {
-            let mut v: Vec<Box<dyn Model>> = (0..=6)
-                .map(|n| Box::new(ContextModel::new(n, cap)) as Box<dyn Model>)
-                .collect();
+        let mk = |word: bool| -> Vec<AnyModel> {
+            let mut v: Vec<AnyModel> = (0..=6).map(|n| ContextModel::new(n, cap).into()).collect();
             if word {
-                v.push(Box::new(ContextModel::word(cap)));
+                v.push(ContextModel::word(cap).into());
             }
-            v.push(Box::new(MatchModel::new()));
+            v.push(MatchModel::new().into());
             v
         };
 

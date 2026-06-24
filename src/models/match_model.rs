@@ -26,6 +26,7 @@ pub(crate) struct MatchModel {
     key_bytes: u32,
     ptr: usize, // history index of the predicted next byte
     len: u32,   // current match length
+    pb: u8,     // predicted byte (history[ptr]) cached at bpos==0 (byte-constant)
     sm: StateMap,
     predicted: bool, // did predict() consult the StateMap this bit?
     state: usize,    // StateMap state from the last predict()
@@ -63,6 +64,7 @@ impl MatchModel {
             key_bytes,
             ptr: 0,
             len: 0,
+            pb: 0,
             sm: StateMap::new(2 * (LEN_CAP as usize + 1)),
             predicted: false,
             state: 0,
@@ -109,7 +111,12 @@ impl Model for MatchModel {
         if self.len == 0 || self.ptr >= hist.len() {
             return 0;
         }
-        let pb = u32::from(hist[self.ptr]);
+        // ptr, len and hist (appended only at end_symbol) are byte-constant, so
+        // the predicted byte is the same for all 8 bits; load it once at bpos==0.
+        if ctx.bpos == 0 {
+            self.pb = hist[self.ptr];
+        }
+        let pb = u32::from(self.pb);
         let bpos = u32::from(ctx.bpos);
         let coded = ctx.c0 & ((1 << bpos) - 1);
         if coded != pb >> (8 - bpos) {

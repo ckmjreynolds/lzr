@@ -128,3 +128,75 @@ pub(crate) trait Model {
         None
     }
 }
+
+/// Static-dispatch wrapper over the concrete model types. The production model
+/// set is stored as `Vec<AnyModel>` rather than `Vec<Box<dyn Model>>`, so the
+/// per-bit predict/update loops dispatch through a `match` the compiler can
+/// inline — removing the ~66 vtable indirections per byte and letting the
+/// independent per-model table loads overlap (matters most at enwik9 scale,
+/// where each is a DRAM miss). `AnyModel` also `impl Model`, and `From` impls
+/// exist for each variant, so the ablation helpers compose models unchanged.
+pub(crate) enum AnyModel {
+    Context(context::ContextModel),
+    Indirect(indirect::IndirectModel),
+    Match(match_model::MatchModel),
+    // Boxed: the online-neural LSTM arm is far larger than the deterministic
+    // variants, so an unboxed variant would bloat every `AnyModel` slot.
+    #[cfg(feature = "arm")]
+    Arm(Box<lstm::ArmModel>),
+}
+
+impl From<context::ContextModel> for AnyModel {
+    fn from(m: context::ContextModel) -> Self {
+        Self::Context(m)
+    }
+}
+impl From<indirect::IndirectModel> for AnyModel {
+    fn from(m: indirect::IndirectModel) -> Self {
+        Self::Indirect(m)
+    }
+}
+impl From<match_model::MatchModel> for AnyModel {
+    fn from(m: match_model::MatchModel) -> Self {
+        Self::Match(m)
+    }
+}
+#[cfg(feature = "arm")]
+impl From<lstm::ArmModel> for AnyModel {
+    fn from(m: lstm::ArmModel) -> Self {
+        Self::Arm(Box::new(m))
+    }
+}
+
+impl Model for AnyModel {
+    #[inline]
+    fn predict(&mut self, ctx: &Context) -> i32 {
+        match self {
+            Self::Context(m) => m.predict(ctx),
+            Self::Indirect(m) => m.predict(ctx),
+            Self::Match(m) => m.predict(ctx),
+            #[cfg(feature = "arm")]
+            Self::Arm(m) => m.predict(ctx),
+        }
+    }
+    #[inline]
+    fn update(&mut self, ctx: &Context, bit: u8) {
+        match self {
+            Self::Context(m) => m.update(ctx, bit),
+            Self::Indirect(m) => m.update(ctx, bit),
+            Self::Match(m) => m.update(ctx, bit),
+            #[cfg(feature = "arm")]
+            Self::Arm(m) => m.update(ctx, bit),
+        }
+    }
+    #[inline]
+    fn selector(&self) -> Option<usize> {
+        match self {
+            Self::Context(m) => m.selector(),
+            Self::Indirect(m) => m.selector(),
+            Self::Match(m) => m.selector(),
+            #[cfg(feature = "arm")]
+            Self::Arm(m) => m.selector(),
+        }
+    }
+}

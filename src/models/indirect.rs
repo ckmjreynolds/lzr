@@ -55,6 +55,7 @@ pub(crate) struct IndirectModel {
     sm: StateMap,
     hist_idx: usize, // current byte's follower-history slot (refreshed at bpos 0)
     fh: u16,         // current byte's follower history
+    key_base: u64,   // fh | (c1 << 16), the byte-constant part of the cell key (set at bpos 0)
     idx: usize,      // current bit's cells slot
     check: u16,      // expected 4-bit confirm tag for the current cell
 }
@@ -103,6 +104,7 @@ impl IndirectModel {
             sm: StateMap::new(SM_STATES),
             hist_idx: 0,
             fh: 0,
+            key_base: 0,
             idx: 0,
             check: 0,
         }
@@ -133,9 +135,10 @@ impl Model for IndirectModel {
             let cv = self.ctx_value(ctx);
             self.hist_idx = (cv.wrapping_mul(MULT) >> self.hist_shift) as usize;
             self.fh = self.hist[self.hist_idx];
+            // fh and byte_back(1) are byte-constant; only c0 varies per bit.
+            self.key_base = u64::from(self.fh) | (u64::from(ctx.byte_back(1)) << 16);
         }
-        let key =
-            u64::from(self.fh) | (u64::from(ctx.byte_back(1)) << 16) | (u64::from(ctx.c0) << 24);
+        let key = self.key_base | (u64::from(ctx.c0) << 24);
         self.idx = (key.wrapping_mul(MULT) >> self.cell_shift) as usize;
         self.check = (key.wrapping_mul(MULT2) >> 60) as u16;
         let cell = self.cells[self.idx];

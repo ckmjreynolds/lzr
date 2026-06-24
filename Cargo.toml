@@ -46,6 +46,16 @@ codegen-units = 1
 strip         = true
 panic         = "unwind"
 
+# `fast`: dev/experiment-iteration profile — NOT shipped. Identical to `release`
+# except `opt-level = 3`, which trades binary size (irrelevant off the submission
+# path) for ~10-20% faster encode/decode. The shipped artifact is still built with
+# `--release` (size-optimized for L(D)); use `--profile fast` only for timing runs
+# and ablations. Output is byte-identical to `release` (opt-level is bound by the
+# as-if rule over the all-integer hot path; verified same archive SHA).
+[profile.fast]
+inherits      = "release"
+opt-level     = 3
+
 [lints.rust]
 keyword_idents = { level = "forbid", priority = -1 }
 missing_copy_implementations = "warn"

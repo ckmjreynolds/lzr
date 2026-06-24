@@ -485,17 +485,27 @@ impl ArmModel {
     const WIN: usize = 16;
     const NO_MATCH: usize = Self::V; // emb_match row used when no match is active
     const FINDER_BITS: u32 = 24; // 16M slots ≈ 96 MB; a feature, not the main matcher
-    /// Hidden width — the operating point, trading bpb for throughput. Against
-    /// the strengthened deterministic baseline with ARMKEY=6 (5 MB slice), the
-    /// e2e marginal / enwik9 ETA was h=96 −0.0390/19.5h, h=128 −0.0449/29.8h,
-    /// h=160 −0.0490/43.3h. We ship h=128: the largest width whose enwik9 ETA
-    /// (≈30 h, ≈34 h with e=64) stays inside the ~41 h Hutter budget with margin
-    /// (h=160 overruns it). `LZR_H` overrides.
-    pub(crate) const H: usize = 128;
+    /// Hidden width — the operating point, trading bpb for throughput. A 5 MB
+    /// enwik8 e2e capacity scan (opt-3, vs the deterministic baseline) had the
+    /// marginal still rising with width: h=96/128/160/192/256 = −0.0401/−0.0468/
+    /// −0.0502/−0.0546/−0.0595 (diminishing, no plateau). We ship h=192: the opt-3
+    /// throughput headroom (≈1.73× over the size-optimized opt-s build) puts its
+    /// enwik9 ETA at ≈33 h, inside the ~41 h Hutter budget, where the opt-s build
+    /// only afforded h=128 — a roughly −0.008 marginal gain at L(D)≈0 (h=256 ≈50 h
+    /// overruns the budget). Stacking a 2nd LSTM layer was a clean negative at this
+    /// scale (2L h=96/128 = −0.0231/−0.0310, far worse than 1 layer at equal
+    /// compute — the online single-pass regime learns a deeper net too slowly).
+    /// `LZR_H` overrides.
+    pub(crate) const H: usize = 192;
 
-    /// The shipped arm at the default hidden width [`Self::H`].
+    /// The shipped arm at the default hidden width [`Self::H`] (overridable by
+    /// `LZR_H` for offline sweeps; production sets no env and gets `Self::H`).
     pub(crate) fn arm() -> Self {
-        Self::new(Self::H)
+        let h = std::env::var("LZR_H")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::H);
+        Self::new(h)
     }
 
     pub(crate) fn new(h: usize) -> Self {
@@ -859,10 +869,10 @@ mod tests {
         // exercising encode→decode of the arm byte-for-byte.
         let data = Pipeline::default_pipeline().forward(&e8[1_000_000..1_004_000]);
         let mut enc_models = baseline_models(data.len());
-        enc_models.push(Box::new(ArmModel::new(64)));
+        enc_models.push(ArmModel::new(64).into());
         let coded = code_stream_models(enc_models, &data);
         let mut dec_models = baseline_models(data.len());
-        dec_models.push(Box::new(ArmModel::new(64)));
+        dec_models.push(ArmModel::new(64).into());
         let decoded = decode_stream_models(dec_models, &coded);
         assert_eq!(decoded, data, "arm codec must round-trip byte-exact");
     }
@@ -901,7 +911,7 @@ mod tests {
         println!("baseline (deterministic models): {base_bpb:.4} bpb  ({base_secs:.0}s)");
 
         let mut withv = baseline_models(data.len());
-        withv.push(Box::new(ArmModel::new(h)));
+        withv.push(ArmModel::new(h).into());
         let t1 = Instant::now();
         let arm = code_stream_models(withv, &data).len();
         let arm_secs = t1.elapsed().as_secs_f64();

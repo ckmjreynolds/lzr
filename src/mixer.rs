@@ -99,6 +99,9 @@ impl Mixer {
     /// the word-hash byte, and the match-length bucket (all × bit-position).
     pub(crate) fn new(n: usize) -> Self {
         let cards = vec![256usize, 256, 256, 256, 64, 16, 16, 16];
+        // mix() reduces a selector mod its card via `& (card - 1)`, which equals
+        // `% card` exactly only for power-of-two cards — enforce that here.
+        debug_assert!(cards.iter().all(|c| c.is_power_of_two()));
         let w = cards
             .iter()
             .map(|&c| vec![0i32; c * BIT_POSITIONS * n])
@@ -125,12 +128,30 @@ impl Mixer {
     pub(crate) fn mix(&mut self, stretched: &[i32], sel: &[usize], bpos: usize) -> i32 {
         self.inputs.copy_from_slice(stretched);
         let nsub = self.w.len();
+        let n = self.n;
         let mut acc: i64 = 0;
         for k in 0..nsub {
-            let off = ((sel[k] % self.cards[k]) * BIT_POSITIONS + bpos) * self.n;
+            // `& (card - 1)` == `% card` for the power-of-two cards (asserted in
+            // new()), turning 8 integer divisions/bit into masks.
+            let off = ((sel[k] & (self.cards[k] - 1)) * BIT_POSITIONS + bpos) * n;
             self.set[k] = off;
-            let mut dot: i64 = 0;
-            for (wt, st) in self.w[k][off..off + self.n].iter().zip(stretched) {
+            let row = &self.w[k][off..off + n];
+            // Four independent i64 partials break the serial multiply-add
+            // dependency chain (and let the backend issue lanes in parallel).
+            // i64 addition is exact and associative, and the partials cannot
+            // overflow (|wt*st| <= 2^31*2047 ~ 4.4e12, *22 terms ~ 9.7e13 <<
+            // i64::MAX ~ 9.2e18), so any grouping yields the identical sum.
+            let mut a = [0i64; 4];
+            let mut wc = row.chunks_exact(4);
+            let mut sc = stretched.chunks_exact(4);
+            for (w4, s4) in wc.by_ref().zip(sc.by_ref()) {
+                a[0] += i64::from(w4[0]) * i64::from(s4[0]);
+                a[1] += i64::from(w4[1]) * i64::from(s4[1]);
+                a[2] += i64::from(w4[2]) * i64::from(s4[2]);
+                a[3] += i64::from(w4[3]) * i64::from(s4[3]);
+            }
+            let mut dot = a[0] + a[1] + a[2] + a[3];
+            for (wt, st) in wc.remainder().iter().zip(sc.remainder()) {
                 dot += i64::from(*wt) * i64::from(*st);
             }
             acc += dot >> 16;
@@ -143,10 +164,12 @@ impl Mixer {
     #[allow(clippy::needless_range_loop)]
     pub(crate) fn update(&mut self, bit: u8) {
         let err = (i32::from(bit) << PROB_BITS) - self.pr;
+        let lr = self.lr;
+        let n = self.n;
         for k in 0..self.w.len() {
             let off = self.set[k];
-            for (wt, st) in self.w[k][off..off + self.n].iter_mut().zip(&self.inputs) {
-                *wt += (st * err) >> self.lr;
+            for (wt, st) in self.w[k][off..off + n].iter_mut().zip(&self.inputs) {
+                *wt += (st * err) >> lr;
             }
         }
     }
