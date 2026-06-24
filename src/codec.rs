@@ -463,6 +463,344 @@ mod tests {
         );
     }
 
+    // ---- preprocessor lab: runtime pipeline experiments on the linear mixer ----
+    // M1 is off here (`nmix = None`): ~4x faster per encode, and directly comparable
+    // to the journal's pre-M1 preprocessor numbers. Keepers get re-checked with the
+    // full stack before shipping.
+
+    /// Deterministic codec (linear mixer, M1 off) over already-preprocessed `data`;
+    /// returns the coded byte length. Shared by the prep-lab sweeps below.
+    fn encode_det_linear(data: &[u8]) -> usize {
+        let mut state = CodecState::with_models(baseline_models(data.len()), data.len());
+        state.nmix = None;
+        let mut enc = Encoder::with_capacity(data.len());
+        for &byte in data {
+            for k in (0..8).rev() {
+                let bit = (byte >> k) & 1;
+                let p = state.predict();
+                enc.encode(bit, p);
+                state.commit(bit);
+            }
+            state.end_symbol();
+        }
+        enc.finish().len()
+    }
+
+    /// E1 — dict-N sweep: deterministic bpb (per original byte) and the post-dict
+    /// stream length (the arm-speed proxy) as the word dictionary grows. Words are
+    /// mined from full case-folded enwik8 at runtime (no rebuild); the
+    /// `[LZR_LO..LZR_HI]` slice (default 20 MB) is encoded with each. Run:
+    /// `cargo test --release dict_n_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prep-lab: dict-N sweep (bpb + stream length / speed proxy)"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn dict_n_lab() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::word_dict::{WordDict, min_word_len};
+        use std::collections::HashMap;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+
+        let folded: &'static [u8] = Box::leak(CaseFold.forward(&e8).into_boxed_slice());
+        let mut freq: HashMap<&'static [u8], u32> = HashMap::new();
+        let mut i = 0;
+        while i < folded.len() {
+            if folded[i].is_ascii_lowercase() {
+                let s = i;
+                while i < folded.len() && folded[i].is_ascii_lowercase() {
+                    i += 1;
+                }
+                *freq.entry(&folded[s..i]).or_insert(0) += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let mut sorted: Vec<(&'static [u8], u32)> = freq.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let sorted: Vec<&'static [u8]> = sorted.into_iter().map(|(w, _)| w).collect();
+
+        let folded_slice = CaseFold.forward(&e8[lo..hi]);
+        let fold_len = folded_slice.len() as f64;
+        println!("slice [{lo}..{hi}]  folded {} bytes", folded_slice.len());
+        for &n in &[0usize, 2000, 4000, 8000, 16000, 32000] {
+            let mut words: Vec<&'static [u8]> = Vec::new();
+            for &w in &sorted {
+                if words.len() >= n {
+                    break;
+                }
+                if w.len() >= min_word_len(words.len()) {
+                    words.push(w);
+                }
+            }
+            let dict = WordDict::from_words(&words);
+            let data = dict.forward(&folded_slice);
+            let coded = encode_det_linear(&data);
+            let bpb = coded as f64 * 8.0 / orig;
+            let shrink = 100.0 * (1.0 - data.len() as f64 / fold_len);
+            println!(
+                "N={n:6}  bpb {bpb:.4}  stream {:9} ({shrink:4.1}% < fold)",
+                data.len()
+            );
+        }
+    }
+
+    /// E2 — phrase dictionary: do boundary-crossing phrases earn dictionary code
+    /// slots over plain words? Mines words (whole corpus) and phrases (n-grams with
+    /// ≥1 non-letter, over a sample, freq-filtered), scores both by savings
+    /// (freq × (len−1)), then compares, under one `LZR_NENT` code budget: A =
+    /// words-only vs B = words+phrases competing for the same slots. Reports bpb
+    /// (per original byte, linear mixer) + stream length (speed proxy), round-trip
+    /// asserted. `LZR_PMAX` max phrase len, `LZR_PMIN` min phrase freq,
+    /// `LZR_PSAMPLE` mining sample. Run:
+    /// `cargo test --release phrase_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prep-lab: phrase dictionary (words+phrases) vs words-only"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::too_many_lines
+    )]
+    fn phrase_lab() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::dictionary::GDict;
+        use crate::preprocessors::word_dict::min_word_len;
+        use std::collections::HashMap;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let folded: &'static [u8] = Box::leak(CaseFold.forward(&e8).into_boxed_slice());
+
+        // words: maximal a-z runs over the whole folded corpus.
+        let mut wfreq: HashMap<&'static [u8], u32> = HashMap::new();
+        let mut i = 0;
+        while i < folded.len() {
+            if folded[i].is_ascii_lowercase() {
+                let s = i;
+                while i < folded.len() && folded[i].is_ascii_lowercase() {
+                    i += 1;
+                }
+                *wfreq.entry(&folded[s..i]).or_insert(0) += 1;
+            } else {
+                i += 1;
+            }
+        }
+        // phrases: n-grams (2..=PMAX) with >=1 non-lowercase byte (complementary to
+        // words), over a sample, kept if frequent enough.
+        let pmax = env("LZR_PMAX", 6);
+        let pminlen = env("LZR_PMINLEN", 3); // skip junk bigrams by default
+        let pmin = env("LZR_PMIN", 50) as u32;
+        let sample = env("LZR_PSAMPLE", 10_000_000).min(folded.len());
+        let mut pfreq: HashMap<&'static [u8], u32> = HashMap::new();
+        for n in pminlen..=pmax {
+            for j in 0..sample.saturating_sub(n) {
+                let g = &folded[j..j + n];
+                if g.iter().all(u8::is_ascii_lowercase) {
+                    continue;
+                }
+                *pfreq.entry(g).or_insert(0) += 1;
+            }
+        }
+        // Frequency-order (word_dict's order) — beats savings-order for bpb (the
+        // dict's value is canonicalizing the *most common* tokens, not removing the
+        // most bytes).
+        let score = |_s: &[u8], f: u32| u64::from(f);
+        let mut words: Vec<(&'static [u8], u64)> =
+            wfreq.iter().map(|(&w, &f)| (w, score(w, f))).collect();
+        let mut phrases: Vec<(&'static [u8], u64)> = pfreq
+            .iter()
+            .filter(|&(_, &f)| f >= pmin)
+            .map(|(&g, &f)| (g, score(g, f)))
+            .collect();
+        words.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        phrases.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+
+        let nent = env("LZR_NENT", 4000);
+        let build = |cands: &[(&'static [u8], u64)], cap: usize| -> Vec<&'static [u8]> {
+            let mut v: Vec<&'static [u8]> = Vec::new();
+            for &(e, _) in cands {
+                if v.len() >= cap {
+                    break;
+                }
+                if e.len() >= min_word_len(v.len()) {
+                    v.push(e);
+                }
+            }
+            v
+        };
+
+        let folded_slice = CaseFold.forward(&e8[lo..hi]);
+        let fold_len = folded_slice.len() as f64;
+        let run = |label: &str, entries: &[&'static [u8]]| {
+            let dict = GDict::new(entries);
+            let data = dict.forward(&folded_slice);
+            assert_eq!(dict.inverse(&data), folded_slice, "{label} must round-trip");
+            let coded = encode_det_linear(&data);
+            let bpb = coded as f64 * 8.0 / orig;
+            let shrink = 100.0 * (1.0 - data.len() as f64 / fold_len);
+            println!(
+                "{label:30} entries {:6}  bpb {bpb:.4}  stream {:9} ({shrink:4.1}% < fold)",
+                entries.len(),
+                data.len()
+            );
+        };
+
+        println!(
+            "mined {} words, {} phrases (freq>={pmin}, len<= {pmax}, sample {sample})",
+            words.len(),
+            phrases.len()
+        );
+        let a = build(&words, nent);
+        run("A words-only", &a);
+        // B: words+phrases compete for one nent budget (freq-order).
+        let mut merged = words.clone();
+        merged.extend_from_slice(&phrases);
+        merged.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
+        let b = build(&merged, nent);
+        let nph = b
+            .iter()
+            .filter(|e| e.iter().any(|c| !c.is_ascii_lowercase()))
+            .count();
+        run(&format!("B merged-budget ({nph} ph)"), &b);
+        // C: words(nent) + top phrases APPENDED (higher codes, don't displace
+        // words) — the fairest "do phrases add on top of the word dict" test.
+        let np = env("LZR_NPHRASE", 2000);
+        let mut c = a.clone();
+        for &(e, _) in &phrases {
+            if c.len() >= nent + np {
+                break;
+            }
+            if e.len() >= min_word_len(c.len()) {
+                c.push(e);
+            }
+        }
+        run(&format!("C words+{}ph-appended", c.len() - a.len()), &c);
+    }
+
+    /// E10 — word+trailing-space dictionary: absorb the post-word space into the
+    /// code (still WHOLE-word matching, no sub-word fragmentation). Inter-word
+    /// spaces are ~15% of the stream, so this is a clean speed lever; the bpb
+    /// question is whether folding the (cheap but non-zero) space helps. Mines word
+    /// and word+space freqs, freq-orders, compares A=words-only (≈ word_dict, a
+    /// validation that a-z-run matching reproduces the baseline) vs B=words+wordspace
+    /// under one `LZR_NENT` budget. Run:
+    /// `cargo test --release wordspace_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prep-lab: word+trailing-space dictionary vs words-only"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::similar_names,
+        clippy::doc_markdown
+    )]
+    fn wordspace_lab() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::dictionary::WSDict;
+        use crate::preprocessors::word_dict::min_word_len;
+        use std::collections::HashMap;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let folded: &'static [u8] = Box::leak(CaseFold.forward(&e8).into_boxed_slice());
+
+        let mut wfreq: HashMap<&'static [u8], u32> = HashMap::new();
+        let mut wsfreq: HashMap<&'static [u8], u32> = HashMap::new();
+        let mut i = 0;
+        while i < folded.len() {
+            if folded[i].is_ascii_lowercase() {
+                let s = i;
+                while i < folded.len() && folded[i].is_ascii_lowercase() {
+                    i += 1;
+                }
+                *wfreq.entry(&folded[s..i]).or_insert(0) += 1;
+                if i < folded.len() && folded[i] == b' ' {
+                    *wsfreq.entry(&folded[s..=i]).or_insert(0) += 1; // run + the space
+                }
+            } else {
+                i += 1;
+            }
+        }
+        let mut words: Vec<(&'static [u8], u32)> = wfreq.iter().map(|(&w, &f)| (w, f)).collect();
+        let mut both: Vec<(&'static [u8], u32)> = words.clone();
+        both.extend(wsfreq.iter().map(|(&w, &f)| (w, f)));
+        let by_freq = |v: &mut Vec<(&'static [u8], u32)>| {
+            v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        };
+        by_freq(&mut words);
+        by_freq(&mut both);
+
+        let nent = env("LZR_NENT", 4000);
+        let build = |cands: &[(&'static [u8], u32)]| -> Vec<&'static [u8]> {
+            let mut v: Vec<&'static [u8]> = Vec::new();
+            for &(e, _) in cands {
+                if v.len() >= nent {
+                    break;
+                }
+                if e.len() >= min_word_len(v.len()) {
+                    v.push(e);
+                }
+            }
+            v
+        };
+
+        let folded_slice = CaseFold.forward(&e8[lo..hi]);
+        let fold_len = folded_slice.len() as f64;
+        let run = |label: &str, entries: &[&'static [u8]]| {
+            let dict = WSDict::new(entries);
+            let data = dict.forward(&folded_slice);
+            assert_eq!(dict.inverse(&data), folded_slice, "{label} must round-trip");
+            let coded = encode_det_linear(&data);
+            let bpb = coded as f64 * 8.0 / orig;
+            let shrink = 100.0 * (1.0 - data.len() as f64 / fold_len);
+            println!(
+                "{label:28} entries {:6}  bpb {bpb:.4}  stream {:9} ({shrink:4.1}% < fold)",
+                entries.len(),
+                data.len()
+            );
+        };
+
+        let a = build(&words);
+        run("A words-only", &a);
+        let b = build(&both);
+        let nws = b.iter().filter(|e| e.last() == Some(&b' ')).count();
+        run(&format!("B words+wordspace ({nws} ws)"), &b);
+    }
+
     /// Composition check: does the opt-in LSTM arm (a recurrent *model*) still add
     /// on top of the residual neural *mixer* (M1), or do they overlap? Encodes one
     /// enwik8 slice through the 2×2 of {arm off/on} × {nmix off/on} and reports each

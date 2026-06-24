@@ -127,9 +127,301 @@ impl Preprocessor for Dictionary {
     }
 }
 
+/// Unified greedy longest-match dictionary over arbitrary byte-string entries
+/// (words AND phrases), using the same three-tier code scheme as [`super::word_dict`]
+/// (so up to ~1.05M entries, not the 74 of [`Dictionary`]). Built for the prep-lab
+/// phrase experiments; decode is byte-for-byte the word-dict scheme.
+#[cfg(test)]
+#[derive(Default)]
+struct GNode {
+    code: Option<Vec<u8>>, // code bytes emitted when an entry ends at this node
+    next: HashMap<u8, usize>,
+}
+
+#[cfg(test)]
+pub(crate) struct GDict {
+    nodes: Vec<GNode>,
+    is1: [bool; 256],
+    is2: [bool; 256],
+    is3: [bool; 256],
+    rev1: Vec<Option<Vec<u8>>>,
+    rev2: HashMap<u16, Vec<u8>>,
+    rev3: HashMap<u32, Vec<u8>>,
+    active: bool,
+}
+
+#[cfg(test)]
+impl GDict {
+    /// Build from entries in priority order (`entries[i]` takes the `i`-th code).
+    pub(crate) fn new(entries: &[&[u8]]) -> Self {
+        use super::word_dict::code_for;
+        let pool = code_pool();
+        let mut nodes = vec![GNode::default()];
+        let mut is1 = [false; 256];
+        let mut is2 = [false; 256];
+        let mut is3 = [false; 256];
+        let mut rev1: Vec<Option<Vec<u8>>> = vec![None; 256];
+        let mut rev2: HashMap<u16, Vec<u8>> = HashMap::new();
+        let mut rev3: HashMap<u32, Vec<u8>> = HashMap::new();
+        for (pos, &e) in entries.iter().enumerate() {
+            let code = code_for(pos, &pool);
+            let mut node = 0;
+            for &b in e {
+                let nlen = nodes.len();
+                let child = *nodes[node].next.entry(b).or_insert(nlen);
+                if child == nlen {
+                    nodes.push(GNode::default());
+                }
+                node = child;
+            }
+            nodes[node].code = Some(code.clone());
+            match code.as_slice() {
+                [c] => {
+                    is1[*c as usize] = true;
+                    rev1[*c as usize] = Some(e.to_vec());
+                }
+                [l, idx] => {
+                    is2[*l as usize] = true;
+                    rev2.insert((u16::from(*l) << 8) | u16::from(*idx), e.to_vec());
+                }
+                [l, b1, b2] => {
+                    is3[*l as usize] = true;
+                    rev3.insert(
+                        (u32::from(*l) << 16) | (u32::from(*b1) << 8) | u32::from(*b2),
+                        e.to_vec(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        Self {
+            active: !entries.is_empty(),
+            nodes,
+            is1,
+            is2,
+            is3,
+            rev1,
+            rev2,
+            rev3,
+        }
+    }
+
+    fn longest(&self, input: &[u8], i: usize) -> Option<(&[u8], usize)> {
+        let mut node = 0;
+        let mut best: Option<(&[u8], usize)> = None;
+        for (k, &b) in input[i..].iter().enumerate() {
+            let Some(&n) = self.nodes[node].next.get(&b) else {
+                break;
+            };
+            node = n;
+            if let Some(code) = &self.nodes[node].code {
+                best = Some((code, k + 1));
+            }
+        }
+        best
+    }
+}
+
+#[cfg(test)]
+impl Preprocessor for GDict {
+    fn forward(&self, input: &[u8]) -> Vec<u8> {
+        if !self.active {
+            return input.to_vec();
+        }
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if let Some((code, len)) = self.longest(input, i) {
+                out.extend_from_slice(code);
+                i += len;
+            } else {
+                out.push(input[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn inverse(&self, input: &[u8]) -> Vec<u8> {
+        if !self.active {
+            return input.to_vec();
+        }
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            let b = input[i];
+            if self.is1[b as usize] {
+                out.extend_from_slice(self.rev1[b as usize].as_ref().unwrap());
+                i += 1;
+            } else if self.is2[b as usize] {
+                let key = (u16::from(b) << 8) | u16::from(input[i + 1]);
+                out.extend_from_slice(&self.rev2[&key]);
+                i += 2;
+            } else if self.is3[b as usize] {
+                let key =
+                    (u32::from(b) << 16) | (u32::from(input[i + 1]) << 8) | u32::from(input[i + 2]);
+                out.extend_from_slice(&self.rev3[&key]);
+                i += 3;
+            } else {
+                out.push(b);
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
+/// Whole-word dictionary that may also absorb a single trailing space into a
+/// word's code (so "the " can become one code). Matches *maximal* a-z runs like
+/// [`super::word_dict`] (no sub-word fragmentation), then, if the run is followed
+/// by a space and "run+space" is an entry, prefers that. Decode is the three-tier
+/// scheme. Built for the prep-lab inter-word-space experiment.
+#[cfg(test)]
+pub(crate) struct WSDict {
+    code_of: HashMap<Vec<u8>, Vec<u8>>,
+    is1: [bool; 256],
+    is2: [bool; 256],
+    is3: [bool; 256],
+    rev1: Vec<Option<Vec<u8>>>,
+    rev2: HashMap<u16, Vec<u8>>,
+    rev3: HashMap<u32, Vec<u8>>,
+    active: bool,
+}
+
+#[cfg(test)]
+impl WSDict {
+    pub(crate) fn new(entries: &[&[u8]]) -> Self {
+        use super::word_dict::code_for;
+        let pool = code_pool();
+        let mut code_of = HashMap::new();
+        let mut is1 = [false; 256];
+        let mut is2 = [false; 256];
+        let mut is3 = [false; 256];
+        let mut rev1: Vec<Option<Vec<u8>>> = vec![None; 256];
+        let mut rev2: HashMap<u16, Vec<u8>> = HashMap::new();
+        let mut rev3: HashMap<u32, Vec<u8>> = HashMap::new();
+        for (pos, &e) in entries.iter().enumerate() {
+            let code = code_for(pos, &pool);
+            match code.as_slice() {
+                [c] => {
+                    is1[*c as usize] = true;
+                    rev1[*c as usize] = Some(e.to_vec());
+                }
+                [l, idx] => {
+                    is2[*l as usize] = true;
+                    rev2.insert((u16::from(*l) << 8) | u16::from(*idx), e.to_vec());
+                }
+                [l, b1, b2] => {
+                    is3[*l as usize] = true;
+                    rev3.insert(
+                        (u32::from(*l) << 16) | (u32::from(*b1) << 8) | u32::from(*b2),
+                        e.to_vec(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            code_of.insert(e.to_vec(), code);
+        }
+        Self {
+            active: !entries.is_empty(),
+            code_of,
+            is1,
+            is2,
+            is3,
+            rev1,
+            rev2,
+            rev3,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Preprocessor for WSDict {
+    fn forward(&self, input: &[u8]) -> Vec<u8> {
+        if !self.active {
+            return input.to_vec();
+        }
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if input[i].is_ascii_lowercase() {
+                let s = i;
+                while i < input.len() && input[i].is_ascii_lowercase() {
+                    i += 1;
+                }
+                // Prefer "run + trailing space" if that is an entry.
+                if i < input.len() && input[i] == b' ' {
+                    let mut ws = input[s..i].to_vec();
+                    ws.push(b' ');
+                    if let Some(code) = self.code_of.get(&ws) {
+                        out.extend_from_slice(code);
+                        i += 1;
+                        continue;
+                    }
+                }
+                match self.code_of.get(&input[s..i]) {
+                    Some(code) => out.extend_from_slice(code),
+                    None => out.extend_from_slice(&input[s..i]),
+                }
+            } else {
+                out.push(input[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn inverse(&self, input: &[u8]) -> Vec<u8> {
+        if !self.active {
+            return input.to_vec();
+        }
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            let b = input[i];
+            if self.is1[b as usize] {
+                out.extend_from_slice(self.rev1[b as usize].as_ref().unwrap());
+                i += 1;
+            } else if self.is2[b as usize] {
+                let key = (u16::from(b) << 8) | u16::from(input[i + 1]);
+                out.extend_from_slice(&self.rev2[&key]);
+                i += 2;
+            } else if self.is3[b as usize] {
+                let key =
+                    (u32::from(b) << 16) | (u32::from(input[i + 1]) << 8) | u32::from(input[i + 2]);
+                out.extend_from_slice(&self.rev3[&key]);
+                i += 3;
+            } else {
+                out.push(b);
+                i += 1;
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsdict_roundtrips_word_space() {
+        let dict = WSDict::new(&[b"the ", b"the", b"category"]);
+        let data = b"\x00the category the,the the end";
+        let fwd = dict.forward(data);
+        assert!(fwd.len() < data.len());
+        assert_eq!(dict.inverse(&fwd), data);
+    }
+
+    #[test]
+    fn gdict_roundtrips_words_and_phrases() {
+        // mixes a phrase (crossing a space) and plain words; greedy longest-match.
+        let dict = GDict::new(&[b"the", b" of the ", b"category"]);
+        let data = b"\x00the category of the things the of the end";
+        let fwd = dict.forward(data);
+        assert!(fwd.len() < data.len());
+        assert_eq!(dict.inverse(&fwd), data);
+    }
 
     #[test]
     fn code_pool_is_74_unique_descending() {

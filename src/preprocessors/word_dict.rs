@@ -76,7 +76,7 @@ pub(crate) struct WordDict {
 
 impl WordDict {
     /// Build from words in code order (`words[i]` takes the `i`-th code).
-    fn from_words(words: &[&'static [u8]]) -> Self {
+    pub(crate) fn from_words(words: &[&'static [u8]]) -> Self {
         let pool = code_pool();
         let mut code_of = HashMap::new();
         let mut is1 = [false; 256];
