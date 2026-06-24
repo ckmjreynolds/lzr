@@ -13,6 +13,12 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-23 (autonomous evening session, part 5) — enwik9 confirmation of the evening's deterministic stack: L(C) 1.27744 → 1.1988 (−0.0786), net ~1.205, round-trip byte-exact
+
+With CDR's explicit approval, a full enwik9 encode→decode→compare on the evening's deterministic stack (the `8348364` build, arm-free): 1e9 → **149,850,930 bytes = 1.1988 bpb L(C)**, **round-trip byte-exact**, peak RSS **8.14 GB** (under the 10 GB cap, ~1.9 GB headroom), encode 3929.78 s / decode 3938.04 s (~65.5 min each, 0.25 MB/s). Net = 1.1988 + L(D) 0.00618 (386 KB stripped binary, the ×16/1e9 reckoning) ≈ **1.2050**.
+
+This confirms the prediction that the evening's two dominant levers — the multi-mixer (with the match-state and derived-regime selectors) and the indirect context models — amplify at enwik9 scale: the enwik9 L(C) fell −0.0786 from the pre-session 1.27744, a touch *more* than the full-enwik8 drop (−0.0771, 1.5608 → 1.4837), because both feed the heavy cross-article redundancy enwik9 carries. Deterministic v9 now stands at **enwik9 net ~1.205** — a large lead over the prior session's 1.2836 and the v8-neural best-shippable 1.4160, from deterministic code at L(D)≈0, comfortably within the 10 GB RAM cap. The remaining gap to the ~0.928 record (~0.28) is the neural-modeling frontier (the opt-in online arm, or a larger net), not the deterministic stack, which is now exhaustively mined.
+
 ## 2026-06-23 (autonomous evening session, part 4) — derived-regime mixer selectors are a new vein: enwik8 20 MB slice 1.5929 → 1.5878
 
 After the SSE-blend retune the deterministic stack looked exhausted, but probing the *mixer-selector* axis with **derived run-relative features** — quantities the fixed-offset byte selectors c1/c2/c3 structurally cannot see — reopened it. The mixer gained three more averaged sub-mixers (it was five: c1/c2/c3/word/match-length), each selected by a feature tracked cheaply in `Context`:
