@@ -13,6 +13,10 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-24 — overnight verification: the online arm round-trips on full enwik8 and earns −0.0345 against the strengthened baseline
+
+CDR-requested overnight verification of the opt-in online-LSTM arm (`--features arm`, h=96) against the evening's much-stronger deterministic baseline. Full enwik8 encode→decode→compare: 100 MB → 18,115,261 bytes = **1.4492 bpb**, **round-trip byte-exact** (the arm's per-byte online learning is bit-identical on encode and decode at full scale, as the design requires), peak RSS 5.86 GB, ~1.92 h/direction (0.0145 MB/s, ~50× the deterministic codec). The arm's marginal is **−0.0345** over the deterministic 1.4837, at L(D)≈0 (ships only code). That is thinner than the −0.0587 it earned against the weak pre-roadmap baseline (the stronger the deterministic stack, the less decorrelated headroom remains for the arm — the recurring stronger-baseline→smaller-marginal pattern), but it is still a real lever and is now verified end-to-end at full enwik8. The enwik9 +arm encode is running for the scale figure; with the deterministic enwik9 already at 1.1988, the arm's enwik9 marginal is expected to be thinner still, so the shipped-decision tradeoff (−0.03-ish for ~19 h/direction) is sharpened rather than changed.
+
 ## 2026-06-23 (autonomous evening session, part 5) — enwik9 confirmation of the evening's deterministic stack: L(C) 1.27744 → 1.1988 (−0.0786), net ~1.205, round-trip byte-exact
 
 With CDR's explicit approval, a full enwik9 encode→decode→compare on the evening's deterministic stack (the `8348364` build, arm-free): 1e9 → **149,850,930 bytes = 1.1988 bpb L(C)**, **round-trip byte-exact**, peak RSS **8.14 GB** (under the 10 GB cap, ~1.9 GB headroom), encode 3929.78 s / decode 3938.04 s (~65.5 min each, 0.25 MB/s). Net = 1.1988 + L(D) 0.00618 (386 KB stripped binary, the ×16/1e9 reckoning) ≈ **1.2050**.
