@@ -313,6 +313,70 @@ mod tests {
         assert_eq!(decode(&encode(b"")), b"");
     }
 
+    /// Offline: the [`Lz`] preprocessor across a min-match sweep. Hash-chain
+    /// matcher over the whole prior buffer, rep-distance cache, op-coded L/D
+    /// widths. Reports stream shrinkage (the speed proxy) and the CM bpb delta per
+    /// min-match — the question being whether re-coding already-cheap long matches
+    /// as explicit (L,D) tokens costs bpb. Run on casefolded enwik8 (no word dict,
+    /// generous to LZ — matches are longer). `LZR_LO`/`LZR_HI` slice; `LZR_MINS`
+    /// overrides the sweep. Run:
+    /// `cargo test --release lz_preprocess -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: LZ-factoring preprocessor (stream shrink vs bpb)"]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::naive_bytecount
+    )]
+    fn lz_preprocess() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::lz::Lz;
+
+        const ESC: u8 = 0x02; // census-free in enwik8 → never a casefolded literal
+
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let folded = CaseFold.forward(&e8[lo..hi]);
+        assert!(!folded.contains(&ESC), "ESC must be absent from literals");
+
+        let base = code_stream(&folded).len();
+        let base_bpb = base as f64 * 8.0 / orig;
+        println!(
+            "baseline (casefold only): {base_bpb:.4} bpb  ({} bytes in, {base} coded)",
+            folded.len()
+        );
+
+        let mins: Vec<usize> = std::env::var("LZR_MINS")
+            .unwrap_or_else(|_| "8,12,16,20,24,28,32,64,128".into())
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        for minlen in mins {
+            let lz = Lz::new(ESC, minlen);
+            let fac = lz.forward(&folded);
+            assert_eq!(lz.inverse(&fac), folded, "LZ factor must round-trip");
+            let tokens = fac.iter().filter(|&&b| b == ESC).count();
+            let coded = code_stream(&fac).len();
+            let bpb = coded as f64 * 8.0 / orig;
+            println!(
+                "minlen={minlen:>3}: stream {:.1}% shorter ({tokens} tokens) | {bpb:.4} bpb ({:+.4})",
+                100.0 * (folded.len() - fac.len()) as f64 / folded.len() as f64,
+                bpb - base_bpb,
+            );
+        }
+    }
+
     /// Harness sanity / reference baseline: encode an enwik8 slice (full
     /// pipeline) with the shipped deterministic model set and print bpb. The
     /// 20 MB slice [1M..21M] should land at ≈ 1.6695 (the journal's 14-model

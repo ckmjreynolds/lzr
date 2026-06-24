@@ -39,6 +39,7 @@ pub(crate) mod casefold;
 pub(crate) mod dictionary;
 #[cfg(debug_assertions)]
 pub(crate) mod guard;
+pub(crate) mod lz;
 pub(crate) mod word_dict;
 
 /// A reversible transform applied to the byte stream.
