@@ -304,6 +304,44 @@ impl Lstm {
         }
     }
 
+    /// Advance the recurrent state by one step WITHOUT computing the output
+    /// distribution or touching the BPTT window. Used to keep the cell coherent
+    /// across gated (matched) bytes the arm abstains on, at ~2/3 of a full
+    /// forward (no `v×h` output projection) and none of the backward/Adam cost.
+    fn step_recur(&mut self, input: usize, mpred: usize) {
+        let (e, h) = (self.e, self.h);
+        for k in 0..e {
+            self.x[k] = self.emb.w[input * e + k] + self.emb_match.w[mpred * e + k];
+        }
+        self.a.copy_from_slice(&self.b.w);
+        for r in 0..4 * h {
+            self.a[r] += dot(&self.wx.w[r * e..r * e + e], &self.x)
+                + dot(&self.wh.w[r * h..r * h + h], &self.h_prev);
+        }
+        let (hi, hh) = (h, 2 * h);
+        for k in 0..h {
+            let iv = sigmoid(self.a[k]);
+            let fv = sigmoid(self.a[hi + k]);
+            let gv = self.a[hh + k].tanh();
+            let ov = sigmoid(self.a[3 * h + k]);
+            let cv = fv * self.c_prev[k] + iv * gv;
+            self.c[k] = cv;
+            self.dh[k] = ov * cv.tanh(); // reuse dh as the new-hidden scratch
+        }
+        self.h_prev.copy_from_slice(&self.dh);
+        self.c_prev.copy_from_slice(&self.c);
+    }
+
+    /// Run truncated BPTT + an Adam step over whatever literal slots have
+    /// accumulated, then reset the window — called at a match boundary so a BPTT
+    /// segment never spans a gated (skipped) gap.
+    fn flush(&mut self, lr: f32) {
+        if self.win.len > 0 {
+            self.backward();
+            self.adam_step(lr);
+        }
+    }
+
     /// Truncated BPTT over the window → gradient accumulation (no update).
     fn backward(&mut self) {
         let (e, h, v) = (self.e, self.h, self.v);
@@ -426,21 +464,34 @@ pub(crate) struct ArmModel {
     // match-predicted next byte into the LSTM input.
     finder: FlatFinder,
     last8: u64,
+    key_mask: u64, // masks `last8` to the low N bytes for the match feature/gate
     mptr: usize,
     mlen: u32,
+    // Match-gating: when the arm's own LZP match reaches `gate` length, the next
+    // byte is "easy" (the deterministic match model owns it), so the arm abstains
+    // and only advances its recurrent state cheaply (no output projection, no
+    // backward, no Adam) — cutting the dominant per-byte cost on the ~majority of
+    // matched bytes. `gated` carries that decision from one byte to the next.
+    gate: u32,
+    gated: bool,
 }
 
 impl ArmModel {
-    const E: usize = 32;
+    // Input embedding dim. e=64 (was 32) keeps scaling the e2e marginal at a
+    // small compute cost (4h·e ≪ 4h²): 5 MB h=128 e=32/48/64 = −0.0449/−0.0457/
+    // −0.0468. `LZR_ARME` overrides.
+    const E: usize = 64;
     const V: usize = 256;
     const WIN: usize = 16;
     const NO_MATCH: usize = Self::V; // emb_match row used when no match is active
     const FINDER_BITS: u32 = 24; // 16M slots ≈ 96 MB; a feature, not the main matcher
-    /// Hidden width — the operating point. Trades bpb for throughput: the
-    /// enwik8 e2e marginal / enwik9 ETA was h=64 −0.046/7.1h, h=96 −0.061/11.6h,
-    /// h=128 −0.068/16.9h (5 MB slice). We ship h=96, the knee: ~90% of h=128's
-    /// gain at 1.46× the speed (the 96→128 step buys only −0.0065 more for +5.3h).
-    pub(crate) const H: usize = 96;
+    /// Hidden width — the operating point, trading bpb for throughput. Against
+    /// the strengthened deterministic baseline with ARMKEY=6 (5 MB slice), the
+    /// e2e marginal / enwik9 ETA was h=96 −0.0390/19.5h, h=128 −0.0449/29.8h,
+    /// h=160 −0.0490/43.3h. We ship h=128: the largest width whose enwik9 ETA
+    /// (≈30 h, ≈34 h with e=64) stays inside the ~41 h Hutter budget with margin
+    /// (h=160 overruns it). `LZR_H` overrides.
+    pub(crate) const H: usize = 128;
 
     /// The shipped arm at the default hidden width [`Self::H`].
     pub(crate) fn arm() -> Self {
@@ -448,19 +499,47 @@ impl ArmModel {
     }
 
     pub(crate) fn new(h: usize) -> Self {
-        let mut lstm = Lstm::new(Self::E, h, Self::V, Self::WIN);
+        let w_win = std::env::var("LZR_WIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::WIN);
+        let e = std::env::var("LZR_ARME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Self::E);
+        let mut lstm = Lstm::new(e, h, Self::V, w_win);
         lstm.predict_dist(0, Self::NO_MATCH); // BOS → distribution for the first byte
         let mut m = Self {
             lstm,
             cumsum: vec![0.0; Self::V + 1],
             bitbuf: 0,
             nbits: 0,
-            w_win: Self::WIN,
+            w_win,
             lr: 1e-3,
             finder: FlatFinder::new(Self::FINDER_BITS),
             last8: 0,
+            // 6-byte match key for the feature: higher coverage than the 8-byte
+            // (the feature fires far more often) yet more reliable than 4-byte —
+            // the e2e marginal peaks here (3 MB sweep: key 4/5/6/7/8 =
+            // −0.0346/−0.0346/−0.0353/−0.0339/−0.0327). `LZR_ARMKEY` overrides.
+            key_mask: {
+                let kb: u32 = std::env::var("LZR_ARMKEY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(6);
+                if kb >= 8 {
+                    u64::MAX
+                } else {
+                    (1u64 << (8 * kb)) - 1
+                }
+            },
             mptr: 0,
             mlen: 0,
+            gate: std::env::var("LZR_GATE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u32::MAX),
+            gated: false,
         };
         m.refresh_cumsum();
         m
@@ -480,13 +559,14 @@ impl ArmModel {
             self.mlen = 0;
         }
         self.last8 = (self.last8 << 8) | u64::from(b);
+        let key = self.last8 & self.key_mask;
         if self.mlen == 0 {
-            if let Some(q) = self.finder.lookup(self.last8) {
+            if let Some(q) = self.finder.lookup(key) {
                 self.mptr = q as usize;
                 self.mlen = 1;
             }
         }
-        self.finder.insert(self.last8, (n + 1) as u32);
+        self.finder.insert(key, (n + 1) as u32);
         if self.mlen == 0 {
             Self::NO_MATCH
         } else if self.mptr < n {
@@ -510,6 +590,9 @@ impl ArmModel {
 
 impl Model for ArmModel {
     fn predict(&mut self, ctx: &Context) -> i32 {
+        if self.gated {
+            return 0; // abstain on matched bytes; the cumsum is stale here
+        }
         let bpos = ctx.bpos as usize;
         let prefix = (ctx.c0 - (1 << bpos)) as usize; // top `bpos` bits of the byte
         let shift = 8 - bpos;
@@ -528,11 +611,26 @@ impl Model for ArmModel {
         self.nbits += 1;
         if self.nbits == 8 {
             let byte = (self.bitbuf & 0xff) as usize;
-            self.lstm.observe(byte, self.w_win, self.lr); // finalize prediction of this byte
+            // A gated byte had no real prediction/window slot, so nothing to
+            // finalize and nothing to learn from (the match model owns it).
+            if !self.gated {
+                self.lstm.observe(byte, self.w_win, self.lr); // finalize prediction of this byte
+            }
             #[allow(clippy::cast_possible_truncation)]
             let mpred = self.match_step(ctx, byte as u8); // LZP guess for the next byte
-            self.lstm.predict_dist(byte, mpred); // predict the next byte
-            self.refresh_cumsum();
+            if self.mlen >= self.gate {
+                // Next byte is inside a confident match: abstain and advance the
+                // recurrent state cheaply instead of a full forward + backward.
+                if !self.gated {
+                    self.lstm.flush(self.lr); // close the literal BPTT segment before the gap
+                }
+                self.lstm.step_recur(byte, mpred);
+                self.gated = true;
+            } else {
+                self.lstm.predict_dist(byte, mpred); // predict the next byte
+                self.refresh_cumsum();
+                self.gated = false;
+            }
             self.bitbuf = 0;
             self.nbits = 0;
         }
