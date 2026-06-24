@@ -431,11 +431,10 @@ mod tests {
             .and_then(|x| x.parse().ok())
             .unwrap_or(0.002);
 
+        // `None` = linear-only baseline; `Some((hm, lr))` = the residual neural mixer.
         let encode_len = |nmix: Option<(usize, f32)>| -> (usize, f64) {
             let t = Instant::now();
             let mut state = CodecState::new(data.len());
-            // Override the production default: linear-only for the baseline, the
-            // swept config for the candidate.
             state.nmix = nmix.map(|(hm, lr)| NeuralMixer::new(state.stretched.len(), hm, 1, lr));
             let mut enc = Encoder::with_capacity(data.len());
             for &byte in &data {
@@ -450,15 +449,96 @@ mod tests {
             (enc.finish().len(), t.elapsed().as_secs_f64())
         };
 
+        let bpb = |len: usize| len as f64 * 8.0 / orig;
         let (base, base_s) = encode_len(None);
-        let base_bpb = base as f64 * 8.0 / orig;
-        println!("baseline (linear mixer):           {base_bpb:.4} bpb  ({base_s:.0}s)");
-        let (cand, cand_s) = encode_len(Some((hm, lr)));
-        let cand_bpb = cand as f64 * 8.0 / orig;
         println!(
-            "+ residual neural mixer h={hm} lr={lr}: {cand_bpb:.4} bpb  ({cand_s:.0}s)\n  \
-             marginal delta = {:+.4} bpb",
-            cand_bpb - base_bpb
+            "linear mixer (baseline):       {:.4} bpb  ({base_s:.0}s)",
+            bpb(base)
+        );
+        let (m1, m1_s) = encode_len(Some((hm, lr)));
+        println!(
+            "+ residual neural mixer h={hm} lr={lr}: {:.4} bpb  ({m1_s:.0}s)  marginal {:+.4}",
+            bpb(m1),
+            bpb(m1) - bpb(base)
+        );
+    }
+
+    /// Composition check: does the opt-in LSTM arm (a recurrent *model*) still add
+    /// on top of the residual neural *mixer* (M1), or do they overlap? Encodes one
+    /// enwik8 slice through the 2×2 of {arm off/on} × {nmix off/on} and reports each
+    /// marginal plus the additivity gap (combined minus the sum of the singles).
+    /// Both are online (L(D)≈0). `LZR_LO`/`LZR_HI` slice (default `[1M..6M]`),
+    /// `LZR_H` arm hidden width (default 128 for tractable runtime). Run:
+    /// `cargo test --features arm --profile fast arm_nmix_compose -- --ignored --nocapture`
+    #[cfg(feature = "arm")]
+    #[test]
+    #[ignore = "arm (recurrent model) × neural mixer (M1) composition on enwik8"]
+    fn arm_nmix_compose() {
+        use crate::models::lstm::ArmModel;
+        use std::time::Instant;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 6_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let h = env("LZR_H", 128);
+
+        let run = |arm: bool, nmix: bool| -> (f64, f64) {
+            let mut models = baseline_models(data.len());
+            if arm {
+                models.push(ArmModel::new(h).into());
+            }
+            let mut state = CodecState::with_models(models, data.len());
+            if !nmix {
+                state.nmix = None;
+            }
+            let t = Instant::now();
+            let mut enc = Encoder::with_capacity(data.len());
+            for &byte in &data {
+                for k in (0..8).rev() {
+                    let bit = (byte >> k) & 1;
+                    let p = state.predict();
+                    enc.encode(bit, p);
+                    state.commit(bit);
+                }
+                state.end_symbol();
+            }
+            (
+                enc.finish().len() as f64 * 8.0 / orig,
+                t.elapsed().as_secs_f64(),
+            )
+        };
+
+        let (lin, _) = run(false, false);
+        let (nm, nm_s) = run(false, true);
+        let (ar, ar_s) = run(true, false);
+        let (both, both_s) = run(true, true);
+        println!("linear only:      {lin:.4} bpb");
+        println!(
+            "+ nmix (M1):      {nm:.4} bpb  ({:+.4}, {nm_s:.0}s)",
+            nm - lin
+        );
+        println!(
+            "+ arm (h={h}):     {ar:.4} bpb  ({:+.4}, {ar_s:.0}s)",
+            ar - lin
+        );
+        println!(
+            "+ arm + nmix:     {both:.4} bpb  ({:+.4}, {both_s:.0}s)",
+            both - lin
+        );
+        let sum = (nm - lin) + (ar - lin);
+        println!(
+            "additivity: singles-sum {sum:+.4} vs combined {:+.4}  (overlap {:+.4})",
+            both - lin,
+            (both - lin) - sum
         );
     }
 
