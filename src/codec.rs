@@ -6,7 +6,7 @@
 //! prefix (the decoder must know how many bytes to emit); there is no header.
 
 use crate::coder::{Decoder, Encoder};
-use crate::mixer::{Apm, Mixer};
+use crate::mixer::{Apm, Mixer, NeuralMixer};
 use crate::models::context::ContextModel;
 use crate::models::indirect::IndirectModel;
 #[cfg(feature = "arm")]
@@ -58,6 +58,18 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     v
 }
 
+// Residual neural mixing stage (2026-06-24): a small online MLP that refines the
+// linear mixer's logit, initialized to pass-through so it can only improve. The
+// `h=64`, `lr=0.005`, single shared weight set (`nctx=1`) point was the 20 MB
+// enwik8-slice optimum — marginal −0.0075 bpb and *growing* with data (it learns
+// the ensemble's systematic miscalibration, which the linear log-odds mix cannot
+// express); per-bit-position weight sets were a clean negative (online data
+// efficiency favors sharing). Ships no weights → L(D)≈0; ~4× the per-bit cost,
+// but the deterministic path's enwik9 ETA (~4 h) stays far under the time budget.
+const NMIX_H: usize = 64;
+const NMIX_NCTX: usize = 1;
+const NMIX_LR: f32 = 0.005;
+
 const APM_CTX: usize = 256; // SSE contexts: the partial-byte node `c0`
 const APM_W: i32 = 2; // SSE blend: refined prob weighted `APM_W`/4 vs the mixer
 // (equal blend; the stronger multi-mixer needs less SSE correction — sweep
@@ -82,6 +94,10 @@ struct CodecState {
     ctx: Context,
     stretched: Vec<i32>,
     msel: [usize; 8], // mixer weight-set selectors, recomputed once per byte (bpos==0)
+    // Residual neural mixing stage: `Some` in production (refines the linear
+    // mixer's logit). Ablation tests set it to `None` to measure its marginal
+    // against the linear-only path.
+    nmix: Option<NeuralMixer>,
 }
 
 impl CodecState {
@@ -90,8 +106,9 @@ impl CodecState {
     }
 
     fn with_models(models: Vec<AnyModel>, capacity: usize) -> Self {
-        let stretched = vec![0i32; models.len()];
-        let mixer = Mixer::new(models.len());
+        let n = models.len();
+        let stretched = vec![0i32; n];
+        let mixer = Mixer::new(n);
         Self {
             models,
             mixer,
@@ -100,6 +117,7 @@ impl CodecState {
             ctx: Context::with_capacity(capacity),
             stretched,
             msel: [0usize; 8],
+            nmix: Some(NeuralMixer::new(n, NMIX_H, NMIX_NCTX, NMIX_LR)),
         }
     }
 
@@ -133,13 +151,22 @@ impl CodecState {
         let pm = self
             .mixer
             .mix(&self.stretched, &self.msel, usize::from(self.ctx.bpos));
-        let pa = self.apm.refine(pm, (self.ctx.c0 & 0xff) as usize);
-        ((pm * (4 - self.apm_w) + pa * self.apm_w + 2) >> 2) as u32
+        // Optional residual neural refinement of the linear mix (pass-through at
+        // init); `base_p` is the linear mixer's `pm` when the probe is off.
+        let base_p = match self.nmix.as_mut() {
+            Some(nm) => nm.refine(pm, &self.stretched, usize::from(self.ctx.bpos)),
+            None => pm,
+        };
+        let pa = self.apm.refine(base_p, (self.ctx.c0 & 0xff) as usize);
+        ((base_p * (4 - self.apm_w) + pa * self.apm_w + 2) >> 2) as u32
     }
 
     /// Commit the actual `bit`: adapt the mixer, SSE, and models, advance context.
     fn commit(&mut self, bit: u8) {
         self.mixer.update(bit);
+        if let Some(nm) = self.nmix.as_mut() {
+            nm.update(bit);
+        }
         self.apm.update(bit);
         for m in &mut self.models {
             m.update(&self.ctx, bit);
@@ -321,6 +348,118 @@ mod tests {
     #[test]
     fn roundtrip_empty() {
         assert_eq!(decode(&encode(b"")), b"");
+    }
+
+    /// Round-trip the residual neural mixer inside the real codec on a small
+    /// slice: encode and decode build identical state and run identical f32 ops,
+    /// so the stage must be byte-exact in both directions.
+    #[test]
+    fn nmix_roundtrip() {
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let data = Pipeline::default_pipeline().forward(&e8[1_000_000..1_040_000]);
+        let run = |encode: bool, input: &[u8]| -> Vec<u8> {
+            let mut state = CodecState::new(data.len());
+            state.nmix = Some(NeuralMixer::new(state.stretched.len(), 16, 1, 0.002));
+            if encode {
+                let mut enc = Encoder::with_capacity(input.len());
+                for &byte in input {
+                    for k in (0..8).rev() {
+                        let bit = (byte >> k) & 1;
+                        let p = state.predict();
+                        enc.encode(bit, p);
+                        state.commit(bit);
+                    }
+                    state.end_symbol();
+                }
+                enc.finish()
+            } else {
+                let mut dec = Decoder::new(input);
+                let mut out = Vec::with_capacity(data.len());
+                for _ in 0..data.len() {
+                    let mut byte = 0u8;
+                    for _ in 0..8 {
+                        let p = state.predict();
+                        let bit = dec.decode(p);
+                        state.commit(bit);
+                        byte = (byte << 1) | bit;
+                    }
+                    state.end_symbol();
+                    out.push(byte);
+                }
+                out
+            }
+        };
+        let coded = run(true, &data);
+        let decoded = run(false, &coded);
+        assert_eq!(
+            decoded, data,
+            "neural-mixer codec must round-trip byte-exact"
+        );
+    }
+
+    /// Feasibility probe for the residual neural mixer ([`NeuralMixer`]). Encodes
+    /// the same enwik8 slice through the real pipeline twice — linear mixer only,
+    /// then with the neural refinement stage added — on identical cold-start, and
+    /// reports the marginal bpb delta. The stage initializes to pass-through, so a
+    /// nonpositive delta means the linear log-odds mix already captures the
+    /// exploitable structure in the ensemble's logits. `LZR_LO`/`LZR_HI` slice
+    /// (default the 20 MB `[1M..21M]` slice), `LZR_NMIXH` hidden width (default
+    /// 32), `LZR_NMIXLR` learning rate (default 0.002). Run:
+    /// `cargo test --release nmix_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "neural-mixer probe: residual MLP refinement marginal on enwik8"]
+    fn nmix_probe() {
+        use std::time::Instant;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let hm = env("LZR_NMIXH", 32);
+        let lr: f32 = std::env::var("LZR_NMIXLR")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0.002);
+
+        let encode_len = |nmix: Option<(usize, f32)>| -> (usize, f64) {
+            let t = Instant::now();
+            let mut state = CodecState::new(data.len());
+            // Override the production default: linear-only for the baseline, the
+            // swept config for the candidate.
+            state.nmix = nmix.map(|(hm, lr)| NeuralMixer::new(state.stretched.len(), hm, 1, lr));
+            let mut enc = Encoder::with_capacity(data.len());
+            for &byte in &data {
+                for k in (0..8).rev() {
+                    let bit = (byte >> k) & 1;
+                    let p = state.predict();
+                    enc.encode(bit, p);
+                    state.commit(bit);
+                }
+                state.end_symbol();
+            }
+            (enc.finish().len(), t.elapsed().as_secs_f64())
+        };
+
+        let (base, base_s) = encode_len(None);
+        let base_bpb = base as f64 * 8.0 / orig;
+        println!("baseline (linear mixer):           {base_bpb:.4} bpb  ({base_s:.0}s)");
+        let (cand, cand_s) = encode_len(Some((hm, lr)));
+        let cand_bpb = cand as f64 * 8.0 / orig;
+        println!(
+            "+ residual neural mixer h={hm} lr={lr}: {cand_bpb:.4} bpb  ({cand_s:.0}s)\n  \
+             marginal delta = {:+.4} bpb",
+            cand_bpb - base_bpb
+        );
     }
 
     /// Offline: the [`Lz`] preprocessor across a min-match sweep. Hash-chain

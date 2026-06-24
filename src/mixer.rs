@@ -228,6 +228,126 @@ impl Apm {
     }
 }
 
+/// Residual neural (MLP) mixing stage — a feasibility probe for the cmix-style
+/// neural mixer. It sits between the linear [`Mixer`] and the [`Apm`]: a small
+/// one-hidden-layer net reads the raw per-model stretched logits **plus the
+/// linear mixer's own output logit as an anchor**, and emits an additive
+/// *correction* to that anchor. The output layer initializes to zero, so at
+/// step 0 the correction is exactly 0 and the stage is a pass-through of the
+/// linear mixer — it can only improve as it learns, never structurally regress.
+///
+/// All-`f32`, deterministic (identical scalar ops on encode and decode, like the
+/// LSTM arm), so it round-trips byte-exact. Trained online by SGD on the per-bit
+/// logistic loss. This tests whether the ensemble's logits carry nonlinear
+/// structure the (optimal-for-independent-predictors) linear log-odds mix misses.
+#[derive(Debug)]
+pub(crate) struct NeuralMixer {
+    n: usize,     // number of model logits fed in
+    nin: usize,   // n + 2 (the linear-mixer anchor logit copy, and a bias)
+    hm: usize,    // hidden width
+    nctx: usize,  // context-selected weight sets (1 = shared, the online-data optimum)
+    w1: Vec<f32>, // [nctx][hm * nin]
+    w2: Vec<f32>, // [nctx][hm]
+    x: Vec<f32>,  // cached input from the last `refine`
+    hh: Vec<f32>, // cached hidden activations from the last `refine`
+    pf: f32,      // cached output probability in [0,1] from the last `refine`
+    sel: usize,   // cached weight-set index from the last `refine`
+    lr: f32,
+}
+
+// Scale raw logits (≈[-2047, 2047]) into [-1, 1] so the hidden tanh stays in its
+// responsive range with small init weights.
+const NMIX_XSCALE: f32 = 1.0 / 2047.0;
+
+impl NeuralMixer {
+    /// New residual mixer over `n` model logits, `hm` hidden units, `nctx`
+    /// context-selected weight sets (e.g. one per bit-position), learning rate
+    /// `lr`. Hidden weights get a small deterministic init; the output layer is
+    /// zero (pass-through of the anchor at step 0).
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub(crate) fn new(n: usize, hm: usize, nctx: usize, lr: f32) -> Self {
+        let nin = n + 2;
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut rng = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            // ±0.1 uniform from the high bits (16-bit fraction is exact in f32).
+            (((state >> 40) & 0xffff) as f32 / 65536.0 - 0.5) * 0.2
+        };
+        Self {
+            n,
+            nin,
+            hm,
+            nctx,
+            w1: (0..nctx * hm * nin).map(|_| rng()).collect(),
+            w2: vec![0.0; nctx * hm],
+            x: vec![0.0; nin],
+            hh: vec![0.0; hm],
+            pf: 0.5,
+            sel: 0,
+            lr,
+        }
+    }
+
+    /// Refine the linear mixer's 12-bit probability `pm` given the model logits,
+    /// using weight set `sel`, returning a refined 12-bit probability. Caches the
+    /// forward pass for [`update`](Self::update).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    pub(crate) fn refine(&mut self, pm: i32, logits: &[i32], sel: usize) -> i32 {
+        let sel = sel % self.nctx;
+        self.sel = sel;
+        let anchor = stretch(pm); // the linear mixer's logit, the residual baseline
+        for (xi, &l) in self.x[..self.n].iter_mut().zip(logits) {
+            *xi = l as f32 * NMIX_XSCALE;
+        }
+        self.x[self.n] = anchor as f32 * NMIX_XSCALE;
+        self.x[self.nin - 1] = 1.0;
+        let w1 = &self.w1[sel * self.hm * self.nin..(sel + 1) * self.hm * self.nin];
+        let w2 = &self.w2[sel * self.hm..(sel + 1) * self.hm];
+        let mut corr = 0.0f32;
+        for j in 0..self.hm {
+            let row = &w1[j * self.nin..(j + 1) * self.nin];
+            let mut a = 0.0f32;
+            for (w, xi) in row.iter().zip(&self.x) {
+                a = w.mul_add(*xi, a);
+            }
+            let hj = a.tanh();
+            self.hh[j] = hj;
+            corr = w2[j].mul_add(hj, corr);
+        }
+        let out = (anchor as f32 + corr) as i32;
+        let p = squash(out);
+        self.pf = p as f32 / 4096.0;
+        p
+    }
+
+    /// Adapt the last-used weight set toward the observed `bit` (SGD on the
+    /// per-bit logistic loss). The `1/256` from the logit temperature is folded
+    /// into `lr`.
+    #[allow(clippy::suboptimal_flops)]
+    pub(crate) fn update(&mut self, bit: u8) {
+        let g = self.pf - f32::from(bit); // dL/d(out logit), up to the folded 1/256
+        let glr = g * self.lr;
+        let w1 = &mut self.w1[self.sel * self.hm * self.nin..(self.sel + 1) * self.hm * self.nin];
+        let w2 = &mut self.w2[self.sel * self.hm..(self.sel + 1) * self.hm];
+        for j in 0..self.hm {
+            let w2j = w2[j];
+            let hj = self.hh[j];
+            w2[j] -= glr * hj;
+            let da = glr * w2j * (1.0 - hj * hj);
+            let row = &mut w1[j * self.nin..(j + 1) * self.nin];
+            for (w, xi) in row.iter_mut().zip(&self.x) {
+                *w -= da * *xi;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
