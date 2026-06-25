@@ -20,13 +20,29 @@ pub(crate) struct PretrainedMlp {
     h: usize,
     v: usize,
     emb: Vec<f32>,    // [v*e]
-    w1: Vec<f32>,     // [(k*e)*h]
+    w1: Vec<f32>,     // [h*(k*e)] — transposed from the blob's [k*e, h] at load
     b1: Vec<f32>,     // [h]
-    w2: Vec<f32>,     // [h*v]
+    w2: Vec<f32>,     // [v*h] — transposed from the blob's [h, v] at load
     b2: Vec<f32>,     // [v]
     cumsum: Vec<f32>, // [v+1] prefix sums of the current next-byte distribution
     x: Vec<f32>,      // [k*e] flattened context embedding
     hid: Vec<f32>,    // [h]
+}
+
+/// Transpose a `[rows, cols]` row-major matrix to `[cols, rows]` row-major. Done
+/// once at load so the per-byte matvec reads each weight row contiguously. The
+/// blob stores `w1`/`w2` in the matvec's strided orientation; contiguous rows are
+/// neutral while the ~768 KB of weights stay cache-resident (small slices) but
+/// avoid cache misses at enwik9 scale, where the deterministic hash tables evict
+/// them — and it is the orientation a future vectorized dot would need.
+fn transpose(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; src.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = src[r * cols + c];
+        }
+    }
+    out
 }
 
 #[allow(
@@ -58,6 +74,8 @@ impl PretrainedMlp {
         let b1 = take(h);
         let w2 = take(h * v);
         let b2 = take(v);
+        let w1 = transpose(&w1, k * e, h); // [k*e, h] -> [h, k*e] (contiguous matvec)
+        let w2 = transpose(&w2, h, v); // [h, v] -> [v, h]
         let mut m = Self {
             k,
             e,
@@ -98,6 +116,8 @@ impl PretrainedMlp {
         let emb = deq_i8(v * e, es);
         let w1 = deq_i8(k * e * h, w1s);
         let w2 = deq_i8(h * v, w2s);
+        let w1 = transpose(&w1, k * e, h); // [k*e, h] -> [h, k*e] (contiguous matvec)
+        let w2 = transpose(&w2, h, v); // [h, v] -> [v, h]
         let bias_off = 28 + v * e + k * e * h + h * v;
         let read_f32 = |start: usize, n: usize| -> Vec<f32> {
             (0..n).map(|i| f32_at(start + i * 4)).collect()
@@ -169,22 +189,27 @@ impl PretrainedMlp {
             let src = &self.emb[b * self.e..(b + 1) * self.e];
             self.x[j * self.e..(j + 1) * self.e].copy_from_slice(src);
         }
-        // hid = tanh(x @ w1 + b1); w1 is [k*e, h] row-major. (tanh, not relu: the
-        // burn `activation::relu` detached the autodiff graph in training.)
+        // hid = tanh(x @ w1 + b1); w1 stored transposed [h, k*e] so each unit's
+        // weights are contiguous over x — same accumulation order as the [k*e, h]
+        // form, hence bit-identical. (tanh, not relu: burn's activation::relu
+        // detached the autodiff graph in training.)
+        let ke = self.k * self.e;
         for hi in 0..self.h {
             let mut acc = self.b1[hi];
-            for (xi, &xv) in self.x.iter().enumerate() {
-                acc = self.w1[xi * self.h + hi].mul_add(xv, acc);
+            let row = &self.w1[hi * ke..hi * ke + ke];
+            for (&w, &xv) in row.iter().zip(&self.x) {
+                acc = w.mul_add(xv, acc);
             }
             self.hid[hi] = acc.tanh();
         }
-        // logits = hid @ w2 + b2; w2 is [h, v] row-major. Softmax -> cumsum.
+        // logits = hid @ w2 + b2; w2 stored transposed [v, h] (contiguous over hid).
         let mut maxl = f32::MIN;
         // reuse cumsum[1..=v] as the logits scratch, then prefix-sum in place.
         for vi in 0..self.v {
             let mut acc = self.b2[vi];
-            for (hi, &hv) in self.hid.iter().enumerate() {
-                acc = self.w2[hi * self.v + vi].mul_add(hv, acc);
+            let row = &self.w2[vi * self.h..vi * self.h + self.h];
+            for (&w, &hv) in row.iter().zip(&self.hid) {
+                acc = w.mul_add(hv, acc);
             }
             self.cumsum[vi + 1] = acc;
             if acc > maxl {
@@ -320,6 +345,71 @@ mod tests {
         assert_eq!(a.w2, b.w2, "w2");
         assert_eq!(a.b1, b.b1, "b1");
         assert_eq!(a.b2, b.b2, "b2");
+    }
+
+    /// The transposed-at-load matvec must compute bit-for-bit what the naive
+    /// strided `[k*e,h]`/`[h,v]` matvec would. Round-trip tests can't catch a
+    /// transpose typo (a wrong-but-consistent net still round-trips, just predicts
+    /// garbage and silently loses the marginal), so this is the real guard.
+    #[test]
+    fn transposed_recompute_matches_naive() {
+        let (k, e, h, v) = (3usize, 4usize, 5usize, 7usize);
+        let blob = synth_f32_blob(k, e, h, v);
+        let net = PretrainedMlp::from_blob(&blob); // recompute ran on the empty ctx
+        // Naive strided forward on the same empty context (all-zero history ->
+        // x = emb[0..e] repeated k times), from blob-order weights.
+        let mut off = 16usize;
+        let mut take = |n: usize| -> Vec<f32> {
+            let o: Vec<f32> = (0..n)
+                .map(|i| f32::from_le_bytes(blob[off + i * 4..off + i * 4 + 4].try_into().unwrap()))
+                .collect();
+            off += n * 4;
+            o
+        };
+        let emb = take(v * e);
+        let w1 = take(k * e * h);
+        let b1 = take(h);
+        let w2 = take(h * v);
+        let b2 = take(v);
+        let ke = k * e;
+        let mut x = vec![0.0f32; ke];
+        for j in 0..k {
+            x[j * e..(j + 1) * e].copy_from_slice(&emb[0..e]);
+        }
+        let mut hid = vec![0.0f32; h];
+        for hi in 0..h {
+            let mut acc = b1[hi];
+            for xi in 0..ke {
+                acc = w1[xi * h + hi].mul_add(x[xi], acc);
+            }
+            hid[hi] = acc.tanh();
+        }
+        let mut cumsum = vec![0.0f32; v + 1];
+        let mut maxl = f32::MIN;
+        for vi in 0..v {
+            let mut acc = b2[vi];
+            for hi in 0..h {
+                acc = w2[hi * v + vi].mul_add(hid[hi], acc);
+            }
+            cumsum[vi + 1] = acc;
+            if acc > maxl {
+                maxl = acc;
+            }
+        }
+        let mut sum = 0.0f32;
+        for vi in 0..v {
+            let p = (cumsum[vi + 1] - maxl).exp();
+            cumsum[vi + 1] = p;
+            sum += p;
+        }
+        let inv = 1.0 / sum;
+        for vi in 0..v {
+            cumsum[vi + 1] = cumsum[vi] + cumsum[vi + 1] * inv;
+        }
+        assert_eq!(
+            net.cumsum, cumsum,
+            "transposed recompute must match naive strided bit-for-bit"
+        );
     }
 
     /// One-shot tool: convert the f32 net (`LZR_NET`, default `/tmp/lzr_net.bin`)
