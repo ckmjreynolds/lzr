@@ -12,7 +12,6 @@ pub(crate) mod lstm;
 #[cfg(test)]
 mod lstm_spike;
 pub(crate) mod match_model;
-#[cfg(test)]
 pub(crate) mod pretrained;
 pub(crate) mod statemap;
 
@@ -146,9 +145,9 @@ pub(crate) enum AnyModel {
     // variants, so an unboxed variant would bloat every `AnyModel` slot.
     #[cfg(feature = "arm")]
     Arm(Box<lstm::ArmModel>),
-    // Frozen pretrained MLP (test-only for now — un-gate + ship the blob if it
-    // earns its L(D)). Boxed for the same reason as the arm.
-    #[cfg(test)]
+    // Frozen pretrained MLP byte-LM, shipped as a weight blob (paid as L(D)). A
+    // nonlinear function of the raw context window, orthogonal to the per-context
+    // deterministic models. Boxed for the same reason as the arm.
     Pretrained(Box<pretrained::PretrainedMlp>),
 }
 
@@ -173,7 +172,6 @@ impl From<lstm::ArmModel> for AnyModel {
         Self::Arm(Box::new(m))
     }
 }
-#[cfg(test)]
 impl From<pretrained::PretrainedMlp> for AnyModel {
     fn from(m: pretrained::PretrainedMlp) -> Self {
         Self::Pretrained(Box::new(m))
@@ -189,7 +187,6 @@ impl Model for AnyModel {
             Self::Match(m) => m.predict(ctx),
             #[cfg(feature = "arm")]
             Self::Arm(m) => m.predict(ctx),
-            #[cfg(test)]
             Self::Pretrained(m) => m.predict(ctx),
         }
     }
@@ -201,7 +198,6 @@ impl Model for AnyModel {
             Self::Match(m) => m.update(ctx, bit),
             #[cfg(feature = "arm")]
             Self::Arm(m) => m.update(ctx, bit),
-            #[cfg(test)]
             Self::Pretrained(m) => m.update(ctx, bit),
         }
     }
@@ -213,7 +209,6 @@ impl Model for AnyModel {
             Self::Match(m) => m.selector(),
             #[cfg(feature = "arm")]
             Self::Arm(m) => m.selector(),
-            #[cfg(test)]
             Self::Pretrained(m) => m.selector(),
         }
     }

@@ -12,6 +12,7 @@ use crate::models::indirect::IndirectModel;
 #[cfg(feature = "arm")]
 use crate::models::lstm::ArmModel;
 use crate::models::match_model::MatchModel;
+use crate::models::pretrained::PretrainedMlp;
 use crate::models::{AnyModel, Context, Model};
 use crate::preprocessors::Pipeline;
 
@@ -47,12 +48,17 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<AnyModel> {
     ]
 }
 
-/// The active model set. The online-neural arm is appended only under
-/// `--features arm` (opt-in, not shipped — see Cargo.toml).
+/// Frozen pretrained byte-LM weights (`src/models/pretrained.rs`), trained offline
+/// by `examples/pretrain.rs`. Embedded so encode and decode build the identical
+/// predictor from the same bytes; the blob counts as L(D).
+const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
+
+/// The active model set: the deterministic baseline plus the frozen pretrained
+/// net (shipped). The online-neural arm is appended only under `--features arm`
+/// (opt-in, not shipped — see Cargo.toml).
 fn models(capacity: usize) -> Vec<AnyModel> {
-    // `mut` is only used when the arm feature appends below.
-    #[cfg_attr(not(feature = "arm"), allow(unused_mut))]
     let mut v = baseline_models(capacity);
+    v.push(PretrainedMlp::from_blob_q8(PRETRAINED_NET).into());
     #[cfg(feature = "arm")]
     v.push(ArmModel::arm().into());
     v
@@ -937,6 +943,72 @@ mod tests {
             big + small
         );
         println!("NET of L(D): {:+.4}", marginal + ld);
+    }
+
+    /// Authoritative pretrained-net marginal: the same frozen MLP measured over the
+    /// **full production stack** (logistic multi-mixer + M1 residual mixer + APM)
+    /// via [`code_stream_models`], not the linear panel `pretrained_lab` uses. The
+    /// panel overstates an MLP's marginal over a linear mix 5–10× (see JOURNAL), so
+    /// only this number gates a ship decision. Computes the production baseline
+    /// once, then the f32 and 8-bit net marginals (with their `L(D)`) against it.
+    /// Run held-out (the conservative gate) with `LZR_CORPUS=assets/enwik9
+    /// LZR_LO=200000000 LZR_HI=210000000`; defaults to the in-distribution
+    /// enwik8 `[1M..11M]` slice. `cargo test --release pretrained_e2e -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "explore: frozen pretrained MLP marginal over the FULL production stack"]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    fn pretrained_e2e() {
+        use crate::models::pretrained::PretrainedMlp;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let net = std::env::var("LZR_NET").unwrap_or_else(|_| "/tmp/lzr_net.bin".into());
+        let Ok(blob) = std::fs::read(&net) else {
+            println!("no net blob at {net}; skipping");
+            return;
+        };
+        let corpus = std::env::var("LZR_CORPUS").unwrap_or_else(|_| "assets/enwik8".into());
+        let Ok(e8) = std::fs::read(&corpus) else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 11_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        // Full production stack (logistic mixer + M1 + APM), not the linear panel.
+        let base = code_stream_models(baseline_models(data.len()), &data).len();
+        let base_bpb = base as f64 * 8.0 / orig;
+        println!(
+            "baseline (production stack) {base_bpb:.4}  [{base} B over {} pp-bytes]",
+            data.len()
+        );
+        let rd = |o: usize| u32::from_le_bytes(blob[o..o + 4].try_into().unwrap()) as usize;
+        let (k, e, h, v) = (rd(0), rd(4), rd(8), rd(12));
+        let big = v * e + k * e * h + h * v;
+        let small = h + v;
+        for qbits in [32u32, 8] {
+            let mut pre = PretrainedMlp::from_blob(&blob);
+            pre.quantize(qbits);
+            let mut models = baseline_models(data.len());
+            models.push(pre.into());
+            let coded = code_stream_models(models, &data).len();
+            let bpb = coded as f64 * 8.0 / orig;
+            let marginal = bpb - base_bpb;
+            let shipped = if qbits >= 32 {
+                blob.len()
+            } else {
+                16 + (big * qbits as usize).div_ceil(8) + small * 4
+            };
+            let ld = 16.0 * shipped as f64 / 1e9;
+            println!(
+                "  +pretrained(q{qbits}) {bpb:.4}  marginal {marginal:+.4} | shipped {shipped} B | L(D) {ld:.5} | NET {:+.4}",
+                marginal + ld
+            );
+        }
     }
 
     /// Composition check: does the opt-in LSTM arm (a recurrent *model*) still add

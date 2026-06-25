@@ -4,6 +4,7 @@ target/
 .DS_Store
 assets/*
 !assets/v8weights.bin
+!assets/pretrained_net.bin
 checkpoints/
 lcov.info
 src/.DS_Store

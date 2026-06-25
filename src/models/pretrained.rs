@@ -36,7 +36,10 @@ pub(crate) struct PretrainedMlp {
     clippy::suboptimal_flops
 )]
 impl PretrainedMlp {
-    /// Parse a weight blob (see the layout note above).
+    /// Parse an f32 weight blob (see the layout note above). Test-only: production
+    /// ships the int8 blob via `from_blob_q8`; the f32 path drives the offline
+    /// marginal/quantization labs.
+    #[cfg(test)]
     pub(crate) fn from_blob(blob: &[u8]) -> Self {
         let u32_at =
             |o: usize| -> usize { u32::from_le_bytes(blob[o..o + 4].try_into().unwrap()) as usize };
@@ -73,10 +76,57 @@ impl PretrainedMlp {
         m
     }
 
+    /// Load an int8-quantized blob: `[K,E,H,V : u32]`, then per-tensor scales
+    /// (`emb`,`w1`,`w2` : f32), then `i8` `emb`/`w1`/`w2`, then `f32` `b1`/`b2`.
+    /// Dequantizes to f32 in RAM (the on-disk `i8` is what sets `L(D)`); reproduces
+    /// `quantize(8)` exactly, so the shipped net equals the measured 8-bit one.
+    pub(crate) fn from_blob_q8(blob: &[u8]) -> Self {
+        let u32_at =
+            |o: usize| -> usize { u32::from_le_bytes(blob[o..o + 4].try_into().unwrap()) as usize };
+        let f32_at = |o: usize| f32::from_le_bytes(blob[o..o + 4].try_into().unwrap());
+        let (k, e, h, v) = (u32_at(0), u32_at(4), u32_at(8), u32_at(12));
+        let (es, w1s, w2s) = (f32_at(16), f32_at(20), f32_at(24));
+        let mut off = 28usize;
+        let mut deq_i8 = |n: usize, scale: f32| -> Vec<f32> {
+            let out: Vec<f32> = blob[off..off + n]
+                .iter()
+                .map(|&b| f32::from(i8::from_le_bytes([b])) * scale)
+                .collect();
+            off += n;
+            out
+        };
+        let emb = deq_i8(v * e, es);
+        let w1 = deq_i8(k * e * h, w1s);
+        let w2 = deq_i8(h * v, w2s);
+        let bias_off = 28 + v * e + k * e * h + h * v;
+        let read_f32 = |start: usize, n: usize| -> Vec<f32> {
+            (0..n).map(|i| f32_at(start + i * 4)).collect()
+        };
+        let b1 = read_f32(bias_off, h);
+        let b2 = read_f32(bias_off + h * 4, v);
+        let mut m = Self {
+            k,
+            e,
+            h,
+            v,
+            emb,
+            w1,
+            b1,
+            w2,
+            b2,
+            cumsum: vec![0.0; v + 1],
+            x: vec![0.0; k * e],
+            hid: vec![0.0; h],
+        };
+        m.recompute(&Context::with_capacity(0));
+        m
+    }
+
     /// In-place symmetric quantization of the weight tensors to `bits`, dequantized
     /// back to f32 — to estimate the L(C) cost of shipping low-bit weights (the
     /// L(D) saving is computed separately). `bits >= 32` is a no-op. `bits == 2` is
     /// ternary (`{-1,0,1}` × per-tensor abs-mean).
+    #[cfg(test)]
     pub(crate) fn quantize(&mut self, bits: u32) {
         if bits >= 32 {
             return;
@@ -177,5 +227,120 @@ impl Model for PretrainedMlp {
         // Frozen: recompute is driven from `predict` at the byte boundary, when
         // the finalized history (read via byte_back) already includes the byte
         // just completed. Nothing to learn.
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    clippy::suboptimal_flops
+)]
+mod tests {
+    use super::*;
+
+    /// Quantize an f32 net blob to the int8 ship format — the same per-tensor
+    /// symmetric quantization as `quantize(8)`: `[K,E,H,V u32]`, then
+    /// `emb`/`w1`/`w2` scales (f32), then `i8` `emb`/`w1`/`w2`, then `f32`
+    /// `b1`/`b2`. Produces what `from_blob_q8` reads.
+    pub(crate) fn f32_blob_to_q8(f32_blob: &[u8]) -> Vec<u8> {
+        let u32_at = |o: usize| u32::from_le_bytes(f32_blob[o..o + 4].try_into().unwrap()) as usize;
+        let (k, e, h, v) = (u32_at(0), u32_at(4), u32_at(8), u32_at(12));
+        let mut off = 16usize;
+        let mut take = |n: usize| -> Vec<f32> {
+            let out: Vec<f32> = (0..n)
+                .map(|i| {
+                    f32::from_le_bytes(f32_blob[off + i * 4..off + i * 4 + 4].try_into().unwrap())
+                })
+                .collect();
+            off += n * 4;
+            out
+        };
+        let emb = take(v * e);
+        let w1 = take(k * e * h);
+        let b1 = take(h);
+        let w2 = take(h * v);
+        let b2 = take(v);
+        let q8 = |w: &[f32]| -> (f32, Vec<i8>) {
+            let m = w.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+            let scale = if m > 0.0 { m / 127.0 } else { 1.0 };
+            let q = w
+                .iter()
+                .map(|&x| (x / scale).round().clamp(-127.0, 127.0) as i8)
+                .collect();
+            (scale, q)
+        };
+        let (es, eq) = q8(&emb);
+        let (w1s, w1q) = q8(&w1);
+        let (w2s, w2q) = q8(&w2);
+        let mut out = Vec::new();
+        for d in [k as u32, e as u32, h as u32, v as u32] {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        for s in [es, w1s, w2s] {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for &q in eq.iter().chain(&w1q).chain(&w2q) {
+            out.push(q as u8);
+        }
+        for &x in b1.iter().chain(&b2) {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    }
+
+    fn synth_f32_blob(k: usize, e: usize, h: usize, v: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for d in [k, e, h, v] {
+            out.extend_from_slice(&(d as u32).to_le_bytes());
+        }
+        let n = v * e + k * e * h + h + h * v + v;
+        let mut s = 0x1234_5678u32;
+        for _ in 0..n {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let x = (s >> 16) as f32 / f32::from(u16::MAX) * 2.0 - 1.0;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    }
+
+    /// The int8 ship path (`f32_blob_to_q8` → `from_blob_q8`) must reproduce the
+    /// measured 8-bit net (`from_blob` → `quantize(8)`) bit-for-bit, so the
+    /// validated 8-bit marginal transfers to the shipped binary.
+    #[test]
+    fn q8_blob_reproduces_quantize8() {
+        let blob = synth_f32_blob(2, 2, 3, 4);
+        let mut a = PretrainedMlp::from_blob(&blob);
+        a.quantize(8);
+        let b = PretrainedMlp::from_blob_q8(&f32_blob_to_q8(&blob));
+        assert_eq!(a.emb, b.emb, "emb");
+        assert_eq!(a.w1, b.w1, "w1");
+        assert_eq!(a.w2, b.w2, "w2");
+        assert_eq!(a.b1, b.b1, "b1");
+        assert_eq!(a.b2, b.b2, "b2");
+    }
+
+    /// One-shot tool: convert the f32 net (`LZR_NET`, default `/tmp/lzr_net.bin`)
+    /// to the int8 ship asset (`LZR_Q8_OUT`, default `assets/pretrained_net.bin`).
+    /// `LZR_NET=/tmp/lzr_net.bin cargo test --release dump_q8_asset -- --ignored`.
+    #[test]
+    #[ignore = "tool: write assets/pretrained_net.bin (int8) from an f32 net blob"]
+    fn dump_q8_asset() {
+        let src = std::env::var("LZR_NET").unwrap_or_else(|_| "/tmp/lzr_net.bin".into());
+        let dst =
+            std::env::var("LZR_Q8_OUT").unwrap_or_else(|_| "assets/pretrained_net.bin".into());
+        let Ok(f32_blob) = std::fs::read(&src) else {
+            println!("no f32 blob at {src}; skipping");
+            return;
+        };
+        let q8 = f32_blob_to_q8(&f32_blob);
+        std::fs::write(&dst, &q8).unwrap();
+        println!(
+            "wrote {} int8 bytes to {dst} (from {} f32 bytes {src})",
+            q8.len(),
+            f32_blob.len()
+        );
     }
 }

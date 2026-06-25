@@ -120,6 +120,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1e-3);
+    // Opt-in cosine lr decay to 0 over the run (LZR_COSINE): unlocks descent past
+    // the fixed-lr plateau. Off by default so the trainer stays reproducible.
+    let cosine = std::env::var("LZR_COSINE").is_ok();
     let data = std::fs::read(&data_path).expect("preprocessed training data");
     let span = data.len() - K - 1;
     println!(
@@ -228,7 +231,12 @@ fn main() {
         }
         let grads = loss.backward();
         let gp = GradientsParams::from_grads(grads, &model);
-        model = optim.step(lr, model, gp);
+        let lr_t = if cosine {
+            lr * 0.5 * (1.0 + (std::f64::consts::PI * step as f64 / steps as f64).cos())
+        } else {
+            lr
+        };
+        model = optim.step(lr_t, model, gp);
     }
 
     let mut blob = Vec::new();
