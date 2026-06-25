@@ -13,6 +13,12 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-25 (full enwik9 CONFIRMATION) — shipped codec det+M1+net: L(C) 1.1758, net 1.1859 — the corrected projection holds, the slice's 1.145 was wrong by ~0.04
+
+CDR approved the full-enwik9 run of the shipped codec (det + 22-model stack + M1 + the frozen pretrained net; no arm). Result: 1 GB → 146,972,286 B = **1.1758 bpb** in 21,724 s (~6.03 h, 0.05 MB/s single-core), peak RSS 8.18 GB (under the 10 GB cap). The net's full-enwik9 marginal is **−0.0130** over det+M1's standing 1.1888 — and it shrank exactly as the 02:20 correction predicted from the enwik8-full −0.0251 (the enwik9 stack is stronger still: more data, cross-article redundancy, match at ~99% coverage erode the frozen net's edge further). With L(D) 0.01014 (634 KB binary, ×16/1e9) the net is **1.1859**, vs det+M1's 1.1960 (L(C) 1.1888 + L(D) 0.00723) — a **−0.0101 net** improvement and the new project best. The net spends 0.0029 L(D) to buy 0.0130 L(C): a 4.5× return, clearly worth it, but modest — comparable to M1's own enwik9 −0.010.
+
+This vindicates the slice-overstatement corrections: the honest full-scale answer (net 1.1859, in the projected 1.17–1.18 band) is ~0.04 better-on-paper than the original slice projection (1.145) would have claimed, i.e. the slice would have overstated the net's net win ~5× (−0.05 vs the real −0.010). Throughput in budget (6.03 h decode-equivalent vs the ~41 h ceiling). Encode-only (deterministic f32, round-trips on slices + the byte-exact integration tests; a full enwik9 round-trip is a separate ~6 h if submission-grade verification is wanted). The shipped enwik9 standing is now **L(C) 1.1758 / net 1.1859**.
+
 ## 2026-06-25 03:25 — net quality does NOT scale the marginal at full scale: "scale the net" is a weak lever; the frozen net is ~capped near −0.025 (enwik8)
 
 A direct full-scale test of the scaling thesis from the 06-25 ship entry. The slice "quality scales" finding (commit e893939: a cosine retrain to 1.96 nats beat the 2.06-nat net, −0.0537 vs −0.0466 on the held-out slice) predicted a still-better net would earn a still-bigger marginal. So a 1M-step cosine net was trained (1.87 nats, vs 1.96 at 500K) and measured at FULL enwik8:
