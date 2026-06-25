@@ -45,6 +45,28 @@ fn transpose(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
+/// `bias + sum w[i]*x[i]` with 16 independent accumulators, so the `mul_add` chain
+/// is throughput-bound (auto-vectorizes to NEON `fmla`) instead of latency-bound
+/// on a single dependent accumulator — the per-byte forward's dominant cost. The
+/// 16-way reassociation differs from a sequential sum by ~1e-6 (f32), immaterial
+/// to the prediction (`recompute_matches_naive_approx` bounds it).
+#[allow(clippy::needless_range_loop)]
+fn dot(w: &[f32], x: &[f32], bias: f32) -> f32 {
+    let mut acc = [0.0f32; 16];
+    let mut wi = w.chunks_exact(16);
+    let mut xi = x.chunks_exact(16);
+    for (wc, xc) in wi.by_ref().zip(xi.by_ref()) {
+        for l in 0..16 {
+            acc[l] = wc[l].mul_add(xc[l], acc[l]);
+        }
+    }
+    let mut s = bias + acc.iter().sum::<f32>();
+    for (wr, xr) in wi.remainder().iter().zip(xi.remainder()) {
+        s = wr.mul_add(*xr, s);
+    }
+    s
+}
+
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -190,27 +212,19 @@ impl PretrainedMlp {
             self.x[j * self.e..(j + 1) * self.e].copy_from_slice(src);
         }
         // hid = tanh(x @ w1 + b1); w1 stored transposed [h, k*e] so each unit's
-        // weights are contiguous over x — same accumulation order as the [k*e, h]
-        // form, hence bit-identical. (tanh, not relu: burn's activation::relu
-        // detached the autodiff graph in training.)
+        // weights are contiguous over x for the vectorized `dot`. (tanh, not relu:
+        // burn's activation::relu detached the autodiff graph in training.)
         let ke = self.k * self.e;
         for hi in 0..self.h {
-            let mut acc = self.b1[hi];
             let row = &self.w1[hi * ke..hi * ke + ke];
-            for (&w, &xv) in row.iter().zip(&self.x) {
-                acc = w.mul_add(xv, acc);
-            }
-            self.hid[hi] = acc.tanh();
+            self.hid[hi] = dot(row, &self.x, self.b1[hi]).tanh();
         }
         // logits = hid @ w2 + b2; w2 stored transposed [v, h] (contiguous over hid).
         let mut maxl = f32::MIN;
         // reuse cumsum[1..=v] as the logits scratch, then prefix-sum in place.
         for vi in 0..self.v {
-            let mut acc = self.b2[vi];
             let row = &self.w2[vi * self.h..vi * self.h + self.h];
-            for (&w, &hv) in row.iter().zip(&self.hid) {
-                acc = w.mul_add(hv, acc);
-            }
+            let acc = dot(row, &self.hid, self.b2[vi]);
             self.cumsum[vi + 1] = acc;
             if acc > maxl {
                 maxl = acc;
@@ -347,12 +361,13 @@ mod tests {
         assert_eq!(a.b2, b.b2, "b2");
     }
 
-    /// The transposed-at-load matvec must compute bit-for-bit what the naive
-    /// strided `[k*e,h]`/`[h,v]` matvec would. Round-trip tests can't catch a
-    /// transpose typo (a wrong-but-consistent net still round-trips, just predicts
-    /// garbage and silently loses the marginal), so this is the real guard.
+    /// The transposed + vectorized matvec must compute what the naive strided
+    /// `[k*e,h]`/`[h,v]` single-accumulator matvec would, up to f32 reassociation
+    /// (the 16-lane `dot` reorders the sum by ~1e-6). Round-trip tests can't catch
+    /// a transpose/index typo (a wrong-but-consistent net still round-trips, just
+    /// predicts garbage and silently loses the marginal), so this is the real guard.
     #[test]
-    fn transposed_recompute_matches_naive() {
+    fn recompute_matches_naive_approx() {
         let (k, e, h, v) = (3usize, 4usize, 5usize, 7usize);
         let blob = synth_f32_blob(k, e, h, v);
         let net = PretrainedMlp::from_blob(&blob); // recompute ran on the empty ctx
@@ -406,9 +421,16 @@ mod tests {
         for vi in 0..v {
             cumsum[vi + 1] = cumsum[vi] + cumsum[vi + 1] * inv;
         }
-        assert_eq!(
-            net.cumsum, cumsum,
-            "transposed recompute must match naive strided bit-for-bit"
+        let max_err = net
+            .cumsum
+            .iter()
+            .zip(&cumsum)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-4,
+            "vectorized recompute must match the naive strided matvec within f32 \
+             reassociation (max abs cumsum error {max_err:e})"
         );
     }
 
