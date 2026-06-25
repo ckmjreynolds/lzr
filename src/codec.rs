@@ -58,7 +58,11 @@ const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
 /// (opt-in, not shipped — see Cargo.toml).
 fn models(capacity: usize) -> Vec<AnyModel> {
     let mut v = baseline_models(capacity);
-    v.push(PretrainedMlp::from_blob_q8(PRETRAINED_NET).into());
+    // `LZR_NO_NET` (offline ablation only) drops the pretrained net to isolate its
+    // marginal / test additivity with the arm; unset (the default) keeps it shipped.
+    if std::env::var("LZR_NO_NET").is_err() {
+        v.push(PretrainedMlp::from_blob_q8(PRETRAINED_NET).into());
+    }
     #[cfg(feature = "arm")]
     v.push(ArmModel::arm().into());
     v
