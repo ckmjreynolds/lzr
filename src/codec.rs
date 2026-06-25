@@ -468,10 +468,10 @@ mod tests {
     // to the journal's pre-M1 preprocessor numbers. Keepers get re-checked with the
     // full stack before shipping.
 
-    /// Deterministic codec (linear mixer, M1 off) over already-preprocessed `data`;
-    /// returns the coded byte length. Shared by the prep-lab sweeps below.
-    fn encode_det_linear(data: &[u8]) -> usize {
-        let mut state = CodecState::with_models(baseline_models(data.len()), data.len());
+    /// Deterministic codec (linear mixer, M1 off) over already-preprocessed `data`
+    /// with an explicit model set; returns the coded byte length.
+    fn encode_linear_models(models: Vec<AnyModel>, data: &[u8]) -> usize {
+        let mut state = CodecState::with_models(models, data.len());
         state.nmix = None;
         let mut enc = Encoder::with_capacity(data.len());
         for &byte in data {
@@ -484,6 +484,80 @@ mod tests {
             state.end_symbol();
         }
         enc.finish().len()
+    }
+
+    /// As [`encode_linear_models`] with the shipped deterministic set. Shared by the
+    /// prep-lab pipeline sweeps.
+    fn encode_det_linear(data: &[u8]) -> usize {
+        encode_linear_models(baseline_models(data.len()), data)
+    }
+
+    /// Exploration — marginal of candidate sparse-context masks on top of the
+    /// shipped stack (linear mixer). `mask` bit `i` reads `byte_back(i+1)`. Run:
+    /// `cargo test --release sparse_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "explore: candidate sparse-context masks (marginal over the stack)"]
+    #[allow(clippy::cast_precision_loss, clippy::unreadable_literal)]
+    fn sparse_lab() {
+        use crate::models::context::ContextModel;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 21_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let base = encode_det_linear(&data);
+        let base_bpb = base as f64 * 8.0 / orig;
+        println!("baseline (shipped stack): {base_bpb:.4} bpb");
+        // (mask, label) — untested patterns; shipped are {1,3}{2,3}{1,2,4}{3,4}{1,5}.
+        let cands: [(u32, &str); 6] = [
+            (0b1001, "{1,4}"),
+            (0b1010, "{2,4}"),
+            (0b10010, "{2,5}"),
+            (0b100001, "{1,6}"),
+            (0b10101, "{1,3,5}"),
+            (0b100011, "{1,2,6}"),
+        ];
+        for (mask, label) in cands {
+            let mut models = baseline_models(data.len());
+            models.push(ContextModel::sparse(mask, data.len()).into());
+            let coded = encode_linear_models(models, &data);
+            let bpb = coded as f64 * 8.0 / orig;
+            println!(
+                "+ sparse {label:8} {bpb:.4} bpb  marginal {:+.4}",
+                bpb - base_bpb
+            );
+        }
+    }
+
+    /// Offline: dump the preprocessed (post-pipeline) enwik8 — what every model,
+    /// including a pretrained net, actually sees — for GPU pretraining (the burn
+    /// `pretrain` example reads it). `LZR_PP_OUT` sets the path. Run:
+    /// `LZR_PP_OUT=/tmp/lzr_pp.bin cargo test --release dump_preprocessed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: dump preprocessed enwik8 for net pretraining"]
+    fn dump_preprocessed() {
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let out = std::env::var("LZR_PP_OUT").unwrap_or_else(|_| "/tmp/lzr_pp.bin".into());
+        // `LZR_CF_ONLY=1` dumps casefold-only (no word dict) — easy data for a
+        // training sanity check (a working net must beat unigram on it).
+        let pp = if std::env::var("LZR_CF_ONLY").is_ok() {
+            use crate::preprocessors::Preprocessor;
+            crate::preprocessors::casefold::CaseFold.forward(&e8)
+        } else {
+            Pipeline::default_pipeline().forward(&e8)
+        };
+        std::fs::write(&out, &pp).unwrap();
+        println!("wrote {} preprocessed bytes to {out}", pp.len());
     }
 
     /// E1 — dict-N sweep: deterministic bpb (per original byte) and the post-dict
@@ -799,6 +873,58 @@ mod tests {
         let b = build(&both);
         let nws = b.iter().filter(|e| e.last() == Some(&b' ')).count();
         run(&format!("B words+wordspace ({nws} ws)"), &b);
+    }
+
+    /// Exploration — frozen pretrained MLP byte-LM (GPU-trained by the `pretrain`
+    /// example): its marginal over the shipped stack (linear mixer) and its `L(D)`.
+    /// Loads the weight blob `LZR_NET` (default `/tmp/lzr_net.bin`); skips if
+    /// absent. The net is trained on the corpus it compresses (the real Hutter
+    /// setup), so the slice being in its training data is legitimate. Reports
+    /// net-of-L(D) for f32 and ternary shipping. Run:
+    /// `cargo test --release pretrained_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "explore: frozen pretrained MLP marginal + L(D)"]
+    #[allow(clippy::cast_precision_loss)]
+    fn pretrained_lab() {
+        use crate::models::pretrained::PretrainedMlp;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let net = std::env::var("LZR_NET").unwrap_or_else(|_| "/tmp/lzr_net.bin".into());
+        let Ok(blob) = std::fs::read(&net) else {
+            println!("no net blob at {net}; skipping");
+            return;
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 11_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let base = encode_det_linear(&data);
+        let base_bpb = base as f64 * 8.0 / orig;
+        let mut models = baseline_models(data.len());
+        models.push(PretrainedMlp::from_blob(&blob).into());
+        let coded = encode_linear_models(models, &data);
+        let bpb = coded as f64 * 8.0 / orig;
+        let marginal = bpb - base_bpb;
+        let params = (blob.len() - 16) / 4;
+        let ld_f32 = 16.0 * blob.len() as f64 / 1e9;
+        let ld_tern = 16.0 * (params as f64 * 2.0 / 8.0) / 1e9; // 2 bits/param
+        println!("baseline (linear) {base_bpb:.4}  +pretrained {bpb:.4}  marginal {marginal:+.4}");
+        println!(
+            "net: {params} params, blob {} B | L(D): f32 {ld_f32:.5}, ternary {ld_tern:.5}",
+            blob.len()
+        );
+        println!(
+            "NET of L(D):  f32 {:+.4}   ternary {:+.4}",
+            marginal + ld_f32,
+            marginal + ld_tern
+        );
     }
 
     /// Composition check: does the opt-in LSTM arm (a recurrent *model*) still add

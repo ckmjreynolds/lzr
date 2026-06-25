@@ -17,6 +17,10 @@ include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
 
 [dependencies]
 lru         = "=0.18.0"
+# Training-only, gated behind the `neural` feature (offline GPU pretraining of a
+# small net via the `pretrain` example). NEVER in default/submission — trimmed to
+# the wgpu+ndarray+autodiff backends (defaults pull 600+ media/web crates).
+burn        = { version = "0.21", optional = true, default-features = false, features = ["std", "wgpu", "ndarray", "autodiff"] }
 
 [dev-dependencies]
 # Offline-only: suffix-array construction for the dictionary-candidate miner
@@ -34,6 +38,20 @@ submission  = []
 # (enwik9 ~12 h) for a modest gain, so the default/submission build stays
 # deterministic and fast. Enable for arm work: `cargo test --features arm`.
 arm         = []
+# `neural`: offline GPU pretraining of a small byte-LM via burn (the `pretrain`
+# example). Training-only — produces a weight blob the submission build embeds and
+# runs on the CPU; burn is never in default/submission.
+neural      = ["dep:burn"]
+
+# Offline pretraining example (burn). Build/run with `--features neural`.
+[[example]]
+name              = "pretrain"
+required-features = ["neural"]
+
+# Optimize dependency crates even in dev so the burn `pretrain` example's CPU-side
+# host code is fast to iterate without a full release/LTO build.
+[profile.dev.package."*"]
+opt-level = 3
 
 # `release` is the iteration-speed default (CDR, 2026-06-24): `opt-level = 3` for
 # the fastest encode/decode while we iterate — iteration speed currently outweighs
