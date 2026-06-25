@@ -12,14 +12,18 @@
 //!       cargo run --example pretrain --features neural`
 //!
 //! STATUS (2026-06-24): the pipeline is end-to-end (compiles, trains on the GPU,
-//! the embedding gather is verified input-dependent, all params update), but this
-//! MLP currently **collapses to the unigram** — on casefold data it converges to
-//! 3.40 nats vs the 3.4278-nat unigram, i.e. the context path contributes ~nothing
-//! despite training. A "collapse to the marginal" pathology that resisted init /
-//! activation / lr fixes; needs careful debugging (overfit-a-batch, grad checks).
-//! Independently, a *frozen* simple net on the word-dict'd stream is expected to be
-//! low-value (the dict removes the learnable word-structure; the deterministic
-//! stack + online arm already cover it), so this is kept as a scaffold, not shipped.
+//! the embedding gather is verified input-dependent at batch-variance 0.85, all
+//! params update), but the net **cannot learn the context** — it converges to the
+//! unigram (3.44 vs 3.4278 nats on casefold), and the decisive `LZR_OVERFIT=1`
+//! test (train on ONE fixed 512-sample batch) ALSO sticks at the unigram. A 205K
+//! net must memorize 512 samples trivially, so this is a forward/backward bug (the
+//! gradients move the params but are not descent directions for this graph), not a
+//! data/lr issue — needs a minimal burn repro / gradient check (the suspect is the
+//! `select`-gather → `reshape([batch, K*E])` flatten path, which differs from v8's
+//! `[b,t,d]` layout that trained fine). Independently, a *frozen* simple net on the
+//! word-dict'd stream is expected low-value regardless (the dict removes the
+//! learnable word-structure; the deterministic stack + online arm already cover
+//! it), so this is kept as a documented scaffold/WIP, not shipped.
 
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
@@ -136,19 +140,47 @@ fn main() {
         println!("DIAG: g batch-variance {var:.5} | ctx-index variance {cvar:.1}");
     }
 
-    let t0 = std::time::Instant::now();
-    for step in 0..steps {
-        let mut ctx_ids: Vec<i32> = Vec::with_capacity(batch * K);
-        let mut tgt_ids: Vec<i32> = Vec::with_capacity(batch);
+    // `LZR_OVERFIT=1`: train on ONE fixed batch every step. A working net must
+    // drive the loss toward 0 (memorize 512 samples); if it sticks at the unigram,
+    // the forward/backward is broken, not the data/lr.
+    let overfit = std::env::var("LZR_OVERFIT").is_ok();
+    let fixed = if overfit {
+        let mut ci: Vec<i32> = Vec::with_capacity(batch * K);
+        let mut ti: Vec<i32> = Vec::with_capacity(batch);
         for _ in 0..batch {
             let p = K + (next() % span);
             for j in 0..K {
-                ctx_ids.push(i32::from(data[p - K + j]));
+                ci.push(i32::from(data[p - K + j]));
             }
-            tgt_ids.push(i32::from(data[p]));
+            ti.push(i32::from(data[p]));
         }
-        let ctx = Tensor::<AB, 2, Int>::from_data(TensorData::new(ctx_ids, [batch, K]), &device);
-        let tgt = Tensor::<AB, 1, Int>::from_data(TensorData::new(tgt_ids, [batch]), &device);
+        Some((
+            Tensor::<AB, 2, Int>::from_data(TensorData::new(ci, [batch, K]), &device),
+            Tensor::<AB, 1, Int>::from_data(TensorData::new(ti, [batch]), &device),
+        ))
+    } else {
+        None
+    };
+
+    let t0 = std::time::Instant::now();
+    for step in 0..steps {
+        let (ctx, tgt) = if let Some((c, t)) = &fixed {
+            (c.clone(), t.clone())
+        } else {
+            let mut ctx_ids: Vec<i32> = Vec::with_capacity(batch * K);
+            let mut tgt_ids: Vec<i32> = Vec::with_capacity(batch);
+            for _ in 0..batch {
+                let p = K + (next() % span);
+                for j in 0..K {
+                    ctx_ids.push(i32::from(data[p - K + j]));
+                }
+                tgt_ids.push(i32::from(data[p]));
+            }
+            (
+                Tensor::<AB, 2, Int>::from_data(TensorData::new(ctx_ids, [batch, K]), &device),
+                Tensor::<AB, 1, Int>::from_data(TensorData::new(tgt_ids, [batch]), &device),
+            )
+        };
         let logits = model.forward(ctx);
         let loss = CrossEntropyLossConfig::new()
             .init(&device)
