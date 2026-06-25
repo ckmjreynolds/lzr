@@ -13,6 +13,18 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-25 03:25 — net quality does NOT scale the marginal at full scale: "scale the net" is a weak lever; the frozen net is ~capped near −0.025 (enwik8)
+
+A direct full-scale test of the scaling thesis from the 06-25 ship entry. The slice "quality scales" finding (commit e893939: a cosine retrain to 1.96 nats beat the 2.06-nat net, −0.0537 vs −0.0466 on the held-out slice) predicted a still-better net would earn a still-bigger marginal. So a 1M-step cosine net was trained (1.87 nats, vs 1.96 at 500K) and measured at FULL enwik8:
+
+- det+M1 (no net): 1.4747
+- det+M1 + 500cos net (1.96 nats): 1.4496 — marginal −0.0251
+- det+M1 + 1M net (1.87 nats): 1.4489 — marginal −0.0258
+
+The 1.96→1.87 nat quality jump buys **−0.0007** at full scale — against **−0.0071** for the comparable 2.06→1.96 jump on 10 MB slices, a 10× gap. So net-quality scaling is real but almost entirely a cold-stack effect: a better frozen net helps while the online stack (mixer/M1/StateMaps) is cold, and is absorbed as it warms. At full scale the frozen net's marginal is ~capped near −0.025 (enwik8), nearly insensitive to net quality past ~2 nats.
+
+Strategic consequence: "scale the pretrained net" (more training, and by extension more params/context) is a WEAK lever — the online stack eats the gains, so a bigger/better frozen net mostly pays more L(D) for the same full-scale marginal. More neural marginal at scale needs a component that warms WITH the data (the online arm — itself baseline-eroded, but at least improving online) or a structurally different model, not a better frozen net. Kept the 500cos net shipped (the 1M net's −0.0007 is within noise, and an enwik9 submission retrains the net regardless). The cosine-LR trainer knob (`LZR_COSINE`) stays as useful infra. This supersedes the ship entry's "Frontier: a stronger pretrained net" — that frontier is weak; the frozen-net lever is essentially spent at ~−0.025/enwik8.
+
 ## 2026-06-25 02:20 — CORRECTION to the entry below: the 10 MB slices overstated ~2×; full enwik8 with the net is 1.4496 (marginal −0.0251), and the enwik9 net is ~1.17–1.18, not ~1.145
 
 A full-enwik8 confirmation of the shipped codec (det + M1 + the cosine pretrained net) corrects the over-optimistic projection in the entry below, which extrapolated from 10 MB slices. Full enwik8: 100 MB → 18,119,753 B = **1.4496 bpb**, a marginal of **−0.0251** over the det+M1 baseline (1.4747, 06-24) — roughly *half* the slice marginals (held-out −0.0537, in-dist −0.0491). The slices overstated because the pretrained net is **frozen**: its edge is front-loaded and erodes as the *online* stack (the logistic mixer, M1, and the context models' StateMaps) warms up over more data — the same "stronger-baseline → smaller-marginal, amplified at scale" that the online arm shows ([[project-v9-trajectory]]). The clean in-distribution comparison makes it explicit: −0.0491 at 10 MB → −0.0251 at 100 MB (~46%). A frozen contributor's slice marginal is an upper bound, not an estimate — it should have been confirmed at full scale before the projection. Lesson logged.
