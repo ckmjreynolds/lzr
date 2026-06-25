@@ -212,6 +212,29 @@ impl Lstm {
         }
     }
 
+    /// Build the augmented input `x = emb[input] + emb_match[mpred]` and the gate
+    /// pre-activations `a = b + Wx·x + Wh·h_prev`. `Wx`/`Wh` are interpreted
+    /// column-major (`e`/`h` blocks of `4h`) so each input scales a contiguous
+    /// `4h` row via `axpy` — full-width SIMD, no per-gate reduction.
+    fn gate_preact(&mut self, input: usize, mpred: usize) {
+        let (e, h) = (self.e, self.h);
+        let f4h = 4 * h;
+        for k in 0..e {
+            self.x[k] = self.emb.w[input * e + k] + self.emb_match.w[mpred * e + k];
+        }
+        self.a.copy_from_slice(&self.b.w);
+        for k in 0..e {
+            axpy(&mut self.a, &self.wx.w[k * f4h..k * f4h + f4h], self.x[k]);
+        }
+        for k in 0..h {
+            axpy(
+                &mut self.a,
+                &self.wh.w[k * f4h..k * f4h + f4h],
+                self.h_prev[k],
+            );
+        }
+    }
+
     /// Forward one token, returning the loss in **nats** (`-ln p[target]`).
     /// Writes activations into the next window slot and advances the state.
     /// Forward one step on `input`, writing activations into the pending window
@@ -219,20 +242,9 @@ impl Lstm {
     /// Advances the recurrent state but does NOT set a target or grow the window
     /// — `forward` (offline) and `observe` (online) finalize the slot.
     fn step_forward(&mut self, input: usize, mpred: usize) {
-        let (e, h, v) = (self.e, self.h, self.v);
+        let (h, v) = (self.h, self.v);
         let s = self.win.len;
-        // Input embedding is the sum of the previous-byte embedding and the
-        // match-predicted-next-byte embedding (mpred == 256 ⇒ "no match"), so the
-        // LSTM conditions on what the LZP match expects and learns the residual.
-        for k in 0..e {
-            self.x[k] = self.emb.w[input * e + k] + self.emb_match.w[mpred * e + k];
-        }
-
-        self.a.copy_from_slice(&self.b.w);
-        for r in 0..4 * h {
-            self.a[r] += dot(&self.wx.w[r * e..r * e + e], &self.x)
-                + dot(&self.wh.w[r * h..r * h + h], &self.h_prev);
-        }
+        self.gate_preact(input, mpred);
         let (hi, hh) = (h, 2 * h);
         for k in 0..h {
             let iv = sigmoid(self.a[k]);
@@ -253,8 +265,8 @@ impl Lstm {
         let hslice = &self.win.h[s * h..s * h + h];
         let pslot = &mut self.win.p[s * v..s * v + v];
         pslot.copy_from_slice(&self.bo.w);
-        for vi in 0..v {
-            pslot[vi] += dot(&self.wo.w[vi * h..vi * h + h], hslice);
+        for k in 0..h {
+            axpy(pslot, &self.wo.w[k * v..k * v + v], hslice[k]);
         }
         let max = pslot.iter().copied().fold(f32::MIN, f32::max);
         let mut sum = 0.0f32;
@@ -309,15 +321,8 @@ impl Lstm {
     /// across gated (matched) bytes the arm abstains on, at ~2/3 of a full
     /// forward (no `v×h` output projection) and none of the backward/Adam cost.
     fn step_recur(&mut self, input: usize, mpred: usize) {
-        let (e, h) = (self.e, self.h);
-        for k in 0..e {
-            self.x[k] = self.emb.w[input * e + k] + self.emb_match.w[mpred * e + k];
-        }
-        self.a.copy_from_slice(&self.b.w);
-        for r in 0..4 * h {
-            self.a[r] += dot(&self.wx.w[r * e..r * e + e], &self.x)
-                + dot(&self.wh.w[r * h..r * h + h], &self.h_prev);
-        }
+        let h = self.h;
+        self.gate_preact(input, mpred);
         let (hi, hh) = (h, 2 * h);
         for k in 0..h {
             let iv = sigmoid(self.a[k]);
@@ -353,11 +358,13 @@ impl Lstm {
             let tgt = self.win.tgt[s];
             self.win.p[s * v + tgt] -= 1.0;
             self.dh.copy_from_slice(&self.dh_next);
+            let dy = &self.win.p[s * v..s * v + v]; // p[tgt] already -= 1
             for vi in 0..v {
-                let d = self.win.p[s * v + vi];
-                axpy(&mut self.wo.g[vi * h..vi * h + h], hslice, d);
-                axpy(&mut self.dh, &self.wo.w[vi * h..vi * h + h], d);
-                self.bo.g[vi] += d;
+                self.bo.g[vi] += dy[vi];
+            }
+            for k in 0..h {
+                axpy(&mut self.wo.g[k * v..k * v + v], dy, hslice[k]);
+                self.dh[k] += dot(&self.wo.w[k * v..k * v + v], dy);
             }
             // cell
             self.dc.copy_from_slice(&self.dc_next);
@@ -388,19 +395,18 @@ impl Lstm {
             for k in 0..e {
                 self.x[k] = self.emb.w[tok * e + k] + self.emb_match.w[mpred * e + k];
             }
-            self.dx.iter_mut().for_each(|x| *x = 0.0);
-            self.dh_prev.iter_mut().for_each(|x| *x = 0.0);
-            for r in 0..4 * h {
-                let d = self.da[r];
-                axpy(&mut self.wx.g[r * e..r * e + e], &self.x, d);
-                axpy(&mut self.dx, &self.wx.w[r * e..r * e + e], d);
-                axpy(
-                    &mut self.wh.g[r * h..r * h + h],
-                    &self.win.h_prev[s * h..s * h + h],
-                    d,
-                );
-                axpy(&mut self.dh_prev, &self.wh.w[r * h..r * h + h], d);
-                self.b.g[r] += d;
+            let f4h = 4 * h;
+            for r in 0..f4h {
+                self.b.g[r] += self.da[r];
+            }
+            for k in 0..e {
+                axpy(&mut self.wx.g[k * f4h..k * f4h + f4h], &self.da, self.x[k]);
+                self.dx[k] = dot(&self.wx.w[k * f4h..k * f4h + f4h], &self.da);
+            }
+            for k in 0..h {
+                let hp = self.win.h_prev[s * h + k];
+                axpy(&mut self.wh.g[k * f4h..k * f4h + f4h], &self.da, hp);
+                self.dh_prev[k] = dot(&self.wh.w[k * f4h..k * f4h + f4h], &self.da);
             }
             // x = emb[tok] + emb_match[mpred] ⇒ dL/d(both embeddings) = dx.
             axpy(&mut self.emb.g[tok * e..tok * e + e], &self.dx, 1.0);
