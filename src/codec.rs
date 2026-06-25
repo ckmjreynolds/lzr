@@ -884,7 +884,7 @@ mod tests {
     /// `cargo test --release pretrained_lab -- --ignored --nocapture`
     #[test]
     #[ignore = "explore: frozen pretrained MLP marginal + L(D)"]
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn pretrained_lab() {
         use crate::models::pretrained::PretrainedMlp;
         let env = |k: &str, d: usize| {
@@ -898,33 +898,45 @@ mod tests {
             println!("no net blob at {net}; skipping");
             return;
         };
-        let Ok(e8) = std::fs::read("assets/enwik8") else {
+        let corpus = std::env::var("LZR_CORPUS").unwrap_or_else(|_| "assets/enwik8".into());
+        let Ok(e8) = std::fs::read(&corpus) else {
             return;
         };
         let lo = env("LZR_LO", 1_000_000);
         let hi = env("LZR_HI", 11_000_000).min(e8.len());
         let orig = (hi - lo) as f64;
         let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        // `LZR_QBITS` (default 32 = f32): quantize the big weight tensors to measure
+        // the true low-bit marginal (not assume f32's survives) + the shipped L(D).
+        let qbits = env("LZR_QBITS", 32) as u32;
         let base = encode_det_linear(&data);
         let base_bpb = base as f64 * 8.0 / orig;
+        let mut pre = PretrainedMlp::from_blob(&blob);
+        pre.quantize(qbits);
         let mut models = baseline_models(data.len());
-        models.push(PretrainedMlp::from_blob(&blob).into());
+        models.push(pre.into());
         let coded = encode_linear_models(models, &data);
         let bpb = coded as f64 * 8.0 / orig;
         let marginal = bpb - base_bpb;
-        let params = (blob.len() - 16) / 4;
-        let ld_f32 = 16.0 * blob.len() as f64 / 1e9;
-        let ld_tern = 16.0 * (params as f64 * 2.0 / 8.0) / 1e9; // 2 bits/param
-        println!("baseline (linear) {base_bpb:.4}  +pretrained {bpb:.4}  marginal {marginal:+.4}");
-        println!(
-            "net: {params} params, blob {} B | L(D): f32 {ld_f32:.5}, ternary {ld_tern:.5}",
+        // Shipped-blob L(D): big tensors (emb,w1,w2) at `qbits`, biases at f32.
+        let rd = |o: usize| u32::from_le_bytes(blob[o..o + 4].try_into().unwrap()) as usize;
+        let (k, e, h, v) = (rd(0), rd(4), rd(8), rd(12));
+        let big = v * e + k * e * h + h * v;
+        let small = h + v;
+        let shipped = if qbits >= 32 {
             blob.len()
+        } else {
+            16 + (big * qbits as usize).div_ceil(8) + small * 4
+        };
+        let ld = 16.0 * shipped as f64 / 1e9;
+        println!(
+            "baseline (linear) {base_bpb:.4}  +pretrained(q{qbits}) {bpb:.4}  marginal {marginal:+.4}"
         );
         println!(
-            "NET of L(D):  f32 {:+.4}   ternary {:+.4}",
-            marginal + ld_f32,
-            marginal + ld_tern
+            "net: {} params | shipped {shipped} B (q{qbits}) | L(D) {ld:.5}",
+            big + small
         );
+        println!("NET of L(D): {:+.4}", marginal + ld);
     }
 
     /// Composition check: does the opt-in LSTM arm (a recurrent *model*) still add

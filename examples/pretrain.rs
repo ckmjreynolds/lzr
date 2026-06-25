@@ -11,19 +11,22 @@
 //! Run: `LZR_PP_DATA=/tmp/lzr_pp.bin LZR_NET_OUT=/tmp/lzr_net.bin \
 //!       cargo run --example pretrain --features neural`
 //!
-//! STATUS (2026-06-24): the pipeline is end-to-end (compiles, trains on the GPU,
-//! the embedding gather is verified input-dependent at batch-variance 0.85, all
-//! params update), but the net **cannot learn the context** — it converges to the
-//! unigram (3.44 vs 3.4278 nats on casefold), and the decisive `LZR_OVERFIT=1`
-//! test (train on ONE fixed 512-sample batch) ALSO sticks at the unigram. A 205K
-//! net must memorize 512 samples trivially, so this is a forward/backward bug (the
-//! gradients move the params but are not descent directions for this graph), not a
-//! data/lr issue — needs a minimal burn repro / gradient check (the suspect is the
-//! `select`-gather → `reshape([batch, K*E])` flatten path, which differs from v8's
-//! `[b,t,d]` layout that trained fine). Independently, a *frozen* simple net on the
-//! word-dict'd stream is expected low-value regardless (the dict removes the
-//! learnable word-structure; the deterministic stack + online arm already cover
-//! it), so this is kept as a documented scaffold/WIP, not shipped.
+//! STATUS (2026-06-24): FIXED. The net was stuck at the unigram because the
+//! `[batch*K, E] -> [batch, K*E]` flatten reshape has a broken backward in burn
+//! 0.21 (it moved the params but produced non-descent gradients — the
+//! `LZR_OVERFIT=1` test couldn't even memorize one batch). Replacing the
+//! concat-flatten with a per-position weight `w1[K,E,H]` and a batched matmul
+//! summed over positions (no `[batch,K*E]` ever formed) fixes it: it now overfits
+//! a batch to ~0 and trains normally. `w1[K,E,H]` is row-major-identical to
+//! `[K*E,H]`, so the exported blob and the CPU forward (`pretrained.rs`) are
+//! unchanged. Whether a frozen net on the word-dict'd stream earns its L(D) is the
+//! open question `pretrained_lab` measures.
+
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::too_many_lines
+)]
 
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
@@ -41,7 +44,7 @@ const V: usize = 256; // vocab (bytes)
 #[derive(Module, Debug)]
 struct Mlp<B: Backend> {
     emb: Param<Tensor<B, 2>>, // [V, E]
-    w1: Param<Tensor<B, 2>>,  // [K*E, H]
+    w1: Param<Tensor<B, 3>>,  // [K, E, H] (per-position; row-major == [K*E, H])
     b1: Param<Tensor<B, 1>>,  // [H]
     w2: Param<Tensor<B, 2>>,  // [H, V]
     b2: Param<Tensor<B, 1>>,  // [V]
@@ -56,12 +59,15 @@ impl<B: Backend> Mlp<B> {
                 device,
             ))
         };
-        // Embeddings at unit scale (std 0.1 left the hidden activations tiny, so
-        // the context path could not drive the logits and only the unigram bias
-        // was learned); He init for the relu layers.
+        // Embeddings at unit scale; the per-position w1 [K,E,H] has effective
+        // fan-in K*E (summed over positions).
         Self {
             emb: rnd2(V, E, 1.0),
-            w1: rnd2(K * E, H, (2.0 / (K * E) as f64).sqrt()),
+            w1: Param::from_tensor(Tensor::random(
+                [K, E, H],
+                Distribution::Normal(0.0, (2.0 / (K * E) as f64).sqrt()),
+                device,
+            )),
             b1: Param::from_tensor(Tensor::zeros([H], device)),
             w2: rnd2(H, V, (2.0 / H as f64).sqrt()),
             b2: Param::from_tensor(Tensor::zeros([V], device)),
@@ -72,14 +78,28 @@ impl<B: Backend> Mlp<B> {
     fn forward(&self, ctx: Tensor<B, 2, Int>) -> Tensor<B, 2> {
         let [batch, k] = ctx.dims();
         let flat = ctx.reshape([batch * k]);
-        let g = self.emb.val().select(0, flat).reshape([batch, k * E]);
-        let pre = g.matmul(self.w1.val()).add(self.b1.val().reshape([1, H]));
+        // [batch,K,E] -> [K,batch,E] @ w1[K,E,H] (batched over positions) -> sum_K.
+        // Avoids the [batch,K*E] flatten, whose backward is broken in burn 0.21.
+        let g3 = self
+            .emb
+            .val()
+            .select(0, flat)
+            .reshape([batch, k, E])
+            .swap_dims(0, 1); // [K, batch, E]
+        let pre = g3
+            .matmul(self.w1.val()) // [K, batch, H]
+            .sum_dim(0)
+            .reshape([batch, H])
+            .add(self.b1.val().reshape([1, H]));
         let hid = pre.tanh();
         hid.matmul(self.w2.val()).add(self.b2.val().reshape([1, V]))
     }
 }
 
 fn vec2<B: Backend>(p: &Param<Tensor<B, 2>>) -> Vec<f32> {
+    p.val().into_data().to_vec::<f32>().unwrap()
+}
+fn vec3<B: Backend>(p: &Param<Tensor<B, 3>>) -> Vec<f32> {
     p.val().into_data().to_vec::<f32>().unwrap()
 }
 fn vec1<B: Backend>(p: &Param<Tensor<B, 1>>) -> Vec<f32> {
@@ -162,7 +182,6 @@ fn main() {
         None
     };
 
-    let t0 = std::time::Instant::now();
     for step in 0..steps {
         let (ctx, tgt) = if let Some((c, t)) = &fixed {
             (c.clone(), t.clone())
@@ -192,13 +211,16 @@ fn main() {
             let n2 = |p: &Param<Tensor<AB, 2>>| {
                 p.val().abs().sum().into_data().to_vec::<f32>().unwrap()[0]
             };
+            let n3 = |p: &Param<Tensor<AB, 3>>| {
+                p.val().abs().sum().into_data().to_vec::<f32>().unwrap()[0]
+            };
             let n1 = |p: &Param<Tensor<AB, 1>>| {
                 p.val().abs().sum().into_data().to_vec::<f32>().unwrap()[0]
             };
             println!(
                 "step {step:7} loss {nats:.4} ({bpb:.4} bpb) | |emb| {:.0} |w1| {:.0} |w2| {:.0} |b1| {:.1} |b2| {:.1}",
                 n2(&model.emb),
-                n2(&model.w1),
+                n3(&model.w1),
                 n2(&model.w2),
                 n1(&model.b1),
                 n1(&model.b2)
@@ -215,7 +237,7 @@ fn main() {
     }
     for x in vec2(&model.emb)
         .into_iter()
-        .chain(vec2(&model.w1))
+        .chain(vec3(&model.w1))
         .chain(vec1(&model.b1))
         .chain(vec2(&model.w2))
         .chain(vec1(&model.b2))

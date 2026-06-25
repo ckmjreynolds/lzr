@@ -73,6 +73,41 @@ impl PretrainedMlp {
         m
     }
 
+    /// In-place symmetric quantization of the weight tensors to `bits`, dequantized
+    /// back to f32 — to estimate the L(C) cost of shipping low-bit weights (the
+    /// L(D) saving is computed separately). `bits >= 32` is a no-op. `bits == 2` is
+    /// ternary (`{-1,0,1}` × per-tensor abs-mean).
+    pub(crate) fn quantize(&mut self, bits: u32) {
+        if bits >= 32 {
+            return;
+        }
+        let q = |w: &mut [f32]| {
+            if w.is_empty() {
+                return;
+            }
+            if bits == 2 {
+                let scale = w.iter().map(|x| x.abs()).sum::<f32>() / w.len() as f32;
+                if scale > 0.0 {
+                    for x in w.iter_mut() {
+                        *x = (*x / scale).round().clamp(-1.0, 1.0) * scale;
+                    }
+                }
+            } else {
+                let lvl = f32::from((1u16 << (bits - 1)) - 1); // 8-bit -> 127
+                let scale = w.iter().map(|x| x.abs()).fold(0.0f32, f32::max) / lvl;
+                if scale > 0.0 {
+                    for x in w.iter_mut() {
+                        *x = (*x / scale).round().clamp(-lvl, lvl) * scale;
+                    }
+                }
+            }
+        };
+        q(&mut self.emb);
+        q(&mut self.w1);
+        q(&mut self.w2);
+        self.recompute(&Context::with_capacity(0));
+    }
+
     /// Forward the MLP over the last `k` finalized bytes and refresh the
     /// next-byte distribution's prefix sums. Bytes before history start are 0.
     fn recompute(&mut self, ctx: &Context) {
