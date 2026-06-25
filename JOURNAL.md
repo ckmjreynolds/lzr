@@ -13,6 +13,21 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-25 — arm × net additivity (full-enwik8 2×2) + the arm matvec rewrite: the online arm is the dominant neural source and largely subsumes the frozen net
+
+CDR asked whether the online LSTM arm is additive on top of the shipped frozen pretrained net (both neural — they might overlap). Measured the full 2×2 at full enwik8 (the trustworthy scale; an `LZR_NO_NET` ablation knob, committed 6c76abf, drops the net cleanly):
+
+- det+M1: 1.4747
+- + pretrained net: 1.4496 — net marginal **−0.0251**
+- + online arm (h=192): 1.4398 — arm marginal **−0.0349**
+- + net + arm: 1.4292 — combined **−0.0455**
+
+Additivity: the linear-additive prediction is −0.0600; the actual combined is −0.0455, so the two neural sources **overlap by 0.0145 (~24% of the sum)**. Decomposed asymmetrically: the arm keeps −0.0204 of its −0.0349 over the net (58% unique), but the net keeps only **−0.0106 of its −0.0251 over the arm — 58% of the frozen net is redundant with the arm.** So the **online arm is the dominant neural lever**: bigger standalone (−0.0349 vs −0.0251) and it largely contains the frozen net. The frozen net is best understood as a cheap (L(D) 0.0033), throughput-free *partial substitute* for the arm — valuable precisely because the arm is throughput-expensive and the net is not.
+
+Strategic consequence (answering CDR's "bigger / more models?"): the frozen net is L(D)-walled (its marginal is quality-insensitive at scale — see the 03:25 entry — so more params mostly buy L(D), and the v8 L(D)-wall precedent applies), and it is mostly subsumed by the arm anyway. The L(D)-free neural headroom is the **online** side (the arm's marginal rises with width, no plateau: h=96..256 = −0.040..−0.060), bounded only by throughput. So big neural wins live in scaling the arm, which is gated on cracking its throughput.
+
+Throughput attempt (the arm matvec rewrite, committed 60065c6): hypothesis was that the 16-lane-`dot` per-output reductions were the bottleneck. Reinterpreted Wx/Wh/Wo column-major and accumulated via `axpy` across outputs (a shared `gate_preact`; no per-output reduction, full-width SIMD). Result: **only ~7%** (512 KB enwik8 71.81 s → 67.13 s, contended) — the reductions were *not* the bottleneck; the arm is compute-bound on the raw mul-add volume, which the blocked form doesn't change. Kept anyway (correct — `lstm_gradient_check` max-rel-err 0.165; marginal-preserving — benchmark output 103236 vs 103255 B; cleaner — dedups the gate matvec; arm-only, zero effect on the submission build). The backward dominates (~65%) and resists int8, so the arm's throughput wall remains hard. The all-things enwik9 run (det+M1+net+arm, ETA ~35 h) was started then called off — its ceiling (~net 1.176–1.181) is determined by this 2×2, and the arm is not submission-viable on throughput regardless. Shipped codec stands at net 1.1859 (det+M1+net, ~6 h/dir).
+
 ## 2026-06-25 (full enwik9 CONFIRMATION) — shipped codec det+M1+net: L(C) 1.1758, net 1.1859 — the corrected projection holds, the slice's 1.145 was wrong by ~0.04
 
 CDR approved the full-enwik9 run of the shipped codec (det + 22-model stack + M1 + the frozen pretrained net; no arm). Result: 1 GB → 146,972,286 B = **1.1758 bpb** in 21,724 s (~6.03 h, 0.05 MB/s single-core), peak RSS 8.18 GB (under the 10 GB cap). The net's full-enwik9 marginal is **−0.0130** over det+M1's standing 1.1888 — and it shrank exactly as the 02:20 correction predicted from the enwik8-full −0.0251 (the enwik9 stack is stronger still: more data, cross-article redundancy, match at ~99% coverage erode the frozen net's edge further). With L(D) 0.01014 (634 KB binary, ×16/1e9) the net is **1.1859**, vs det+M1's 1.1960 (L(C) 1.1888 + L(D) 0.00723) — a **−0.0101 net** improvement and the new project best. The net spends 0.0029 L(D) to buy 0.0130 L(C): a 4.5× return, clearly worth it, but modest — comparable to M1's own enwik9 −0.010.
