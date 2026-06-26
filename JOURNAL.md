@@ -13,6 +13,29 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-26 — context length (K) IS the frozen-net lever quality wasn't: a full-enwik8 K-sweep finds the net optimum at K=32, shipping −0.0075 over K=16
+
+The 06-25 finding [[project-v9-trajectory]] that frozen-net *quality* doesn't scale at full enwik8 (a 1M-step / 1.87-nat net beat the 500cos / 1.96-nat net by only −0.0007) left open whether the frozen net was genuinely capped near −0.025/enwik8 or capped only along the *quality* axis. CDR's call was to test the one axis quality didn't touch: **context length K** (the number of past bytes the MLP sees). The 06-25 net was K=16. This sweep trains K∈{32,64,128} on the identical recipe (cosine LR, 500K steps, E=32/H=256) and measures each over the FULL production stack on full enwik8 via `pretrained_e2e` (the real per-bit driver, not a slice — slices proved unreliable here, see below).
+
+Full enwik8, marginal over det+M1 baseline 1.4747; NET = marginal + blob L(D):
+
+| K | raw marginal | blob L(D) | NET | vs shipped K=16 |
+|---|---|---|---|---|
+| 16 (was shipped) | −0.0251 | 0.00331 | −0.0218 | — |
+| **32** | **−0.0347** | 0.00541 | **−0.0293** | **−0.0075** |
+| 64 | −0.0379 | 0.00960 | −0.0283 | −0.0065 |
+| 128 | (aborted) | ~0.0135 | — | — |
+
+**K=32 is the optimum and ships.** The shape is a clean knee: raw marginal has sharply diminishing returns (K16→32 buys +0.0096, K32→64 only +0.0032) while blob L(D) grows ~linearly with K, so net peaks at K=32 and K=64 is already past it. K=128 was aborted mid-e2e (CDR call) — its ~0.0135 L(D) would need raw marginal < −0.043 just to tie K=32, implausible on the K64 trend. So the correction to 06-25 is: frozen-net **quality** (more steps / width) washes out at scale, but frozen-net **context length** is a real lever up to K≈32 — it lifts the full-enwik8 marginal −0.0251→−0.0347 and the net to −0.0293. The frozen net was capped along the quality axis, not the context axis.
+
+A second, methodologically important finding: **longer-context nets erode LESS under the warming online stack.** The cold-stack effect (a frozen contributor's edge is front-loaded and erodes as the mixer/M1/StateMaps warm) deflated K=16 from a 10 MB-slice marginal −0.0563 to full-enwik8 −0.0251 (0.45×); K=64 deflated only −0.0699→−0.0379 (0.54×). The extra context carries structure that survives the warming baseline better, so slice marginals *understate* longer-K nets relative to shorter ones — which is exactly why the 10 MB slice ranked K=64's net best (−0.0603, vs K=16's −0.0529) and, deflated to full scale, projected K=64 as roughly tying K=16; only the full-enwik8 runs revealed the K=32 knee. Per the standing lesson, the full-scale numbers, not the slice, decided it.
+
+Costs at K=32: blob 207→338 KB (L(D) +0.0021); forward 2× K=16's (~262K vs 131K w1 mul-adds/byte) — about half K=64's throughput hit, well inside budget. `LZR_K` is now an env knob in `examples/pretrain.rs` (default 16; the CPU loader already reads K from the blob header, so no codec change). Asset `assets/pretrained_net.bin` regenerated from the K=32 net via `dump_q8_asset`.
+
+enwik9 CONFIRMED (full encode, 7.6 h, peak RSS 8.28 GB, encode-only per CDR): compressed 146,124,266 B = L(C) **1.1690** (vs K=16's 1.1758, −0.0068), binary L(D) 0.01225, **net 1.1812** — a **−0.0047 over the shipped K=16 net 1.1859**, NEW PROJECT BEST. The enwik9 *net* marginal over det+M1 (L(C) 1.1888) is −0.0198, vs K=16's −0.0130 — so the longer context's larger marginal survived to enwik9 even after the +0.0021 L(D), and eroded less than the K=16-based scaling predicted (the slice-vs-full erosion finding above, holding at 10× scale). Throughput ~7.6 h/dir (5 MB-slice projection was ~8.2 h), comfortably inside budget. enwik9-scale decode round-trip not exercised this run (encode-only); guarded by the 5 MB round-trip and build.sh's production-stack integration test, both byte-exact.
+
+---
+
 ## 2026-06-25 — arm × net additivity (full-enwik8 2×2) + the arm matvec rewrite: the online arm is the dominant neural source and largely subsumes the frozen net
 
 CDR asked whether the online LSTM arm is additive on top of the shipped frozen pretrained net (both neural — they might overlap). Measured the full 2×2 at full enwik8 (the trustworthy scale; an `LZR_NO_NET` ablation knob, committed 6c76abf, drops the net cleanly):

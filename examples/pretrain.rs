@@ -36,7 +36,6 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Distribution, Int, Tensor, TensorData};
 
-const K: usize = 16; // context bytes
 const E: usize = 32; // byte embedding dim
 const H: usize = 256; // hidden width
 const V: usize = 256; // vocab (bytes)
@@ -51,7 +50,7 @@ struct Mlp<B: Backend> {
 }
 
 impl<B: Backend> Mlp<B> {
-    fn new(device: &B::Device) -> Self {
+    fn new(k: usize, device: &B::Device) -> Self {
         let rnd2 = |a: usize, b: usize, std: f64| {
             Param::from_tensor(Tensor::random(
                 [a, b],
@@ -64,8 +63,8 @@ impl<B: Backend> Mlp<B> {
         Self {
             emb: rnd2(V, E, 1.0),
             w1: Param::from_tensor(Tensor::random(
-                [K, E, H],
-                Distribution::Normal(0.0, (2.0 / (K * E) as f64).sqrt()),
+                [k, E, H],
+                Distribution::Normal(0.0, (2.0 / (k * E) as f64).sqrt()),
                 device,
             )),
             b1: Param::from_tensor(Tensor::zeros([H], device)),
@@ -115,6 +114,10 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(200_000);
+    let k: usize = std::env::var("LZR_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16); // context bytes
     let batch: usize = 512;
     let lr: f64 = std::env::var("LZR_LR")
         .ok()
@@ -124,14 +127,14 @@ fn main() {
     // the fixed-lr plateau. Off by default so the trainer stays reproducible.
     let cosine = std::env::var("LZR_COSINE").is_ok();
     let data = std::fs::read(&data_path).expect("preprocessed training data");
-    let span = data.len() - K - 1;
+    let span = data.len() - k - 1;
     println!(
-        "pretrain MLP K={K} E={E} H={H} V={V} (~{} params) | data {} B | {steps} steps batch {batch}",
-        V * E + K * E * H + H + H * V + V,
+        "pretrain MLP K={k} E={E} H={H} V={V} (~{} params) | data {} B | {steps} steps batch {batch}",
+        V * E + k * E * H + H + H * V + V,
         data.len()
     );
 
-    let mut model = Mlp::<AB>::new(&device);
+    let mut model = Mlp::<AB>::new(k, &device);
     let mut optim = AdamConfig::new().init();
     let mut rng = 0x2545_f491_4f6c_dd1du64;
     let mut next = || {
@@ -144,17 +147,17 @@ fn main() {
     {
         let mut cids: Vec<i32> = Vec::new();
         for _ in 0..batch {
-            let p = K + (next() % span);
-            for j in 0..K {
-                cids.push(i32::from(data[p - K + j]));
+            let p = k + (next() % span);
+            for j in 0..k {
+                cids.push(i32::from(data[p - k + j]));
             }
         }
-        let c = Tensor::<AB, 2, Int>::from_data(TensorData::new(cids, [batch, K]), &device);
-        let flat = c.clone().reshape([batch * K]);
-        let g = model.emb.val().select(0, flat).reshape([batch, K * E]);
+        let c = Tensor::<AB, 2, Int>::from_data(TensorData::new(cids, [batch, k]), &device);
+        let flat = c.clone().reshape([batch * k]);
+        let g = model.emb.val().select(0, flat).reshape([batch, k * E]);
         let var = g.var(0).mean().into_data().to_vec::<f32>().unwrap()[0];
         let cvar = c
-            .reshape([batch * K])
+            .reshape([batch * k])
             .float()
             .var(0)
             .into_data()
@@ -168,17 +171,17 @@ fn main() {
     // the forward/backward is broken, not the data/lr.
     let overfit = std::env::var("LZR_OVERFIT").is_ok();
     let fixed = if overfit {
-        let mut ci: Vec<i32> = Vec::with_capacity(batch * K);
+        let mut ci: Vec<i32> = Vec::with_capacity(batch * k);
         let mut ti: Vec<i32> = Vec::with_capacity(batch);
         for _ in 0..batch {
-            let p = K + (next() % span);
-            for j in 0..K {
-                ci.push(i32::from(data[p - K + j]));
+            let p = k + (next() % span);
+            for j in 0..k {
+                ci.push(i32::from(data[p - k + j]));
             }
             ti.push(i32::from(data[p]));
         }
         Some((
-            Tensor::<AB, 2, Int>::from_data(TensorData::new(ci, [batch, K]), &device),
+            Tensor::<AB, 2, Int>::from_data(TensorData::new(ci, [batch, k]), &device),
             Tensor::<AB, 1, Int>::from_data(TensorData::new(ti, [batch]), &device),
         ))
     } else {
@@ -189,17 +192,17 @@ fn main() {
         let (ctx, tgt) = if let Some((c, t)) = &fixed {
             (c.clone(), t.clone())
         } else {
-            let mut ctx_ids: Vec<i32> = Vec::with_capacity(batch * K);
+            let mut ctx_ids: Vec<i32> = Vec::with_capacity(batch * k);
             let mut tgt_ids: Vec<i32> = Vec::with_capacity(batch);
             for _ in 0..batch {
-                let p = K + (next() % span);
-                for j in 0..K {
-                    ctx_ids.push(i32::from(data[p - K + j]));
+                let p = k + (next() % span);
+                for j in 0..k {
+                    ctx_ids.push(i32::from(data[p - k + j]));
                 }
                 tgt_ids.push(i32::from(data[p]));
             }
             (
-                Tensor::<AB, 2, Int>::from_data(TensorData::new(ctx_ids, [batch, K]), &device),
+                Tensor::<AB, 2, Int>::from_data(TensorData::new(ctx_ids, [batch, k]), &device),
                 Tensor::<AB, 1, Int>::from_data(TensorData::new(tgt_ids, [batch]), &device),
             )
         };
@@ -240,7 +243,7 @@ fn main() {
     }
 
     let mut blob = Vec::new();
-    for d in [K as u32, E as u32, H as u32, V as u32] {
+    for d in [k as u32, E as u32, H as u32, V as u32] {
         blob.extend_from_slice(&d.to_le_bytes());
     }
     for x in vec2(&model.emb)
