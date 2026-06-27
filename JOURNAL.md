@@ -13,6 +13,12 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-27 (autonomous, ~00:50) — FULL enwik8 confirms the 4-head stack: −0.0215 (the slice UNDERSTATED), the heads grow with scale; lr settled, stack saturated
+
+The trustworthy full-scale check the journal's standing lesson demands (slices overstate frozen contributors). The 4-head warming stack `{order-1, word, order-2, sparse(2,3)}` over FULL enwik8 (100 MB), via `diversity_lab` (the real per-bit driver, M1 + APM on): no-head baseline 1.4399 (det + M1 + the K=32 frozen net — note this is below the 06-25 K=16 figure 1.4496, reflecting the shipped K=32 net), 4-head stack **1.4185**, marginal **−0.0215**. Crucially the marginal GREW with scale — 10 MB −0.0202, 20 MB −0.0208, 100 MB −0.0215 — the OPPOSITE of a frozen contributor (which erodes ~2× from slice to full, e.g. the frozen net's −0.05→−0.025). The heads are online and warm WITH the data, so the slice UNDERSTATED them; the full-scale number is the larger one. This is the strongest validation short of enwik9 and removes the slice-overstatement risk that has bitten frozen levers all along.
+
+Two tuning/saturation confirmations alongside: the stack's lr optimum is a broad plateau (10 MB: lr 3 and 4 both −0.0202, lr 6 −0.0183) so `HEAD_LR=4` stands; and depth is saturated — a 5th head adds almost nothing whether sparse byte_back(1,3) (−0.0006) or order-6 (−0.0004), so the 4-head knee is correct. enwik9 not run (CDR); projecting the full-enwik8 −0.0215 to enwik9 (online/warming erodes less than frozen, but the enwik9 deterministic baseline is stronger — match ~99%), the head stack is plausibly −0.010 to −0.020 on enwik9, i.e. a new project best in the ~1.16–1.17 net band over the standing 1.1812, pending a confirmation run. Session total: five commits (fec840a→d7cb21a), the warming-head stack, all L(D)≈0.
+
 ## 2026-06-26 (autonomous evening, cont.) — head stack depth: order-2 then a sparse skip keep paying, then it saturates; SHIP a 4-head stack (−0.0202 @10 MB, −0.0208 @20 MB)
 
 Pushed the neural-head stack deeper with a clean head-spec probe (`LZR_HEADS="1,w,2,s6"`; tokens `N`=byte-order, `w`=word, `sM`=sparse mask) and a sparse-context head (`mask` bit i → byte_back(i+1)). Cumulative full-stack 10 MB enwik8 marginals over no-head, per added head:
