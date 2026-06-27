@@ -102,7 +102,10 @@ fn models(capacity: usize) -> Vec<AnyModel> {
 // express); per-bit-position weight sets were a clean negative (online data
 // efficiency favors sharing). Ships no weights → L(D)≈0; ~4× the per-bit cost,
 // but the deterministic path's enwik9 ETA (~4 h) stays far under the time budget.
-const NMIX_H: usize = 64;
+// Width re-tuned 64→96 once the warming-head stack added 4 strong mixer inputs:
+// the richer input set wants more hidden capacity (10 MB −0.0004, 20 MB −0.0006,
+// growing). 96 is the knee (128 adds only −0.0001). Overridable by `LZR_NMIXH`.
+const NMIX_H: usize = 96;
 const NMIX_NCTX: usize = 1;
 const NMIX_LR: f32 = 0.005;
 
@@ -117,6 +120,15 @@ fn apm_w() -> i32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(APM_W)
+}
+
+/// Shipped residual-mixer hidden width, overridable by `LZR_NMIXH` for offline
+/// sweeps only (re-tuning M1's capacity for the head-augmented input set).
+fn nmix_h() -> usize {
+    std::env::var("LZR_NMIXH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(NMIX_H)
 }
 
 /// The shared predictor state driven identically by both directions: encode and
@@ -162,7 +174,7 @@ impl CodecState {
             stretched,
             msel: [0usize; 8],
             n_heads,
-            nmix: Some(NeuralMixer::new(inputs, NMIX_H, NMIX_NCTX, NMIX_LR)),
+            nmix: Some(NeuralMixer::new(inputs, nmix_h(), NMIX_NCTX, NMIX_LR)),
         }
     }
 
