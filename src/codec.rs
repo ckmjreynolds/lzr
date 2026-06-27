@@ -63,10 +63,18 @@ const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
 /// −0.0190; + sparse `byte_back(2,3)` −0.0202 — each added DECORRELATED context
 /// keeps paying (diminishing: a 5th sparse head adds only −0.0006). lr≈4; each
 /// head is a `HEAD_BITS`-wide table (~64 MB at 16; order-2's hash collisions there
-/// are benign — the frozen embedding still separates colliding contexts). Four
-/// heads ≈ 256 MB (enwik9 RSS ~8.4 GB, under the 10 GB cap); −0.0208 at 20 MB.
+/// are benign — the frozen embedding still separates colliding contexts). With
+/// the dual-rate slow head (see `HEAD_SLOW_LR`) the stack is 5 heads ≈ 320 MB
+/// (enwik9 RSS ~8.5 GB, under the 10 GB cap).
 const HEAD_LR: f32 = 4.0;
 const HEAD_BITS: u32 = 16;
+/// A second, SLOW readout on the order-1 context (dual-rate): the fast head
+/// (`HEAD_LR`) tracks recent structure, this slow one (lr 0.5) the stable
+/// per-context structure the fast rate washes out — decorrelation by TIMESCALE.
+/// As a 5th head it adds −0.0016 (10 MB), MORE than any new context at this depth
+/// (a 5th distinct context added only −0.0004 to −0.0006); slow copies of the
+/// other contexts overlap each other and add little more.
+const HEAD_SLOW_LR: f32 = 0.5;
 
 /// The active model set: the deterministic baseline plus the frozen pretrained
 /// net (shipped). The online-neural arm is appended only under `--features arm`
@@ -86,6 +94,7 @@ fn models(capacity: usize) -> Vec<AnyModel> {
             net.push_head_word(HEAD_LR, HEAD_BITS);
             net.push_head_ctx(HEAD_LR, 2, HEAD_BITS);
             net.push_head_sparse(HEAD_LR, 0b110, HEAD_BITS);
+            net.push_head_ctx(HEAD_SLOW_LR, 1, HEAD_BITS); // dual-rate: slow order-1
         }
         v.push(net.into());
     }
@@ -574,16 +583,22 @@ mod tests {
             .unwrap_or(16u32);
         let spec = std::env::var("LZR_HEADS").unwrap_or_default();
 
+        // A token may carry an optional per-head lr override as `CTX:LR` (e.g.
+        // `w:0.5` for a slow word head — dual-rate stacking).
         let build = |spec: &str| -> Vec<AnyModel> {
             let mut v = baseline_models(cap);
             let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
             for tok in spec.split(',').filter(|t| !t.is_empty()) {
-                if tok == "w" {
-                    net.push_head_word(lr, bits);
-                } else if let Some(m) = tok.strip_prefix('s') {
-                    net.push_head_sparse(lr, m.parse().unwrap(), bits);
+                let (ctx, hlr) = match tok.split_once(':') {
+                    Some((c, l)) => (c, l.parse().unwrap()),
+                    None => (tok, lr),
+                };
+                if ctx == "w" {
+                    net.push_head_word(hlr, bits);
+                } else if let Some(m) = ctx.strip_prefix('s') {
+                    net.push_head_sparse(hlr, m.parse().unwrap(), bits);
                 } else {
-                    net.push_head_ctx(lr, tok.parse().unwrap(), bits);
+                    net.push_head_ctx(hlr, ctx.parse().unwrap(), bits);
                 }
             }
             v.push(net.into());
