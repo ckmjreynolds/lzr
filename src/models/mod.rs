@@ -213,3 +213,22 @@ impl Model for AnyModel {
         }
     }
 }
+
+impl AnyModel {
+    /// The pretrained net's warming-head logit for this bit (a SEPARATE mixer
+    /// input alongside the frozen logit), `None` for every other model and when
+    /// the head is disabled. Valid after `predict` ran for the bit.
+    #[inline]
+    pub(crate) fn head_out(&self) -> Option<i32> {
+        match self {
+            Self::Pretrained(m) => m.head_out(),
+            _ => None,
+        }
+    }
+
+    /// Whether this model contributes a warming-head extra input (static — drives
+    /// the codec's extra mixer-input slot reservation).
+    pub(crate) fn has_head(&self) -> bool {
+        matches!(self, Self::Pretrained(m) if m.has_head())
+    }
+}

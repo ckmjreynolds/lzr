@@ -53,6 +53,12 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<AnyModel> {
 /// predictor from the same bytes; the blob counts as L(D).
 const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
 
+/// Learning rate for the pretrained net's online warming head. A full-stack lr
+/// sweep on enwik8 slices plateaued at ~−0.005 bpb near lr≈2 (a fast online
+/// readout exploits the frozen embedding; the separate-input design + mixer
+/// gating keep high lr stable).
+const HEAD_LR: f32 = 2.0;
+
 /// The active model set: the deterministic baseline plus the frozen pretrained
 /// net (shipped). The online-neural arm is appended only under `--features arm`
 /// (opt-in, not shipped — see Cargo.toml).
@@ -61,7 +67,15 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     // `LZR_NO_NET` (offline ablation only) drops the pretrained net to isolate its
     // marginal / test additivity with the arm; unset (the default) keeps it shipped.
     if std::env::var("LZR_NO_NET").is_err() {
-        v.push(PretrainedMlp::from_blob_q8(PRETRAINED_NET).into());
+        let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
+        // The online warming head: a fast per-bit-tree-node linear readout over the
+        // frozen net's hidden embedding, contributed as a second mixer input. It
+        // warms WITH the data (its marginal grows at scale, unlike the frozen net's)
+        // and ships no weights (L(D)≈0). `LZR_NO_HEAD` drops it (offline ablation).
+        if std::env::var("LZR_NO_HEAD").is_err() {
+            net.enable_head(HEAD_LR);
+        }
+        v.push(net.into());
     }
     #[cfg(feature = "arm")]
     v.push(ArmModel::arm().into());
@@ -104,6 +118,10 @@ struct CodecState {
     ctx: Context,
     stretched: Vec<i32>,
     msel: [usize; 8], // mixer weight-set selectors, recomputed once per byte (bpos==0)
+    // The pretrained net's warming-head logit (when enabled) occupies one extra
+    // `stretched` slot beyond the models, so the mixer sees it as an input distinct
+    // from the frozen logit. `None` when no model has a head.
+    head_slot: Option<usize>,
     // Residual neural mixing stage: `Some` in production (refines the linear
     // mixer's logit). Ablation tests set it to `None` to measure its marginal
     // against the linear-only path.
@@ -117,8 +135,12 @@ impl CodecState {
 
     fn with_models(models: Vec<AnyModel>, capacity: usize) -> Self {
         let n = models.len();
-        let stretched = vec![0i32; n];
-        let mixer = Mixer::new(n);
+        // The pretrained net's warming head adds one extra mixer input beyond the
+        // models. Reserve its slot so the mixer/nmix are sized to see it.
+        let head_slot = models.iter().any(AnyModel::has_head).then_some(n);
+        let inputs = n + usize::from(head_slot.is_some());
+        let stretched = vec![0i32; inputs];
+        let mixer = Mixer::new(inputs);
         Self {
             models,
             mixer,
@@ -127,7 +149,8 @@ impl CodecState {
             ctx: Context::with_capacity(capacity),
             stretched,
             msel: [0usize; 8],
-            nmix: Some(NeuralMixer::new(n, NMIX_H, NMIX_NCTX, NMIX_LR)),
+            head_slot,
+            nmix: Some(NeuralMixer::new(inputs, NMIX_H, NMIX_NCTX, NMIX_LR)),
         }
     }
 
@@ -157,6 +180,10 @@ impl CodecState {
         }
         for (m, s) in self.models.iter_mut().zip(&mut self.stretched) {
             *s = m.predict(&self.ctx);
+        }
+        // The warming head's logit is the one extra input past the models.
+        if let Some(slot) = self.head_slot {
+            self.stretched[slot] = self.models.iter().find_map(AnyModel::head_out).unwrap_or(0);
         }
         let pm = self
             .mixer
@@ -470,6 +497,57 @@ mod tests {
             "+ residual neural mixer h={hm} lr={lr}: {:.4} bpb  ({m1_s:.0}s)  marginal {:+.4}",
             bpb(m1),
             bpb(m1) - bpb(base)
+        );
+    }
+
+    /// Exploration — the frozen net's online warming readout head as a SEPARATE
+    /// mixer input alongside the clean frozen logit. `LZR_HEAD` (lr, default 0 =
+    /// off) enables it; measured as a marginal over the shipped stack (M1 + APM on,
+    /// the trustworthy panel) on the `[LZR_LO..LZR_HI]` slice (default 10 MB). Run:
+    /// `LZR_HEAD=0.01 cargo test --release diversity_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "explore: frozen-net warming-head marginal over the full stack"]
+    #[allow(clippy::cast_precision_loss)]
+    fn diversity_lab() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 11_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let cap = data.len();
+        let head_lr: f32 = std::env::var("LZR_HEAD")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0.0);
+
+        // Production shape: one net emitting two logits (frozen + warming head as a
+        // separate mixer input via the codec's head slot). `head_lr == 0` is the
+        // frozen-only baseline.
+        let build = |head_lr: f32| -> Vec<AnyModel> {
+            let mut v = baseline_models(cap);
+            let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
+            if head_lr > 0.0 {
+                net.enable_head(head_lr);
+            }
+            v.push(net.into());
+            v
+        };
+        let bpb = |m: Vec<AnyModel>| code_stream_models(m, &data).len() as f64 * 8.0 / orig;
+
+        let base = bpb(build(0.0));
+        println!("baseline (shipped stack):         {base:.4} bpb");
+        let v = bpb(build(head_lr));
+        println!(
+            "+ head_lr={head_lr}:   {v:.4} bpb  marginal {:+.4}",
+            v - base
         );
     }
 

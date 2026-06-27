@@ -13,6 +13,24 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-26 (autonomous evening) — the frozen net's ONLINE warming head: a fast per-node readout over the frozen embedding, full-stack enwik8 −0.0055 (20 MB), L(D)≈0, warms with scale
+
+CDR opened an autonomous session (no enwik9, two experiments at a time, keep/revert by outcome). The standing tension from the frozen-net work above is that the frozen net's marginal *erodes at scale* precisely because it is frozen — its edge is front-loaded and the warming online stack (mixer/M1/StateMaps) overtakes it (the 06-25 correction: enwik8-full −0.0251 → enwik9 −0.0130). Idea: recover that erosion with a component that warms WITH the data — an online linear readout over the frozen net's hidden embedding.
+
+Design. The frozen net already computes a 256-dim tanh hidden vector `hid` per byte. A per-bit-tree-node linear head `head[256][H]` (zero-init) emits a residual logit `head[node]·hid`, contributed as a SEPARATE mixer input alongside the clean frozen logit; online logistic SGD trains it with the frozen logit as a fixed offset. A decisive design finding came first: a residual-on-frozen SINGLE input (head folded INTO the frozen logit) is a clean NEGATIVE (+0.0020, lr=0.02, 10 MB) — it corrupts the frozen prediction and the mixer can only down-weight the whole net, losing good signal with bad. As a SEPARATE input the mixer keeps full weight on the frozen logit and adds the head only where it helps.
+
+lr sweep (10 MB enwik8 slice, marginal over the full shipped stack, baseline 1.5635):
+
+| lr | 0.01 | 0.1 | 0.2 | 0.4 | 0.8 | 1.6 | 3.2 | 6.4 |
+|---|---|---|---|---|---|---|---|---|
+| marginal | −0.0008 | −0.0012 | −0.0017 | −0.0029 | −0.0042 | −0.0051 | **−0.0053** | −0.0039 |
+
+Clean peak at lr≈2–3 (−0.0053), rolling off by 6.4. The optimum being a FAST rate is the point: the head behaves as an online predictor over the frozen embedding (similar contexts → similar `hid` → shared learning, but near-instant adaptation), capturing local nonstationarity the frozen net cannot. Scaling CONFIRMS the warming hypothesis — at lr=0.1 the marginal grew 10 MB −0.0012 → 20 MB −0.0014, and at the peak lr=2.0 it is 10 MB −0.0052 → 20 MB **−0.0055** (it does not erode like a frozen contributor). This recovers much of the online arm's value (the arm is the dominant neural lever but throughput-walled on its backward) cheaply: the head reuses the frozen forward and adds only a ~4K-mul-add/byte readout + update (~1% throughput), with NO backward through the embedding.
+
+SHIPPED (HEAD_LR=2.0, commit pending). Folded into `PretrainedMlp` so one forward emits TWO logits — the frozen logit (its model slot) and the head logit (one extra mixer input via `CodecState::head_slot`) — so the head costs no second net forward (the two-net probe and the one-forward production path measure identically, −0.0052 @ 10 MB). Ships no weights → L(D) unchanged at 0.01225 (765,856-B release binary, byte-identical size); the head is online, the only would-be L(D) is a few lines of code. Round-trips byte-exact (deterministic online update; `roundtrip_enwik8_slice` + `nmix_roundtrip` green, full build.sh green incl. arm + coverage). `LZR_NO_HEAD` ablates it. enwik9 not run (CDR); projecting 20 MB −0.0055 to enwik9 (online/warming erodes less than the frozen net's ~0.5×) estimates an enwik9 net ~−0.003 to −0.005 over the current best 1.1812 — a likely new project best, pending an enwik9 confirmation run.
+
+NEGATIVE this session (reverted): a word-suffix context model (last ≤4 lowercase letters of the current word, a position-independent morphology key) — flat −0.0003 at both 10 and 20 MB, does not scale; removed (the `suf` field was being maintained in the shipped `push_byte`). Prose morphology is already captured by the word/order models. Probe `diversity_lab` (`LZR_HEAD` lr) kept.
+
 ## 2026-06-26 — context length (K) IS the frozen-net lever quality wasn't: a full-enwik8 K-sweep finds the net optimum at K=32, shipping −0.0075 over K=16
 
 The 06-25 finding [[project-v9-trajectory]] that frozen-net *quality* doesn't scale at full enwik8 (a 1M-step / 1.87-nat net beat the 500cos / 1.96-nat net by only −0.0007) left open whether the frozen net was genuinely capped near −0.025/enwik8 or capped only along the *quality* axis. CDR's call was to test the one axis quality didn't touch: **context length K** (the number of past bytes the MLP sees). The 06-25 net was K=16. This sweep trains K∈{32,64,128} on the identical recipe (cosine LR, 500K steps, E=32/H=256) and measures each over the FULL production stack on full enwik8 via `pretrained_e2e` (the real per-bit driver, not a slice — slices proved unreliable here, see below).
