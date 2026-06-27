@@ -13,6 +13,21 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-26 (autonomous evening, cont.) — head stack depth: order-2 then a sparse skip keep paying, then it saturates; SHIP a 4-head stack (−0.0202 @10 MB, −0.0208 @20 MB)
+
+Pushed the neural-head stack deeper with a clean head-spec probe (`LZR_HEADS="1,w,2,s6"`; tokens `N`=byte-order, `w`=word, `sM`=sparse mask) and a sparse-context head (`mask` bit i → byte_back(i+1)). Cumulative full-stack 10 MB enwik8 marginals over no-head, per added head:
+
+| stack | marginal | Δ |
+|---|---|---|
+| order-1 | −0.0126 | — |
+| + word | −0.0154 | −0.0028 |
+| + order-2 | −0.0190 | −0.0036 |
+| + sparse byte_back(2,3) | −0.0202 | −0.0012 |
+| + sparse byte_back(1,3) | −0.0208 | −0.0006 |
+| + order-3 (instead of sparse) | −0.0197 | −0.0007 |
+
+Two lessons: (1) **decorrelated contexts beat deeper contiguous ones** — a sparse byte_back(2,3) skip head adds −0.0012 where order-3 adds only −0.0007 (order-3 overlaps order-2). (2) **the stack saturates** — each head roughly halves the prior's gain, so past ~4 heads it is not worth the RAM. SHIP a 4-head stack `{order-1, word, order-2, sparse(2,3)}` (commit pending), the well-validated knee: −0.0202 at 10 MB, **−0.0208 at 20 MB** (the sparse head scales like the rest), 4×64 MB = 256 MB (enwik9 RSS ~8.4 GB). The 5th head's −0.0006 was 10 MB-only and is left out. Byte-exact round-trip; build.sh green; L(D) unchanged (0.01225). enwik9 not run (CDR); the 4-head stack is the session's cumulative neural win, projecting a likely new project best over 1.1812.
+
 ## 2026-06-26 (autonomous evening, cont.) — warming heads STACK: a neural context-model stack over the shared frozen forward; order-1 + word = −0.0154, all L(D)≈0
 
 If one per-context readout over the frozen embedding is a neural-indirect model (entry below), several on DISTINCT contexts should stack like the deterministic order/sparse/word models do. Tested a word-context head (node hashes the current word hash) against and alongside the order-1 (prev-byte) head, full stack, 10 MB enwik8 (baseline 1.5635): word-context head ALONE −0.0087 (a strong standalone on a different axis), and **order-1 + word = −0.0154** (word adds −0.0028 over order-1's −0.0126; ~partly decorrelated, as expected since both condition on recent context). Stacking is additive.

@@ -86,8 +86,9 @@ struct Head {
     weights: Vec<f32>, // [nodes * h]
     h: usize,
     lr: f32,
-    ctx_bytes: usize, // prev finalized bytes in the node (0 = bit-tree only), unless `word`
+    ctx_bytes: usize, // prev finalized bytes in the node (0 = bit-tree only), unless `word`/`mask`
     word: bool,       // node hashes the word hash instead of prev bytes
+    mask: u32,        // if nonzero, node hashes the sparse byte set (bit i → byte_back(i+1))
     bits: u32,        // hashed-node table size (bits); unused when ctx_bytes == 0 && !word
     node: usize,      // node of the last eval (for the learn step)
     p: f32,           // this head's squashed P(bit==1) at the last eval
@@ -100,8 +101,8 @@ struct Head {
     clippy::cast_sign_loss
 )]
 impl Head {
-    fn new(h: usize, lr: f32, ctx_bytes: usize, word: bool, bits: u32) -> Self {
-        let nodes = if !word && ctx_bytes == 0 {
+    fn new(h: usize, lr: f32, ctx_bytes: usize, word: bool, mask: u32, bits: u32) -> Self {
+        let nodes = if !word && mask == 0 && ctx_bytes == 0 {
             256
         } else {
             1usize << bits
@@ -112,6 +113,7 @@ impl Head {
             lr,
             ctx_bytes,
             word,
+            mask,
             bits,
             node: 0,
             p: 0.0,
@@ -123,6 +125,17 @@ impl Head {
         let c0 = u64::from(ctx.c0 & 0xff);
         if self.word {
             let key = (ctx.word_hash << 8) | c0;
+            return (key.wrapping_mul(HEAD_HASH) >> (64 - self.bits)) as usize;
+        }
+        if self.mask != 0 {
+            let mut cv = u64::from(self.mask);
+            let mut m = self.mask;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize + 1;
+                cv = (cv << 8) | u64::from(ctx.byte_back(i));
+                m &= m - 1;
+            }
+            let key = (cv << 8) | c0;
             return (key.wrapping_mul(HEAD_HASH) >> (64 - self.bits)) as usize;
         }
         if self.ctx_bytes == 0 {
@@ -299,13 +312,20 @@ impl PretrainedMlp {
     /// `ctx_bytes == 0` is the plain per-bit-tree-node head (256 nodes, direct).
     pub(crate) fn push_head_ctx(&mut self, lr: f32, ctx_bytes: usize, bits: u32) {
         self.heads
-            .push(Head::new(self.h, lr, ctx_bytes, false, bits));
+            .push(Head::new(self.h, lr, ctx_bytes, false, 0, bits));
     }
 
     /// Add a word-context warming head: the node hashes the current word hash with
     /// the bit-tree position (a decorrelation axis distinct from the byte context).
     pub(crate) fn push_head_word(&mut self, lr: f32, bits: u32) {
-        self.heads.push(Head::new(self.h, lr, 0, true, bits));
+        self.heads.push(Head::new(self.h, lr, 0, true, 0, bits));
+    }
+
+    /// Add a sparse-context warming head: the node hashes the byte set selected by
+    /// `mask` (bit i → `byte_back(i+1)`) — a skip/gap context decorrelated from the
+    /// contiguous orders.
+    pub(crate) fn push_head_sparse(&mut self, lr: f32, mask: u32, bits: u32) {
+        self.heads.push(Head::new(self.h, lr, 0, false, mask, bits));
     }
 
     /// Number of warming heads (each contributes one extra mixer input).

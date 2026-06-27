@@ -59,11 +59,12 @@ const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
 /// forward, so each head costs only its readout (~free); each warms WITH the data
 /// (its marginal holds/grows at scale, unlike the frozen net). Ships no weights
 /// (online → L(D)≈0). Full-stack enwik8 (10 MB) sweep, cumulative over no-head:
-/// order-1 (prev byte) −0.0126; + word-context head −0.0154; + order-2 (prev 2
-/// bytes) −0.0190 — each added context keeps paying. lr≈4; each head is a
-/// `HEAD_BITS`-wide table (~64 MB at 16; order-2's hash collisions there are
-/// benign, the frozen embedding still separates colliding contexts). Three heads
-/// ≈ 192 MB (enwik9 RSS ~8.4 GB, under the 10 GB cap).
+/// order-1 (prev byte) −0.0126; + word-context −0.0154; + order-2 (prev 2 bytes)
+/// −0.0190; + sparse `byte_back(2,3)` −0.0202 — each added DECORRELATED context
+/// keeps paying (diminishing: a 5th sparse head adds only −0.0006). lr≈4; each
+/// head is a `HEAD_BITS`-wide table (~64 MB at 16; order-2's hash collisions there
+/// are benign — the frozen embedding still separates colliding contexts). Four
+/// heads ≈ 256 MB (enwik9 RSS ~8.4 GB, under the 10 GB cap); −0.0208 at 20 MB.
 const HEAD_LR: f32 = 4.0;
 const HEAD_BITS: u32 = 16;
 
@@ -76,14 +77,15 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     // marginal / test additivity with the arm; unset (the default) keeps it shipped.
     if std::env::var("LZR_NO_NET").is_err() {
         let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
-        // The warming-head stack: order-1 (prev-byte), word-context, and order-2
-        // (prev 2 bytes) readouts over the frozen embedding, each a separate mixer
-        // input that warms with the data. Ships no weights (L(D)≈0). `LZR_NO_HEAD`
-        // drops them.
+        // The warming-head stack: order-1 (prev-byte), word-context, order-2 (prev
+        // 2 bytes), and a sparse byte_back(2,3) skip readout over the frozen
+        // embedding — each a separate mixer input that warms with the data. Ships no
+        // weights (L(D)≈0). `LZR_NO_HEAD` drops them.
         if std::env::var("LZR_NO_HEAD").is_err() {
             net.push_head_ctx(HEAD_LR, 1, HEAD_BITS);
             net.push_head_word(HEAD_LR, HEAD_BITS);
             net.push_head_ctx(HEAD_LR, 2, HEAD_BITS);
+            net.push_head_sparse(HEAD_LR, 0b110, HEAD_BITS);
         }
         v.push(net.into());
     }
@@ -516,13 +518,16 @@ mod tests {
         );
     }
 
-    /// Exploration — the frozen net's online warming readout head as a SEPARATE
-    /// mixer input alongside the clean frozen logit. `LZR_HEAD` (lr, default 0 =
-    /// off) enables it; measured as a marginal over the shipped stack (M1 + APM on,
-    /// the trustworthy panel) on the `[LZR_LO..LZR_HI]` slice (default 10 MB). Run:
-    /// `LZR_HEAD=0.01 cargo test --release diversity_lab -- --ignored --nocapture`
+    /// Exploration — a STACK of warming-readout heads over the frozen embedding,
+    /// each a separate mixer input, measured over the full shipped stack (M1 + APM
+    /// on) on the `[LZR_LO..LZR_HI]` slice (default 10 MB). `LZR_HEADS` is a
+    /// comma-separated spec; each token is a context: `N` = byte-order N (`0` =
+    /// bit-tree only), `w` = word, `sM` = sparse mask `M` (bit i → `byte_back(i+1)`).
+    /// `LZR_HEAD` is the shared lr (default 4), `LZR_HEADBITS` the table size
+    /// (default 16). Empty/unset spec = head-free baseline. Run:
+    /// `LZR_HEADS=1,w,2 cargo test --release diversity_lab -- --ignored --nocapture`
     #[test]
-    #[ignore = "explore: frozen-net warming-head marginal over the full stack"]
+    #[ignore = "explore: frozen-net warming-head stack marginal over the full stack"]
     #[allow(clippy::cast_precision_loss)]
     fn diversity_lab() {
         let env = |k: &str, d: usize| {
@@ -539,54 +544,26 @@ mod tests {
         let orig = (hi - lo) as f64;
         let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
         let cap = data.len();
-        let head_lr: f32 = std::env::var("LZR_HEAD")
+        let lr: f32 = std::env::var("LZR_HEAD")
             .ok()
             .and_then(|x| x.parse().ok())
-            .unwrap_or(0.0);
-        let ctx_bytes = env("LZR_HEADCTXB", 0);
+            .unwrap_or(4.0);
         let bits = std::env::var("LZR_HEADBITS")
             .ok()
             .and_then(|x| x.parse().ok())
             .unwrap_or(16u32);
-        // Optional second stacked head (stacking probe): LZR_HEAD2 lr; LZR_HEAD2W
-        // bits for a word-context head, else LZR_HEAD2CTXB byte-context head.
-        let lr2: f32 = std::env::var("LZR_HEAD2")
-            .ok()
-            .and_then(|x| x.parse().ok())
-            .unwrap_or(0.0);
-        let word2_bits: u32 = std::env::var("LZR_HEAD2W")
-            .ok()
-            .and_then(|x| x.parse().ok())
-            .unwrap_or(0);
-        let ctxb2 = env("LZR_HEAD2CTXB", 1);
-        // Optional third stacked head: LZR_HEAD3 lr, LZR_HEAD3CTXB byte-context.
-        let lr3: f32 = std::env::var("LZR_HEAD3")
-            .ok()
-            .and_then(|x| x.parse().ok())
-            .unwrap_or(0.0);
-        let ctxb3 = env("LZR_HEAD3CTXB", 2);
-        let bits3: u32 = std::env::var("LZR_HEAD3BITS")
-            .ok()
-            .and_then(|x| x.parse().ok())
-            .unwrap_or(20);
+        let spec = std::env::var("LZR_HEADS").unwrap_or_default();
 
-        // One net carrying a STACK of heads (production shape): head 1 byte-context;
-        // head 2 (if `h2 > 0`) word- or byte-context; head 3 (if `lr3 > 0`) byte.
-        // `head_lr == 0` is the head-free baseline (all stacked heads gated on it).
-        let build = |head_lr: f32, ctx_bytes: usize, bits: u32, h2: f32| -> Vec<AnyModel> {
+        let build = |spec: &str| -> Vec<AnyModel> {
             let mut v = baseline_models(cap);
             let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
-            if head_lr > 0.0 {
-                net.push_head_ctx(head_lr, ctx_bytes, bits);
-                if h2 > 0.0 {
-                    if word2_bits > 0 {
-                        net.push_head_word(h2, word2_bits);
-                    } else {
-                        net.push_head_ctx(h2, ctxb2, bits);
-                    }
-                }
-                if lr3 > 0.0 {
-                    net.push_head_ctx(lr3, ctxb3, bits3);
+            for tok in spec.split(',').filter(|t| !t.is_empty()) {
+                if tok == "w" {
+                    net.push_head_word(lr, bits);
+                } else if let Some(m) = tok.strip_prefix('s') {
+                    net.push_head_sparse(lr, m.parse().unwrap(), bits);
+                } else {
+                    net.push_head_ctx(lr, tok.parse().unwrap(), bits);
                 }
             }
             v.push(net.into());
@@ -594,11 +571,11 @@ mod tests {
         };
         let bpb = |m: Vec<AnyModel>| code_stream_models(m, &data).len() as f64 * 8.0 / orig;
 
-        let base = bpb(build(0.0, 0, 0, 0.0));
+        let base = bpb(build(""));
         println!("baseline (shipped stack):         {base:.4} bpb");
-        let v = bpb(build(head_lr, ctx_bytes, bits, lr2));
+        let v = bpb(build(&spec));
         println!(
-            "+ head_lr={head_lr} ctx_bytes={ctx_bytes} bits={bits} head2={lr2}(w={word2_bits}):   {v:.4} bpb  marginal {:+.4}",
+            "+ heads=[{spec}] lr={lr} bits={bits}:   {v:.4} bpb  marginal {:+.4}",
             v - base
         );
     }
