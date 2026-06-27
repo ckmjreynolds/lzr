@@ -58,9 +58,12 @@ const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
 /// context-model stack), each a separate mixer input. All share the one frozen
 /// forward, so each head costs only its readout (~free); each warms WITH the data
 /// (its marginal holds/grows at scale, unlike the frozen net). Ships no weights
-/// (online → L(D)≈0). Full-stack enwik8 sweep: order-1 (prev byte) gives −0.0126
-/// and adding a word-context head reaches −0.0154 (word contributes −0.0028, only
-/// partly decorrelated). lr≈4 at 65 536-node tables (`HEAD_BITS=16`, ~64 MB each).
+/// (online → L(D)≈0). Full-stack enwik8 (10 MB) sweep, cumulative over no-head:
+/// order-1 (prev byte) −0.0126; + word-context head −0.0154; + order-2 (prev 2
+/// bytes) −0.0190 — each added context keeps paying. lr≈4; each head is a
+/// `HEAD_BITS`-wide table (~64 MB at 16; order-2's hash collisions there are
+/// benign, the frozen embedding still separates colliding contexts). Three heads
+/// ≈ 192 MB (enwik9 RSS ~8.4 GB, under the 10 GB cap).
 const HEAD_LR: f32 = 4.0;
 const HEAD_BITS: u32 = 16;
 
@@ -73,12 +76,14 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     // marginal / test additivity with the arm; unset (the default) keeps it shipped.
     if std::env::var("LZR_NO_NET").is_err() {
         let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
-        // The warming-head stack: an order-1 (prev-byte) and a word-context
-        // readout over the frozen embedding, each a separate mixer input that warms
-        // with the data. Ships no weights (L(D)≈0). `LZR_NO_HEAD` drops them.
+        // The warming-head stack: order-1 (prev-byte), word-context, and order-2
+        // (prev 2 bytes) readouts over the frozen embedding, each a separate mixer
+        // input that warms with the data. Ships no weights (L(D)≈0). `LZR_NO_HEAD`
+        // drops them.
         if std::env::var("LZR_NO_HEAD").is_err() {
             net.push_head_ctx(HEAD_LR, 1, HEAD_BITS);
             net.push_head_word(HEAD_LR, HEAD_BITS);
+            net.push_head_ctx(HEAD_LR, 2, HEAD_BITS);
         }
         v.push(net.into());
     }
@@ -554,20 +559,34 @@ mod tests {
             .and_then(|x| x.parse().ok())
             .unwrap_or(0);
         let ctxb2 = env("LZR_HEAD2CTXB", 1);
+        // Optional third stacked head: LZR_HEAD3 lr, LZR_HEAD3CTXB byte-context.
+        let lr3: f32 = std::env::var("LZR_HEAD3")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0.0);
+        let ctxb3 = env("LZR_HEAD3CTXB", 2);
+        let bits3: u32 = std::env::var("LZR_HEAD3BITS")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(20);
 
-        // One net carrying a STACK of heads (production shape): head 1 is the
-        // byte-context head; head 2 (if `h2 > 0`) is a word- or byte-context head.
+        // One net carrying a STACK of heads (production shape): head 1 byte-context;
+        // head 2 (if `h2 > 0`) word- or byte-context; head 3 (if `lr3 > 0`) byte.
+        // `head_lr == 0` is the head-free baseline (all stacked heads gated on it).
         let build = |head_lr: f32, ctx_bytes: usize, bits: u32, h2: f32| -> Vec<AnyModel> {
             let mut v = baseline_models(cap);
             let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
             if head_lr > 0.0 {
                 net.push_head_ctx(head_lr, ctx_bytes, bits);
-            }
-            if h2 > 0.0 {
-                if word2_bits > 0 {
-                    net.push_head_word(h2, word2_bits);
-                } else {
-                    net.push_head_ctx(h2, ctxb2, bits);
+                if h2 > 0.0 {
+                    if word2_bits > 0 {
+                        net.push_head_word(h2, word2_bits);
+                    } else {
+                        net.push_head_ctx(h2, ctxb2, bits);
+                    }
+                }
+                if lr3 > 0.0 {
+                    net.push_head_ctx(lr3, ctxb3, bits3);
                 }
             }
             v.push(net.into());
