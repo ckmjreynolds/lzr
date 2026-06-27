@@ -13,6 +13,10 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-27 (~05:40) — CORRECTION to the head-stack entries' "L(D) unchanged (0.01225)": the binary GREW +16 KB of code → L(D) 0.01252
+
+The head-stack commits (fec840a→9308965) each said "ships no weights → L(D) unchanged (0.01225)". The first half is right — no weight blob ships, the heads are online — but the ~16 KB of new CODE (the `Head` struct + impl, the sparse/word node hashing, the multi-head `CodecState` wiring) grew the release binary 765,856 → 782,384 B, i.e. L(D) 0.01225 → **0.01252** (+0.00027 under the ×16/1e9 reckoning). Immaterial to every conclusion — the session's −0.0225 full-enwik8 L(C) dwarfs the +0.00027 L(D) by ~80× — but the entries should have said "L(D) +0.00027 (code only, no weights)", not "unchanged". Logged for accuracy.
+
 ## 2026-06-27 (autonomous, ~05:00) — DUAL-RATE heads: a slow readout on a context already in the stack beats a new context; ship a 5th head (+slow order-1, −0.0016, L(D)≈0)
 
 After the head-context axis saturated (a 5th distinct context added only −0.0004 to −0.0006), a different decorrelation axis still pays: TIMESCALE. Adding a SECOND readout on a context already in the stack, but at a slow learning rate (lr 0.5 vs the fast 4), captures the stable per-context structure the fast rate washes out. Full-stack 10 MB enwik8 over the 4-head stack (−0.0202): +slow order-1 head −0.0218 (adds −0.0016), +slow word −0.0215 (−0.0013) — both BEAT any new context at this depth. It scales: +slow order-1 is −0.0018 at 20 MB (1.5046→1.5028), grows like the fast heads. Slow lr optimum ~0.5 (1.0 gives −0.0216 vs 0.5's −0.0218). A full 8-head dual-rate stack (fast+slow on all four contexts) reaches −0.0226, but the three extra slow heads add only −0.0008 over the slow-order-1 alone — the slow readouts overlap each other (all capture "stable structure," correlated across contexts), so one slow head is the efficient knee.
