@@ -131,6 +131,14 @@ fn nmix_h() -> usize {
         .unwrap_or(NMIX_H)
 }
 
+/// Shipped residual-mixer learning rate, overridable by `LZR_NMIXLR` (offline).
+fn nmix_lr() -> f32 {
+    std::env::var("LZR_NMIXLR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(NMIX_LR)
+}
+
 /// The shared predictor state driven identically by both directions: encode and
 /// decode differ only in where each bit comes from (read from the input vs.
 /// decoded from the stream) and which coder consumes it.
@@ -174,7 +182,7 @@ impl CodecState {
             stretched,
             msel: [0usize; 8],
             n_heads,
-            nmix: Some(NeuralMixer::new(inputs, nmix_h(), NMIX_NCTX, NMIX_LR)),
+            nmix: Some(NeuralMixer::new(inputs, nmix_h(), NMIX_NCTX, nmix_lr())),
         }
     }
 
