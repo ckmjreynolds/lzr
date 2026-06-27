@@ -53,16 +53,15 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<AnyModel> {
 /// predictor from the same bytes; the blob counts as L(D).
 const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
 
-/// The pretrained net's online warming head: a per-context online linear readout
-/// over the frozen embedding (a "neural-indirect" context model). The node hashes
-/// the previous byte with the bit-tree position, so the head learns a distinct
-/// readout per order-1 context. A full-stack enwik8 sweep put the optimum at
-/// order-1 (`HEAD_CTX_BYTES=1`, 65 536 nodes) with lr≈4: −0.0126 bpb (2.4× the
-/// plain per-bit-tree head's −0.0053, and ≈ M1's own −0.010), holding at 20 MB.
-/// order-2 added nothing for 16× the RAM. Ships no weights (online → L(D)≈0); the
-/// only cost is a fixed ~64 MB table and a one-node-per-bit readout (~free).
+/// The pretrained net's online warming-head STACK: per-context online linear
+/// readouts over the frozen embedding (a neural analog of the deterministic
+/// context-model stack), each a separate mixer input. All share the one frozen
+/// forward, so each head costs only its readout (~free); each warms WITH the data
+/// (its marginal holds/grows at scale, unlike the frozen net). Ships no weights
+/// (online → L(D)≈0). Full-stack enwik8 sweep: order-1 (prev byte) gives −0.0126
+/// and adding a word-context head reaches −0.0154 (word contributes −0.0028, only
+/// partly decorrelated). lr≈4 at 65 536-node tables (`HEAD_BITS=16`, ~64 MB each).
 const HEAD_LR: f32 = 4.0;
-const HEAD_CTX_BYTES: usize = 1;
 const HEAD_BITS: u32 = 16;
 
 /// The active model set: the deterministic baseline plus the frozen pretrained
@@ -74,12 +73,12 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     // marginal / test additivity with the arm; unset (the default) keeps it shipped.
     if std::env::var("LZR_NO_NET").is_err() {
         let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
-        // The online warming head: a per-context (order-1) linear readout over the
-        // frozen net's hidden embedding, contributed as a second mixer input. It
-        // warms WITH the data (its marginal holds/grows at scale, unlike the frozen
-        // net's) and ships no weights (L(D)≈0). `LZR_NO_HEAD` drops it (ablation).
+        // The warming-head stack: an order-1 (prev-byte) and a word-context
+        // readout over the frozen embedding, each a separate mixer input that warms
+        // with the data. Ships no weights (L(D)≈0). `LZR_NO_HEAD` drops them.
         if std::env::var("LZR_NO_HEAD").is_err() {
-            net.enable_head_ctx(HEAD_LR, HEAD_CTX_BYTES, HEAD_BITS);
+            net.push_head_ctx(HEAD_LR, 1, HEAD_BITS);
+            net.push_head_word(HEAD_LR, HEAD_BITS);
         }
         v.push(net.into());
     }
@@ -124,10 +123,10 @@ struct CodecState {
     ctx: Context,
     stretched: Vec<i32>,
     msel: [usize; 8], // mixer weight-set selectors, recomputed once per byte (bpos==0)
-    // The pretrained net's warming-head logit (when enabled) occupies one extra
-    // `stretched` slot beyond the models, so the mixer sees it as an input distinct
-    // from the frozen logit. `None` when no model has a head.
-    head_slot: Option<usize>,
+    // Each head-enabled net's warming-head logit occupies one extra `stretched`
+    // slot beyond the models (starting at `models.len()`), so the mixer sees it as
+    // an input distinct from the frozen logit. `n_heads` is how many such slots.
+    n_heads: usize,
     // Residual neural mixing stage: `Some` in production (refines the linear
     // mixer's logit). Ablation tests set it to `None` to measure its marginal
     // against the linear-only path.
@@ -141,10 +140,10 @@ impl CodecState {
 
     fn with_models(models: Vec<AnyModel>, capacity: usize) -> Self {
         let n = models.len();
-        // The pretrained net's warming head adds one extra mixer input beyond the
-        // models. Reserve its slot so the mixer/nmix are sized to see it.
-        let head_slot = models.iter().any(AnyModel::has_head).then_some(n);
-        let inputs = n + usize::from(head_slot.is_some());
+        // Each warming head adds one extra mixer input beyond the models. Reserve
+        // those slots so the mixer/nmix are sized to see them.
+        let n_heads: usize = models.iter().map(AnyModel::n_heads).sum();
+        let inputs = n + n_heads;
         let stretched = vec![0i32; inputs];
         let mixer = Mixer::new(inputs);
         Self {
@@ -155,7 +154,7 @@ impl CodecState {
             ctx: Context::with_capacity(capacity),
             stretched,
             msel: [0usize; 8],
-            head_slot,
+            n_heads,
             nmix: Some(NeuralMixer::new(inputs, NMIX_H, NMIX_NCTX, NMIX_LR)),
         }
     }
@@ -187,9 +186,15 @@ impl CodecState {
         for (m, s) in self.models.iter_mut().zip(&mut self.stretched) {
             *s = m.predict(&self.ctx);
         }
-        // The warming head's logit is the one extra input past the models.
-        if let Some(slot) = self.head_slot {
-            self.stretched[slot] = self.models.iter().find_map(AnyModel::head_out).unwrap_or(0);
+        // Each head's logit is an extra input past the models, in model/head order.
+        if self.n_heads > 0 {
+            let mut slot = self.models.len();
+            for i in 0..self.models.len() {
+                for hi in 0..self.models[i].n_heads() {
+                    self.stretched[slot] = self.models[i].head_out(hi);
+                    slot += 1;
+                }
+            }
         }
         let pm = self
             .mixer
@@ -538,27 +543,43 @@ mod tests {
             .ok()
             .and_then(|x| x.parse().ok())
             .unwrap_or(16u32);
+        // Optional second stacked head (stacking probe): LZR_HEAD2 lr; LZR_HEAD2W
+        // bits for a word-context head, else LZR_HEAD2CTXB byte-context head.
+        let lr2: f32 = std::env::var("LZR_HEAD2")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0.0);
+        let word2_bits: u32 = std::env::var("LZR_HEAD2W")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0);
+        let ctxb2 = env("LZR_HEAD2CTXB", 1);
 
-        // Production shape: one net emitting two logits (frozen + warming head as a
-        // separate mixer input via the codec's head slot). `head_lr == 0` is the
-        // frozen-only baseline. `ctx_bytes`/`bits` make the head a per-context
-        // readout (hashed last-`ctx_bytes`-bytes node).
-        let build = |head_lr: f32, ctx_bytes: usize, bits: u32| -> Vec<AnyModel> {
+        // One net carrying a STACK of heads (production shape): head 1 is the
+        // byte-context head; head 2 (if `h2 > 0`) is a word- or byte-context head.
+        let build = |head_lr: f32, ctx_bytes: usize, bits: u32, h2: f32| -> Vec<AnyModel> {
             let mut v = baseline_models(cap);
             let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
             if head_lr > 0.0 {
-                net.enable_head_ctx(head_lr, ctx_bytes, bits);
+                net.push_head_ctx(head_lr, ctx_bytes, bits);
+            }
+            if h2 > 0.0 {
+                if word2_bits > 0 {
+                    net.push_head_word(h2, word2_bits);
+                } else {
+                    net.push_head_ctx(h2, ctxb2, bits);
+                }
             }
             v.push(net.into());
             v
         };
         let bpb = |m: Vec<AnyModel>| code_stream_models(m, &data).len() as f64 * 8.0 / orig;
 
-        let base = bpb(build(0.0, 0, 0));
+        let base = bpb(build(0.0, 0, 0, 0.0));
         println!("baseline (shipped stack):         {base:.4} bpb");
-        let v = bpb(build(head_lr, ctx_bytes, bits));
+        let v = bpb(build(head_lr, ctx_bytes, bits, lr2));
         println!(
-            "+ head_lr={head_lr} ctx_bytes={ctx_bytes} bits={bits}:   {v:.4} bpb  marginal {:+.4}",
+            "+ head_lr={head_lr} ctx_bytes={ctx_bytes} bits={bits} head2={lr2}(w={word2_bits}):   {v:.4} bpb  marginal {:+.4}",
             v - base
         );
     }

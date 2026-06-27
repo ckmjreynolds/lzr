@@ -27,18 +27,12 @@ pub(crate) struct PretrainedMlp {
     cumsum: Vec<f32>, // [v+1] prefix sums of the current next-byte distribution
     x: Vec<f32>,      // [k*e] flattened context embedding
     hid: Vec<f32>,    // [h]
-    // Online warming readout: a per-bit-tree-node linear head over the frozen
-    // hidden features `hid`, contributed as a SEPARATE mixer input (`head_out`).
-    // The frozen net's edge erodes as the online stack warms (it is front-loaded);
-    // this head re-learns the hidden→bit mapping online, so it warms WITH the data
-    // (its marginal grows at scale). `head_lr` == 0 (default) disables it.
-    head: Vec<f32>, // [nodes * h] node-indexed readout weights (empty when off)
-    head_lr: f32,
-    head_ctx_bytes: usize, // prev finalized bytes hashed into the node (0 = bit-tree only)
-    head_bits: u32,        // hashed-node table size (bits); unused when head_ctx_bytes == 0
-    head_node: usize,      // node of the last predict (for the update)
-    head_p: f32,           // this model's own squashed P(bit==1) at the last predict
-    head_out: i32,         // the head logit (extra mixer input) cached at the last predict
+    // Online warming-readout heads (see `Head`): each is a per-context linear
+    // readout over the frozen embedding `hid`, contributed as a SEPARATE mixer
+    // input. The frozen net's edge erodes as the online stack warms (it is
+    // front-loaded); these heads re-learn the hidden→bit mapping online, so they
+    // warm WITH the data. Empty (default) = frozen-only.
+    heads: Vec<Head>,
 }
 
 /// Transpose a `[rows, cols]` row-major matrix to `[cols, rows]` row-major. Done
@@ -77,6 +71,91 @@ fn dot(w: &[f32], x: &[f32], bias: f32) -> f32 {
         s = wr.mul_add(*xr, s);
     }
     s
+}
+
+const HEAD_HASH: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// One online warming-readout head: for each context (the node) it learns, by
+/// online logistic SGD, a linear readout over the frozen net's hidden embedding
+/// `hid`, emitted as a residual on the frozen logit. A stack of heads on distinct
+/// contexts (prev-byte, word, …) forms a neural analog of the deterministic
+/// context-model stack — all sharing the one frozen forward, so each costs only
+/// its readout. Zero-init → contributes nothing until it learns; ships no weights.
+#[derive(Debug)]
+struct Head {
+    weights: Vec<f32>, // [nodes * h]
+    h: usize,
+    lr: f32,
+    ctx_bytes: usize, // prev finalized bytes in the node (0 = bit-tree only), unless `word`
+    word: bool,       // node hashes the word hash instead of prev bytes
+    bits: u32,        // hashed-node table size (bits); unused when ctx_bytes == 0 && !word
+    node: usize,      // node of the last eval (for the learn step)
+    p: f32,           // this head's squashed P(bit==1) at the last eval
+    out: i32,         // this head's logit (extra mixer input) at the last eval
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+impl Head {
+    fn new(h: usize, lr: f32, ctx_bytes: usize, word: bool, bits: u32) -> Self {
+        let nodes = if !word && ctx_bytes == 0 {
+            256
+        } else {
+            1usize << bits
+        };
+        Self {
+            weights: vec![0.0; nodes * h],
+            h,
+            lr,
+            ctx_bytes,
+            word,
+            bits,
+            node: 0,
+            p: 0.0,
+            out: 0,
+        }
+    }
+
+    fn node(&self, ctx: &Context) -> usize {
+        let c0 = u64::from(ctx.c0 & 0xff);
+        if self.word {
+            let key = (ctx.word_hash << 8) | c0;
+            return (key.wrapping_mul(HEAD_HASH) >> (64 - self.bits)) as usize;
+        }
+        if self.ctx_bytes == 0 {
+            return c0 as usize;
+        }
+        let mut cv = 0u64;
+        for i in 1..=self.ctx_bytes {
+            cv = (cv << 8) | u64::from(ctx.byte_back(i));
+        }
+        let key = (cv << 8) | c0;
+        (key.wrapping_mul(HEAD_HASH) >> (64 - self.bits)) as usize
+    }
+
+    /// Residual readout = `weights[node] · hid` added to the frozen logit; cached
+    /// for the mixer (`out`) and the learn step (`node`, `p`).
+    fn eval(&mut self, ctx: &Context, hid: &[f32], frozen: i32) {
+        let node = self.node(ctx);
+        let hl = dot(&self.weights[node * self.h..(node + 1) * self.h], hid, 0.0);
+        let combined = (frozen + hl as i32).clamp(-2047, 2047);
+        self.node = node;
+        self.p = crate::mixer::squash(combined) as f32 / 4096.0;
+        self.out = combined;
+    }
+
+    /// One online logistic SGD step on this head's own prediction (the frozen
+    /// logit is a fixed offset baked into `p`).
+    fn learn(&mut self, hid: &[f32], bit: u8) {
+        let g = self.lr * (f32::from(bit) - self.p);
+        let row = &mut self.weights[self.node * self.h..(self.node + 1) * self.h];
+        for (w, &x) in row.iter_mut().zip(hid) {
+            *w = g.mul_add(x, *w);
+        }
+    }
 }
 
 #[allow(
@@ -123,13 +202,7 @@ impl PretrainedMlp {
             cumsum: vec![0.0; v + 1],
             x: vec![0.0; k * e],
             hid: vec![0.0; h],
-            head: Vec::new(),
-            head_lr: 0.0,
-            head_ctx_bytes: 0,
-            head_bits: 0,
-            head_node: 0,
-            head_p: 0.0,
-            head_out: 0,
+            heads: Vec::new(),
         };
         m.recompute(&Context::with_capacity(0));
         m
@@ -178,13 +251,7 @@ impl PretrainedMlp {
             cumsum: vec![0.0; v + 1],
             x: vec![0.0; k * e],
             hid: vec![0.0; h],
-            head: Vec::new(),
-            head_lr: 0.0,
-            head_ctx_bytes: 0,
-            head_bits: 0,
-            head_node: 0,
-            head_p: 0.0,
-            head_out: 0,
+            heads: Vec::new(),
         };
         m.recompute(&Context::with_capacity(0));
         m
@@ -226,48 +293,30 @@ impl PretrainedMlp {
         self.recompute(&Context::with_capacity(0));
     }
 
-    /// Enable the online warming readout head with learning rate `lr`. A
-    /// per-context readout: the node hashes the last `ctx_bytes` finalized bytes
-    /// (with the bit-tree position) into a `bits`-wide table, so the head learns a
-    /// distinct online readout over the frozen embedding per context — a
-    /// "neural-indirect" context model. `ctx_bytes == 0` is the plain
-    /// per-bit-tree-node head (256 nodes, direct, no hash). Zero-init → contributes
-    /// nothing at step 0, can only add signal as it learns; ships no weights (the
-    /// head is online → L(D)≈0).
-    pub(crate) fn enable_head_ctx(&mut self, lr: f32, ctx_bytes: usize, bits: u32) {
-        self.head_ctx_bytes = ctx_bytes;
-        self.head_bits = bits;
-        let nodes = if ctx_bytes == 0 { 256 } else { 1usize << bits };
-        self.head = vec![0.0; nodes * self.h];
-        self.head_lr = lr;
+    /// Add a per-context warming head: the node hashes the last `ctx_bytes`
+    /// finalized bytes (with the bit-tree position) into a `bits`-wide table, so the
+    /// head learns a distinct online readout over the frozen embedding per context.
+    /// `ctx_bytes == 0` is the plain per-bit-tree-node head (256 nodes, direct).
+    pub(crate) fn push_head_ctx(&mut self, lr: f32, ctx_bytes: usize, bits: u32) {
+        self.heads
+            .push(Head::new(self.h, lr, ctx_bytes, false, bits));
     }
 
-    /// The head node for the current bit: the bit-tree position alone (`ctx_bytes
-    /// == 0`), else the last `ctx_bytes` finalized bytes plus the bit-tree position
-    /// hashed into the `bits`-wide table.
-    fn head_node(&self, ctx: &Context) -> usize {
-        let c0 = u64::from(ctx.c0 & 0xff);
-        if self.head_ctx_bytes == 0 {
-            return c0 as usize;
-        }
-        let mut cv = 0u64;
-        for i in 1..=self.head_ctx_bytes {
-            cv = (cv << 8) | u64::from(ctx.byte_back(i));
-        }
-        let key = (cv << 8) | c0;
-        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.head_bits)) as usize
+    /// Add a word-context warming head: the node hashes the current word hash with
+    /// the bit-tree position (a decorrelation axis distinct from the byte context).
+    pub(crate) fn push_head_word(&mut self, lr: f32, bits: u32) {
+        self.heads.push(Head::new(self.h, lr, 0, true, bits));
     }
 
-    /// The warming head's logit for this bit (the extra mixer input), `None` when
-    /// the head is disabled. Valid after [`Model::predict`] ran for the bit.
-    pub(crate) fn head_out(&self) -> Option<i32> {
-        (self.head_lr != 0.0).then_some(self.head_out)
+    /// Number of warming heads (each contributes one extra mixer input).
+    pub(crate) fn n_heads(&self) -> usize {
+        self.heads.len()
     }
 
-    /// Whether the warming head is enabled (a static property — drives whether the
-    /// codec reserves the extra mixer input slot).
-    pub(crate) fn has_head(&self) -> bool {
-        self.head_lr != 0.0
+    /// The `i`-th head's logit for this bit (an extra mixer input). Valid after
+    /// [`Model::predict`] ran for the bit.
+    pub(crate) fn head_out(&self, i: usize) -> i32 {
+        self.heads[i].out
     }
 
     /// Forward the MLP over the last `k` finalized bytes and refresh the
@@ -334,38 +383,22 @@ impl Model for PretrainedMlp {
         let pr = p1 / (p0 + p1 + 1e-12);
         let q = ((pr * 4096.0) as i32).clamp(1, 4095);
         let frozen = crate::mixer::stretch(q);
-        if self.head_lr == 0.0 {
-            return frozen;
+        // Each warming head evaluates a residual readout over the shared `hid` and
+        // caches its logit as a SEPARATE mixer input (the codec reads them via
+        // `head_out`); the model's own predict return stays the clean frozen logit.
+        let Self { heads, hid, .. } = self;
+        for head in heads.iter_mut() {
+            head.eval(ctx, hid, frozen);
         }
-        // Warming readout: a residual correction = head[node] · hid added to the
-        // frozen logit, contributed as a SEPARATE mixer input (`head_out`) so the
-        // mixer keeps full weight on the clean frozen logit and adds the warming
-        // head only where it helps (a residual-on-frozen single input is a clean
-        // negative — it corrupts). node is the partial-byte bit-tree position.
-        let node = self.head_node(ctx);
-        let hl = dot(
-            &self.head[node * self.h..(node + 1) * self.h],
-            &self.hid,
-            0.0,
-        );
-        let combined = (frozen + hl as i32).clamp(-2047, 2047);
-        self.head_node = node;
-        self.head_p = crate::mixer::squash(combined) as f32 / 4096.0;
-        self.head_out = combined;
         frozen
     }
 
     fn update(&mut self, _ctx: &Context, bit: u8) {
-        // Frozen net itself learns nothing (recompute is driven from predict at the
-        // byte boundary). The optional warming head does online logistic SGD on its
-        // own prediction, with the frozen logit as a fixed offset.
-        if self.head_lr == 0.0 {
-            return;
-        }
-        let g = self.head_lr * (f32::from(bit) - self.head_p);
-        let row = &mut self.head[self.head_node * self.h..(self.head_node + 1) * self.h];
-        for (w, &x) in row.iter_mut().zip(&self.hid) {
-            *w = g.mul_add(x, *w);
+        // The frozen net learns nothing (recompute is driven from predict at the
+        // byte boundary). Each warming head does one online logistic SGD step.
+        let Self { heads, hid, .. } = self;
+        for head in heads.iter_mut() {
+            head.learn(hid, bit);
         }
     }
 }
