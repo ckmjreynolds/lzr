@@ -32,11 +32,13 @@ pub(crate) struct PretrainedMlp {
     // The frozen net's edge erodes as the online stack warms (it is front-loaded);
     // this head re-learns the hidden→bit mapping online, so it warms WITH the data
     // (its marginal grows at scale). `head_lr` == 0 (default) disables it.
-    head: Vec<f32>, // [256 * h] node-indexed readout weights (empty when off)
+    head: Vec<f32>, // [nodes * h] node-indexed readout weights (empty when off)
     head_lr: f32,
-    head_node: usize, // bit-tree node of the last predict (for the update)
-    head_p: f32,      // this model's own squashed P(bit==1) at the last predict
-    head_out: i32,    // the head logit (extra mixer input) cached at the last predict
+    head_ctx_bytes: usize, // prev finalized bytes hashed into the node (0 = bit-tree only)
+    head_bits: u32,        // hashed-node table size (bits); unused when head_ctx_bytes == 0
+    head_node: usize,      // node of the last predict (for the update)
+    head_p: f32,           // this model's own squashed P(bit==1) at the last predict
+    head_out: i32,         // the head logit (extra mixer input) cached at the last predict
 }
 
 /// Transpose a `[rows, cols]` row-major matrix to `[cols, rows]` row-major. Done
@@ -123,6 +125,8 @@ impl PretrainedMlp {
             hid: vec![0.0; h],
             head: Vec::new(),
             head_lr: 0.0,
+            head_ctx_bytes: 0,
+            head_bits: 0,
             head_node: 0,
             head_p: 0.0,
             head_out: 0,
@@ -176,6 +180,8 @@ impl PretrainedMlp {
             hid: vec![0.0; h],
             head: Vec::new(),
             head_lr: 0.0,
+            head_ctx_bytes: 0,
+            head_bits: 0,
             head_node: 0,
             head_p: 0.0,
             head_out: 0,
@@ -220,13 +226,36 @@ impl PretrainedMlp {
         self.recompute(&Context::with_capacity(0));
     }
 
-    /// Enable the online warming readout head with learning rate `lr`. Allocates
-    /// the node-indexed weight table (zero-init → the head contributes nothing at
-    /// step 0 and can only add signal as it learns online). Ships no weights — the
-    /// head is online, so it costs no L(D).
-    pub(crate) fn enable_head(&mut self, lr: f32) {
-        self.head = vec![0.0; 256 * self.h];
+    /// Enable the online warming readout head with learning rate `lr`. A
+    /// per-context readout: the node hashes the last `ctx_bytes` finalized bytes
+    /// (with the bit-tree position) into a `bits`-wide table, so the head learns a
+    /// distinct online readout over the frozen embedding per context — a
+    /// "neural-indirect" context model. `ctx_bytes == 0` is the plain
+    /// per-bit-tree-node head (256 nodes, direct, no hash). Zero-init → contributes
+    /// nothing at step 0, can only add signal as it learns; ships no weights (the
+    /// head is online → L(D)≈0).
+    pub(crate) fn enable_head_ctx(&mut self, lr: f32, ctx_bytes: usize, bits: u32) {
+        self.head_ctx_bytes = ctx_bytes;
+        self.head_bits = bits;
+        let nodes = if ctx_bytes == 0 { 256 } else { 1usize << bits };
+        self.head = vec![0.0; nodes * self.h];
         self.head_lr = lr;
+    }
+
+    /// The head node for the current bit: the bit-tree position alone (`ctx_bytes
+    /// == 0`), else the last `ctx_bytes` finalized bytes plus the bit-tree position
+    /// hashed into the `bits`-wide table.
+    fn head_node(&self, ctx: &Context) -> usize {
+        let c0 = u64::from(ctx.c0 & 0xff);
+        if self.head_ctx_bytes == 0 {
+            return c0 as usize;
+        }
+        let mut cv = 0u64;
+        for i in 1..=self.head_ctx_bytes {
+            cv = (cv << 8) | u64::from(ctx.byte_back(i));
+        }
+        let key = (cv << 8) | c0;
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.head_bits)) as usize
     }
 
     /// The warming head's logit for this bit (the extra mixer input), `None` when
@@ -313,7 +342,7 @@ impl Model for PretrainedMlp {
         // mixer keeps full weight on the clean frozen logit and adds the warming
         // head only where it helps (a residual-on-frozen single input is a clean
         // negative — it corrupts). node is the partial-byte bit-tree position.
-        let node = (ctx.c0 & 0xff) as usize;
+        let node = self.head_node(ctx);
         let hl = dot(
             &self.head[node * self.h..(node + 1) * self.h],
             &self.hid,

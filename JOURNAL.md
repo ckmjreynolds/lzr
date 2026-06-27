@@ -13,6 +13,20 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-26 (autonomous evening, cont.) — the warming head, specialized PER CONTEXT, is a neural-indirect context model: order-1 full-stack enwik8 −0.0126 (20 MB), 2.4× the per-bit-tree head, L(D)≈0
+
+Immediately after shipping the per-bit-tree warming head (entry below), the obvious axis was its node granularity. The head is a linear readout over the frozen 256-dim embedding `hid`, indexed by a node; the shipped node was the bit-tree position alone (256 nodes). Folding the **previous byte** into the node — a distinct online readout per (prev-byte, bit-tree) context — roughly DOUBLED the win. 10 MB enwik8 slice, marginal over the full shipped stack (baseline 1.5635), lr swept per node count:
+
+| node | nodes | best marginal (lr) |
+|---|---|---|
+| bit-tree only (ctx=0) | 256 | −0.0053 (lr 2) |
+| **order-1 (prev byte)** | 65 536 | **−0.0126 (lr 4)** |
+| order-2 (2 bytes, hashed 2²⁰) | 1 M | −0.0125 (lr 4) |
+
+So the head is best understood as a **neural-indirect context model**: for each context it learns, online, a linear readout over the frozen net's nonlinear embedding — exactly the deterministic stack's indirect models (predict from what historically followed a context) but over neural features instead of bit-history states. The dilution intuition (more nodes → fewer samples each → underwarmed) was WRONG at order-1: the per-context specialization more than pays for the sparser warming, and the lr optimum simply rises with node count (order-0 ~2, order-1 ~4, both order-2 levels ~4 with lr=8 already past peak). order-2 adds NOTHING over order-1 for 16× the RAM — either the hash collisions (16 M keys into 2²⁰) cancel it or the frozen `hid` already encodes the deeper context, so order-1 is the knee. Scaling holds: order-1 lr=4 is −0.0126 at both 10 and 20 MB (and the ctx=0→order-1 jump itself grew slightly 10→20 MB), so it does not erode like the frozen net.
+
+SHIPPED (supersedes the ctx=0 head from the entry below): `HEAD_CTX_BYTES=1`, `HEAD_BITS=16` (65 536 nodes, collision-free for order-1), `HEAD_LR=4.0`. The node hashes the last `ctx_bytes` finalized bytes with the bit-tree position; `ctx_bytes=0` keeps the direct per-bit-tree head. Costs a fixed ~64 MB table (enwik9 RSS ~8.18→~8.25 GB, well under the 10 GB cap) and the same one-node-per-bit readout (~free compute). Ships no weights → L(D) unchanged at 0.01225 (765,856-B binary, byte-identical). Round-trips byte-exact (`roundtrip_enwik8_slice`, `nmix_roundtrip`); build.sh green. `LZR_NO_HEAD` ablates; probe `diversity_lab` gains `LZR_HEADCTXB`/`LZR_HEADBITS`. This is the session's biggest lever — −0.0126 over the full stack is larger than M1's own −0.010 and 2.4× the per-bit-tree head; enwik9 not run (CDR), but the warming/holding behavior projects a likely new project best over 1.1812, pending confirmation.
+
 ## 2026-06-26 (autonomous evening) — the frozen net's ONLINE warming head: a fast per-node readout over the frozen embedding, full-stack enwik8 −0.0055 (20 MB), L(D)≈0, warms with scale
 
 CDR opened an autonomous session (no enwik9, two experiments at a time, keep/revert by outcome). The standing tension from the frozen-net work above is that the frozen net's marginal *erodes at scale* precisely because it is frozen — its edge is front-loaded and the warming online stack (mixer/M1/StateMaps) overtakes it (the 06-25 correction: enwik8-full −0.0251 → enwik9 −0.0130). Idea: recover that erosion with a component that warms WITH the data — an online linear readout over the frozen net's hidden embedding.

@@ -53,11 +53,17 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<AnyModel> {
 /// predictor from the same bytes; the blob counts as L(D).
 const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
 
-/// Learning rate for the pretrained net's online warming head. A full-stack lr
-/// sweep on enwik8 slices plateaued at ~−0.005 bpb near lr≈2 (a fast online
-/// readout exploits the frozen embedding; the separate-input design + mixer
-/// gating keep high lr stable).
-const HEAD_LR: f32 = 2.0;
+/// The pretrained net's online warming head: a per-context online linear readout
+/// over the frozen embedding (a "neural-indirect" context model). The node hashes
+/// the previous byte with the bit-tree position, so the head learns a distinct
+/// readout per order-1 context. A full-stack enwik8 sweep put the optimum at
+/// order-1 (`HEAD_CTX_BYTES=1`, 65 536 nodes) with lr≈4: −0.0126 bpb (2.4× the
+/// plain per-bit-tree head's −0.0053, and ≈ M1's own −0.010), holding at 20 MB.
+/// order-2 added nothing for 16× the RAM. Ships no weights (online → L(D)≈0); the
+/// only cost is a fixed ~64 MB table and a one-node-per-bit readout (~free).
+const HEAD_LR: f32 = 4.0;
+const HEAD_CTX_BYTES: usize = 1;
+const HEAD_BITS: u32 = 16;
 
 /// The active model set: the deterministic baseline plus the frozen pretrained
 /// net (shipped). The online-neural arm is appended only under `--features arm`
@@ -68,12 +74,12 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     // marginal / test additivity with the arm; unset (the default) keeps it shipped.
     if std::env::var("LZR_NO_NET").is_err() {
         let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
-        // The online warming head: a fast per-bit-tree-node linear readout over the
+        // The online warming head: a per-context (order-1) linear readout over the
         // frozen net's hidden embedding, contributed as a second mixer input. It
-        // warms WITH the data (its marginal grows at scale, unlike the frozen net's)
-        // and ships no weights (L(D)≈0). `LZR_NO_HEAD` drops it (offline ablation).
+        // warms WITH the data (its marginal holds/grows at scale, unlike the frozen
+        // net's) and ships no weights (L(D)≈0). `LZR_NO_HEAD` drops it (ablation).
         if std::env::var("LZR_NO_HEAD").is_err() {
-            net.enable_head(HEAD_LR);
+            net.enable_head_ctx(HEAD_LR, HEAD_CTX_BYTES, HEAD_BITS);
         }
         v.push(net.into());
     }
@@ -527,26 +533,32 @@ mod tests {
             .ok()
             .and_then(|x| x.parse().ok())
             .unwrap_or(0.0);
+        let ctx_bytes = env("LZR_HEADCTXB", 0);
+        let bits = std::env::var("LZR_HEADBITS")
+            .ok()
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(16u32);
 
         // Production shape: one net emitting two logits (frozen + warming head as a
         // separate mixer input via the codec's head slot). `head_lr == 0` is the
-        // frozen-only baseline.
-        let build = |head_lr: f32| -> Vec<AnyModel> {
+        // frozen-only baseline. `ctx_bytes`/`bits` make the head a per-context
+        // readout (hashed last-`ctx_bytes`-bytes node).
+        let build = |head_lr: f32, ctx_bytes: usize, bits: u32| -> Vec<AnyModel> {
             let mut v = baseline_models(cap);
             let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
             if head_lr > 0.0 {
-                net.enable_head(head_lr);
+                net.enable_head_ctx(head_lr, ctx_bytes, bits);
             }
             v.push(net.into());
             v
         };
         let bpb = |m: Vec<AnyModel>| code_stream_models(m, &data).len() as f64 * 8.0 / orig;
 
-        let base = bpb(build(0.0));
+        let base = bpb(build(0.0, 0, 0));
         println!("baseline (shipped stack):         {base:.4} bpb");
-        let v = bpb(build(head_lr));
+        let v = bpb(build(head_lr, ctx_bytes, bits));
         println!(
-            "+ head_lr={head_lr}:   {v:.4} bpb  marginal {:+.4}",
+            "+ head_lr={head_lr} ctx_bytes={ctx_bytes} bits={bits}:   {v:.4} bpb  marginal {:+.4}",
             v - base
         );
     }
