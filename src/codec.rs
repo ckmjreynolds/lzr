@@ -75,6 +75,12 @@ const HEAD_BITS: u32 = 16;
 /// (a 5th distinct context added only −0.0004 to −0.0006); slow copies of the
 /// other contexts overlap each other and add little more.
 const HEAD_SLOW_LR: f32 = 0.5;
+/// Learning rate for the match-derived heads (primary/secondary match, match×prev).
+/// They fire only when a match is active — a sparser, more stationary distribution
+/// than the byte-context heads — so a slower rate wins: a full-stack 10 MB sweep
+/// put the match heads' optimum on a broad lr 1–2 plateau (−0.0242 vs −0.0234 at
+/// lr 4), and the secondary-match head likewise gained −0.0007 moving 4→2.
+const HEAD_MATCH_LR: f32 = 2.0;
 
 /// The active model set: the deterministic baseline plus the frozen pretrained
 /// net (shipped). The online-neural arm is appended only under `--features arm`
@@ -85,19 +91,24 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     // marginal / test additivity with the arm; unset (the default) keeps it shipped.
     if std::env::var("LZR_NO_NET").is_err() {
         let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
-        // The warming-head stack: order-1 (prev-byte), word-context, order-2 (prev
-        // 2 bytes), a sparse byte_back(2,3) skip readout, the dual-rate slow order-1,
-        // and a match-state head (the primary match's length bucket + predicted byte
-        // — long-range LZP context the frozen net's K-byte window lacks) — each a
-        // separate mixer input that warms with the data. Ships no weights (L(D)≈0).
-        // `LZR_NO_HEAD` drops them.
+        // The warming-head stack — each a separate mixer input that warms with the
+        // data (ships no weights, L(D)≈0). Two axes: byte-context heads (order-1,
+        // word, order-2, sparse byte_back(2,3), and a dual-rate slow order-1), and a
+        // MATCH cluster (primary match state, the secondary/key-4 match, and the
+        // primary match's predicted byte × the previous byte) — long-range LZP
+        // context the frozen net's K-byte window lacks. The match cluster stacks:
+        // each is decorrelated (different match model / different keying), full-stack
+        // 20 MB marginals over the byte-context heads −0.0025 (m2) and −0.0014 (mc).
+        // `LZR_NO_HEAD` drops the stack.
         if std::env::var("LZR_NO_HEAD").is_err() {
             net.push_head_ctx(HEAD_LR, 1, HEAD_BITS);
             net.push_head_word(HEAD_LR, HEAD_BITS);
             net.push_head_ctx(HEAD_LR, 2, HEAD_BITS);
             net.push_head_sparse(HEAD_LR, 0b110, HEAD_BITS);
             net.push_head_ctx(HEAD_SLOW_LR, 1, HEAD_BITS); // dual-rate: slow order-1
-            net.push_head_match(HEAD_LR, HEAD_BITS); // long-range LZP match state
+            net.push_head_match(HEAD_MATCH_LR, HEAD_BITS); // primary (key=8) match state
+            net.push_head_match2(HEAD_MATCH_LR, HEAD_BITS); // secondary (key=4) match
+            net.push_head_match_prev(HEAD_MATCH_LR, HEAD_BITS); // match pred × prev byte
         }
         v.push(net.into());
     }
@@ -211,15 +222,18 @@ impl CodecState {
         if self.ctx.bpos == 0 {
             let c4 = self.ctx.c4;
             let match_sel = self.models.iter().find_map(AnyModel::selector).unwrap_or(0);
-            // Deposit the primary match model's (length bucket, predicted byte) so
-            // the frozen net's warming heads can condition on the long-range match.
-            let (mlen, mpb) = self
-                .models
-                .iter()
-                .find_map(|m| m.match_key(&self.ctx))
-                .unwrap_or((0, 0));
-            self.ctx.match_len = mlen;
-            self.ctx.match_pb = mpb;
+            // Deposit the match models' (length bucket, predicted byte) so the
+            // frozen net's warming heads can condition on the long-range match. The
+            // first (primary, key=8) feeds `match_*`; the second (key=4, faster
+            // acquisition) feeds `match_*2` for experimental decorrelated heads.
+            let ((l1, p1), (l2, p2)) = {
+                let mut mk = self.models.iter().filter_map(|m| m.match_key(&self.ctx));
+                (mk.next().unwrap_or((0, 0)), mk.next().unwrap_or((0, 0)))
+            };
+            self.ctx.match_len = l1;
+            self.ctx.match_pb = p1;
+            self.ctx.match_len2 = l2;
+            self.ctx.match_pb2 = p2;
             self.msel = [
                 (c4 & 0xff) as usize,                   // c1
                 ((c4 >> 8) & 0xff) as usize,            // c2
@@ -610,6 +624,18 @@ mod tests {
                     net.push_head_word(hlr, bits);
                 } else if ctx == "m" {
                     net.push_head_match(hlr, bits);
+                } else if ctx == "m2" {
+                    net.push_head_exp(hlr, 1, bits);
+                } else if ctx == "col" {
+                    net.push_head_exp(hlr, 2, bits);
+                } else if ctx == "num" {
+                    net.push_head_exp(hlr, 3, bits);
+                } else if ctx == "mc" {
+                    net.push_head_exp(hlr, 4, bits);
+                } else if ctx == "mm" {
+                    net.push_head_exp(hlr, 5, bits);
+                } else if ctx == "m2c" {
+                    net.push_head_exp(hlr, 6, bits);
                 } else if let Some(m) = ctx.strip_prefix('s') {
                     net.push_head_sparse(hlr, m.parse().unwrap(), bits);
                 } else {

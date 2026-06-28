@@ -48,6 +48,10 @@ pub(crate) struct Context {
     /// predicts. Carries long-range (LZP) information the net's K-byte window lacks.
     pub(crate) match_len: u32,
     pub(crate) match_pb: u8,
+    /// Secondary (shorter-key) match model's state — for experimental heads that
+    /// key on the faster-acquiring match, decorrelated from the primary.
+    pub(crate) match_len2: u32,
+    pub(crate) match_pb2: u8,
 }
 
 /// Mixing multiplier for folding a letter into the rolling word hash.
@@ -68,6 +72,8 @@ impl Context {
             col: 0,
             match_len: 0,
             match_pb: 0,
+            match_len2: 0,
+            match_pb2: 0,
         }
     }
 

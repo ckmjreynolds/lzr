@@ -89,6 +89,7 @@ struct Head {
     ctx_bytes: usize, // prev finalized bytes in the node (0 = bit-tree only), unless `word`/`mask`
     word: bool,       // node hashes the word hash instead of prev bytes
     match_st: bool,   // node hashes the match (length bucket, predicted byte) state
+    exp: u8,          // experimental head kind (0=none): 1=match2, 2=col, 3=num, 4=match×prev
     mask: u32,        // if nonzero, node hashes the sparse byte set (bit i → byte_back(i+1))
     bits: u32,        // hashed-node table size (bits); unused when ctx_bytes == 0 && !word
     node: usize,      // node of the last eval (for the learn step)
@@ -108,10 +109,11 @@ impl Head {
         ctx_bytes: usize,
         word: bool,
         match_st: bool,
+        exp: u8,
         mask: u32,
         bits: u32,
     ) -> Self {
-        let nodes = if !word && !match_st && mask == 0 && ctx_bytes == 0 {
+        let nodes = if exp == 0 && !word && !match_st && mask == 0 && ctx_bytes == 0 {
             256
         } else {
             1usize << bits
@@ -123,6 +125,7 @@ impl Head {
             ctx_bytes,
             word,
             match_st,
+            exp,
             mask,
             bits,
             node: 0,
@@ -133,6 +136,17 @@ impl Head {
 
     fn node(&self, ctx: &Context) -> usize {
         let c0 = u64::from(ctx.c0 & 0xff);
+        if self.exp != 0 {
+            let key = match self.exp {
+                1 => (u64::from(ctx.match_len2) << 16) | (u64::from(ctx.match_pb2) << 8) | c0,
+                2 => (u64::from(ctx.col) << 8) | c0,
+                3 => (u64::from(ctx.num_field) << 16) | (u64::from(ctx.num_pos) << 8) | c0,
+                4 => (u64::from(ctx.match_pb) << 16) | (u64::from(ctx.byte_back(1)) << 8) | c0,
+                5 => (u64::from(ctx.match_pb) << 16) | (u64::from(ctx.match_pb2) << 8) | c0,
+                _ => (u64::from(ctx.match_pb2) << 16) | (u64::from(ctx.byte_back(1)) << 8) | c0,
+            };
+            return (key.wrapping_mul(HEAD_HASH) >> (64 - self.bits)) as usize;
+        }
         if self.match_st {
             let key = (u64::from(ctx.match_len) << 16) | (u64::from(ctx.match_pb) << 8) | c0;
             return (key.wrapping_mul(HEAD_HASH) >> (64 - self.bits)) as usize;
@@ -326,14 +340,14 @@ impl PretrainedMlp {
     /// `ctx_bytes == 0` is the plain per-bit-tree-node head (256 nodes, direct).
     pub(crate) fn push_head_ctx(&mut self, lr: f32, ctx_bytes: usize, bits: u32) {
         self.heads
-            .push(Head::new(self.h, lr, ctx_bytes, false, false, 0, bits));
+            .push(Head::new(self.h, lr, ctx_bytes, false, false, 0, 0, bits));
     }
 
     /// Add a word-context warming head: the node hashes the current word hash with
     /// the bit-tree position (a decorrelation axis distinct from the byte context).
     pub(crate) fn push_head_word(&mut self, lr: f32, bits: u32) {
         self.heads
-            .push(Head::new(self.h, lr, 0, true, false, 0, bits));
+            .push(Head::new(self.h, lr, 0, true, false, 0, 0, bits));
     }
 
     /// Add a sparse-context warming head: the node hashes the byte set selected by
@@ -341,7 +355,7 @@ impl PretrainedMlp {
     /// contiguous orders.
     pub(crate) fn push_head_sparse(&mut self, lr: f32, mask: u32, bits: u32) {
         self.heads
-            .push(Head::new(self.h, lr, 0, false, false, mask, bits));
+            .push(Head::new(self.h, lr, 0, false, false, 0, mask, bits));
     }
 
     /// Add a match-state warming head: the node hashes the primary match model's
@@ -350,7 +364,30 @@ impl PretrainedMlp {
     /// conditioned on what the match predicts.
     pub(crate) fn push_head_match(&mut self, lr: f32, bits: u32) {
         self.heads
-            .push(Head::new(self.h, lr, 0, false, true, 0, bits));
+            .push(Head::new(self.h, lr, 0, false, true, 0, 0, bits));
+    }
+
+    /// Warming head keyed on `exp`: 1=secondary (key-4) match state, 2=column,
+    /// 3=digit-field, 4=match-pred×prev-byte, 5=joint primary×secondary match pred,
+    /// 6=secondary-match-pred×prev. Kinds 1 and 4 ship (via `push_head_match2` /
+    /// `push_head_match_prev`); the rest are reachable only from `diversity_lab`.
+    pub(crate) fn push_head_exp(&mut self, lr: f32, exp: u8, bits: u32) {
+        self.heads
+            .push(Head::new(self.h, lr, 0, false, false, exp, 0, bits));
+    }
+
+    /// Add a secondary-match warming head: keyed on the shorter-key (key=4) match
+    /// model's state, which acquires faster than the primary — a decorrelated
+    /// long-range signal that stacks on the primary match head.
+    pub(crate) fn push_head_match2(&mut self, lr: f32, bits: u32) {
+        self.push_head_exp(lr, 1, bits);
+    }
+
+    /// Add a match×prev-byte warming head: keyed on the primary match's predicted
+    /// byte and the previous byte — the match prediction conditioned on local
+    /// context, decorrelated from the plain match-state head.
+    pub(crate) fn push_head_match_prev(&mut self, lr: f32, bits: u32) {
+        self.push_head_exp(lr, 4, bits);
     }
 
     /// Number of warming heads (each contributes one extra mixer input).
