@@ -148,6 +148,20 @@ impl Model for MatchModel {
     }
 }
 
+impl MatchModel {
+    /// `(match-length bucket, predicted byte)` for warming heads to key on:
+    /// `(0, 0)` when there is no active match, else the capped length and the byte
+    /// the match predicts (`history[ptr]`). Byte-constant within a symbol.
+    pub(crate) fn match_key(&self, ctx: &Context) -> (u32, u8) {
+        let hist = ctx.history();
+        if self.len == 0 || self.ptr >= hist.len() {
+            (0, 0)
+        } else {
+            (self.len.min(LEN_CAP), hist[self.ptr])
+        }
+    }
+}
+
 impl Drop for MatchModel {
     #[allow(clippy::cast_precision_loss)]
     fn drop(&mut self) {

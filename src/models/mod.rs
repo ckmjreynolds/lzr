@@ -42,6 +42,12 @@ pub(crate) struct Context {
     pub(crate) word_pos: u8,
     /// Bytes since the last newline (column) — a line-position regime selector.
     pub(crate) col: u16,
+    /// Primary match model's state, deposited by the codec once per byte (bpos==0)
+    /// so the frozen net's warming heads can key on it: `match_len` = current
+    /// match-length bucket (0 = no active match), `match_pb` = the byte the match
+    /// predicts. Carries long-range (LZP) information the net's K-byte window lacks.
+    pub(crate) match_len: u32,
+    pub(crate) match_pb: u8,
 }
 
 /// Mixing multiplier for folding a letter into the rolling word hash.
@@ -60,6 +66,8 @@ impl Context {
             num_field: 0,
             word_pos: 0,
             col: 0,
+            match_len: 0,
+            match_pb: 0,
         }
     }
 
@@ -232,6 +240,16 @@ impl AnyModel {
         match self {
             Self::Pretrained(m) => m.head_out(i),
             _ => 0,
+        }
+    }
+
+    /// This model's current `(match-length bucket, predicted byte)`, or `None` if
+    /// it is not a match model. The codec deposits the first match model's key into
+    /// the [`Context`] so warming heads can condition on it.
+    pub(crate) fn match_key(&self, ctx: &Context) -> Option<(u32, u8)> {
+        match self {
+            Self::Match(m) => Some(m.match_key(ctx)),
+            _ => None,
         }
     }
 }

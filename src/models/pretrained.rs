@@ -88,6 +88,7 @@ struct Head {
     lr: f32,
     ctx_bytes: usize, // prev finalized bytes in the node (0 = bit-tree only), unless `word`/`mask`
     word: bool,       // node hashes the word hash instead of prev bytes
+    match_st: bool,   // node hashes the match (length bucket, predicted byte) state
     mask: u32,        // if nonzero, node hashes the sparse byte set (bit i → byte_back(i+1))
     bits: u32,        // hashed-node table size (bits); unused when ctx_bytes == 0 && !word
     node: usize,      // node of the last eval (for the learn step)
@@ -101,8 +102,16 @@ struct Head {
     clippy::cast_sign_loss
 )]
 impl Head {
-    fn new(h: usize, lr: f32, ctx_bytes: usize, word: bool, mask: u32, bits: u32) -> Self {
-        let nodes = if !word && mask == 0 && ctx_bytes == 0 {
+    fn new(
+        h: usize,
+        lr: f32,
+        ctx_bytes: usize,
+        word: bool,
+        match_st: bool,
+        mask: u32,
+        bits: u32,
+    ) -> Self {
+        let nodes = if !word && !match_st && mask == 0 && ctx_bytes == 0 {
             256
         } else {
             1usize << bits
@@ -113,6 +122,7 @@ impl Head {
             lr,
             ctx_bytes,
             word,
+            match_st,
             mask,
             bits,
             node: 0,
@@ -123,6 +133,10 @@ impl Head {
 
     fn node(&self, ctx: &Context) -> usize {
         let c0 = u64::from(ctx.c0 & 0xff);
+        if self.match_st {
+            let key = (u64::from(ctx.match_len) << 16) | (u64::from(ctx.match_pb) << 8) | c0;
+            return (key.wrapping_mul(HEAD_HASH) >> (64 - self.bits)) as usize;
+        }
         if self.word {
             let key = (ctx.word_hash << 8) | c0;
             return (key.wrapping_mul(HEAD_HASH) >> (64 - self.bits)) as usize;
@@ -312,20 +326,31 @@ impl PretrainedMlp {
     /// `ctx_bytes == 0` is the plain per-bit-tree-node head (256 nodes, direct).
     pub(crate) fn push_head_ctx(&mut self, lr: f32, ctx_bytes: usize, bits: u32) {
         self.heads
-            .push(Head::new(self.h, lr, ctx_bytes, false, 0, bits));
+            .push(Head::new(self.h, lr, ctx_bytes, false, false, 0, bits));
     }
 
     /// Add a word-context warming head: the node hashes the current word hash with
     /// the bit-tree position (a decorrelation axis distinct from the byte context).
     pub(crate) fn push_head_word(&mut self, lr: f32, bits: u32) {
-        self.heads.push(Head::new(self.h, lr, 0, true, 0, bits));
+        self.heads
+            .push(Head::new(self.h, lr, 0, true, false, 0, bits));
     }
 
     /// Add a sparse-context warming head: the node hashes the byte set selected by
     /// `mask` (bit i → `byte_back(i+1)`) — a skip/gap context decorrelated from the
     /// contiguous orders.
     pub(crate) fn push_head_sparse(&mut self, lr: f32, mask: u32, bits: u32) {
-        self.heads.push(Head::new(self.h, lr, 0, false, mask, bits));
+        self.heads
+            .push(Head::new(self.h, lr, 0, false, false, mask, bits));
+    }
+
+    /// Add a match-state warming head: the node hashes the primary match model's
+    /// (length bucket, predicted byte) — long-range (LZP) context the frozen net's
+    /// K-byte window cannot see, letting the head learn a frozen-embedding readout
+    /// conditioned on what the match predicts.
+    pub(crate) fn push_head_match(&mut self, lr: f32, bits: u32) {
+        self.heads
+            .push(Head::new(self.h, lr, 0, false, true, 0, bits));
     }
 
     /// Number of warming heads (each contributes one extra mixer input).

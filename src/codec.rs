@@ -86,15 +86,18 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     if std::env::var("LZR_NO_NET").is_err() {
         let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
         // The warming-head stack: order-1 (prev-byte), word-context, order-2 (prev
-        // 2 bytes), and a sparse byte_back(2,3) skip readout over the frozen
-        // embedding — each a separate mixer input that warms with the data. Ships no
-        // weights (L(D)≈0). `LZR_NO_HEAD` drops them.
+        // 2 bytes), a sparse byte_back(2,3) skip readout, the dual-rate slow order-1,
+        // and a match-state head (the primary match's length bucket + predicted byte
+        // — long-range LZP context the frozen net's K-byte window lacks) — each a
+        // separate mixer input that warms with the data. Ships no weights (L(D)≈0).
+        // `LZR_NO_HEAD` drops them.
         if std::env::var("LZR_NO_HEAD").is_err() {
             net.push_head_ctx(HEAD_LR, 1, HEAD_BITS);
             net.push_head_word(HEAD_LR, HEAD_BITS);
             net.push_head_ctx(HEAD_LR, 2, HEAD_BITS);
             net.push_head_sparse(HEAD_LR, 0b110, HEAD_BITS);
             net.push_head_ctx(HEAD_SLOW_LR, 1, HEAD_BITS); // dual-rate: slow order-1
+            net.push_head_match(HEAD_LR, HEAD_BITS); // long-range LZP match state
         }
         v.push(net.into());
     }
@@ -208,6 +211,15 @@ impl CodecState {
         if self.ctx.bpos == 0 {
             let c4 = self.ctx.c4;
             let match_sel = self.models.iter().find_map(AnyModel::selector).unwrap_or(0);
+            // Deposit the primary match model's (length bucket, predicted byte) so
+            // the frozen net's warming heads can condition on the long-range match.
+            let (mlen, mpb) = self
+                .models
+                .iter()
+                .find_map(|m| m.match_key(&self.ctx))
+                .unwrap_or((0, 0));
+            self.ctx.match_len = mlen;
+            self.ctx.match_pb = mpb;
             self.msel = [
                 (c4 & 0xff) as usize,                   // c1
                 ((c4 >> 8) & 0xff) as usize,            // c2
@@ -551,7 +563,8 @@ mod tests {
     /// each a separate mixer input, measured over the full shipped stack (M1 + APM
     /// on) on the `[LZR_LO..LZR_HI]` slice (default 10 MB). `LZR_HEADS` is a
     /// comma-separated spec; each token is a context: `N` = byte-order N (`0` =
-    /// bit-tree only), `w` = word, `sM` = sparse mask `M` (bit i → `byte_back(i+1)`).
+    /// bit-tree only), `w` = word, `sM` = sparse mask `M` (bit i → `byte_back(i+1)`),
+    /// `m` = match state (length bucket, predicted byte — long-range LZP context).
     /// `LZR_HEAD` is the shared lr (default 4), `LZR_HEADBITS` the table size
     /// (default 16). Empty/unset spec = head-free baseline. Run:
     /// `LZR_HEADS=1,w,2 cargo test --release diversity_lab -- --ignored --nocapture`
@@ -595,6 +608,8 @@ mod tests {
                 };
                 if ctx == "w" {
                     net.push_head_word(hlr, bits);
+                } else if ctx == "m" {
+                    net.push_head_match(hlr, bits);
                 } else if let Some(m) = ctx.strip_prefix('s') {
                     net.push_head_sparse(hlr, m.parse().unwrap(), bits);
                 } else {
