@@ -13,6 +13,26 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-06-27 → 2026-06-28 — the match-state head opens a match-diversity axis: an 8-head warming stack, full-stack 20 MB enwik8 −0.0293 (slice; full-enwik8 confirmation running)
+
+A short feature session (CDR scoping, Claude implementing) followed by an autonomous overnight run (CDR's standing autonomous protocol: enwik8/slices only, no enwik9, two experiments at a time, keep/discard by outcome, hourly status) found that the warming-head idea — declared "heavily mined, context axis saturated" in the 06-27 entries below — was saturated only along the *byte-context* axis. A head keyed on the **match model's state** is a different mechanism, and it reopened the frontier.
+
+The match-state head. A warming readout (the same per-context linear readout over the frozen net's 256-dim `hid` as the existing heads) keyed on the primary (key=8) match model's `(length bucket, predicted byte)`. The decorrelation argument is structural: the frozen `hid` encodes only the last K=32 bytes, while the match's predicted byte comes from an LZP pointer that can be millions of bytes back — long-range information categorically absent from `hid`, and the linear mixer cannot form the interaction "read the frozen embedding differently depending on what the match predicts" (the head can). Plumbing: the codec deposits the match model's `(len, pb)` into the shared `Context` once per byte (mirroring the existing match-length mixer selector), so a head's `node()` can hash it. Full-stack 10 MB slice (diversity_lab, M1 + APM on), over the saturated 5-head stack (−0.0218): the match head adds −0.0016, and it **scales** — 20 MB increment −0.0021 (vs 10 MB −0.0016), the warming signature, where every new *context* head had saturated to −0.0004/−0.0006. Shipped as the 6th head (commit 321a793), L(D)≈0 (online, no weights; binary 782,384 B / L(D) 0.01252 unchanged).
+
+The cluster. The overnight session then mined the axis and found it is a rich vein — several decorrelated match-derived heads stack:
+
+| head added (10 MB, over prior) | increment | mechanism |
+|---|---|---|
+| match-head lr 4 → **2** | −0.0007 | match heads fire only on the sparser, more stationary "active-match" distribution → slower rate wins (broad lr 1–2 plateau) |
+| + **secondary (key=4) match** (`m2`@lr2) | −0.0025 | the shorter-key match acquires faster → decorrelated from the primary (key=8) |
+| + **match-pred × prev-byte** (`mc`@lr2) | −0.0014 | the match prediction conditioned on local context |
+
+Assembled 8-head stack {order-1, word, order-2, sparse(2,3), slow order-1, match, match2, match×prev}: 10 MB −0.0280, **20 MB −0.0293** — it GREW with scale (warming), and the 20 MB figure is **+−0.0051 over the committed 6-head** (−0.0242 @ 20 MB). The match-derived heads each wanted the slower lr=2 (the secondary-match head gained another −0.0007 moving 4→2), confirming the "active-match distribution is more stationary" read. Shipped (commit ba1e5c3): a `HEAD_MATCH_LR=2.0` const and `push_head_match2`/`push_head_match_prev` constructors; `Context` now carries both match models' `(len, pb)`. 8 heads × 64 MB = 512 MB (enwik9 RSS ~8.6 GB, under cap); L(D) 0.01252 unchanged; byte-exact round-trip (build.sh green incl. arm + coverage).
+
+Negatives (discarded, all L(D)/RAM-disciplined): a **dual-rate slow match** head (−0.0008, a 7th 64 MB table for too little); **structural** column (−0.0003) and digit-field (−0.0006) warming heads (matching the journal's standing column-context model negative — prose, not structure, is the wall); and second-order match combos — joint primary×secondary prediction (`mm`) and secondary×prev (`m2c`), each only −0.0007 and mutually overlapping, poor ROI on RAM. An NMIX (M1) width sweep for the grown input set (5 → 8 head inputs) found 96 → 160 worth only −0.0004 (96 → 128 −0.0001); kept width 96.
+
+Methodological caveat, owed: every number above is a 10/20 MB slice. Per the standing lesson (slices mis-rank; the trustworthy gate is full-enwik8 — it caught the K=32 knee the slice missed), a **full-enwik8 confirmation of the production 8-head binary is running** at the time of writing; its result will be recorded as a follow-up. The 20 MB → growing trend predicts the full-enwik8 marginal holds or grows (warming heads do not erode like frozen contributors), projecting full enwik8 around 1.408 (vs the 5-head 1.4154) and a likely new enwik9 net best in the ~1.15 band, but enwik9 is held pending CDR approval and the full-enwik8 number lands first.
+
 ## 2026-06-27 — enwik9 CONFIRMED: the warming-head stack ships net 1.1573 (L(C) 1.1448), a −0.0239 new project best; the heads HOLD their marginal at 10× scale
 
 The full enwik9 encode of the shipped codec (deterministic 22-model stack + M1 at NMIX_H=96 + frozen K=32 net + the 5-head dual-rate warming stack; no arm) finished: 1,000,000,000 → 143,098,713 B = **L(C) 1.1448 bpb** in 36,432 s (**10.12 h**, 0.03 MB/s single-core, encode-only per CDR). With the release binary's L(D) 0.01252 (782,368 B × 16/1e9), **net = 1.1573** — a **−0.0239 over the standing best 1.1812** (det+M1+K32-net, L(C) 1.1690 + L(D) 0.01225) and −0.0387 over det+M1 (net 1.1960). New project best by a wide margin.
