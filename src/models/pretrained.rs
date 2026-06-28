@@ -100,7 +100,8 @@ struct Head {
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments
 )]
 impl Head {
     fn new(
