@@ -173,6 +173,13 @@ struct Lstm {
     dx: Vec<f32>,
     dh_prev: Vec<f32>,
     x: Vec<f32>, // augmented input embedding (emb[tok] + emb_match[mpred])
+    // Error-threshold update-skipping (fx2-cmix-style): when > 0, a BPTT window
+    // whose mean predicted prob of its coded tokens exceeds this is "easy" and its
+    // backward+Adam is skipped — cutting the dominant per-byte cost over predictable
+    // spans so the time budget buys more width. 0 = always update (shipped default).
+    skip_tau: f32,
+    windows_total: u64,
+    windows_skipped: u64,
 }
 
 impl Lstm {
@@ -209,6 +216,9 @@ impl Lstm {
             dx: vec![0.0; e],
             dh_prev: vec![0.0; h],
             x: vec![0.0; e],
+            skip_tau: 0.0,
+            windows_total: 0,
+            windows_skipped: 0,
         }
     }
 
@@ -311,8 +321,7 @@ impl Lstm {
         self.win.tgt[s] = target;
         self.win.len += 1;
         if self.win.len >= w_win {
-            self.backward();
-            self.adam_step(lr);
+            self.learn_window(lr);
         }
     }
 
@@ -341,10 +350,35 @@ impl Lstm {
     /// accumulated, then reset the window — called at a match boundary so a BPTT
     /// segment never spans a gated (skipped) gap.
     fn flush(&mut self, lr: f32) {
-        if self.win.len > 0 {
-            self.backward();
-            self.adam_step(lr);
+        self.learn_window(lr);
+    }
+
+    /// BPTT + Adam over the accumulated window — UNLESS error-threshold skipping is
+    /// on (`skip_tau > 0`) and this window was easy (mean predicted prob of its
+    /// coded tokens > `skip_tau`), in which case the update is skipped (saving the
+    /// dominant backward cost over predictable spans). The skip decision reads only
+    /// cached predictions and the coded targets — identical on encode and decode —
+    /// so the round-trip stays byte-exact. Always resets the window.
+    fn learn_window(&mut self, lr: f32) {
+        if self.win.len == 0 {
+            return;
         }
+        self.windows_total += 1;
+        if self.skip_tau > 0.0 {
+            let mut sp = 0.0f32;
+            for s in 0..self.win.len {
+                sp += self.win.p[s * self.v + self.win.tgt[s]];
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let mean = sp / self.win.len as f32;
+            if mean > self.skip_tau {
+                self.windows_skipped += 1;
+                self.win.len = 0;
+                return;
+            }
+        }
+        self.backward();
+        self.adam_step(lr);
     }
 
     /// Truncated BPTT over the window → gradient accumulation (no update).
@@ -514,6 +548,15 @@ impl ArmModel {
         Self::new(h)
     }
 
+    /// The arm at width `h` with error-threshold update-skipping at `tau` (0 = off).
+    /// Offline lab constructor; production uses [`Self::arm`] (env / shipped default).
+    #[cfg(test)]
+    pub(crate) fn with_skip(h: usize, tau: f32) -> Self {
+        let mut m = Self::new(h);
+        m.lstm.skip_tau = tau;
+        m
+    }
+
     pub(crate) fn new(h: usize) -> Self {
         let w_win = std::env::var("LZR_WIN")
             .ok()
@@ -524,6 +567,10 @@ impl ArmModel {
             .and_then(|v| v.parse().ok())
             .unwrap_or(Self::E);
         let mut lstm = Lstm::new(e, h, Self::V, w_win);
+        lstm.skip_tau = std::env::var("LZR_ARMSKIP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
         lstm.predict_dist(0, Self::NO_MATCH); // BOS → distribution for the first byte
         let mut m = Self {
             lstm,
@@ -649,6 +696,21 @@ impl Model for ArmModel {
             }
             self.bitbuf = 0;
             self.nbits = 0;
+        }
+    }
+}
+
+impl Drop for ArmModel {
+    #[allow(clippy::cast_precision_loss)]
+    fn drop(&mut self) {
+        if self.lstm.skip_tau > 0.0 && self.lstm.windows_total > 0 {
+            eprintln!(
+                "arm skip τ={:.2}: skipped {}/{} BPTT windows ({:.1}%)",
+                self.lstm.skip_tau,
+                self.lstm.windows_skipped,
+                self.lstm.windows_total,
+                100.0 * self.lstm.windows_skipped as f64 / self.lstm.windows_total as f64,
+            );
         }
     }
 }

@@ -1198,6 +1198,131 @@ mod tests {
         }
     }
 
+    /// Idea 3 probe: deterministic-stack bpb of a raw byte file (`LZR_FILE`), for
+    /// comparing original vs similarity-reordered article order. Same articles, same
+    /// bytes → the bpb delta is the reorder's compression gain. The article
+    /// permutation itself ships free (enwik order is page-id-monotonic, restored by
+    /// sorting decoded articles on their `<id>`). Deterministic stack only (the
+    /// reorder gain is match/context locality, the dominant mechanism — fast). Run:
+    /// `LZR_FILE=/path cargo test --release reorder_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "idea 3: deterministic bpb of a (re)ordered raw article file"]
+    fn reorder_lab() {
+        let Ok(path) = std::env::var("LZR_FILE") else {
+            return;
+        };
+        let Ok(raw) = std::fs::read(&path) else {
+            return;
+        };
+        let data = Pipeline::default_pipeline().forward(&raw);
+        // LZR_FULLSTACK adds the frozen net + 8 warming heads (mirrors models()
+        // minus the arm) — to check whether reordering, which the K=32 net was not
+        // trained on, hurts the frozen net (it should not: reorder permutes whole
+        // articles, leaving within-article 32-byte windows byte-identical).
+        let mut models = baseline_models(data.len());
+        let full = std::env::var("LZR_FULLSTACK").is_ok();
+        if full {
+            let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
+            net.push_head_ctx(HEAD_LR, 1, HEAD_BITS);
+            net.push_head_word(HEAD_LR, HEAD_BITS);
+            net.push_head_ctx(HEAD_LR, 2, HEAD_BITS);
+            net.push_head_sparse(HEAD_LR, 0b110, HEAD_BITS);
+            net.push_head_ctx(HEAD_SLOW_LR, 1, HEAD_BITS);
+            net.push_head_match(HEAD_MATCH_LR, HEAD_BITS);
+            net.push_head_match2(HEAD_MATCH_LR, HEAD_BITS);
+            net.push_head_match_prev(HEAD_MATCH_LR, HEAD_BITS);
+            models.push(net.into());
+        }
+        let coded = code_stream_models(models, &data).len();
+        #[allow(clippy::cast_precision_loss)]
+        let bpb = coded as f64 * 8.0 / raw.len() as f64;
+        let tag = if full {
+            "full-stack net+heads"
+        } else {
+            "deterministic"
+        };
+        println!(
+            "{path}: {} raw -> {} folded -> {coded} coded = {bpb:.4} bpb ({tag})",
+            raw.len(),
+            data.len(),
+        );
+    }
+
+    /// Idea 3 end-to-end: reorder an enwik8 window with the Rust [`Reorder`] stage
+    /// (greedy TF-IDF similarity), assert it round-trips, and report deterministic
+    /// bpb original vs reordered plus the ordering wall-time (projects enwik9
+    /// feasibility — the ordering runs once at encode). `LZR_LO`/`LZR_HI` slice. Run:
+    /// `cargo test --release reorder_e2e -- --ignored --nocapture`
+    #[test]
+    #[ignore = "idea 3: Rust reorder gain + round-trip + ordering time on an enwik8 window"]
+    fn reorder_e2e() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::reorder::Reorder;
+        use std::time::Instant;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 11_000_000).min(e8.len());
+        let raw = &e8[lo..hi];
+        let t = Instant::now();
+        let reordered = Reorder.forward(raw);
+        let order_s = t.elapsed().as_secs_f64();
+        assert_eq!(Reorder.inverse(&reordered), raw, "reorder must round-trip");
+        // LZR_NOENC: time the ordering + prove round-trip at scale, skip the encode.
+        if std::env::var("LZR_NOENC").is_ok() {
+            println!(
+                "[{lo}..{hi}] {:.0} MB | round-trip OK | ordering {order_s:.1}s",
+                (hi - lo) as f64 / 1e6,
+            );
+            return;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let bpb = |bytes: &[u8]| {
+            let d = Pipeline::default_pipeline().forward(bytes);
+            code_stream_models(baseline_models(d.len()), &d).len() as f64 * 8.0 / raw.len() as f64
+        };
+        let bo = bpb(raw);
+        let br = bpb(&reordered);
+        println!(
+            "[{lo}..{hi}] {:.0} MB | orig {bo:.4}  reorder {br:.4}  marginal {:+.4} | \
+             ordering {order_s:.1}s",
+            (hi - lo) as f64 / 1e6,
+            br - bo,
+        );
+    }
+
+    /// Tool: write `LZR_OUT` = `Reorder.forward(read(LZR_IN))` (idea 3) — a reordered
+    /// enwik file to encode with the shipped binary. Asserts round-trip before
+    /// writing. Run:
+    /// `LZR_IN=assets/enwik9 LZR_OUT=/tmp/enwik9.reordered cargo test --release reorder_to_file -- --ignored --nocapture`
+    #[test]
+    #[ignore = "tool: reorder an enwik file (LZR_IN -> LZR_OUT)"]
+    fn reorder_to_file() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::reorder::Reorder;
+        let (Ok(inp), Ok(outp)) = (std::env::var("LZR_IN"), std::env::var("LZR_OUT")) else {
+            println!("set LZR_IN and LZR_OUT");
+            return;
+        };
+        let raw = std::fs::read(&inp).unwrap();
+        let t = std::time::Instant::now();
+        let re = Reorder.forward(&raw);
+        let order_s = t.elapsed().as_secs_f64();
+        assert_eq!(Reorder.inverse(&re), raw, "round-trip before writing");
+        std::fs::write(&outp, &re).unwrap();
+        println!(
+            "reordered {inp} -> {outp} ({} bytes) | ordering+roundtrip {order_s:.1}s",
+            re.len(),
+        );
+    }
+
     /// Composition check: does the opt-in LSTM arm (a recurrent *model*) still add
     /// on top of the residual neural *mixer* (M1), or do they overlap? Encodes one
     /// enwik8 slice through the 2×2 of {arm off/on} × {nmix off/on} and reports each
@@ -1275,6 +1400,94 @@ mod tests {
             both - lin,
             (both - lin) - sum
         );
+    }
+
+    /// Error-threshold update-skipping on the arm (fx2-cmix's "skip weight updates
+    /// when errors are below a threshold"): when a BPTT window was easy (high mean
+    /// predicted prob of its coded bytes) skip its backward+Adam — saving the
+    /// dominant per-byte cost over the predictable majority, so the same wall-clock
+    /// buys a wider arm. Sweeps the skip τ over the FULL production stack
+    /// (deterministic + frozen net + warming heads) + arm, reporting bpb, marginal
+    /// over the arm-free stack, encode time, speedup vs no-skip, and (to stderr) the
+    /// backward-skip rate. `LZR_LO`/`LZR_HI` slice (default 3 MB), `LZR_H` arm width
+    /// (default 128). Run:
+    /// `cargo test --features arm --release arm_skip_lab -- --ignored --nocapture`
+    #[cfg(feature = "arm")]
+    #[test]
+    #[ignore = "arm error-threshold update-skipping: bpb vs throughput sweep"]
+    fn arm_skip_lab() {
+        use crate::models::lstm::ArmModel;
+        use std::time::Instant;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 4_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let h = env("LZR_H", 128);
+
+        // Arm-free production stack: deterministic baseline + frozen net + the
+        // shipped 8-head warming stack (mirrors `models()` minus the arm).
+        let stack = || -> Vec<AnyModel> {
+            let mut v = baseline_models(data.len());
+            let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
+            net.push_head_ctx(HEAD_LR, 1, HEAD_BITS);
+            net.push_head_word(HEAD_LR, HEAD_BITS);
+            net.push_head_ctx(HEAD_LR, 2, HEAD_BITS);
+            net.push_head_sparse(HEAD_LR, 0b110, HEAD_BITS);
+            net.push_head_ctx(HEAD_SLOW_LR, 1, HEAD_BITS);
+            net.push_head_match(HEAD_MATCH_LR, HEAD_BITS);
+            net.push_head_match2(HEAD_MATCH_LR, HEAD_BITS);
+            net.push_head_match_prev(HEAD_MATCH_LR, HEAD_BITS);
+            v.push(net.into());
+            v
+        };
+
+        let run = |arm_tau: Option<f32>| -> (f64, f64) {
+            let mut models = stack();
+            if let Some(tau) = arm_tau {
+                models.push(ArmModel::with_skip(h, tau).into());
+            }
+            let mut state = CodecState::with_models(models, data.len());
+            let t = Instant::now();
+            let mut enc = Encoder::with_capacity(data.len());
+            for &byte in &data {
+                for k in (0..8).rev() {
+                    let bit = (byte >> k) & 1;
+                    let p = state.predict();
+                    enc.encode(bit, p);
+                    state.commit(bit);
+                }
+                state.end_symbol();
+            }
+            (
+                enc.finish().len() as f64 * 8.0 / orig,
+                t.elapsed().as_secs_f64(),
+            )
+        };
+
+        let (off, off_s) = run(None);
+        println!("arm-free stack:        {off:.4} bpb  ({off_s:.0}s)");
+        let (b0, s0) = run(Some(0.0));
+        println!(
+            "arm h={h} (no skip):    {b0:.4} bpb  marginal {:+.4}  ({s0:.0}s, 1.00x)",
+            b0 - off
+        );
+        for tau in [0.25f32, 0.4, 0.55, 0.7] {
+            let (b, s) = run(Some(tau));
+            println!(
+                "arm skip τ={tau:.2}:       {b:.4} bpb  marginal {:+.4}  ({s:.0}s, {:.2}x speedup)",
+                b - off,
+                s0 / s,
+            );
+        }
     }
 
     /// Offline: the [`Lz`] preprocessor across a min-match sweep. Hash-chain
