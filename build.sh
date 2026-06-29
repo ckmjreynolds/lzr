@@ -15,16 +15,13 @@ cargo $TC fmt || exit
 # Submission (default features): must stay clippy-clean.
 cargo $TC clippy --all-targets -- -Dwarnings || exit
 
-# Bare-bones build (no features) also compiles clippy-clean.
+# Bare-bones build (no features; this is also the reorder-OFF A/B build, since
+# `reorder` is pulled in by `submission`) also compiles clippy-clean.
 cargo $TC clippy --no-default-features --all-targets -- -Dwarnings || exit
 
 # Opt-in online-neural arm (`--features arm`): not shipped, but must stay
 # clippy-clean and pass its correctness tests (gradient check + round-trip).
 cargo $TC clippy --features arm --all-targets -- -Dwarnings || exit
-
-# Opt-in article-reorder preprocessor (`--features reorder`): not shipped (off by
-# default), but must stay clippy-clean and pass its pipeline round-trip test.
-cargo $TC clippy --features reorder --all-targets -- -Dwarnings || exit
 
 # CLAUDE.md invariant: the submission binary must not pull in a threading
 # crate. `cargo tree` splits its output into the main dep tree and a
@@ -38,14 +35,12 @@ if cargo $TC tree --features submission -e=no-dev 2>/dev/null | \
   exit 1
 fi
 
-# Tests (default = fast, arm-free).
+# Tests (default = fast, arm-free; default now includes reorder, so the reorder
+# pipeline round-trip test runs here).
 cargo $TC test --release -- --nocapture 2>&1 || exit
 
 # Arm correctness: gradient check + byte-exact round-trip (small inputs, fast).
 cargo $TC test --release --features arm -- --nocapture 2>&1 || exit
-
-# Reorder correctness: full-pipeline byte-exact round-trip on an enwik8 slice.
-cargo $TC test --release --features reorder -- --nocapture 2>&1 || exit
 
 # Release binary.
 cargo $TC build --release || exit

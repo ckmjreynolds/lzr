@@ -29,19 +29,22 @@ burn        = { version = "0.21", optional = true, default-features = false, fea
 cdivsufsort = "=2.0.0"
 
 [features]
-# `default == submission`: the shipped, single-threaded build. `build.sh` checks
-# both this and `--no-default-features`, and uses `--features submission` for the
+# `default == submission`: the shipped, single-threaded build — now includes the
+# article-`reorder` preprocessor (enwik9 net 1.1440, free; full-enwik8 round-trip
+# byte-exact). `build.sh` checks both this and `--no-default-features` (which builds
+# WITHOUT reorder — the A/B baseline), and uses `--features submission` for the
 # zero-threading-dependency `cargo tree` gate.
 default     = ["submission"]
-submission  = []
+submission  = ["reorder"]
 # `arm`: the online-neural LSTM arm, opt-in and NOT shipped — it is ~50x slower
 # (enwik9 ~12 h) for a modest gain, so the default/submission build stays
 # deterministic and fast. Enable for arm work: `cargo test --features arm`.
 arm         = []
 # `reorder`: article-reorder preprocessor (idea 3) as the FIRST pipeline stage —
 # permutes <page> articles into a content-similarity order, restored on decode via
-# each article's in-content page <id> (free, no shipped permutation). Opt-in (off
-# by default) pending a full round-trip enwik9 validation; enwik9 gain ~-0.013.
+# each article's in-content page <id> (free, no shipped permutation). Now part of
+# the shipped build (pulled by `submission`); `--no-default-features` builds without
+# it for A/B. enwik9 gain ~-0.013; full-enwik8 round-trip byte-exact.
 reorder     = []
 # `neural`: offline GPU pretraining of a small byte-LM via burn (the `pretrain`
 # example). Training-only — produces a weight blob the submission build embeds and
