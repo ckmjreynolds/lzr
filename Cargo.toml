@@ -38,6 +38,11 @@ submission  = []
 # (enwik9 ~12 h) for a modest gain, so the default/submission build stays
 # deterministic and fast. Enable for arm work: `cargo test --features arm`.
 arm         = []
+# `reorder`: article-reorder preprocessor (idea 3) as the FIRST pipeline stage —
+# permutes <page> articles into a content-similarity order, restored on decode via
+# each article's in-content page <id> (free, no shipped permutation). Opt-in (off
+# by default) pending a full round-trip enwik9 validation; enwik9 gain ~-0.013.
+reorder     = []
 # `neural`: offline GPU pretraining of a small byte-LM via burn (the `pretrain`
 # example). Training-only — produces a weight blob the submission build embeds and
 # runs on the CPU; burn is never in default/submission.

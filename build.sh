@@ -22,6 +22,10 @@ cargo $TC clippy --no-default-features --all-targets -- -Dwarnings || exit
 # clippy-clean and pass its correctness tests (gradient check + round-trip).
 cargo $TC clippy --features arm --all-targets -- -Dwarnings || exit
 
+# Opt-in article-reorder preprocessor (`--features reorder`): not shipped (off by
+# default), but must stay clippy-clean and pass its pipeline round-trip test.
+cargo $TC clippy --features reorder --all-targets -- -Dwarnings || exit
+
 # CLAUDE.md invariant: the submission binary must not pull in a threading
 # crate. `cargo tree` splits its output into the main dep tree and a
 # `[dev-dependencies]` section; we only care about the main tree.
@@ -39,6 +43,9 @@ cargo $TC test --release -- --nocapture 2>&1 || exit
 
 # Arm correctness: gradient check + byte-exact round-trip (small inputs, fast).
 cargo $TC test --release --features arm -- --nocapture 2>&1 || exit
+
+# Reorder correctness: full-pipeline byte-exact round-trip on an enwik8 slice.
+cargo $TC test --release --features reorder -- --nocapture 2>&1 || exit
 
 # Release binary.
 cargo $TC build --release || exit

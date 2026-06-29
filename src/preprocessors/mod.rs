@@ -62,6 +62,10 @@ impl Pipeline {
     /// present only in debug builds; real stages are appended after it.
     pub(crate) fn default_pipeline() -> Self {
         let stages: Vec<Box<dyn Preprocessor>> = vec![
+            // `reorder` (opt-in) must run FIRST, on the raw XML, before casefold
+            // rewrites the `<page>`/`<id>` tags it keys on.
+            #[cfg(feature = "reorder")]
+            Box::new(reorder::Reorder),
             #[cfg(debug_assertions)]
             Box::new(guard::Guard),
             Box::new(casefold::CaseFold),
@@ -96,5 +100,26 @@ impl Pipeline {
             data = stage.inverse(&data);
         }
         data
+    }
+}
+
+#[cfg(all(test, feature = "reorder"))]
+mod reorder_pipeline_tests {
+    use super::*;
+
+    /// With the `reorder` feature the full pipeline (`reorder` → `casefold` →
+    /// `word_dict`) must round-trip byte-exact on an article-spanning enwik8 slice — the
+    /// guarantee that makes reorder a safe shipped stage (encode similarity-orders
+    /// the `<page>` articles; decode restores the original order via each article's
+    /// in-content page `<id>`).
+    #[test]
+    fn pipeline_roundtrips_with_reorder() {
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let slice = &e8[1_000_000..4_000_000];
+        let p = Pipeline::default_pipeline();
+        let coded = p.forward(slice);
+        assert_eq!(p.inverse(&coded), slice, "reorder pipeline must round-trip");
     }
 }
