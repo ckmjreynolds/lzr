@@ -753,6 +753,38 @@ mod tests {
         println!("wrote {} preprocessed bytes to {out}", pp.len());
     }
 
+    /// Offline: dump a `casefold+word_dict` (NO reorder — a mid-corpus slice isn't
+    /// whole `<page>` articles) preprocessed slice of enwik9, the held-out
+    /// robustness probe for the Stage-0 backbone bake-off. `LZR_EVAL_OUT` path,
+    /// `LZR_EVAL_LO`/`LZR_EVAL_HI` bounds (default 200M..210M, beyond enwik8). Run:
+    /// `LZR_EVAL_OUT=/tmp/lzr_eval.bin cargo test --release dump_eval_slice -- --ignored --nocapture`
+    #[test]
+    #[ignore = "offline: dump a casefold+word_dict enwik9 slice for the bake-off"]
+    fn dump_eval_slice() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::word_dict::WordDict;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e9) = std::fs::read("assets/enwik9") else {
+            return;
+        };
+        let lo = env("LZR_EVAL_LO", 200_000_000).min(e9.len());
+        let hi = env("LZR_EVAL_HI", 210_000_000).min(e9.len());
+        let out = std::env::var("LZR_EVAL_OUT").unwrap_or_else(|_| "/tmp/lzr_eval.bin".into());
+        let folded = CaseFold.forward(&e9[lo..hi]);
+        let pp = WordDict::embedded().forward(&folded);
+        std::fs::write(&out, &pp).unwrap();
+        println!(
+            "wrote {} preprocessed bytes ({lo}..{hi}) to {out}",
+            pp.len()
+        );
+    }
+
     /// E1 — dict-N sweep: deterministic bpb (per original byte) and the post-dict
     /// stream length (the arm-speed proxy) as the word dictionary grows. Words are
     /// mined from full case-folded enwik8 at runtime (no rebuild); the

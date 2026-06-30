@@ -56,6 +56,11 @@ neural      = ["dep:burn"]
 name              = "pretrain"
 required-features = ["neural"]
 
+# Stage-0 backbone bake-off (burn GPU). Build/run with `--features neural`.
+[[example]]
+name              = "bakeoff"
+required-features = ["neural"]
+
 # Optimize dependency crates even in dev so the burn `pretrain` example's CPU-side
 # host code is fast to iterate without a full release/LTO build.
 [profile.dev.package."*"]
