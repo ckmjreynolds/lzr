@@ -743,8 +743,111 @@ fn run<M: Backbone<AB> + AutodiffModule<AB>>(
     (bpb, tail_bpb)
 }
 
+/// Stage-1 forward-equivalence gate: a hand-written SCALAR CPU forward of the SEL
+/// architecture must reproduce burn's forward for the same (random) weights and
+/// input — the math the codec's online arm will run. Processing one timestep
+/// through all layers (carrying per-layer state) equals burn's layer-over-sequence
+/// pass, and matches the codec's one-byte-at-a-time use. Prints max abs/rel logit
+/// diff; wgpu f32 vs scalar f32 differ ~1e-3/op so a small residual is expected.
+fn verify_sel_cpu(device: &WgpuDevice) {
+    let d = 16usize;
+    let nl = 3usize;
+    let w = 24usize;
+    let net = SelNet::<AB>::new(d, nl, device);
+
+    let toks: Vec<i32> = (0..w).map(|t| ((t * 37 + 11) % V) as i32).collect();
+    let inp = Tensor::<AB, 2, Int>::from_data(TensorData::new(toks.clone(), [1, w]), device);
+    let (logits, _) = net.forward_chunk(inp, net.init_state(1, device));
+    let burn_logits = logits.into_data().to_vec::<f32>().unwrap(); // [w*V] row-major
+
+    let v2 = |p: &Param<Tensor<AB, 2>>| p.val().into_data().to_vec::<f32>().unwrap();
+    let v1 = |p: &Param<Tensor<AB, 1>>| p.val().into_data().to_vec::<f32>().unwrap();
+    let emb = v2(&net.emb);
+    let wo = v2(&net.wo);
+    let bo = v1(&net.bo);
+    struct L {
+        win: Vec<f32>,
+        wa: Vec<f32>,
+        ba: Vec<f32>,
+        wg: Vec<f32>,
+        wmix: Vec<f32>,
+        bmix: Vec<f32>,
+    }
+    let layers: Vec<L> = net
+        .layers
+        .iter()
+        .map(|l| L {
+            win: v2(&l.win),
+            wa: v2(&l.wa),
+            ba: v1(&l.ba),
+            wg: v2(&l.wg),
+            wmix: v2(&l.wmix),
+            bmix: v1(&l.bmix),
+        })
+        .collect();
+
+    let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
+    // out[j] = sum_k x[k] * w[k*d+j]  (burn matmul [1,d]@[d,d] convention)
+    let matvec = |x: &[f32], wt: &[f32]| -> Vec<f32> {
+        let mut o = vec![0.0f32; d];
+        for k in 0..d {
+            let xk = x[k];
+            let base = k * d;
+            for j in 0..d {
+                o[j] += xk * wt[base + j];
+            }
+        }
+        o
+    };
+
+    let mut s: Vec<Vec<f32>> = vec![vec![0.0f32; d]; nl];
+    let mut cpu_logits = vec![0.0f32; w * V];
+    for (t, &tok) in toks.iter().enumerate() {
+        let tok = tok as usize;
+        let mut x: Vec<f32> = emb[tok * d..tok * d + d].to_vec();
+        for (li, l) in layers.iter().enumerate() {
+            let u = matvec(&x, &l.win);
+            let a: Vec<f32> = matvec(&x, &l.wa).iter().zip(&l.ba).map(|(v, b)| sig(v + b)).collect();
+            let g: Vec<f32> = matvec(&x, &l.wg).iter().map(|v| sig(*v)).collect();
+            for j in 0..d {
+                s[li][j] = a[j] * s[li][j] + (1.0 - a[j]) * u[j];
+            }
+            let y: Vec<f32> = (0..d).map(|j| g[j] * s[li][j]).collect();
+            let mixed = matvec(&y, &l.wmix);
+            for j in 0..d {
+                x[j] += mixed[j] + l.bmix[j];
+            }
+        }
+        for v in 0..V {
+            let mut acc = bo[v];
+            for k in 0..d {
+                acc += x[k] * wo[k * V + v];
+            }
+            cpu_logits[t * V + v] = acc;
+        }
+    }
+
+    let (mut max_abs, mut max_rel) = (0.0f32, 0.0f32);
+    for (c, b) in cpu_logits.iter().zip(&burn_logits) {
+        let diff = (c - b).abs();
+        max_abs = max_abs.max(diff);
+        max_rel = max_rel.max(diff / b.abs().max(1.0));
+    }
+    println!(
+        "SEL CPU-vs-burn forward equivalence: max_abs {max_abs:.3e}  max_rel {max_rel:.3e}  (d={d} layers={nl} w={w})"
+    );
+    println!(
+        "{}",
+        if max_rel < 1e-2 { "  PASS — scalar CPU forward matches burn." } else { "  FAIL — forward mismatch, investigate." }
+    );
+}
+
 fn main() {
     let device = WgpuDevice::default();
+    if std::env::var("LZR_VERIFY").is_ok() {
+        verify_sel_cpu(&device);
+        return;
+    }
     let env_us = |k: &str, d: usize| {
         std::env::var(k)
             .ok()
