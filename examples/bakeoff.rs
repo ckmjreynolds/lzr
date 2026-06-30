@@ -386,7 +386,10 @@ impl<B: Backend> SelNet<B> {
         // Embedding init std. Default 1.0 (what the byte-level greenlight used);
         // LZR_EMBSTD lowers it — the unnormalized SEL residual stream blows up at
         // larger vocab when rare-token embeddings sit at the std-1.0 init scale.
-        let emb_std = std::env::var("LZR_EMBSTD").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+        let emb_std = std::env::var("LZR_EMBSTD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         Self {
             emb: rnd([vocab, d], emb_std, device),
             layers: (0..n_layers).map(|_| SelLayer::new(d, device)).collect(),
@@ -446,7 +449,12 @@ impl<B: Backend> Backbone<B> for SelNet<B> {
         (v * d) as u64 + per * self.layers.len() as u64 + (d * v + v) as u64
     }
     fn label(&self) -> String {
-        format!("SEL   d={} layers={} vocab={}", self.d(), self.layers.len(), self.vocab())
+        format!(
+            "SEL   d={} layers={} vocab={}",
+            self.d(),
+            self.layers.len(),
+            self.vocab()
+        )
     }
 }
 
@@ -985,7 +993,11 @@ fn verify_sel_cpu(device: &WgpuDevice) {
         let mut x: Vec<f32> = emb[tok * d..tok * d + d].to_vec();
         for (li, l) in layers.iter().enumerate() {
             let u = matvec(&x, &l.win);
-            let a: Vec<f32> = matvec(&x, &l.wa).iter().zip(&l.ba).map(|(v, b)| sig(v + b)).collect();
+            let a: Vec<f32> = matvec(&x, &l.wa)
+                .iter()
+                .zip(&l.ba)
+                .map(|(v, b)| sig(v + b))
+                .collect();
             let g: Vec<f32> = matvec(&x, &l.wg).iter().map(|v| sig(*v)).collect();
             for j in 0..d {
                 s[li][j] = a[j] * s[li][j] + (1.0 - a[j]) * u[j];
@@ -1016,7 +1028,11 @@ fn verify_sel_cpu(device: &WgpuDevice) {
     );
     println!(
         "{}",
-        if max_rel < 1e-2 { "  PASS — scalar CPU forward matches burn." } else { "  FAIL — forward mismatch, investigate." }
+        if max_rel < 1e-2 {
+            "  PASS — scalar CPU forward matches burn."
+        } else {
+            "  FAIL — forward mismatch, investigate."
+        }
     );
 }
 
@@ -1069,7 +1085,8 @@ fn main() {
                 (m.label(), run(m, &data, &cfg, &device))
             }
             "sel" => {
-                let m = SelNet::<AB>::new(env_us("LZR_SD", 160), env_us("LZR_SLAYERS", 2), V, &device);
+                let m =
+                    SelNet::<AB>::new(env_us("LZR_SD", 160), env_us("LZR_SLAYERS", 2), V, &device);
                 (m.label(), run(m, &data, &cfg, &device))
             }
             "mamba" => {

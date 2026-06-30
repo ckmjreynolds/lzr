@@ -588,6 +588,46 @@ mod tests {
         println!("ssm gradient check ok, max relative error {max_rel:.5}");
     }
 
+    /// e2e marginal: encode a real enwik8 slice with the deterministic baseline,
+    /// then with the SEL arm added, and report both bpb and the delta — the number
+    /// that decides the arm (its decorrelated contribution over the existing stack).
+    /// `LZR_LO`/`LZR_HI` (default `0..2_000_000`); arm dims via `LZR_SSM_*`. Run:
+    /// `cargo test --release --features ssm ssm_arm_e2e -- --ignored --nocapture`
+    #[test]
+    #[ignore = "online SSM arm: e2e marginal bpb in the mixer on enwik8"]
+    fn ssm_arm_e2e() {
+        use crate::codec::{baseline_models, code_stream_models};
+        use crate::preprocessors::Pipeline;
+        use std::time::Instant;
+        let env = |k: &str, d: usize| {
+            std::env::var(k).ok().and_then(|x| x.parse().ok()).unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 0);
+        let hi = env("LZR_HI", 2_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+
+        let base = code_stream_models(baseline_models(data.len()), &data).len();
+        let base_bpb = base as f64 * 8.0 / orig;
+
+        let mut withv = baseline_models(data.len());
+        withv.push(SsmModel::arm().into());
+        let t1 = Instant::now();
+        let arm = code_stream_models(withv, &data).len();
+        let secs = t1.elapsed().as_secs_f64();
+        let arm_bpb = arm as f64 * 8.0 / orig;
+        let e9_eta = (1e9 / orig) * secs / 3600.0;
+        println!(
+            "baseline {base_bpb:.4} | +SEL arm {arm_bpb:.4} | marginal {:+.4} bpb  \
+             ({secs:.0}s on {:.1} MB; enwik9 ETA ~{e9_eta:.1} h/dir)",
+            arm_bpb - base_bpb,
+            orig / 1e6
+        );
+    }
+
     /// Byte-exact round-trip inside the real codec: encode an enwik8 slice with the
     /// baseline models + SEL arm, decode with a fresh identical set, assert equal.
     #[test]
