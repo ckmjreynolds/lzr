@@ -734,6 +734,112 @@ mod tests {
         }
     }
 
+    /// Offline probe — the break-exclusion idea (the encoder knows where every
+    /// match breaks). Flag long-match breaks and let the primary match model
+    /// abstain there (a stand-in for a side channel that tells the decoder "this
+    /// match breaks here"), measure the GROSS coded-bit gain, then weigh it against
+    /// the side channel's own entropy cost (one continue/break decision per
+    /// active-long-match byte). Abstaining is a LOWER bound on the gain — true
+    /// exclusion coding (renormalize without the predicted byte) would do better —
+    /// so a negative net here is a real negative. Sweeps the length threshold T.
+    /// Run: `cargo test --release match_break_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "explore: break-exclusion gross gain vs side-channel cost"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::suboptimal_flops
+    )]
+    fn match_break_lab() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 9_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let n = data.len();
+
+        // Trace pass: drive a lone primary match model (key=8) over the
+        // preprocessed stream, recording its pre-byte (length bucket, predicted
+        // byte) at each byte. The match model's state depends only on the byte
+        // history, so this is exactly what the codec's match model sees.
+        let mut mm = MatchModel::new();
+        let mut ctx = Context::with_capacity(n);
+        let mut lp: Vec<(u32, u8)> = Vec::with_capacity(n);
+        for &byte in &data {
+            lp.push(mm.match_key(&ctx));
+            for k in (0..8).rev() {
+                let bit = (byte >> k) & 1;
+                let _ = mm.predict(&ctx);
+                ctx.push_bit(bit);
+                mm.update(&ctx, bit);
+            }
+            ctx.push_byte();
+        }
+
+        let base = encode_det_linear(&data);
+        let base_bpb = base as f64 * 8.0 / orig;
+        println!(
+            "baseline (det linear): {base_bpb:.4} bpb  ({base} B over {:.1} MB)",
+            orig / 1e6
+        );
+
+        let binent = |q: f64| -> f64 {
+            if q <= 0.0 || q >= 1.0 {
+                0.0
+            } else {
+                -q * q.log2() - (1.0 - q) * (1.0 - q).log2()
+            }
+        };
+
+        for t in [2u32, 4, 6, 8, 12, 16] {
+            let mut flags = vec![false; n];
+            let mut n_long = 0u64;
+            let mut n_break = 0u64;
+            for i in 0..n {
+                let (len, pb) = lp[i];
+                if len >= t {
+                    n_long += 1;
+                    if pb != data[i] {
+                        flags[i] = true;
+                        n_break += 1;
+                    }
+                }
+            }
+            let flags: std::rc::Rc<[bool]> = flags.into();
+            let mut models = baseline_models(n);
+            for m in &mut models {
+                if let AnyModel::Match(mm) = m {
+                    mm.set_abstain(flags.clone(), t);
+                    break; // primary (key=8) only
+                }
+            }
+            let treat = encode_linear_models(models, &data);
+            let gross = base as f64 - treat as f64; // bytes saved
+            let q = n_break as f64 / n_long.max(1) as f64;
+            let sidech_bits = n_long as f64 * binent(q); // idealized adaptive coder
+            let net = gross - sidech_bits / 8.0;
+            println!(
+                "T={t:2}  long {:>8} ({:>4.1}% bytes)  breaks {:>7} (q={:.4})  \
+                 gross {:+.4}  sidech {:.4}  NET {:+.4} bpb",
+                n_long,
+                100.0 * n_long as f64 / n as f64,
+                n_break,
+                q,
+                gross * 8.0 / orig,
+                sidech_bits / orig,
+                net * 8.0 / orig,
+            );
+        }
+    }
+
     /// Offline: dump the preprocessed (post-pipeline) enwik8 — what every model,
     /// including a pretrained net, actually sees — for GPU pretraining (the burn
     /// `pretrain` example reads it). `LZR_PP_OUT` sets the path. Run:

@@ -30,6 +30,12 @@ pub(crate) struct MatchModel {
     sm: StateMap,
     predicted: bool, // did predict() consult the StateMap this bit?
     state: usize,    // StateMap state from the last predict()
+    // Offline break-exclusion probe (test-only): when set, the model abstains
+    // (returns 0) on byte positions flagged as long-match breaks, simulating a
+    // side channel that tells the decoder "this match breaks here". Measures the
+    // gross gain of break exclusion before any real side channel is built.
+    #[cfg(test)]
+    abstain: Option<(std::rc::Rc<[bool]>, u32)>,
     // tuning stats
     total: u64,
     covered: u64,
@@ -68,6 +74,8 @@ impl MatchModel {
             sm: StateMap::new(2 * (LEN_CAP as usize + 1)),
             predicted: false,
             state: 0,
+            #[cfg(test)]
+            abstain: None,
             total: 0,
             covered: 0,
             lookups: 0,
@@ -107,6 +115,12 @@ impl Model for MatchModel {
     #[allow(clippy::cast_possible_truncation)]
     fn predict(&mut self, ctx: &Context) -> i32 {
         self.predicted = false;
+        #[cfg(test)]
+        if let Some((flags, t)) = &self.abstain {
+            if self.len >= *t && flags.get(ctx.history().len()).copied().unwrap_or(false) {
+                return 0;
+            }
+        }
         let hist = ctx.history();
         if self.len == 0 || self.ptr >= hist.len() {
             return 0;
@@ -149,6 +163,13 @@ impl Model for MatchModel {
 }
 
 impl MatchModel {
+    /// Arm the offline break-exclusion probe: abstain on flagged positions whose
+    /// active match length is at least `thresh` (test-only).
+    #[cfg(test)]
+    pub(crate) fn set_abstain(&mut self, flags: std::rc::Rc<[bool]>, thresh: u32) {
+        self.abstain = Some((flags, thresh));
+    }
+
     /// `(match-length bucket, predicted byte)` for warming heads to key on:
     /// `(0, 0)` when there is no active match, else the capped length and the byte
     /// the match predicts (`history[ptr]`). Byte-constant within a symbol.
