@@ -968,6 +968,131 @@ mod tests {
         }
     }
 
+    /// Dictionary-size sweep: no-dict vs static-N vs dynamic-frozen-N, on the
+    /// net-free linear path, to find each curve's knee. The static dict is mined
+    /// from the data with global frequency foresight and shipped (2× L(D)); the
+    /// dynamic dict is built online — first-N distinct words in appearance order,
+    /// then frozen (no ID reuse) — and ships nothing (1× L(C)). Defaults to FULL
+    /// enwik8 (`LZR_LO=0 LZR_HI=100000000`): on a large slice the dynamic dict fills
+    /// in the first ~1% and is effectively static for the rest, so warmup does not
+    /// dominate the number (the failure mode on small slices). Round-trip asserted
+    /// for the dynamic dict. Run (override the slice for a quick check):
+    /// `LZR_LO=1000000 LZR_HI=9000000 cargo test --release online_dict_lab -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prep-lab: online LRU dict vs static dict (bpb gap = price of generality)"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn online_dict_lab() {
+        use crate::preprocessors::Preprocessor;
+        use crate::preprocessors::casefold::CaseFold;
+        use crate::preprocessors::online_dict::OnlineDict;
+        use crate::preprocessors::word_dict::{WordDict, min_word_len};
+        use std::collections::HashMap;
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 0);
+        let hi = env("LZR_HI", 100_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+
+        // Static-dict word list: global frequencies over all of case-folded enwik8.
+        let folded: &'static [u8] = Box::leak(CaseFold.forward(&e8).into_boxed_slice());
+        let mut freq: HashMap<&'static [u8], u32> = HashMap::new();
+        let mut i = 0;
+        while i < folded.len() {
+            if folded[i].is_ascii_lowercase() {
+                let s = i;
+                while i < folded.len() && folded[i].is_ascii_lowercase() {
+                    i += 1;
+                }
+                *freq.entry(&folded[s..i]).or_insert(0) += 1;
+            } else {
+                i += 1;
+            }
+        }
+        let mut sorted: Vec<(&'static [u8], u32)> = freq.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let sorted: Vec<&'static [u8]> = sorted.into_iter().map(|(w, _)| w).collect();
+
+        let fold_slice: &'static [u8] = Box::leak(CaseFold.forward(&e8[lo..hi]).into_boxed_slice());
+        let nodict_bpb = encode_det_linear(fold_slice) as f64 * 8.0 / orig;
+
+        // Appearance-order distinct words (the dynamic dict's word *choice*). Pairing
+        // these with the static machinery (stable codes from byte 0) isolates word
+        // selection from online non-stationarity.
+        let mut seen: std::collections::HashSet<&'static [u8]> = std::collections::HashSet::new();
+        let mut appeared: Vec<&'static [u8]> = Vec::new();
+        let mut i = 0;
+        while i < fold_slice.len() {
+            if fold_slice[i].is_ascii_lowercase() {
+                let s = i;
+                while i < fold_slice.len() && fold_slice[i].is_ascii_lowercase() {
+                    i += 1;
+                }
+                let w = &fold_slice[s..i];
+                if seen.insert(w) {
+                    appeared.push(w);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        println!(
+            "slice [{lo}..{hi}]  folded {} bytes  |  no-dict {nodict_bpb:.4} bpb",
+            fold_slice.len(),
+        );
+        println!("         static-freq      static-appear     dynamic-frozen    | select   online");
+        // Pick the first N words from an ordered list, with the same length gating
+        // the static dict uses (a word must be long enough for its code slot).
+        let pick = |order: &[&'static [u8]], n: usize| -> Vec<&'static [u8]> {
+            let mut w: Vec<&'static [u8]> = Vec::new();
+            for &x in order {
+                if w.len() >= n {
+                    break;
+                }
+                if x.len() >= min_word_len(w.len()) {
+                    w.push(x);
+                }
+            }
+            w
+        };
+        for &n in &[1000usize, 2000, 4000, 8000, 16000, 32000] {
+            let sf = encode_det_linear(&WordDict::from_words(&pick(&sorted, n)).forward(fold_slice))
+                as f64
+                * 8.0
+                / orig;
+            let sa =
+                encode_det_linear(&WordDict::from_words(&pick(&appeared, n)).forward(fold_slice))
+                    as f64
+                    * 8.0
+                    / orig;
+            let dyn_ = OnlineDict::frozen(n).forward(fold_slice);
+            let dy = encode_det_linear(&dyn_) as f64 * 8.0 / orig;
+            assert_eq!(
+                OnlineDict::frozen(n).inverse(&dyn_),
+                fold_slice,
+                "frozen dynamic dict must round-trip"
+            );
+            println!(
+                "N={n:5}  {sf:7.4} ({:+.4})  {sa:7.4} ({:+.4})  {dy:7.4} ({:+.4})  | {:+.4}  {:+.4}",
+                sf - nodict_bpb,
+                sa - nodict_bpb,
+                dy - nodict_bpb,
+                sa - sf, // word-selection cost (appearance vs frequency, both static)
+                dy - sa, // online non-stationarity cost (same words, online codes)
+            );
+        }
+    }
+
     /// E2 — phrase dictionary: do boundary-crossing phrases earn dictionary code
     /// slots over plain words? Mines words (whole corpus) and phrases (n-grams with
     /// ≥1 non-letter, over a sample, freq-filtered), scores both by savings
