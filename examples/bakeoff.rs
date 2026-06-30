@@ -35,6 +35,7 @@ use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::{AutodiffModule, Module, Param};
 use burn::nn::loss::CrossEntropyLossConfig;
+use burn::optim::grad_clipping::GradientClippingConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::{sigmoid, silu, tanh};
 use burn::tensor::backend::Backend;
@@ -381,16 +382,23 @@ struct SelNet<B: Backend> {
 }
 
 impl<B: Backend> SelNet<B> {
-    fn new(d: usize, n_layers: usize, device: &B::Device) -> Self {
+    fn new(d: usize, n_layers: usize, vocab: usize, device: &B::Device) -> Self {
+        // Embedding init std. Default 1.0 (what the byte-level greenlight used);
+        // LZR_EMBSTD lowers it — the unnormalized SEL residual stream blows up at
+        // larger vocab when rare-token embeddings sit at the std-1.0 init scale.
+        let emb_std = std::env::var("LZR_EMBSTD").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
         Self {
-            emb: rnd([V, d], 1.0, device),
+            emb: rnd([vocab, d], emb_std, device),
             layers: (0..n_layers).map(|_| SelLayer::new(d, device)).collect(),
-            wo: rnd([d, V], (1.0 / d as f64).sqrt(), device),
-            bo: zeros1(V, device),
+            wo: rnd([d, vocab], (1.0 / d as f64).sqrt(), device),
+            bo: zeros1(vocab, device),
         }
     }
     fn d(&self) -> usize {
         self.emb.val().dims()[1]
+    }
+    fn vocab(&self) -> usize {
+        self.emb.val().dims()[0]
     }
 }
 
@@ -420,24 +428,25 @@ impl<B: Backend> Backbone<B> for SelNet<B> {
             x = out;
             new_state.push(s2);
         }
+        let vocab = self.vocab();
         let logits = x
             .reshape([batch * w, d])
             .matmul(self.wo.val())
-            .add(self.bo.val().reshape([1, V]))
-            .reshape([batch, w, V]);
+            .add(self.bo.val().reshape([1, vocab]))
+            .reshape([batch, w, vocab]);
         (logits, new_state)
     }
     fn macs_per_token(&self) -> u64 {
-        let d = self.d();
-        (4 * d * d) as u64 * self.layers.len() as u64 + (V * d) as u64 // win+wa+wg+wmix
+        let (d, v) = (self.d(), self.vocab());
+        (4 * d * d) as u64 * self.layers.len() as u64 + (v * d) as u64 // win+wa+wg+wmix
     }
     fn n_params(&self) -> u64 {
-        let d = self.d();
+        let (d, v) = (self.d(), self.vocab());
         let per = (4 * d * d + 2 * d) as u64;
-        (V * d) as u64 + per * self.layers.len() as u64 + (d * V + V) as u64
+        (v * d) as u64 + per * self.layers.len() as u64 + (d * v + v) as u64
     }
     fn label(&self) -> String {
-        format!("SEL   d={} layers={}", self.d(), self.layers.len())
+        format!("SEL   d={} layers={} vocab={}", self.d(), self.layers.len(), self.vocab())
     }
 }
 
@@ -670,7 +679,12 @@ fn run<M: Backbone<AB> + AutodiffModule<AB>>(
         cfg.window
     );
 
-    let mut optim = AdamConfig::new().init();
+    // Gradient-norm clipping stabilizes the unnormalized SEL at larger vocab/width
+    // (the byte path was marginally stable; the sharper 1024-way softmax diverges
+    // without it). Applied to both run() and run_bpe() so comparisons stay fair.
+    let mut optim = AdamConfig::new()
+        .init()
+        .with_grad_clipping(GradientClippingConfig::Norm(1.0).init());
     let mut state = model.init_state(cfg.batch, device);
     let mut total_nats = 0.0f64;
     let mut total_positions = 0u64;
@@ -743,6 +757,170 @@ fn run<M: Backbone<AB> + AutodiffModule<AB>>(
     (bpb, tail_bpb)
 }
 
+// ───────────────────────── BPE (the bpb-per-FLOP token lever) ─────────────────────────
+
+/// Greedy BPE: learn merges on `data` (bytes → tokens up to `target_vocab`).
+/// New token id = 256 + merge index. Trained on a sample (merges generalize).
+fn bpe_train(data: &[u8], target_vocab: usize) -> Vec<(u32, u32)> {
+    use std::collections::HashMap;
+    let mut seq: Vec<u32> = data.iter().map(|&b| u32::from(b)).collect();
+    let mut merges = Vec::new();
+    for m in 0..target_vocab.saturating_sub(256) {
+        let mut counts: HashMap<(u32, u32), u32> = HashMap::new();
+        for win in seq.windows(2) {
+            *counts.entry((win[0], win[1])).or_insert(0) += 1;
+        }
+        let Some((&pair, &cnt)) = counts.iter().max_by_key(|&(_, &c)| c) else {
+            break;
+        };
+        if cnt < 2 {
+            break;
+        }
+        let new_id = 256 + m as u32;
+        merges.push(pair);
+        let mut out = Vec::with_capacity(seq.len());
+        let mut i = 0;
+        while i < seq.len() {
+            if i + 1 < seq.len() && seq[i] == pair.0 && seq[i + 1] == pair.1 {
+                out.push(new_id);
+                i += 2;
+            } else {
+                out.push(seq[i]);
+                i += 1;
+            }
+        }
+        seq = out;
+    }
+    merges
+}
+
+/// Tokenize `data` with learned `merges` (applied in learned order). Returns the
+/// token-id stream and the byte count each token covers (for per-byte bpb).
+fn bpe_tokenize(data: &[u8], merges: &[(u32, u32)]) -> (Vec<u32>, Vec<u32>) {
+    let mut seq: Vec<u32> = data.iter().map(|&b| u32::from(b)).collect();
+    let mut lens: Vec<u32> = vec![1; seq.len()];
+    for (m, &pair) in merges.iter().enumerate() {
+        let new_id = 256 + m as u32;
+        let mut out = Vec::with_capacity(seq.len());
+        let mut ol = Vec::with_capacity(seq.len());
+        let mut i = 0;
+        while i < seq.len() {
+            if i + 1 < seq.len() && seq[i] == pair.0 && seq[i + 1] == pair.1 {
+                out.push(new_id);
+                ol.push(lens[i] + lens[i + 1]);
+                i += 2;
+            } else {
+                out.push(seq[i]);
+                ol.push(lens[i]);
+                i += 1;
+            }
+        }
+        seq = out;
+        lens = ol;
+    }
+    (seq, lens)
+}
+
+/// Like `run`, but over a BPE token stream — bpb is per ORIGINAL BYTE (sum of the
+/// predicted tokens' byte lengths), so it is directly comparable to the byte-level
+/// archs. SEL-only (the settled winner). Vocab=256 / 0 merges reproduces `run`'s
+/// byte-level bpb (the sanity gate — validated: 2.931 vs run()'s 2.933).
+///
+/// FINDING (2026-06-30): real-vocab (1024/2048) training DIVERGES (bpb → 1e17+,
+/// forward overflow) regardless of gradient clipping (Norm 1.0) or embedding-init
+/// scale (1.0 / 0.1). The unnormalized SEL residual stream is only conditionally
+/// stable — fine on the byte stream, unstable on the BPE token stream. Evaluating
+/// BPE needs a normalized SEL (pre-norm RMSNorm, as in the Mamba block here, which
+/// never diverged) + byte-baseline re-validation. Deferred; the byte-level SEL is
+/// the stable, committed Stage-0 winner.
+fn run_bpe(
+    mut model: SelNet<AB>,
+    tokens: &[u32],
+    byte_lens: &[u32],
+    cfg: &Cfg,
+    device: &WgpuDevice,
+) -> (f64, f64) {
+    let vocab = model.vocab();
+    let n = tokens.len();
+    let shard = n / cfg.batch;
+    let w = cfg.window;
+    let total_byte: u64 = byte_lens.iter().map(|&l| u64::from(l)).sum();
+    let avg_bpt = total_byte as f64 / n as f64;
+    let macs_byte = model.macs_per_token() as f64 / avg_bpt;
+    let label = model.label();
+    println!(
+        "  [{label}] {:.0} K MACs/byte ({:.0} K/tok ÷ {avg_bpt:.2} B/tok) | {n} tokens, shard {shard} × {} | win {w}",
+        macs_byte / 1000.0,
+        model.macs_per_token() as f64 / 1000.0,
+        cfg.batch
+    );
+
+    // Gradient-norm clipping stabilizes the unnormalized SEL at larger vocab/width
+    // (the byte path was marginally stable; the sharper 1024-way softmax diverges
+    // without it). Applied to both run() and run_bpe() so comparisons stay fair.
+    let mut optim = AdamConfig::new()
+        .init()
+        .with_grad_clipping(GradientClippingConfig::Norm(1.0).init());
+    let mut state = model.init_state(cfg.batch, device);
+    let (mut tot_nats, mut tot_bytes) = (0.0f64, 0.0f64);
+    let total_steps = (shard.saturating_sub(w + 1)) / w;
+    let tail_start = total_steps * 3 / 4;
+    let (mut tail_nats, mut tail_bytes) = (0.0f64, 0.0f64);
+    let t0 = Instant::now();
+    let (mut s, mut step) = (0usize, 0usize);
+    while s + w + 1 <= shard {
+        let mut inp: Vec<i32> = Vec::with_capacity(cfg.batch * w);
+        let mut tgt: Vec<i32> = Vec::with_capacity(cfg.batch * w);
+        let mut chunk_bytes = 0.0f64;
+        for b in 0..cfg.batch {
+            let base = b * shard + s;
+            for j in 0..w {
+                inp.push(tokens[base + j] as i32);
+                tgt.push(tokens[base + j + 1] as i32);
+                chunk_bytes += f64::from(byte_lens[base + j + 1]);
+            }
+        }
+        let inp_t = Tensor::<AB, 2, Int>::from_data(TensorData::new(inp, [cfg.batch, w]), device);
+        let tgt_t = Tensor::<AB, 1, Int>::from_data(TensorData::new(tgt, [cfg.batch * w]), device);
+        let (logits, new_state) = model.forward_chunk(inp_t, state);
+        let loss = CrossEntropyLossConfig::new()
+            .init(device)
+            .forward(logits.reshape([cfg.batch * w, vocab]), tgt_t);
+        let nats = f64::from(loss.clone().into_data().to_vec::<f32>().unwrap()[0]);
+        let chunk_nats = nats * (cfg.batch * w) as f64;
+        tot_nats += chunk_nats;
+        tot_bytes += chunk_bytes;
+        if step >= tail_start {
+            tail_nats += chunk_nats;
+            tail_bytes += chunk_bytes;
+        }
+        let grads = loss.backward();
+        let gp = GradientsParams::from_grads(grads, &model);
+        model = optim.step(cfg.lr, model, gp);
+        state = new_state.into_iter().map(Tensor::detach).collect();
+        if step % 200 == 0 {
+            println!(
+                "    step {step:6} | {:5.1}% | running bpb {:.4}",
+                100.0 * (s + w) as f64 / shard as f64,
+                tot_nats / std::f64::consts::LN_2 / tot_bytes
+            );
+        }
+        s += w;
+        step += 1;
+    }
+    let bpb = tot_nats / std::f64::consts::LN_2 / tot_bytes;
+    let tail = if tail_bytes > 0.0 {
+        tail_nats / std::f64::consts::LN_2 / tail_bytes
+    } else {
+        bpb
+    };
+    println!(
+        "  [{label}] DONE  bpb {bpb:.4} | tail-25% {tail:.4}  ({:.0}s)\n",
+        t0.elapsed().as_secs_f64()
+    );
+    (bpb, tail)
+}
+
 /// Stage-1 forward-equivalence gate: a hand-written SCALAR CPU forward of the SEL
 /// architecture must reproduce burn's forward for the same (random) weights and
 /// input — the math the codec's online arm will run. Processing one timestep
@@ -753,7 +931,7 @@ fn verify_sel_cpu(device: &WgpuDevice) {
     let d = 16usize;
     let nl = 3usize;
     let w = 24usize;
-    let net = SelNet::<AB>::new(d, nl, device);
+    let net = SelNet::<AB>::new(d, nl, V, device);
 
     let toks: Vec<i32> = (0..w).map(|t| ((t * 37 + 11) % V) as i32).collect();
     let inp = Tensor::<AB, 2, Int>::from_data(TensorData::new(toks.clone(), [1, w]), device);
@@ -891,7 +1069,7 @@ fn main() {
                 (m.label(), run(m, &data, &cfg, &device))
             }
             "sel" => {
-                let m = SelNet::<AB>::new(env_us("LZR_SD", 160), env_us("LZR_SLAYERS", 2), &device);
+                let m = SelNet::<AB>::new(env_us("LZR_SD", 160), env_us("LZR_SLAYERS", 2), V, &device);
                 (m.label(), run(m, &data, &cfg, &device))
             }
             "mamba" => {
@@ -902,6 +1080,24 @@ fn main() {
                     &device,
                 );
                 (m.label(), run(m, &data, &cfg, &device))
+            }
+            // SEL over a BPE token stream: the bpb-per-FLOP token lever. LZR_VOCAB
+            // (0 merges → vocab 256 = byte-level identity, the sanity gate).
+            "bpe" => {
+                let nslice = cfg.bytes.min(data.len());
+                let target = env_us("LZR_VOCAB", 1024);
+                let sample = (nslice / 4).clamp(1, 4_000_000).min(nslice);
+                println!("  training BPE→vocab {target} on {sample} B sample…");
+                let merges = bpe_train(&data[..sample], target);
+                let (tokens, lens) = bpe_tokenize(&data[..nslice], &merges);
+                let vocab = 256 + merges.len();
+                let m = SelNet::<AB>::new(
+                    env_us("LZR_SD", 112),
+                    env_us("LZR_SLAYERS", 4),
+                    vocab,
+                    &device,
+                );
+                (m.label(), run_bpe(m, &tokens, &lens, &cfg, &device))
             }
             other => {
                 println!("(unknown arch '{other}' — skipping)");
