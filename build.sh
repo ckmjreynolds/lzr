@@ -23,6 +23,9 @@ cargo $TC clippy --no-default-features --all-targets -- -Dwarnings || exit
 # clippy-clean and pass its correctness tests (gradient check + round-trip).
 cargo $TC clippy --features arm --all-targets -- -Dwarnings || exit
 
+# Opt-in online-neural selective-SSM arm (`--features ssm`): same policy as arm.
+cargo $TC clippy --features ssm --all-targets -- -Dwarnings || exit
+
 # CLAUDE.md invariant: the submission binary must not pull in a threading
 # crate. `cargo tree` splits its output into the main dep tree and a
 # `[dev-dependencies]` section; we only care about the main tree.
@@ -41,6 +44,9 @@ cargo $TC test --release -- --nocapture 2>&1 || exit
 
 # Arm correctness: gradient check + byte-exact round-trip (small inputs, fast).
 cargo $TC test --release --features arm -- --nocapture 2>&1 || exit
+
+# SSM-arm correctness: finite-difference gradient check + byte-exact round-trip.
+cargo $TC test --release --features ssm -- --nocapture 2>&1 || exit
 
 # Release binary.
 cargo $TC build --release || exit

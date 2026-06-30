@@ -13,6 +13,8 @@ use crate::models::indirect::IndirectModel;
 use crate::models::lstm::ArmModel;
 use crate::models::match_model::MatchModel;
 use crate::models::pretrained::PretrainedMlp;
+#[cfg(feature = "ssm")]
+use crate::models::ssm::SsmModel;
 use crate::models::{AnyModel, Context, Model};
 use crate::preprocessors::Pipeline;
 
@@ -114,6 +116,8 @@ fn models(capacity: usize) -> Vec<AnyModel> {
     }
     #[cfg(feature = "arm")]
     v.push(ArmModel::arm().into());
+    #[cfg(feature = "ssm")]
+    v.push(SsmModel::arm().into());
     v
 }
 

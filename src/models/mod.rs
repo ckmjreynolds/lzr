@@ -13,6 +13,8 @@ pub(crate) mod lstm;
 mod lstm_spike;
 pub(crate) mod match_model;
 pub(crate) mod pretrained;
+#[cfg(feature = "ssm")]
+pub(crate) mod ssm;
 pub(crate) mod statemap;
 
 /// Mutable per-stream prediction context shared by every model.
@@ -163,6 +165,10 @@ pub(crate) enum AnyModel {
     // nonlinear function of the raw context window, orthogonal to the per-context
     // deterministic models. Boxed for the same reason as the arm.
     Pretrained(Box<pretrained::PretrainedMlp>),
+    // Online-neural selective-SSM arm (opt-in `ssm`, NOT shipped). Boxed for the
+    // same reason as the LSTM arm.
+    #[cfg(feature = "ssm")]
+    Ssm(Box<ssm::SsmModel>),
 }
 
 impl From<context::ContextModel> for AnyModel {
@@ -191,6 +197,12 @@ impl From<pretrained::PretrainedMlp> for AnyModel {
         Self::Pretrained(Box::new(m))
     }
 }
+#[cfg(feature = "ssm")]
+impl From<ssm::SsmModel> for AnyModel {
+    fn from(m: ssm::SsmModel) -> Self {
+        Self::Ssm(Box::new(m))
+    }
+}
 
 impl Model for AnyModel {
     #[inline]
@@ -202,6 +214,8 @@ impl Model for AnyModel {
             #[cfg(feature = "arm")]
             Self::Arm(m) => m.predict(ctx),
             Self::Pretrained(m) => m.predict(ctx),
+            #[cfg(feature = "ssm")]
+            Self::Ssm(m) => m.predict(ctx),
         }
     }
     #[inline]
@@ -213,6 +227,8 @@ impl Model for AnyModel {
             #[cfg(feature = "arm")]
             Self::Arm(m) => m.update(ctx, bit),
             Self::Pretrained(m) => m.update(ctx, bit),
+            #[cfg(feature = "ssm")]
+            Self::Ssm(m) => m.update(ctx, bit),
         }
     }
     #[inline]
@@ -224,6 +240,8 @@ impl Model for AnyModel {
             #[cfg(feature = "arm")]
             Self::Arm(m) => m.selector(),
             Self::Pretrained(m) => m.selector(),
+            #[cfg(feature = "ssm")]
+            Self::Ssm(m) => m.selector(),
         }
     }
 }

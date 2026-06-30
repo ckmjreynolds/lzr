@@ -40,6 +40,10 @@ submission  = ["reorder"]
 # (enwik9 ~12 h) for a modest gain, so the default/submission build stays
 # deterministic and fast. Enable for arm work: `cargo test --features arm`.
 arm         = []
+# `ssm`: the online-neural selective-SSM (SEL) arm, opt-in and NOT shipped (same
+# policy as `arm`). The Stage-0 bake-off found it beats the LSTM arm per-FLOP and
+# the edge grows with scale. Enable for SSM work: `cargo test --features ssm`.
+ssm         = []
 # `reorder`: article-reorder preprocessor (idea 3) as the FIRST pipeline stage —
 # permutes <page> articles into a content-similarity order, restored on decode via
 # each article's in-content page <id> (free, no shipped permutation). Now part of
