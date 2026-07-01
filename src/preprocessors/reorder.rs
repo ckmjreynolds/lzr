@@ -134,6 +134,12 @@ fn similarity_order(blocks: &[&[u8]]) -> Vec<usize> {
                 .iter()
                 .map(|(&w, &c)| (w, c as f32 * (nf / df[&w] as f32).ln()))
                 .collect();
+            // Canonical (word-sorted) order so the downstream f32 norm and cosine
+            // accumulations sum in a FIXED order. `tf` is a HashMap iterated in
+            // per-process-random order, and f32 addition is non-associative, so
+            // without this the greedy chain's near-ties flip run-to-run — the same
+            // permutation and bpb every run only holds once the order is pinned.
+            v.sort_unstable_by_key(|&(w, _)| w);
             let norm = v.iter().map(|&(_, x)| x * x).sum::<f32>().sqrt().max(1e-9);
             for e in &mut v {
                 e.1 /= norm;

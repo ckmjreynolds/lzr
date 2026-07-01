@@ -111,6 +111,12 @@ fn models(capacity: usize) -> Vec<AnyModel> {
             net.push_head_match(HEAD_MATCH_LR, HEAD_BITS); // primary (key=8) match state
             net.push_head_match2(HEAD_MATCH_LR, HEAD_BITS); // secondary (key=4) match
             net.push_head_match_prev(HEAD_MATCH_LR, HEAD_BITS); // match pred × prev byte
+            // Diversity sweep (2026-07-01): three more decorrelated axes, each an
+            // independent −0.0006, gate-passed −0.0022 on full enwik8 and GROWING
+            // with scale (−0.0018/−0.0020/−0.0022 at 8/40/100 MB). L(D)≈0.
+            net.push_head_exp(HEAD_LR, 3, HEAD_BITS); // digit-field
+            net.push_head_exp(HEAD_MATCH_LR, 6, HEAD_BITS); // secondary-match-pred × prev
+            net.push_head_sparse(HEAD_LR, 0b1001, HEAD_BITS); // sparse bytes-back {1,4}
         }
         v.push(net.into());
     }
