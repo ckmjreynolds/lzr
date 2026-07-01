@@ -651,13 +651,21 @@ mod tests {
         };
         let bpb = |m: Vec<AnyModel>| code_stream_models(m, &data).len() as f64 * 8.0 / orig;
 
-        let base = bpb(build(""));
-        println!("baseline (shipped stack):         {base:.4} bpb");
-        let v = bpb(build(&spec));
-        println!(
-            "+ heads=[{spec}] lr={lr} bits={bits}:   {v:.4} bpb  marginal {:+.4}",
-            v - base
-        );
+        // Base spec (`LZR_HEADS_BASE`, default "" = headless) and the candidate
+        // specs (`LZR_HEADS`, ';'-separated) are all encoded in THIS process on
+        // THIS `data`, so every marginal is against the same reorder permutation.
+        // Comparing across separate cargo runs is NOT clean — the reorder greedy
+        // order depends on a per-process HashMap seed, shifting bpb ~±0.001.
+        let base_spec = std::env::var("LZR_HEADS_BASE").unwrap_or_default();
+        let base = bpb(build(&base_spec));
+        println!("base heads=[{base_spec}] lr={lr} bits={bits}:   {base:.4} bpb");
+        for cand in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let v = bpb(build(cand));
+            println!(
+                "+ heads=[{cand}]:   {v:.4} bpb  marginal-over-base {:+.4}",
+                v - base
+            );
+        }
     }
 
     // ---- preprocessor lab: runtime pipeline experiments on the linear mixer ----

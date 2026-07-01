@@ -600,7 +600,10 @@ mod tests {
         use crate::preprocessors::Pipeline;
         use std::time::Instant;
         let env = |k: &str, d: usize| {
-            std::env::var(k).ok().and_then(|x| x.parse().ok()).unwrap_or(d)
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
         };
         let Ok(e8) = std::fs::read("assets/enwik8") else {
             return;
