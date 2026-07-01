@@ -13,6 +13,14 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-07-01 — enwik9 CONFIRMED: net 1.1416 (L(C) 1.1285 + L(D) 0.01305), a −0.0030 NEW PROJECT BEST — and the first reproducible enwik9 figure
+
+The enwik9 encode of the shipped codec (deterministic reorder + the `num,m2c,s9` head triple) finished: 1,000,000,000 → 141,065,890 bytes = L(C) 1.1285, plus L(D) 0.01305 (binary 815,504 B), net 1.1416. That is −0.0030 over the prior standing best of 1.1446 (which was L(C) 1.1315), and it is the first enwik9 number that is byte-reproducible run to run, now that reorder's per-process permutation drift is fixed. Encode wall time 43,430 s (12.06 h); RSS peaked ~9.3 GB during the in-process reorder pass and settled to ~6.6 GB through coding; match coverage held (key-4 99.3%).
+
+Attribution: the −0.0030 bundles the head triple and the random→deterministic reorder permutation change, but the heads dominate — their clean same-permutation full-enwik8 gate was −0.0022 and growing with scale (−0.0018/−0.0020/−0.0022 at 8/40/100 MB), so at enwik9's 10× the extrapolated head gain is ~−0.0026 to −0.0030, leaving the reorder-permutation delta ~neutral (it is one sample from the prior ±0.001 noise band). Either way the ship is validated at scale.
+
+The remaining ultimate gate is a full enwik9 encode+decode round-trip (~another 12 h) — the component round-trips already hold (byte-exact enwik8-slice codec round-trip in `build.sh`, and reorder's inverse round-trips byte-exact on full enwik9's 243k articles, recorded earlier), so end-to-end is expected, but the ~24 h combined gate is owed before this is submission-final. Two RAM follow-ups surfaced by this first in-process-reorder run at enwik9 scale: the reorder pass peaks ~9.3 GB (TF-IDF structures for 243k articles + the held 1 GB input), which is tight under the 10 GB judging cap — reducible by freeing the per-article TF maps once the TF-IDF vectors are built, and by dropping the input after `forward` for the coding phase.
+
 ## 2026-07-01 — SHIPPED: the `num,m2c,s9` head triple added to `models()`, and reorder made cross-process deterministic; enwik9 confirmation launched
 
 With the full-enwik8 gate passed (below) CDR approved the enwik9 run, gated on first fixing reorder's non-determinism. Both shipped changes landed together, `build.sh` green including the byte-exact enwik8-slice round-trip, the M1 `nmix_roundtrip`, and the reorder pipeline round-trip.
