@@ -38,7 +38,19 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<AnyModel> {
         ContextModel::sparse(0b10001, capacity).into(), // bytes back 1 and 5 (skip 2,3,4)
         ContextModel::number(capacity).into(),        // field-aware digit-run context
         MatchModel::new().into(),
-        MatchModel::with_key(4).into(), // shorter-key match: faster acquisition
+        // Shorter-key match: faster acquisition. Its 4-byte contexts are
+        // cardinality-bounded (~2M distinct at full enwik8; occupancy 2.8% of
+        // 2^25 at 20 MB), so 25 bits is neutral-bpb at ≥3× headroom for enwik9
+        // and reclaims 576 MB vs 27 — funding the 18-bit head tables.
+        // `LZR_M4BITS` sweeps it offline.
+        MatchModel::with_key_bits(
+            4,
+            std::env::var("LZR_M4BITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25),
+        )
+        .into(),
         // Higher-order matches (v7's order-scaling lever): acquire only from
         // longer repeats, decorrelated from key-8 the way key-8 is from key-4.
         // Marginals GROW with scale (coverage-driven): key-12 −0.0009 (8 MB) →
@@ -77,7 +89,13 @@ const PRETRAINED_NET: &[u8] = include_bytes!("../assets/pretrained_net.bin");
 /// the dual-rate slow head (see `HEAD_SLOW_LR`) the stack is 5 heads ≈ 320 MB
 /// (enwik9 RSS ~8.5 GB, under the 10 GB cap).
 const HEAD_LR: f32 = 4.0;
-const HEAD_BITS: u32 = 16;
+/// Head table bits. 16 was collision-starved: every head's node hashes its
+/// context WITH the bit-tree position (×256), so even order-1 is 256×256 = 64k
+/// = exactly a 16-bit table, and all heads but `num` overflow it. 20 MB sweep
+/// 16→17→18 = base→−0.0007→−0.0012 (no knee); full-enwik8 gate −0.0016 and
+/// GROWING with scale. 18 costs 256 MB/head (11 heads ≈ 2.8 GB), funded by the
+/// key-4 finder shrink (see `baseline_models`); enwik9 coding RSS ~8.6 GB.
+const HEAD_BITS: u32 = 18;
 /// A second, SLOW readout on the order-1 context (dual-rate): the fast head
 /// (`HEAD_LR`) tracks recent structure, this slow one (lr 0.5) the stable
 /// per-context structure the fast rate washes out — decorrelation by TIMESCALE.
@@ -634,15 +652,16 @@ mod tests {
         let spec = std::env::var("LZR_HEADS").unwrap_or_default();
 
         // A token may carry an optional per-head lr override as `CTX:LR` (e.g.
-        // `w:0.5` for a slow word head — dual-rate stacking).
+        // `w:0.5` for a slow word head — dual-rate stacking) and an optional
+        // per-head table-bits override as `CTX:LR:BITS` (e.g. `w:4:18`).
         let build = |spec: &str| -> Vec<AnyModel> {
             let mut v = baseline_models(cap);
             let mut net = PretrainedMlp::from_blob_q8(PRETRAINED_NET);
             for tok in spec.split(',').filter(|t| !t.is_empty()) {
-                let (ctx, hlr) = match tok.split_once(':') {
-                    Some((c, l)) => (c, l.parse().unwrap()),
-                    None => (tok, lr),
-                };
+                let mut it = tok.split(':');
+                let ctx = it.next().unwrap();
+                let hlr = it.next().map_or(lr, |l| l.parse().unwrap());
+                let bits = it.next().map_or(bits, |b| b.parse().unwrap());
                 if ctx == "w" {
                     net.push_head_word(hlr, bits);
                 } else if ctx == "m" {
@@ -676,8 +695,16 @@ mod tests {
         // Comparing across separate cargo runs is NOT clean — the reorder greedy
         // order depends on a per-process HashMap seed, shifting bpb ~±0.001.
         let base_spec = std::env::var("LZR_HEADS_BASE").unwrap_or_default();
-        let base = bpb(build(&base_spec));
-        println!("base heads=[{base_spec}] lr={lr} bits={bits}:   {base:.4} bpb");
+        // `LZR_HEADS_BASE_BPB=<bpb>` substitutes a known base figure instead of
+        // re-encoding it (sound across processes: reorder is deterministic).
+        let base = std::env::var("LZR_HEADS_BASE_BPB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                let b = bpb(build(&base_spec));
+                println!("base heads=[{base_spec}] lr={lr} bits={bits}:   {b:.4} bpb");
+                b
+            });
         for cand in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             let v = bpb(build(cand));
             println!(
