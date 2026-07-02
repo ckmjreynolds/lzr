@@ -126,9 +126,12 @@ fn similarity_order(blocks: &[&[u8]]) -> Vec<usize> {
     }
     let nf = n as f32;
     let hi_df = ((0.30 * nf) as u32).max(2); // drop ~stopwords: bounds postings & idf≈0
-    // L2-normalised TF-IDF vectors.
+    // L2-normalised TF-IDF vectors. `into_iter` consumes `tfs` so each block's
+    // TF map is freed as its vector is built — at enwik9 scale the 243k live
+    // HashMaps are ~3 GB of the pass's ~9.3 GB peak, the tightest moment under
+    // the 10 GB judging cap.
     let vecs: Vec<Vec<(u64, f32)>> = tfs
-        .iter()
+        .into_iter()
         .map(|tf| {
             let mut v: Vec<(u64, f32)> = tf
                 .iter()
@@ -156,6 +159,7 @@ fn similarity_order(blocks: &[&[u8]]) -> Vec<usize> {
             }
         }
     }
+    drop(df); // dead past inv-building; ~1 GB of global word counts at enwik9
     let mut visited = vec![false; n];
     let mut order = Vec::with_capacity(n);
     let mut cur = (0..n).max_by_key(|&j| vecs[j].len()).unwrap_or(0);

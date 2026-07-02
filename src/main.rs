@@ -33,16 +33,17 @@ fn main() -> std::io::Result<()> {
         .is_some_and(|e| e.eq_ignore_ascii_case("lzr"));
 
     let input = std::fs::read(&in_path)?;
+    let in_len = input.len();
     let start = Instant::now();
     let output = if decoding {
         codec::decode(&input)
     } else {
-        codec::encode(&input)
+        codec::encode(input)
     };
     let elapsed = start.elapsed().as_secs_f64();
     std::fs::write(&out_path, &output)?;
 
-    report(decoding, input.len(), output.len(), elapsed);
+    report(decoding, in_len, output.len(), elapsed);
     Ok(())
 }
 

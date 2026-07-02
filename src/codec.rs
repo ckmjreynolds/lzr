@@ -431,10 +431,15 @@ pub(crate) fn decode_stream_models(models: Vec<AnyModel>, input: &[u8]) -> Vec<u
     data
 }
 
-/// Compress `input` into the lzr byte stream.
-pub(crate) fn encode(input: &[u8]) -> Vec<u8> {
-    let data = Pipeline::default_pipeline().forward(input);
-    code_stream_inner(&data, input.len(), true)
+/// Compress `input` into the lzr byte stream. Takes the input by value so the
+/// raw bytes (1 GB at enwik9) are freed once the pipeline has produced the
+/// stream actually coded — the multi-hour coding phase then holds one copy,
+/// not two, under the 10 GB judging cap.
+pub(crate) fn encode(input: Vec<u8>) -> Vec<u8> {
+    let orig_len = input.len();
+    let data = Pipeline::default_pipeline().forward(&input);
+    drop(input);
+    code_stream_inner(&data, orig_len, true)
 }
 
 /// Decompress an lzr byte stream back into the original bytes.
@@ -469,13 +474,13 @@ mod tests {
     #[test]
     fn roundtrip_text() {
         let data = b"Hello, context mixing! The quick brown fox. ".repeat(64);
-        let coded = encode(&data);
+        let coded = encode(data.clone());
         assert_eq!(decode(&coded), data);
     }
 
     #[test]
     fn roundtrip_empty() {
-        assert_eq!(decode(&encode(b"")), b"");
+        assert_eq!(decode(&encode(Vec::new())), b"");
     }
 
     /// Round-trip the residual neural mixer inside the real codec on a small
@@ -1961,7 +1966,7 @@ mod tests {
         // the online LSTM arm is in the default model set; it still exercises
         // the full pipeline and round-trips byte-exact.
         let slice = &bytes[1_000_000..1_008_000];
-        let coded = encode(slice);
+        let coded = encode(slice.to_vec());
         assert_eq!(decode(&coded), slice);
         let bpb = coded.len() as f64 * 8.0 / slice.len() as f64;
         println!("full stack on enwik8 8 KB slice: {bpb:.4} bpb");
