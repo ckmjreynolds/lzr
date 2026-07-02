@@ -37,8 +37,16 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Distribution, Int, Tensor, TensorData};
 
 const E: usize = 32; // byte embedding dim
-const H: usize = 256; // hidden width
 const V: usize = 256; // vocab (bytes)
+
+/// Hidden width — `LZR_H` overrides (default 256, the shipped net). The blob
+/// header carries H, so the CPU loader needs no change for other widths.
+fn hidden() -> usize {
+    std::env::var("LZR_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+}
 
 #[derive(Module, Debug)]
 struct Mlp<B: Backend> {
@@ -50,7 +58,7 @@ struct Mlp<B: Backend> {
 }
 
 impl<B: Backend> Mlp<B> {
-    fn new(k: usize, device: &B::Device) -> Self {
+    fn new(k: usize, h: usize, device: &B::Device) -> Self {
         let rnd2 = |a: usize, b: usize, std: f64| {
             Param::from_tensor(Tensor::random(
                 [a, b],
@@ -63,12 +71,12 @@ impl<B: Backend> Mlp<B> {
         Self {
             emb: rnd2(V, E, 1.0),
             w1: Param::from_tensor(Tensor::random(
-                [k, E, H],
+                [k, E, h],
                 Distribution::Normal(0.0, (2.0 / (k * E) as f64).sqrt()),
                 device,
             )),
-            b1: Param::from_tensor(Tensor::zeros([H], device)),
-            w2: rnd2(H, V, (2.0 / H as f64).sqrt()),
+            b1: Param::from_tensor(Tensor::zeros([h], device)),
+            w2: rnd2(h, V, (2.0 / h as f64).sqrt()),
             b2: Param::from_tensor(Tensor::zeros([V], device)),
         }
     }
@@ -76,6 +84,7 @@ impl<B: Backend> Mlp<B> {
     /// `ctx`: `[batch, K]` byte indices → logits `[batch, V]`.
     fn forward(&self, ctx: Tensor<B, 2, Int>) -> Tensor<B, 2> {
         let [batch, k] = ctx.dims();
+        let [_, _, h] = self.w1.val().dims();
         let flat = ctx.reshape([batch * k]);
         // [batch,K,E] -> [K,batch,E] @ w1[K,E,H] (batched over positions) -> sum_K.
         // Avoids the [batch,K*E] flatten, whose backward is broken in burn 0.21.
@@ -88,8 +97,8 @@ impl<B: Backend> Mlp<B> {
         let pre = g3
             .matmul(self.w1.val()) // [K, batch, H]
             .sum_dim(0)
-            .reshape([batch, H])
-            .add(self.b1.val().reshape([1, H]));
+            .reshape([batch, h])
+            .add(self.b1.val().reshape([1, h]));
         let hid = pre.tanh();
         hid.matmul(self.w2.val()).add(self.b2.val().reshape([1, V]))
     }
@@ -128,13 +137,14 @@ fn main() {
     let cosine = std::env::var("LZR_COSINE").is_ok();
     let data = std::fs::read(&data_path).expect("preprocessed training data");
     let span = data.len() - k - 1;
+    let h = hidden();
     println!(
-        "pretrain MLP K={k} E={E} H={H} V={V} (~{} params) | data {} B | {steps} steps batch {batch}",
-        V * E + k * E * H + H + H * V + V,
+        "pretrain MLP K={k} E={E} H={h} V={V} (~{} params) | data {} B | {steps} steps batch {batch}",
+        V * E + k * E * h + h + h * V + V,
         data.len()
     );
 
-    let mut model = Mlp::<AB>::new(k, &device);
+    let mut model = Mlp::<AB>::new(k, h, &device);
     let mut optim = AdamConfig::new().init();
     let mut rng = 0x2545_f491_4f6c_dd1du64;
     let mut next = || {
@@ -243,7 +253,7 @@ fn main() {
     }
 
     let mut blob = Vec::new();
-    for d in [k as u32, E as u32, H as u32, V as u32] {
+    for d in [k as u32, E as u32, h as u32, V as u32] {
         blob.extend_from_slice(&d.to_le_bytes());
     }
     for x in vec2(&model.emb)
