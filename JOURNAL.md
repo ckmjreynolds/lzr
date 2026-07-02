@@ -13,6 +13,10 @@ Record of experiments, architectural decisions, results, and external data point
 
 ---
 
+## 2026-07-02 — enwik9 ultimate gate CLOSED: full encode+decode round-trip is byte-identical, so net 1.1416 is submission-grade
+
+The decode of the enwik9 archive completed and `cmp` against the original is byte-identical: 141,065,890-byte archive → 1,000,000,000 bytes, exactly the source. Decode wall time 42,654 s (11.85 h), RSS ~6.7 GB (no reorder-forward peak on the decode side — the inverse is a plain id-sort). Combined with the encode (12.06 h), the full enwik9 encode+decode round-trip holds end to end, which closes the ultimate gate the prior entry left owed. So the −0.0030 new project best (net 1.1416) is now submission-grade, not just an encode-side estimate — and reproducible, given the reorder determinism fix. Standing best updated to net 1.1416 (L(C) 1.1285 + L(D) 0.01305).
+
 ## 2026-07-01 — enwik9 CONFIRMED: net 1.1416 (L(C) 1.1285 + L(D) 0.01305), a −0.0030 NEW PROJECT BEST — and the first reproducible enwik9 figure
 
 The enwik9 encode of the shipped codec (deterministic reorder + the `num,m2c,s9` head triple) finished: 1,000,000,000 → 141,065,890 bytes = L(C) 1.1285, plus L(D) 0.01305 (binary 815,504 B), net 1.1416. That is −0.0030 over the prior standing best of 1.1446 (which was L(C) 1.1315), and it is the first enwik9 number that is byte-reproducible run to run, now that reorder's per-process permutation drift is fixed. Encode wall time 43,430 s (12.06 h); RSS peaked ~9.3 GB during the in-process reorder pass and settled to ~6.6 GB through coding; match coverage held (key-4 99.3%).
