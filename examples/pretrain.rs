@@ -135,6 +135,10 @@ fn main() {
     // Opt-in cosine lr decay to 0 over the run (LZR_COSINE): unlocks descent past
     // the fixed-lr plateau. Off by default so the trainer stays reproducible.
     let cosine = std::env::var("LZR_COSINE").is_ok();
+    let warmup: usize = std::env::var("LZR_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let data = std::fs::read(&data_path).expect("preprocessed training data");
     let span = data.len() - k - 1;
     let h = hidden();
@@ -244,11 +248,21 @@ fn main() {
         }
         let grads = loss.backward();
         let gp = GradientsParams::from_grads(grads, &model);
-        let lr_t = if cosine {
+        let mut lr_t = if cosine {
             lr * 0.5 * (1.0 + (std::f64::consts::PI * step as f64 / steps as f64).cos())
         } else {
             lr
         };
+        // Linear LR warmup over the first `LZR_WARMUP` steps (0 = off, the
+        // default). Width-scaling motivation: H=512 falls into a dead-embedding
+        // equilibrium (|emb|→0, unigram loss) within the first ~2K steps at
+        // both lr 1e-3 and 5e-4, while H=256 trains cleanly on the identical
+        // recipe — classic early-training instability, warmup is the standard
+        // stabilizer. (The codec-side warmup-negative lesson is about ONLINE
+        // single-pass coding, not this offline trainer.)
+        if warmup > 0 && step < warmup {
+            lr_t *= (step + 1) as f64 / warmup as f64;
+        }
         model = optim.step(lr_t, model, gp);
     }
 
