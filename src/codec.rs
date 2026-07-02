@@ -39,6 +39,14 @@ pub(crate) fn baseline_models(capacity: usize) -> Vec<AnyModel> {
         ContextModel::number(capacity).into(),        // field-aware digit-run context
         MatchModel::new().into(),
         MatchModel::with_key(4).into(), // shorter-key match: faster acquisition
+        // Higher-order matches (v7's order-scaling lever): acquire only from
+        // longer repeats, decorrelated from key-8 the way key-8 is from key-4.
+        // Marginals GROW with scale (coverage-driven): key-12 −0.0009 (8 MB) →
+        // −0.0012 (20 MB); +key-16 → −0.0017 (20 MB). Appended AFTER the key-8/
+        // key-4 pair so the mixer match-selector and the heads' match-state
+        // deposits (both take the first match models) are untouched.
+        MatchModel::with_key(12).into(),
+        MatchModel::with_key(16).into(),
         // Indirect context models (paq ICM): predict from what historically
         // followed a context. Orders [1,2,3,4,6] — 5 and 8 add ~nothing.
         IndirectModel::new(1, capacity).into(),
@@ -669,6 +677,84 @@ mod tests {
             let v = bpb(build(cand));
             println!(
                 "+ heads=[{cand}]:   {v:.4} bpb  marginal-over-base {:+.4}",
+                v - base
+            );
+        }
+    }
+
+    /// Full-stack lab for higher-order match models (v7's order-scaling lever):
+    /// measures the marginal of extra `MatchModel`s appended to the SHIPPED model
+    /// set, on the `[LZR_LO..LZR_HI]` slice. `LZR_MKEYS` is a `;`-separated list of
+    /// candidates, each a `,`-separated list of `key[@flat_bits]` specs (e.g.
+    /// `LZR_MKEYS="16;12;16@26,12@26"`). Base and candidates run in this process.
+    #[test]
+    #[ignore = "explore: higher-order match models' marginal over the full stack"]
+    fn match_order_lab() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(d)
+        };
+        let Ok(e8) = std::fs::read("assets/enwik8") else {
+            return;
+        };
+        let lo = env("LZR_LO", 1_000_000);
+        let hi = env("LZR_HI", 9_000_000).min(e8.len());
+        let orig = (hi - lo) as f64;
+        let data = Pipeline::default_pipeline().forward(&e8[lo..hi]);
+        let cap = data.len();
+        // Token forms: `KEY[@BITS]` = plain flat-finder match (append);
+        // `vKEY[@BUCKET_BITS[:VCAP]]` = verified multi-candidate match.
+        // `LZR_MREPL=1` replaces the primary (key-8) match instead of appending.
+        let repl = std::env::var("LZR_MREPL").is_ok();
+        let build = |spec: &str| -> Vec<AnyModel> {
+            let mut v = models(cap);
+            for tok in spec.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                #[allow(clippy::option_if_let_else)]
+                let m = if let Some(rest) = tok.strip_prefix('v') {
+                    let (key, cfg) = rest.split_once('@').unwrap_or((rest, "25:48"));
+                    let (bits, vcap) = cfg.split_once(':').unwrap_or((cfg, "48"));
+                    MatchModel::verified(
+                        key.parse().unwrap(),
+                        bits.parse().unwrap(),
+                        vcap.parse().unwrap(),
+                    )
+                } else {
+                    let (key, bits) = match tok.split_once('@') {
+                        Some((k, b)) => (k.parse().unwrap(), b.parse().unwrap()),
+                        None => (tok.parse().unwrap(), 27),
+                    };
+                    MatchModel::with_key_bits(key, bits)
+                };
+                if repl {
+                    let i = v
+                        .iter()
+                        .position(|m| matches!(m, AnyModel::Match(_)))
+                        .unwrap();
+                    v[i] = m.into();
+                } else {
+                    v.push(m.into());
+                }
+            }
+            v
+        };
+        let bpb = |m: Vec<AnyModel>| code_stream_models(m, &data).len() as f64 * 8.0 / orig;
+        // `LZR_MBASE=<bpb>` substitutes a known base figure instead of re-encoding
+        // it — sound across processes now that reorder is deterministic.
+        let base = std::env::var("LZR_MBASE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                let b = bpb(build(""));
+                println!("base (shipped models):   {b:.4} bpb");
+                b
+            });
+        let spec = std::env::var("LZR_MKEYS").unwrap_or_else(|_| "16".into());
+        for cand in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let v = bpb(build(cand));
+            println!(
+                "+ match[{cand}]:   {v:.4} bpb  marginal-over-base {:+.4}",
                 v - base
             );
         }

@@ -7,7 +7,9 @@
 //! matches of that length have actually been. Reads history from [`Context`];
 //! orders 0–6 already cover short contexts, so the 8-byte key is additive.
 
-use super::finder::{Finder, FlatFinder, LruFinder};
+#[cfg(test)]
+use super::finder::SetFinder;
+use super::finder::{Finder, FlatFinder, LruFinder, WAYS};
 use super::statemap::StateMap;
 use super::{Context, Model};
 
@@ -22,8 +24,11 @@ const USE_LRU: bool = false; // false → flat table; true → LRU exact baselin
 pub(crate) struct MatchModel {
     finder: Box<dyn Finder>,
     last8: u64,    // rolling last 8 finalized bytes
+    hi: u64,       // rolling bytes 9..16 back (for keys longer than 8 bytes)
     key_mask: u64, // masks `last8` to the low `key_bytes` bytes for the finder
+    hi_mask: u64,  // masks `hi` to the high `key_bytes - 8` bytes (0 if key ≤ 8)
     key_bytes: u32,
+    vcap: u32,  // back-verify candidates up to this many context bytes (0 = off)
     ptr: usize, // history index of the predicted next byte
     len: u32,   // current match length
     pb: u8,     // predicted byte (history[ptr]) cached at bpos==0 (byte-constant)
@@ -49,25 +54,55 @@ impl MatchModel {
     }
 
     /// A match model keyed on the last `key_bytes` finalized bytes (`key_bytes`
-    /// ≤ 8). A shorter key acquires matches from shorter repeats; the [`StateMap`]
+    /// ≤ 16). A shorter key acquires matches from shorter repeats; the [`StateMap`]
     /// (keyed on length) discounts the resulting shorter/less-reliable matches.
-    #[allow(clippy::cast_possible_truncation)]
+    /// Keys longer than 8 fold the bytes 9..16 word into the finder key — a
+    /// higher-order match that only acquires from long repeats.
     pub(crate) fn with_key(key_bytes: u32) -> Self {
+        Self::with_key_bits(key_bytes, FLAT_BITS)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn with_key_bits(key_bytes: u32, flat_bits: u32) -> Self {
         let finder: Box<dyn Finder> = if USE_LRU {
             Box::new(LruFinder::new(LRU_CAP))
         } else {
-            Box::new(FlatFinder::new(FLAT_BITS))
+            Box::new(FlatFinder::new(flat_bits))
         };
+        Self::with_finder(finder, key_bytes, 0)
+    }
+
+    /// A verified multi-candidate match: a [`SetFinder`] keeps the last [`WAYS`]
+    /// occurrences per key; on acquisition each candidate is verified against
+    /// real history (killing tag false-positives exactly) and the one with the
+    /// longest verified context wins, seeding `len` from it — long-context
+    /// acquisitions start already trusted by the length-keyed [`StateMap`].
+    /// Test-only (see [`SetFinder`]): neutral as a replacement, redundant as an
+    /// extra next to the key-12/16 higher-order matches.
+    #[cfg(test)]
+    pub(crate) fn verified(key_bytes: u32, bucket_bits: u32, vcap: u32) -> Self {
+        Self::with_finder(Box::new(SetFinder::new(bucket_bits)), key_bytes, vcap)
+    }
+
+    fn with_finder(finder: Box<dyn Finder>, key_bytes: u32, vcap: u32) -> Self {
         let key_mask = if key_bytes >= 8 {
             u64::MAX
         } else {
             (1u64 << (8 * key_bytes)) - 1
         };
+        let hi_mask = match key_bytes {
+            0..=8 => 0,
+            16.. => u64::MAX,
+            k => (1u64 << (8 * (k - 8))) - 1,
+        };
         Self {
             finder,
             last8: 0,
+            hi: 0,
             key_mask,
+            hi_mask,
             key_bytes,
+            vcap,
             ptr: 0,
             len: 0,
             pb: 0,
@@ -97,17 +132,58 @@ impl MatchModel {
         } else {
             self.len = 0;
         }
+        self.hi = (self.hi << 8) | (self.last8 >> 56);
         self.last8 = (self.last8 << 8) | u64::from(b);
-        let key = self.last8 & self.key_mask;
+        let key = (self.last8 & self.key_mask)
+            ^ (self.hi & self.hi_mask).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         if self.len == 0 {
             self.lookups += 1;
-            if let Some(q) = self.finder.lookup(key) {
-                self.ptr = q as usize;
-                self.len = 1;
+            if self.vcap == 0 {
+                if let Some(q) = self.finder.lookup(key) {
+                    self.ptr = q as usize;
+                    self.len = 1;
+                    self.hits += 1;
+                }
+            } else if let Some((q, l)) = self.verify_best(ctx, b, n, key) {
+                self.ptr = q;
+                self.len = l - self.key_bytes + 1; // key-length context ⇒ len 1
                 self.hits += 1;
             }
         }
         self.finder.insert(key, (n + 1) as u32);
+    }
+
+    /// Among the finder's candidates for `key`, the one with the longest context
+    /// verified against real history (newest wins ties), with that length.
+    /// Verification checks ALL context bytes (not just beyond the key), so a tag
+    /// false-positive verifies < `key_bytes` and is rejected — exact, no false
+    /// matches. `b` is the current byte (not yet in history at index `n`).
+    #[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
+    fn verify_best(&mut self, ctx: &Context, b: u8, n: usize, key: u64) -> Option<(usize, u32)> {
+        let mut cand = [0u32; WAYS];
+        let m = self.finder.lookup_multi(key, &mut cand);
+        let hist = ctx.history();
+        let mut best = None;
+        let mut bestl = 0u32;
+        for &qr in &cand[..m] {
+            let q = qr as usize;
+            if q == 0 || q > n || hist[q - 1] != b {
+                continue;
+            }
+            // context byte d back: candidate hist[q-d] vs current hist[n+1-d]
+            // (d == 1 is `b`, checked above).
+            let mut l = 1u32;
+            let mut d = 2usize;
+            while l < self.vcap && d <= q && d <= n + 1 && hist[q - d] == hist[n + 1 - d] {
+                l += 1;
+                d += 1;
+            }
+            if l >= self.key_bytes && l > bestl {
+                bestl = l;
+                best = Some(q);
+            }
+        }
+        best.map(|q| (q, bestl))
     }
 }
 

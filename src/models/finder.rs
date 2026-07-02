@@ -11,12 +11,23 @@ use std::num::NonZeroUsize;
 
 use lru::LruCache;
 
+/// Candidates a multi-way finder can return per key.
+pub(crate) const WAYS: usize = 4;
+
 /// A `key -> position` store the match model queries and updates each byte.
 pub(crate) trait Finder: std::fmt::Debug {
     /// Record that the context `key` was last followed by the byte at `pos`.
     fn insert(&mut self, key: u64, pos: u32);
     /// The position recorded for `key`, if any.
     fn lookup(&mut self, key: u64) -> Option<u32>;
+    /// Up to [`WAYS`] recent positions recorded for `key`, newest first; returns
+    /// the count. Single-slot finders yield at most one.
+    fn lookup_multi(&mut self, key: u64, out: &mut [u32; WAYS]) -> usize {
+        self.lookup(key).map_or(0, |q| {
+            out[0] = q;
+            1
+        })
+    }
     /// A one-line summary of fill/eviction, for tuning the table size.
     fn report(&self) -> String;
 }
@@ -96,6 +107,88 @@ impl FlatFinder {
     const fn locate(&self, key: u64) -> (usize, u16) {
         let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         ((h >> self.shift) as usize, h as u16)
+    }
+}
+
+/// Set-associative multi-candidate finder: each bucket keeps the last [`WAYS`]
+/// positions inserted for keys hashing there, newest first, tag-checked. Unlike
+/// [`FlatFinder`] a key's older occurrences survive newer inserts, so the match
+/// model can verify each candidate against real history and start from the one
+/// with the longest verified context (the continuous form of a higher-order key).
+/// Test-only: measured NEUTRAL as a primary-finder replacement and ~redundant
+/// with the shipped key-12/16 higher-order matches as an extra (2026-07-01 lab);
+/// kept for future `match_order_lab` experiments.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct SetFinder {
+    pos: Vec<u32>, // WAYS entries per bucket, newest first (0 = empty)
+    tags: Vec<u16>,
+    shift: u32,
+    writes: u64,
+    occupied: u64,
+}
+
+#[cfg(test)]
+impl SetFinder {
+    pub(crate) fn new(bucket_bits: u32) -> Self {
+        let size = (1usize << bucket_bits) * WAYS;
+        Self {
+            pos: vec![0; size],
+            tags: vec![0; size],
+            shift: 64 - bucket_bits,
+            writes: 0,
+            occupied: 0,
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    const fn locate(&self, key: u64) -> (usize, u16) {
+        let h = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (((h >> self.shift) as usize) * WAYS, h as u16)
+    }
+}
+
+#[cfg(test)]
+impl Finder for SetFinder {
+    fn insert(&mut self, key: u64, pos: u32) {
+        let (s, tag) = self.locate(key);
+        self.writes += 1;
+        if self.pos[s + WAYS - 1] == 0 {
+            self.occupied += 1;
+        }
+        for w in (1..WAYS).rev() {
+            self.pos[s + w] = self.pos[s + w - 1];
+            self.tags[s + w] = self.tags[s + w - 1];
+        }
+        self.pos[s] = pos;
+        self.tags[s] = tag;
+    }
+
+    fn lookup(&mut self, key: u64) -> Option<u32> {
+        let mut out = [0u32; WAYS];
+        (self.lookup_multi(key, &mut out) > 0).then(|| out[0])
+    }
+
+    fn lookup_multi(&mut self, key: u64, out: &mut [u32; WAYS]) -> usize {
+        let (s, tag) = self.locate(key);
+        let mut n = 0;
+        for w in 0..WAYS {
+            if self.pos[s + w] != 0 && self.tags[s + w] == tag {
+                out[n] = self.pos[s + w];
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn report(&self) -> String {
+        let buckets = self.pos.len() / WAYS;
+        format!(
+            "set: {buckets} buckets x {WAYS} ways, full {:.1}%, {} writes",
+            100.0 * self.occupied as f64 / buckets as f64,
+            self.writes,
+        )
     }
 }
 
