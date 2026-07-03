@@ -33,7 +33,7 @@
           with:
             components: clippy
         - uses: Swatinem/rust-cache@v2
-        - run: cargo clippy --all-targets --all-features
+        - run: cargo clippy --locked --all-targets --all-features
 
     # Documentation
     docs:
@@ -45,7 +45,7 @@
         - uses: actions/checkout@v6
         - uses: dtolnay/rust-toolchain@stable
         - uses: Swatinem/rust-cache@v2
-        - run: cargo doc --no-deps --all-features
+        - run: cargo doc --locked --no-deps --all-features
 
     # Test matrix across platforms and Rust versions
     test:
@@ -59,15 +59,15 @@
           include:
             # MSRV check on Linux only
             - os: ubuntu-latest
-              rust: "1.85"
+              rust: "1.87"
       steps:
         - uses: actions/checkout@v6
         - uses: dtolnay/rust-toolchain@master
           with:
             toolchain: ${{ matrix.rust }}
         - uses: Swatinem/rust-cache@v2
-        - run: cargo build --all-features
-        - run: cargo test --all-features
+        - run: cargo build --locked --all-features
+        - run: cargo test --locked --all-features
 
     # Code coverage (Linux only, stable)
     coverage:
@@ -82,7 +82,7 @@
         - uses: Swatinem/rust-cache@v2
         - uses: taiki-e/install-action@cargo-llvm-cov
         - name: Generate coverage
-          run: cargo +nightly llvm-cov --all-features --doctests --branch --lcov --output-path lcov.info
+          run: cargo +nightly llvm-cov --locked --all-features --doctests --branch --lcov --output-path lcov.info
         - name: Upload to Codecov
           uses: codecov/codecov-action@v5
           with:
@@ -111,7 +111,7 @@
         - uses: dtolnay/rust-toolchain@stable
         - uses: Swatinem/rust-cache@v2
         - name: Publish to crates.io
-          run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+          run: cargo publish --locked --token ${{ secrets.CRATES_IO_TOKEN }}
 
     required:
       name: Required

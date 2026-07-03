@@ -9,46 +9,76 @@ description     = "Fast LZ77-based compression library and CLI."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
 repository      = "https://github.com/ckmjreynolds/lzr"
-keywords        = ["LZ77", "compression", "compress"]
-categories      = ["compression"]
+keywords        = ["lz77", "compression", "compress", "codec", "cli"]
+categories      = ["compression", "command-line-utilities"]
 documentation   = "https://docs.rs/lzr"
 
-include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
+include = [
+    "/src/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-*",
+]
 
 [dependencies]
-clap = { version = "=4.6.1", features = ["derive"] }
-lipsum = { version = "=0.9.1", optional = true }
-static_assertions = "=1.1.0"
-thiserror = "=2.0.18"
-wabi_tree = "=0.1.2"
+clap = { version = "4.6.1", features = ["derive"] }
+lipsum = { version = "0.9.1", optional = true }
+static_assertions = "1.1.0"
+thiserror = "2.0.18"
+wabi_tree = "0.1.2"
 
 [dev-dependencies]
-assert_cmd = "=2.2.1"
-criterion = "=0.8.2"
-lipsum = "=0.9.1"
-pretty_assertions = "=1.4.1"
-proptest = "=1.11.0"
+assert_cmd = "2.2.1"
+criterion = "0.8.2"
+lipsum = "0.9.1"
+pretty_assertions = "1.4.1"
+proptest = "1.11.0"
 
 [lints.rust]
 keyword_idents = { level = "forbid", priority = -1 }
+let_underscore_drop = "warn"
+meta_variable_misuse = "warn"
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
 missing_docs = "warn"
 non_ascii_idents = "forbid"
+redundant_lifetimes = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 unreachable_pub = "deny"
 unsafe_code = "forbid"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+unused_qualifications = "warn"
+unused_results = "warn"
 # Too many false positives in a crate with both a library and executable.
 # unused_crate_dependencies = "warn"
-unused_lifetimes = "warn"
-unused_qualifications = "warn"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 cargo = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+# Curated `restriction` lints (never enable the group wholesale).
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+empty_structs_with_brackets = "warn"
+expect_used = "warn"
+panic = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+str_to_string = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+# Transitive duplicate versions are outside our control; keep CI robust.
+multiple_crate_versions = "allow"
 redundant_pub_crate = "allow"
 
 [features]
