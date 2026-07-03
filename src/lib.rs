@@ -11,12 +11,14 @@ pub mod error;
 // visibility is switched with `cfg` instead.
 #[cfg(feature = "bench-internals")]
 pub mod adler32;
+
 #[cfg(not(feature = "bench-internals"))]
 #[cfg_attr(not(test), expect(dead_code, reason = "Development."))]
 pub(crate) mod adler32;
 
 #[cfg(feature = "bench-internals")]
 pub mod uleb128;
+
 #[cfg(not(feature = "bench-internals"))]
 #[cfg_attr(not(test), expect(dead_code, reason = "Development."))]
 pub(crate) mod uleb128;
