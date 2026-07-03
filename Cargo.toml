@@ -23,14 +23,14 @@ include = [
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
-lipsum = { version = "0.9.1", optional = true }
 static_assertions = "1.1.0"
 thiserror = "2.0.18"
-wabi_tree = "0.1.2"
+# Only needed to widen internal visibility for `bench-internals`; pulled by that feature.
+visibility = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
-assert_cmd = "2.2.1"
-criterion = "0.8.2"
+# assert_cmd = "2.2.2"
+divan = "0.1.21"
 lipsum = "0.9.1"
 pretty_assertions = "1.4.1"
 proptest = "1.11.0"
@@ -82,7 +82,8 @@ multiple_crate_versions = "allow"
 redundant_pub_crate = "allow"
 
 [features]
-bench-internals = ["lipsum"]
+# Widens `pub(crate)` internals to `pub` so `benches/` can reach them. Off by default.
+bench-internals = ["dep:visibility"]
 
 [[bench]]
 name = "adler32"
@@ -90,18 +91,9 @@ harness = false
 required-features = ["bench-internals"]
 
 [[bench]]
-name = "entropy"
+name = "uleb128"
 harness = false
 required-features = ["bench-internals"]
-
-[[bench]]
-name = "lz77"
-harness = false
-required-features = ["bench-internals"]
-
-[[bench]]
-name = "roundtrip"
-harness = false
 
 [profile.release]
 lto = "thin"

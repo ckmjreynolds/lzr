@@ -20,7 +20,8 @@ use crate::error::{Error, Result};
 /// encode_uleb128_u64(128, &mut out);
 /// assert_eq!(out, vec![0x80, 0x01]);
 /// ```
-#[allow(clippy::cast_possible_truncation)]
+#[cfg_attr(feature = "bench-internals", visibility::make(pub))]
+#[expect(clippy::cast_possible_truncation, reason = "Truncation masked/intentional.")]
 pub(crate) fn encode_uleb128_u64(mut value: u64, out: &mut Vec<u8>) {
     for _ in 0..8 {
         let byte = (value & 0x7F) as u8;
@@ -53,6 +54,7 @@ pub(crate) fn encode_uleb128_u64(mut value: u64, out: &mut Vec<u8>) {
 /// assert_eq!(decode_uleb128_u64(&buf, &mut pos).unwrap(), 128);
 /// assert_eq!(pos, 2);
 /// ```
+#[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 pub(crate) fn decode_uleb128_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
