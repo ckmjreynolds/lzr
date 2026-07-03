@@ -1,4 +1,0 @@
-[submodule "corpora"]
-	path = corpora
-	url = https://github.com/zlib-ng/corpora.git
-	ignore = dirty
