@@ -21,7 +21,7 @@ use crate::mixer::Mixer;
 use crate::models::null::NullModel;
 use crate::models::order0::Order0;
 use crate::models::{Context, SYMBOL_BITS, TokenModel};
-use crate::preprocessors::{CaseFolding, NullBytes, NullTokens, Pipeline, Transform};
+use crate::preprocessors::{CaseFolding, EntityFolding, NullBytes, NullTokens, Pipeline, Transform};
 use crate::tokenizers::{NullTokenizer, RepairTokenizer, Tokenize};
 use crate::uleb128;
 
@@ -203,6 +203,11 @@ fn build_casefold() -> Box<dyn Transform<u8>> {
     Box::new(CaseFolding)
 }
 
+/// Constructs the [`EntityFolding`] byte preprocessor for the feature registry.
+fn build_entities() -> Box<dyn Transform<u8>> {
+    Box::new(EntityFolding)
+}
+
 /// What enabling a pipeline feature does.
 #[derive(Clone, Copy)]
 enum Kind {
@@ -242,6 +247,13 @@ const FEATURES: &[FeatureSpec] = &[
         name: "casefold",
         default_on: true,
         kind: Kind::BytePre(build_casefold),
+    },
+    // Appended after `casefold` so it applies after it: casefold claims its spare
+    // control bytes first, then entity folding picks its five from what remains.
+    FeatureSpec {
+        name: "entities",
+        default_on: true,
+        kind: Kind::BytePre(build_entities),
     },
 ];
 
@@ -458,22 +470,26 @@ mod tests {
         assert!(profile.enabled("repair"));
         assert!(!profile.enabled("null"));
         assert!(profile.enabled("casefold"));
-        // bit 0 (repair) + bit 2 (casefold), bit 1 (null) off.
-        assert_eq!(profile.to_bits(), 0b101);
+        assert!(profile.enabled("entities"));
+        // bit 0 (repair) + bit 2 (casefold) + bit 3 (entities), bit 1 (null) off.
+        assert_eq!(profile.to_bits(), 0b1101);
     }
 
     #[test]
     fn profile_toggles_by_name() {
-        let mut profile = Profile::default(); // 0b101: repair + casefold
+        let mut profile = Profile::default(); // 0b1101: repair + casefold + entities
         profile.disable("casefold").unwrap();
         profile.disable("repair").unwrap();
-        assert_eq!(profile.to_bits(), 0b000);
+        profile.disable("entities").unwrap();
+        assert_eq!(profile.to_bits(), 0b0000);
         profile.enable("null").unwrap();
-        assert_eq!(profile.to_bits(), 0b010);
+        assert_eq!(profile.to_bits(), 0b0010);
         profile.enable("repair").unwrap();
-        assert_eq!(profile.to_bits(), 0b011);
+        assert_eq!(profile.to_bits(), 0b0011);
         profile.enable("casefold").unwrap();
-        assert_eq!(profile.to_bits(), 0b111);
+        assert_eq!(profile.to_bits(), 0b0111);
+        profile.enable("entities").unwrap();
+        assert_eq!(profile.to_bits(), 0b1111);
     }
 
     #[test]
@@ -485,11 +501,11 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..2 (repair, null, casefold) are all known features.
-        for bits in 0..=0b111 {
+        // bits 0..3 (repair, null, casefold, entities) are all known features.
+        for bits in 0..=0b1111 {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(0b1000).is_err()); // bit 3 is not a known feature
+        assert!(Profile::from_bits(0b10000).is_err()); // bit 4 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 }

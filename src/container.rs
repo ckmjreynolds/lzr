@@ -107,7 +107,7 @@ mod tests {
 
     #[test]
     fn compressed_output_is_self_describing() {
-        // The default profile fits in one ULEB128 byte (bit 0 set).
+        // The default profile fits in one ULEB128 byte (a small feature bitmask).
         let c = compress(b"hello");
         assert!(c.starts_with(MAGIC));
         assert_eq!(c[3], VERSION);
@@ -122,6 +122,7 @@ mod tests {
         let mut profile = Profile::default();
         profile.disable("repair").unwrap();
         profile.disable("casefold").unwrap();
+        profile.disable("entities").unwrap();
         let c = compress_with(b"hello world", profile);
         assert_eq!(c[PREFIX_LEN], 0x00);
         assert_eq!(decompress(&c).unwrap(), b"hello world".to_vec());
@@ -129,9 +130,9 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_profile() {
-        // Bit 3 is not a known feature; a single-byte ULEB128 profile of 0x08 must be rejected.
+        // Bit 4 is not a known feature; a single-byte ULEB128 profile of 0x10 must be rejected.
         let mut c = compress(b"data");
-        c[PREFIX_LEN] = 0x08;
+        c[PREFIX_LEN] = 0x10;
         assert!(decompress(&c).is_err());
     }
 
