@@ -6,9 +6,16 @@
 //!
 //! See the [FORMAT.md](../docs/FORMAT.md) specification for details on the encoding.
 
+use anyhow::{Context as _, Result, bail};
 use arbitrary_int::u15;
 
-use crate::error::{Error, Result};
+/// Reads the byte at `*pos` and advances it, erroring if the input is exhausted.
+/// Shared by the ULEB128 decoders so each read is bounds-checked in one place.
+fn take(buf: &[u8], pos: &mut usize) -> Result<u8> {
+    let byte = *buf.get(*pos).context("unexpected end of input decoding ULEB128")?;
+    *pos += 1;
+    Ok(byte)
+}
 
 /// Encodes `value` as ULEB128 by appending bytes to `out`.
 ///
@@ -45,8 +52,9 @@ pub(crate) fn encode_u64(mut value: u64, out: &mut Vec<u8>) {
 ///
 /// # Errors
 ///
-/// Returns [`Error::NonCanonicalUleb128`] if the terminating 7-bit payload
-/// byte is `0x00` yet a shorter encoding would have produced the same value.
+/// Returns an error if the input ends before the value is complete, or if the
+/// encoding is non-canonical (overlong) — the terminating 7-bit payload byte is
+/// `0x00` yet a shorter encoding would have produced the same value.
 ///
 /// # Examples
 ///
@@ -62,25 +70,23 @@ pub(crate) fn decode_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
     let mut shift: u32 = 0;
 
     for i in 0..8 {
-        let byte = buf[*pos];
-        *pos += 1;
+        let byte = take(buf, pos)?;
         value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             // Canonical requires: either this is the first byte (i=0), or the
             // terminating byte has a nonzero payload. Otherwise a shorter
             // encoding would represent the same value.
             if i > 0 && byte == 0 {
-                return Err(Error::NonCanonicalUleb128);
+                bail!("non-canonical ULEB128 encoding");
             }
             return Ok(value);
         }
         shift += 7;
     }
     // 9th byte: all 8 bits are payload; canonical requires it to be nonzero.
-    let byte = buf[*pos];
-    *pos += 1;
+    let byte = take(buf, pos)?;
     if byte == 0 {
-        return Err(Error::NonCanonicalUleb128);
+        bail!("non-canonical ULEB128 encoding");
     }
     value |= u64::from(byte) << shift;
     Ok(value)
@@ -92,9 +98,9 @@ pub(crate) fn decode_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
 /// statically known to fit in 15 bits (e.g. token ids). Values below `0x80` take
 /// a single byte; everything else takes exactly two, with the terminating byte
 /// carrying all 8 remaining bits rather than 7. A `u15` therefore never needs the
-/// 3 bytes that the general [`encode_uleb128_u64`] would spend on values ≥ 16384,
-/// and the [`u15`] type makes an out-of-range input unrepresentable at the call
-/// site, so the encoder needs no range check of its own.
+/// 3 bytes that the general [`encode_u64`] would spend on values ≥ 16384, and the
+/// [`u15`] type makes an out-of-range input unrepresentable at the call site, so
+/// the encoder needs no range check of its own.
 ///
 /// # Examples
 ///
@@ -122,8 +128,9 @@ pub(crate) fn encode_u15(value: u15, out: &mut Vec<u8>) {
 ///
 /// # Errors
 ///
-/// Returns [`Error::NonCanonicalUleb128`] if the 2-byte form's terminating byte
-/// is `0x00`, since the same value would then fit in a single byte.
+/// Returns an error if the input ends before the value is complete, or if the
+/// encoding is non-canonical — the 2-byte form's terminating byte is `0x00`,
+/// since the same value would then fit in a single byte.
 ///
 /// # Examples
 ///
@@ -135,19 +142,17 @@ pub(crate) fn encode_u15(value: u15, out: &mut Vec<u8>) {
 /// ```
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 pub(crate) fn decode_u15(buf: &[u8], pos: &mut usize) -> Result<u15> {
-    let byte0 = buf[*pos];
-    *pos += 1;
+    let byte0 = take(buf, pos)?;
     if byte0 & 0x80 == 0 {
         // Single-byte form: the 7-bit payload is already a valid `u15`.
         return Ok(u15::new(u16::from(byte0)));
     }
 
-    let byte1 = buf[*pos];
-    *pos += 1;
+    let byte1 = take(buf, pos)?;
     // Canonical requires the terminating 8-bit byte to be nonzero; otherwise the
     // single-byte form would encode the same value (mirrors the u64 decoder).
     if byte1 == 0 {
-        return Err(Error::NonCanonicalUleb128);
+        bail!("non-canonical ULEB128 encoding");
     }
 
     // 7 payload bits + 8 terminating bits = 15 bits, so the result always fits a
@@ -244,18 +249,32 @@ mod tests {
     fn u15_rejects_non_canonical() {
         // `0x80 0x00` represents 0 but the canonical encoding of 0 is `0x00`.
         let mut pos = 0;
-        assert!(matches!(decode_u15(&[0x80, 0x00], &mut pos), Err(Error::NonCanonicalUleb128)));
+        assert!(decode_u15(&[0x80, 0x00], &mut pos).is_err());
     }
 
     #[test]
     fn rejects_non_canonical() {
         // `0x80 0x00` represents 0 but the canonical encoding of 0 is `0x00`.
         let mut pos = 0;
-        assert!(matches!(decode_u64(&[0x80, 0x00], &mut pos), Err(Error::NonCanonicalUleb128),));
+        assert!(decode_u64(&[0x80, 0x00], &mut pos).is_err());
 
         // Nine-byte encoding with a zero top byte is also non-canonical.
         let mut pos = 0;
         let bad = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00];
-        assert!(matches!(decode_u64(&bad, &mut pos), Err(Error::NonCanonicalUleb128),));
+        assert!(decode_u64(&bad, &mut pos).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated() {
+        // A trailing continuation bit with no successor byte must error, not panic.
+        let mut pos = 0;
+        assert!(decode_u64(&[0x80], &mut pos).is_err());
+        let mut pos = 0;
+        assert!(decode_u15(&[0x80], &mut pos).is_err());
+        // An empty buffer must error, not panic.
+        let mut pos = 0;
+        assert!(decode_u64(&[], &mut pos).is_err());
+        let mut pos = 0;
+        assert!(decode_u15(&[], &mut pos).is_err());
     }
 }

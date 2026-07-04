@@ -15,23 +15,23 @@ fn main() {
 /// Input sizes in bytes.
 const SIZES: &[usize] = &[1 << 10, 1 << 16, 1 << 20];
 
-/// Deterministic English-like text of exactly `min_bytes` bytes.
-fn text(min_bytes: usize) -> Vec<u8> {
-    // lipsum counts words, not bytes; average English word is ~5 chars + space.
-    let mut words = min_bytes / 5 + 1;
-    loop {
-        let mut bytes = lipsum::lipsum(words).into_bytes();
-        if bytes.len() >= min_bytes {
-            bytes.truncate(min_bytes);
-            return bytes;
-        }
-        words *= 2;
-    }
+/// A deterministic buffer of exactly `n` bytes.
+///
+/// An odd-constant LCG walk (the same spread trick the `uleb128` bench uses) fills
+/// the whole `0..=255` range without pulling in a text-generation dependency.
+fn bytes(n: usize) -> Vec<u8> {
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+            ((state >> 32) & 0xFF) as u8
+        })
+        .collect()
 }
 
 #[divan::bench(args = SIZES)]
 fn checksum(bencher: Bencher<'_, '_>, size: usize) {
-    let data = text(size);
+    let data = bytes(size);
     bencher.counter(BytesCount::of_slice(&data)).bench(|| {
         let mut ck = Adler32::new();
         ck.update(black_box(&data));

@@ -22,17 +22,16 @@ include = [
 ]
 
 [dependencies]
+anyhow = "1.0.103"
 arbitrary-int = "2.1.1"
 clap = { version = "4.6.1", features = ["derive"] }
 static_assertions = "1.1.0"
-thiserror = "2.0.18"
 # Only needed to widen internal visibility for `bench-internals`; pulled by that feature.
 visibility = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
-# assert_cmd = "2.2.2"
+assert_cmd = "2.2.2"
 divan = "0.1.21"
-lipsum = "0.9.1"
 pretty_assertions = "1.4.1"
 proptest = "1.11.0"
 
@@ -90,11 +89,25 @@ bench-internals = ["dep:visibility"]
 name = "adler32"
 harness = false
 required-features = ["bench-internals"]
+test = false
 
 [[bench]]
 name = "uleb128"
 harness = false
 required-features = ["bench-internals"]
+test = false
+
+[[bench]]
+name = "codec"
+harness = false
+required-features = ["bench-internals"]
+test = false
+
+[[bench]]
+name = "repair"
+harness = false
+required-features = ["bench-internals"]
+test = false
 
 [profile.release]
 lto = "thin"
