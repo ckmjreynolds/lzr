@@ -58,10 +58,19 @@ append-only (never reorder or reuse a bit, or old containers become unreadable):
   of symbol ids. The codec core framing (§2) is unchanged — the grammar rides in the token stream.
 - bit `1` (`0x02`) — **`null`** (default off): an optional entropy model that predicts ½ and never
   learns (a no-op placeholder for the toggleable-model framework).
+- bit `2` (`0x04`) — **`casefold`** (default on): an ASCII case-folding byte preprocessor, applied
+  before tokenization. It lowercases `A`–`Z` and re-encodes the case as two inline control symbols —
+  a **shift** (capitalize the next letter) and a **caps-lock** (toggle capitalize-all until seen
+  again) — whose byte values are chosen per input as two values absent from it. The transformed
+  stream is self-describing: a leading mode byte is `0x00` for a pass-through (used when the input is
+  not text, has no uppercase letter, or has fewer than two spare byte values) or `0x01` for a folded
+  payload, in which case the two chosen symbol bytes follow the mode byte. When clear, the identity
+  (NULL) byte preprocessor is used.
 
-The order-0 entropy model is **always** present and is not a feature. The NULL byte/token
-preprocessors are always present too. Bits with no assigned feature are reserved for future stages
-(more models, tokenizers, preprocessors, coders); a `profile` with any reserved bit set is an error.
+The order-0 entropy model is **always** present and is not a feature. The NULL token preprocessor is
+always present too, as is the NULL byte preprocessor (the `casefold` bit only *adds* a byte stage
+ahead of it). Bits with no assigned feature are reserved for future stages (more models, tokenizers,
+preprocessors, coders); a `profile` with any reserved bit set is an error.
 
 ## 4. ULEB128 (§7 canonical rule)
 

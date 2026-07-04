@@ -21,7 +21,7 @@ use crate::mixer::Mixer;
 use crate::models::null::NullModel;
 use crate::models::order0::Order0;
 use crate::models::{Context, SYMBOL_BITS, TokenModel};
-use crate::preprocessors::{NullBytes, NullTokens, Pipeline, Transform};
+use crate::preprocessors::{CaseFolding, NullBytes, NullTokens, Pipeline, Transform};
 use crate::tokenizers::{NullTokenizer, RepairTokenizer, Tokenize};
 use crate::uleb128;
 
@@ -159,10 +159,9 @@ pub(crate) struct Compressor {
 impl Compressor {
     /// Builds the pipeline `profile` selects.
     pub(crate) fn from_profile(profile: Profile) -> Self {
-        let byte_stages: Vec<Box<dyn Transform<u8>>> = vec![Box::new(NullBytes)];
         let token_stages: Vec<Box<dyn Transform<u15>>> = vec![Box::new(NullTokens)];
         Self {
-            byte_pre: Pipeline::new(byte_stages),
+            byte_pre: Pipeline::new(profile.byte_preprocessors()),
             tokenizer: profile.tokenizer(),
             token_pre: Pipeline::new(token_stages),
             profile,
@@ -199,6 +198,11 @@ fn build_null_model(_capacity: usize) -> Box<dyn TokenModel> {
     Box::new(NullModel::new())
 }
 
+/// Constructs the [`CaseFolding`] byte preprocessor for the feature registry.
+fn build_casefold() -> Box<dyn Transform<u8>> {
+    Box::new(CaseFolding)
+}
+
 /// What enabling a pipeline feature does.
 #[derive(Clone, Copy)]
 enum Kind {
@@ -206,6 +210,8 @@ enum Kind {
     Tokenizer,
     /// Add an optional entropy model, mixed alongside the always-on order-0 model.
     Model(fn(usize) -> Box<dyn TokenModel>),
+    /// Add a byte preprocessor, applied (in registry order) before tokenization.
+    BytePre(fn() -> Box<dyn Transform<u8>>),
 }
 
 /// One toggleable pipeline feature. The order-0 entropy model is always present and is *not* a
@@ -231,6 +237,11 @@ const FEATURES: &[FeatureSpec] = &[
         name: "null",
         default_on: false,
         kind: Kind::Model(build_null_model),
+    },
+    FeatureSpec {
+        name: "casefold",
+        default_on: true,
+        kind: Kind::BytePre(build_casefold),
     },
 ];
 
@@ -306,6 +317,21 @@ impl Profile {
     /// Builds the compressor pipeline this profile selects.
     pub(crate) fn compressor(self) -> Compressor {
         Compressor::from_profile(self)
+    }
+
+    /// The byte preprocessors this profile selects: the always-present identity
+    /// [`NullBytes`] stage plus every enabled [`Kind::BytePre`] feature, applied in
+    /// registry order before tokenization.
+    fn byte_preprocessors(self) -> Vec<Box<dyn Transform<u8>>> {
+        let mut stages: Vec<Box<dyn Transform<u8>>> = vec![Box::new(NullBytes)];
+        for (i, feature) in FEATURES.iter().enumerate() {
+            if let Kind::BytePre(build) = feature.kind
+                && self.is_set(i)
+            {
+                stages.push(build());
+            }
+        }
+        stages
     }
 
     /// The tokenizer this profile selects.
@@ -427,22 +453,27 @@ mod tests {
     }
 
     #[test]
-    fn profile_default_has_repair_on_and_null_off() {
+    fn profile_default_has_repair_on_null_off_casefold_on() {
         let profile = Profile::default();
         assert!(profile.enabled("repair"));
         assert!(!profile.enabled("null"));
-        assert_eq!(profile.to_bits(), 0b01);
+        assert!(profile.enabled("casefold"));
+        // bit 0 (repair) + bit 2 (casefold), bit 1 (null) off.
+        assert_eq!(profile.to_bits(), 0b101);
     }
 
     #[test]
     fn profile_toggles_by_name() {
-        let mut profile = Profile::default();
+        let mut profile = Profile::default(); // 0b101: repair + casefold
+        profile.disable("casefold").unwrap();
         profile.disable("repair").unwrap();
-        assert_eq!(profile.to_bits(), 0b00);
+        assert_eq!(profile.to_bits(), 0b000);
         profile.enable("null").unwrap();
-        assert_eq!(profile.to_bits(), 0b10);
+        assert_eq!(profile.to_bits(), 0b010);
         profile.enable("repair").unwrap();
-        assert_eq!(profile.to_bits(), 0b11);
+        assert_eq!(profile.to_bits(), 0b011);
+        profile.enable("casefold").unwrap();
+        assert_eq!(profile.to_bits(), 0b111);
     }
 
     #[test]
@@ -454,10 +485,11 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        for bits in 0..=0b11 {
+        // bits 0..2 (repair, null, casefold) are all known features.
+        for bits in 0..=0b111 {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(0b100).is_err()); // bit 2 is not a known feature
+        assert!(Profile::from_bits(0b1000).is_err()); // bit 3 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 }

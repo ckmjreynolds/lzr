@@ -24,7 +24,7 @@ include = [
 [dependencies]
 anyhow = "1.0.103"
 arbitrary-int = "2.1.1"
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.1", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 static_assertions = "1.1.0"
 # Only needed to widen internal visibility for `bench-internals`; pulled by that feature.
 visibility = { version = "0.1.1", optional = true }
@@ -110,8 +110,9 @@ required-features = ["bench-internals"]
 test = false
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+strip = "symbols"
 
 [profile.bench]
 lto = "thin"
