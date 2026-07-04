@@ -43,24 +43,17 @@ const VOCAB_CAP: u32 = 0x7FFF;
 /// Decompression-bomb ceiling for `inverse`: a small grammar can expand exponentially, so the
 /// total expansion is bounded regardless of the (untrusted) grammar.
 const MAX_EXPANSION_BYTES: u64 = 1 << 31;
+/// When the lazy-deletion heap grows past this factor times the live digram count (floored by
+/// [`HEAP_COMPACT_FLOOR`]), it is rebuilt from the live `pairs`. The heap is otherwise the run's
+/// dominant memory sink: one candidate is pushed per occurrence at seed time and per rewrite during
+/// merging, and stale entries are only ever discarded on pop, so without compaction the heap holds
+/// O(total pushes over the whole run) rather than O(distinct live digrams).
+const HEAP_COMPACT_SLACK: usize = 2;
+/// Trigger floor for [`Repair::compact_heap_if_bloated`]: below this many live digrams the heap is
+/// already small enough that rebuilding it would cost more than it saves.
+const HEAP_COMPACT_FLOOR: usize = 1 << 16;
 
 const_assert!(VOCAB_CAP == 0x7FFF);
-
-/// One slot in the working sequence, doubly linked both in sequence order and within its digram's
-/// occurrence list.
-#[derive(Debug, Clone, Copy)]
-struct Node {
-    /// Symbol id, or [`NONE_SYM`] once the slot has been merged away.
-    sym: u16,
-    /// Previous live slot in sequence order, or [`NIL`].
-    prev: u32,
-    /// Next live slot in sequence order, or [`NIL`].
-    next: u32,
-    /// Previous slot in this slot's digram occurrence list, or [`NIL`].
-    occ_prev: u32,
-    /// Next slot in this slot's digram occurrence list, or [`NIL`].
-    occ_next: u32,
-}
 
 /// Occurrence bookkeeping for one active digram.
 #[derive(Debug, Clone, Copy)]
@@ -128,9 +121,22 @@ enum Def {
 }
 
 /// Working state for one capped Re-Pair run over a single input.
+///
+/// The working sequence is a doubly linked list with tombstones, held as a struct-of-arrays (one
+/// column per node field) rather than a `Vec<Node>`. A `Node` of one `u16` and four `u32`s carries
+/// 2 bytes of tail padding (20 bytes); the columns pack tightly at 18 bytes per slot, ~10% off the
+/// sequence — the run's largest allocation.
 struct Repair<'a> {
-    /// The working sequence as a linked list with tombstones.
-    nodes: Vec<Node>,
+    /// Symbol id per slot, or [`NONE_SYM`] once the slot has been merged away.
+    sym: Vec<u16>,
+    /// Previous live slot in sequence order, or [`NIL`].
+    prev: Vec<u32>,
+    /// Next live slot in sequence order, or [`NIL`].
+    next: Vec<u32>,
+    /// Previous slot in each slot's digram occurrence list, or [`NIL`].
+    occ_prev: Vec<u32>,
+    /// Next slot in each slot's digram occurrence list, or [`NIL`].
+    occ_next: Vec<u32>,
     /// Live occurrence bookkeeping per digram.
     pairs: HashMap<(u16, u16), PairInfo>,
     /// Lazy max-heap of merge candidates.
@@ -156,26 +162,26 @@ impl<'a> Repair<'a> {
     #[expect(clippy::cast_possible_truncation, reason = "caller guarantees symbols.len() <= u32::MAX")]
     fn new(symbols: &[u16], n_terminals: u16, counts: Vec<u32>, cost: &'a dyn MergeCost) -> Self {
         let n = symbols.len();
-        let mut nodes = Vec::with_capacity(n);
-        for (i, &sym) in symbols.iter().enumerate() {
-            nodes.push(Node {
-                sym,
-                prev: if i == 0 {
-                    NIL
-                } else {
-                    (i - 1) as u32
-                },
-                next: if i + 1 < n {
-                    (i + 1) as u32
-                } else {
-                    NIL
-                },
-                occ_prev: NIL,
-                occ_next: NIL,
+        let mut prev = Vec::with_capacity(n);
+        let mut next = Vec::with_capacity(n);
+        for i in 0..n {
+            prev.push(if i == 0 {
+                NIL
+            } else {
+                (i - 1) as u32
+            });
+            next.push(if i + 1 < n {
+                (i + 1) as u32
+            } else {
+                NIL
             });
         }
         Self {
-            nodes,
+            sym: symbols.to_vec(),
+            prev,
+            next,
+            occ_prev: vec![NIL; n],
+            occ_next: vec![NIL; n],
             pairs: HashMap::new(),
             heap: BinaryHeap::new(),
             rules: Vec::new(),
@@ -198,8 +204,8 @@ impl<'a> Repair<'a> {
     /// Inserts the digram starting at `pos` (which must have a live `next`) into its occurrence
     /// list, bumps its count, and pushes a fresh heap candidate.
     fn add_occurrence(&mut self, pos: u32) {
-        let a = self.nodes[pos as usize].sym;
-        let b = self.nodes[self.nodes[pos as usize].next as usize].sym;
+        let a = self.sym[pos as usize];
+        let b = self.sym[self.next[pos as usize] as usize];
         let key = (a, b);
         let (head, count) = {
             let info = self.pairs.entry(key).or_insert(PairInfo {
@@ -211,10 +217,10 @@ impl<'a> Repair<'a> {
             info.count += 1;
             (head, info.count)
         };
-        self.nodes[pos as usize].occ_prev = NIL;
-        self.nodes[pos as usize].occ_next = head;
+        self.occ_prev[pos as usize] = NIL;
+        self.occ_next[pos as usize] = head;
         if head != NIL {
-            self.nodes[head as usize].occ_prev = pos;
+            self.occ_prev[head as usize] = pos;
         }
         let score = self.score_pair(key, count);
         self.heap.push(Candidate {
@@ -226,15 +232,15 @@ impl<'a> Repair<'a> {
     /// Removes the digram occurrence starting at `pos` (which must have a live `next`) from its
     /// occurrence list and decrements its count, dropping or re-scoring the digram accordingly.
     fn remove_occurrence(&mut self, pos: u32) {
-        let a = self.nodes[pos as usize].sym;
-        let b = self.nodes[self.nodes[pos as usize].next as usize].sym;
+        let a = self.sym[pos as usize];
+        let b = self.sym[self.next[pos as usize] as usize];
         let key = (a, b);
-        let (occ_prev, occ_next) = (self.nodes[pos as usize].occ_prev, self.nodes[pos as usize].occ_next);
+        let (occ_prev, occ_next) = (self.occ_prev[pos as usize], self.occ_next[pos as usize]);
         if occ_prev != NIL {
-            self.nodes[occ_prev as usize].occ_next = occ_next;
+            self.occ_next[occ_prev as usize] = occ_next;
         }
         if occ_next != NIL {
-            self.nodes[occ_next as usize].occ_prev = occ_prev;
+            self.occ_prev[occ_next as usize] = occ_prev;
         }
         let remaining = self.pairs.get_mut(&key).map(|info| {
             if occ_prev == NIL {
@@ -276,6 +282,28 @@ impl<'a> Repair<'a> {
         None
     }
 
+    /// Rebuilds the lazy max-heap from the live digram set once stale entries have come to dominate
+    /// it, capping heap memory at O(distinct live digrams). This is a memory-only compaction:
+    /// [`Repair::pop_best`] already revalidates every candidate against the live score, so dropping
+    /// the redundant stale duplicates never changes which merge is chosen.
+    fn compact_heap_if_bloated(&mut self) {
+        let live = self.pairs.len();
+        if self.heap.len() <= HEAP_COMPACT_SLACK * live.max(HEAP_COMPACT_FLOOR) {
+            return;
+        }
+        // Recompute one fresh candidate per live digram. Collected first so the immutable borrow of
+        // `self.pairs` / `self.score_pair` does not overlap the write to `self.heap`.
+        let fresh: Vec<Candidate> = self
+            .pairs
+            .iter()
+            .map(|(&pair, info)| Candidate {
+                key: Score(self.score_pair(pair, info.count)),
+                pair,
+            })
+            .collect();
+        self.heap = BinaryHeap::from(fresh);
+    }
+
     /// Replaces every (non-overlapping) occurrence of `pair` with the new rule symbol `new_id`.
     fn replace_pair(&mut self, pair: (u16, u16), new_id: u16) {
         let (a, b) = pair;
@@ -287,19 +315,19 @@ impl<'a> Repair<'a> {
         let mut p = self.pairs.get(&pair).map_or(NIL, |info| info.head);
         while p != NIL {
             positions.push(p);
-            p = self.nodes[p as usize].occ_next;
+            p = self.occ_next[p as usize];
         }
         positions.sort_unstable();
         for &i in &positions {
-            if self.nodes[i as usize].sym != a {
+            if self.sym[i as usize] != a {
                 continue; // consumed by an earlier overlapping merge
             }
-            let j = self.nodes[i as usize].next;
-            if j == NIL || self.nodes[j as usize].sym != b {
+            let j = self.next[i as usize];
+            if j == NIL || self.sym[j as usize] != b {
                 continue;
             }
-            let prev = self.nodes[i as usize].prev;
-            let next = self.nodes[j as usize].next;
+            let prev = self.prev[i as usize];
+            let next = self.next[j as usize];
             // Retire the three affected digrams (keys read before any structural change).
             self.remove_occurrence(i);
             if prev != NIL {
@@ -309,12 +337,12 @@ impl<'a> Repair<'a> {
                 self.remove_occurrence(j);
             }
             // Splice: i becomes the rule symbol, j leaves the sequence.
-            self.nodes[i as usize].sym = new_id;
-            self.nodes[i as usize].next = next;
+            self.sym[i as usize] = new_id;
+            self.next[i as usize] = next;
             if next != NIL {
-                self.nodes[next as usize].prev = i;
+                self.prev[next as usize] = i;
             }
-            self.nodes[j as usize].sym = NONE_SYM;
+            self.sym[j as usize] = NONE_SYM;
             // Maintain live symbol counts (a == b decrements a twice).
             self.counts[usize::from(a)] -= 1;
             self.counts[usize::from(b)] -= 1;
@@ -334,15 +362,16 @@ impl<'a> Repair<'a> {
     /// Runs Re-Pair: seed the initial digrams, then merge the best pair until none is profitable or
     /// the vocabulary cap is reached.
     fn run(&mut self) {
-        let mut i = if self.nodes.is_empty() {
+        let mut i = if self.sym.is_empty() {
             NIL
         } else {
             0
         };
         while i != NIL {
-            let next = self.nodes[i as usize].next;
+            let next = self.next[i as usize];
             if next != NIL {
                 self.add_occurrence(i);
+                self.compact_heap_if_bloated();
             }
             i = next;
         }
@@ -355,20 +384,21 @@ impl<'a> Repair<'a> {
             self.counts.push(0);
             self.next_rule_id += 1;
             self.replace_pair(pair, new_id);
+            self.compact_heap_if_bloated();
         }
     }
 
     /// Walks the surviving sequence in order.
     fn collect_sequence(&self) -> Vec<u16> {
         let mut sequence = Vec::new();
-        let mut cur = if self.nodes.is_empty() {
+        let mut cur = if self.sym.is_empty() {
             NIL
         } else {
             0
         };
         while cur != NIL {
-            sequence.push(self.nodes[cur as usize].sym);
-            cur = self.nodes[cur as usize].next;
+            sequence.push(self.sym[cur as usize]);
+            cur = self.next[cur as usize];
         }
         sequence
     }
@@ -605,8 +635,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
 
-    use super::RepairTokenizer;
     use super::cost::{Entropy, Frequency};
+    use super::{HEAP_COMPACT_FLOOR, HEAP_COMPACT_SLACK, Repair, RepairTokenizer};
     use crate::tokenizers::Tokenize;
 
     /// Both shipped cost models — round-trip correctness is independent of the criterion.
@@ -649,6 +679,27 @@ mod tests {
                 assert_eq!(tok.inverse(&tok.forward(input)).unwrap(), input);
             }
         }
+    }
+
+    #[test]
+    fn heap_stays_bounded_over_the_run() {
+        // Many occurrences of very few distinct digrams: the lazy heap receives one push per
+        // occurrence at seed time (and per rewrite while merging), but compaction must keep its
+        // live size O(distinct live digrams). Without the fix the heap would hold ~1M entries here.
+        let n = 1 << 20;
+        let symbols = vec![0u16; n];
+        #[expect(clippy::cast_possible_truncation, reason = "n fits u32")]
+        let counts = vec![n as u32];
+        let cost = Frequency;
+        let mut builder = Repair::new(&symbols, 1, counts, &cost);
+        builder.run();
+        // Invariant maintained by `compact_heap_if_bloated` after every seed push and every merge.
+        assert!(
+            builder.heap.len() <= HEAP_COMPACT_SLACK * builder.pairs.len().max(HEAP_COMPACT_FLOOR),
+            "heap {} not compacted against {} live digrams",
+            builder.heap.len(),
+            builder.pairs.len(),
+        );
     }
 
     #[test]

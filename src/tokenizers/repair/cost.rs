@@ -53,7 +53,14 @@ impl MergeCost for Frequency {
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Entropy {
-    /// Amortized cost in bits charged per new rule; its profitability threshold.
+    /// Profitability threshold: the minimum order-0 code-length saving (in bits) a merge must yield
+    /// to justify emitting its rule. It models the real cost of *materializing* a rule — its
+    /// `(left, right)` definition is two extra `u15` tokens entropy-coded into the grammar list
+    /// (~25+ bits here), far above the `g(f)` term for the new symbol itself. Subtracted uniformly,
+    /// it shifts every score equally, so it never changes merge *ranking* — only where the build
+    /// stops. The bpb-optimal value clusters near 24 across small/medium inputs; at large scale the
+    /// `u15` vocabulary cap ([`super::VOCAB_CAP`]) binds first, so the exact value stops mattering
+    /// (e.g. enwik8 saturates the cap at any `rule_cost` in 6..64).
     rule_cost: f64,
 }
 
@@ -70,7 +77,9 @@ impl Entropy {
 
 impl Default for Entropy {
     fn default() -> Self {
-        Self::new(6.0)
+        // Empirically bpb-optimal across the corpus (paper1..bible); ~4× the naive self-information
+        // charge, reflecting the true coded cost of emitting a rule's definition. See `rule_cost`.
+        Self::new(24.0)
     }
 }
 
@@ -119,8 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn entropy_default_rule_cost_is_six() {
-        assert!((Entropy::default().rule_cost - 6.0).abs() < f64::EPSILON);
+    fn entropy_default_rule_cost_reflects_grammar_emission() {
+        // The default charges the empirically bpb-optimal per-rule cost, well above the naive
+        // self-information charge, because emitting a rule adds two entropy-coded grammar tokens.
+        assert!((Entropy::default().rule_cost - 24.0).abs() < f64::EPSILON);
     }
 
     #[test]
