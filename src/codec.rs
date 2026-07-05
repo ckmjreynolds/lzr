@@ -27,6 +27,9 @@ use crate::transform::{Pipeline, Transform};
 pub struct EncodeOptions {
     /// The Re-Pair vocabulary cap for this run (see [`RepairTokenizer::num_tokens`]).
     num_tokens: u32,
+    /// Whether Re-Pair prunes its built grammar by the serialized-byte cost model (the default) rather
+    /// than to the fixed `num_tokens` count. A caller-pinned `num_tokens` turns it off.
+    cost_stop: bool,
     /// The LZ77 minimum match length: `None` uses the dynamic "only emit a winning match" rule,
     /// `Some(n)` forces every match of length `>= n` (which may expand the stream).
     min_match: Option<u32>,
@@ -36,6 +39,7 @@ impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
             num_tokens: DEFAULT_NUM_TOKENS,
+            cost_stop: true,
             min_match: None,
         }
     }
@@ -53,8 +57,11 @@ impl EncodeOptions {
             (MIN_NUM_TOKENS..=DEFAULT_NUM_TOKENS).contains(&num_tokens),
             "num-tokens must be in {MIN_NUM_TOKENS}..={DEFAULT_NUM_TOKENS}, got {num_tokens}"
         );
+        // An explicit vocabulary cap asks for exactly that many tokens, so grammar pruning switches
+        // from the cost model to a hard post-build count cap at `num_tokens`.
         Ok(Self {
             num_tokens,
+            cost_stop: false,
             ..Self::default()
         })
     }
@@ -131,6 +138,7 @@ const FEATURES: &[FeatureSpec] = &[
         kind: Kind::Stage(|_, options| {
             Box::new(RepairTokenizer {
                 num_tokens: options.num_tokens,
+                cost_stop: options.cost_stop,
             })
         }),
     },
@@ -183,6 +191,12 @@ impl Compressor {
     /// its buffer as it consumes it — at gigabyte scale the tokenizer frees ~1 GB before its build.
     pub(crate) fn encode(&self, input: Vec<u8>) -> Vec<u8> {
         self.pipeline.forward(input)
+    }
+
+    /// Like [`Compressor::encode`] but also returns each pipeline stage's `(name, input length, output
+    /// length)` in order, for the CLI's per-stage bits-per-byte report.
+    pub(crate) fn encode_traced(&self, input: Vec<u8>) -> (Vec<u8>, Vec<(&'static str, usize, usize)>) {
+        self.pipeline.forward_traced(input)
     }
 
     /// Decode a codec core produced by [`Compressor::encode`] back to bytes.
@@ -284,14 +298,16 @@ impl Profile {
     /// registry.
     fn pipeline_with(self, options: EncodeOptions) -> Pipeline {
         let mut stages: Vec<Box<dyn Transform>> = Vec::new();
+        let mut names: Vec<&'static str> = Vec::new();
         for (i, feature) in FEATURES.iter().enumerate() {
             if let Kind::Stage(build) = feature.kind
                 && self.is_set(i)
             {
                 stages.push(build(&self, &options));
+                names.push(feature.name);
             }
         }
-        Pipeline::new(stages)
+        Pipeline::new(stages, names)
     }
 
     /// The entropy model builders: the always-on order-0 model first, then every enabled

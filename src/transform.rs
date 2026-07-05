@@ -35,13 +35,18 @@ pub(crate) trait Transform {
 /// applies each stage's inverse in reverse order.
 pub(crate) struct Pipeline {
     stages: Vec<Box<dyn Transform>>,
+    /// Feature name of each stage, aligned with `stages`, used only to label the CLI's per-stage
+    /// size report (see [`Pipeline::forward_traced`]).
+    names: Vec<&'static str>,
 }
 
 impl Pipeline {
-    /// A pipeline over the given ordered `stages`.
-    pub(crate) fn new(stages: Vec<Box<dyn Transform>>) -> Self {
+    /// A pipeline over the given ordered `stages`, each labelled by the aligned entry in `names`.
+    pub(crate) fn new(stages: Vec<Box<dyn Transform>>, names: Vec<&'static str>) -> Self {
+        debug_assert_eq!(stages.len(), names.len(), "each stage needs exactly one name");
         Self {
             stages,
+            names,
         }
     }
 
@@ -52,6 +57,19 @@ impl Pipeline {
             data = stage.forward(data);
         }
         data
+    }
+
+    /// Like [`Pipeline::forward`] but also returns each stage's `(name, input length, output length)`
+    /// in order, so the CLI can report each transform's own bits-per-byte — what it did to *its* input,
+    /// not a running figure against the original.
+    pub(crate) fn forward_traced(&self, mut data: Vec<u8>) -> (Vec<u8>, Vec<(&'static str, usize, usize)>) {
+        let mut sizes = Vec::with_capacity(self.stages.len());
+        for (stage, &name) in self.stages.iter().zip(&self.names) {
+            let input_len = data.len();
+            data = stage.forward(data);
+            sizes.push((name, input_len, data.len()));
+        }
+        (data, sizes)
     }
 
     /// Apply every stage's inverse in reverse order.
@@ -95,7 +113,7 @@ mod tests {
     /// identity.
     #[test]
     fn empty_pipeline_is_identity() {
-        let p = Pipeline::new(vec![]);
+        let p = Pipeline::new(vec![], vec![]);
         assert_eq!(p.forward(b"hello".to_vec()), b"hello");
         assert_eq!(p.inverse(b"hello".to_vec()).unwrap(), b"hello");
     }
@@ -105,9 +123,19 @@ mod tests {
     #[test]
     fn inverse_reverses_stage_order() {
         // forward pushes 1 then 2; inverse must pop 2 (last stage) before 1.
-        let p = Pipeline::new(vec![Box::new(Append(1)), Box::new(Append(2))]);
+        let p = Pipeline::new(vec![Box::new(Append(1)), Box::new(Append(2))], vec!["one", "two"]);
         let encoded = p.forward(b"data".to_vec());
         assert_eq!(encoded, b"data\x01\x02");
         assert_eq!(p.inverse(encoded).unwrap(), b"data");
+    }
+
+    /// `forward_traced` must return the same bytes as `forward`, plus each stage's name and its own
+    /// input and output length (the second stage's input is the first's output) in pipeline order.
+    #[test]
+    fn forward_traced_records_each_stage() {
+        let p = Pipeline::new(vec![Box::new(Append(1)), Box::new(Append(2))], vec!["one", "two"]);
+        let (encoded, sizes) = p.forward_traced(b"data".to_vec());
+        assert_eq!(encoded, b"data\x01\x02");
+        assert_eq!(sizes, vec![("one", 4, 5), ("two", 5, 6)]);
     }
 }

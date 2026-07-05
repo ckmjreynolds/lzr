@@ -23,6 +23,7 @@
 //! by the space-efficient frequency-based Re-Pair of Bille–Gørtz–Prezza (2017); see [`builder`].
 
 mod builder;
+mod prune;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use arbitrary_int::u22;
@@ -60,14 +61,21 @@ enum Def {
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RepairTokenizer {
-    /// Vocabulary ceiling for this run: the grammar mints at most `num_tokens` symbols.
+    /// Vocabulary ceiling for this run. Under `cost_stop` the grammar is built to its natural floor
+    /// (bounded only by the safety ceiling [`DEFAULT_NUM_TOKENS`]) and this is ignored; otherwise it
+    /// is the post-build count cap — the surviving vocabulary is trimmed to at most `num_tokens`.
     pub(crate) num_tokens: u32,
+    /// Prune the built grammar by the serialized-byte cost model rather than to a fixed `num_tokens`
+    /// count (see [`prune`]). The default; the CLI turns it off when an explicit `--num-tokens` asks
+    /// for a hard count cap instead.
+    pub(crate) cost_stop: bool,
 }
 
 impl Default for RepairTokenizer {
     fn default() -> Self {
         Self {
             num_tokens: DEFAULT_NUM_TOKENS,
+            cost_stop: true,
         }
     }
 }
@@ -100,9 +108,13 @@ impl Transform for RepairTokenizer {
         let symbols: Vec<u32> = input.iter().map(|&byte| byte_to_id[usize::from(byte)]).collect();
         let fits = u32::try_from(input.len()).is_ok();
         drop(input);
-        // Build the capped grammar (identity fallback if the input exceeds u32 position indices).
+        // Build the grammar to its natural floor (bounded by the safety ceiling), then prune it —
+        // either by the serialized-byte cost model or down to the `num_tokens` count cap. Both run
+        // *after* the build so the pruning sees true reference frequencies. Identity fallback if the
+        // input exceeds u32 position indices.
         let (rules, sequence) = if fits {
-            builder::build_grammar(symbols, t as u32, self.num_tokens)
+            let (rules, sequence) = builder::build_grammar(symbols, t as u32, DEFAULT_NUM_TOKENS);
+            prune::prune_grammar(t as u32, rules, sequence, self.num_tokens, self.cost_stop)
         } else {
             (Vec::new(), symbols)
         };
@@ -377,6 +389,7 @@ mod tests {
         let data = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
         let capped = RepairTokenizer {
             num_tokens: 300,
+            cost_stop: false,
         };
         let bytes = capped.forward(data.clone());
         let mut pos = 0;

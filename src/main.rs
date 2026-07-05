@@ -69,12 +69,12 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // Compression is the default; a `.lzr` input flips the default to decompression. Either
     // explicit flag overrides the extension (and the two flags conflict, so at most one is set).
     let decompress = !cli.compress && (cli.decompress || has_lzr_extension(&cli.input));
-    let output = if decompress {
-        lzr::decompress(&input)?
+    let (output, stages) = if decompress {
+        (lzr::decompress(&input)?, Vec::new())
     } else {
         let options = encode_options(cli)?;
         // Take ownership so the pipeline can free the input buffer before the tokenizer build.
-        lzr::compress_owned_with(input, profile(cli)?, options)
+        lzr::compress_owned_with_traced(input, profile(cli)?, options)
     };
     std::fs::write(&cli.output, &output).with_context(|| format!("writing {}", cli.output.display()))?;
 
@@ -85,6 +85,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     } else {
         (input_len, output.len())
     };
+    report_stages(&stages);
     report_stats(original, compressed);
     Ok(())
 }
@@ -138,6 +139,27 @@ fn with_commas(n: u64) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Print each pipeline stage's own bits-per-byte to stderr (compression only): `8 · output / input`,
+/// i.e. what the transform did to *its* input, not a running figure against the original. A stage
+/// above 8 bpb expanded its input; below 8 it shrank it. No-op when there are no stages
+/// (decompression, or an empty profile).
+#[expect(clippy::print_stderr, reason = "A CLI reports run statistics to the user on stderr.")]
+#[expect(clippy::cast_precision_loss, reason = "Display statistics; byte counts are well under 2^53.")]
+fn report_stages(stages: &[lzr::StageSize]) {
+    if stages.is_empty() {
+        return;
+    }
+    eprintln!("stages (bpb):");
+    for stage in stages {
+        let bpb = if stage.input_bytes == 0 {
+            0.0
+        } else {
+            8.0 * stage.output_bytes as f64 / stage.input_bytes as f64
+        };
+        eprintln!("  {:<9} {bpb:.4} bpb", stage.name);
+    }
 }
 
 /// Print compression statistics to stderr: size, ratio, bits-per-byte, and a bits-per-byte figure

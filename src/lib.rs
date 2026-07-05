@@ -44,4 +44,6 @@ pub mod transform;
 mod transform;
 
 pub use codec::{EncodeOptions, Profile};
-pub use container::{compress, compress_owned, compress_owned_with, compress_with, decompress};
+pub use container::{
+    StageSize, compress, compress_owned, compress_owned_with, compress_owned_with_traced, compress_with, decompress,
+};

@@ -25,6 +25,32 @@ const PREFIX_LEN: usize = 4;
 /// Footer length: a big-endian Adler-32 of the original input.
 const FOOTER_LEN: usize = 4;
 
+/// One pipeline stage's input and output size in bytes, paired with its feature name.
+///
+/// Returned by [`compress_owned_with_traced`] so the CLI can report each transform's own
+/// bits-per-byte (`8 · output / input`) — what it did to its input.
+#[derive(Debug, Clone, Copy)]
+pub struct StageSize {
+    /// The stage's feature name (e.g. `"repair"`).
+    pub name: &'static str,
+    /// The stage's input length in bytes (the previous stage's output, or the original input).
+    pub input_bytes: usize,
+    /// The stage's output length in bytes after it ran.
+    pub output_bytes: usize,
+}
+
+/// Wrap a codec `core` in the container framing: magic, version, ULEB128 profile, core, Adler-32
+/// footer (big-endian, over the original input).
+fn frame(profile: Profile, core: &[u8], checksum: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PREFIX_LEN + 1 + core.len() + FOOTER_LEN);
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    uleb128::encode_u64(profile.to_bits(), &mut out);
+    out.extend_from_slice(core);
+    out.extend_from_slice(&checksum.to_be_bytes());
+    out
+}
+
 /// Compress `input` into a self-describing LZR container using the default [`Profile`].
 #[must_use]
 pub fn compress(input: &[u8]) -> Vec<u8> {
@@ -54,14 +80,34 @@ pub fn compress_owned_with(input: Vec<u8>, profile: Profile, options: EncodeOpti
     let checksum = checksum.checksum();
 
     let core = profile.compressor_with(options).encode(input);
+    frame(profile, &core, checksum)
+}
 
-    let mut out = Vec::with_capacity(PREFIX_LEN + 1 + core.len() + FOOTER_LEN);
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    uleb128::encode_u64(profile.to_bits(), &mut out);
-    out.extend_from_slice(&core);
-    out.extend_from_slice(&checksum.to_be_bytes());
-    out
+/// Like [`compress_owned_with`] but also returns each pipeline stage's output size, in order.
+///
+/// For the CLI's per-stage bits-per-byte report. The stage sizes are codec-core bytes; the returned
+/// container additionally carries the (small, fixed) framing.
+#[must_use]
+pub fn compress_owned_with_traced(
+    input: Vec<u8>,
+    profile: Profile,
+    options: EncodeOptions,
+) -> (Vec<u8>, Vec<StageSize>) {
+    let mut checksum = Adler32::new();
+    checksum.update(&input);
+    let checksum = checksum.checksum();
+
+    let (core, stages) = profile.compressor_with(options).encode_traced(input);
+    let out = frame(profile, &core, checksum);
+    let stages = stages
+        .into_iter()
+        .map(|(name, input_bytes, output_bytes)| StageSize {
+            name,
+            input_bytes,
+            output_bytes,
+        })
+        .collect();
+    (out, stages)
 }
 
 /// Decompress an LZR container, verifying its version, profile, and the Adler-32
