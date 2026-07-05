@@ -1,32 +1,69 @@
-//! Reversible stream transforms and the pipeline that chains them.
+//! Byte preprocessors — reversible text transforms applied before tokenization.
 //!
-//! A [`Transform`] rewrites a stream on the encode side ([`Transform::forward`])
-//! and exactly inverts it on the decode side ([`Transform::inverse`]). The trait
-//! is generic over the element type, so the *same* trait serves both the byte
-//! preprocessors (`Transform<u8>`, before tokenization) and the token
-//! preprocessors (`Transform<u15>`, after it). Adding a real stage is a new type
-//! that implements `Transform` plus a push into the relevant [`Pipeline`].
-//!
-//! The concrete byte preprocessors live in their own modules ([`casefold`],
-//! [`entities`]); this file holds only the framework — the trait, the pipeline,
-//! the identity stages, and the text-detection helpers the byte stages share.
+//! Each is a [`Transform`] (defined in [`crate::transform`]): it rewrites the byte
+//! stream on the encode side and exactly inverts it on decode. This file holds the
+//! concrete stages ([`casefold`], [`entities`]) plus the text-detection helpers
+//! they share; the trait and the [`crate::transform::Pipeline`] that chains all
+//! stages live in [`crate::transform`].
 
 mod casefold;
 mod entities;
-mod lz77;
 
+/// Re-exported so the byte stages can refer to `super::Transform`.
+pub(crate) use crate::transform::Transform;
 pub(crate) use casefold::CaseFolding;
 pub(crate) use entities::EntityFolding;
-pub(crate) use lz77::Lz77;
 
 /// Minimum fraction of bytes that must be common-text bytes for the input to count
 /// as text (below this, a byte stage skips its transform and passes through).
 pub(super) const TEXT_FRACTION: f64 = 0.95;
 
+/// Header mode byte: the input was passed through unchanged.
+pub(super) const MODE_PASSTHROUGH: u8 = 0;
+/// Header mode byte: the payload is folded (followed by the stage's chosen control bytes).
+pub(super) const MODE_FOLDED: u8 = 1;
+
 /// Whether `byte` is a byte we expect to see in plain text: printable ASCII plus
 /// tab, newline, and carriage return. Shared by the byte preprocessors' text gate.
 pub(super) const fn is_text_byte(byte: u8) -> bool {
     matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7E)
+}
+
+/// Whether an input of `len` bytes, `text_bytes` of which are [`is_text_byte`],
+/// counts as text for the byte preprocessors' fold gate.
+#[expect(clippy::cast_precision_loss, reason = "byte counts are far under 2^53")]
+pub(super) fn looks_like_text(len: usize, text_bytes: usize) -> bool {
+    len != 0 && text_bytes as f64 >= len as f64 * TEXT_FRACTION
+}
+
+/// The self-describing pass-through encoding: a [`MODE_PASSTHROUGH`] byte followed
+/// by the input verbatim. Byte stages emit this when they have nothing to fold.
+pub(super) fn passthrough(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() + 1);
+    out.push(MODE_PASSTHROUGH);
+    out.extend_from_slice(input);
+    out
+}
+
+/// Dispatch a folded/pass-through stream on its leading mode byte, the shared
+/// inverse of [`passthrough`] and a stage's folded encoding. Empty input (never
+/// produced by `forward`) restores as empty; `decode_folded` receives the bytes
+/// after the mode byte for the folded path; `stage` names the caller for errors.
+pub(super) fn inverse_framed(
+    input: &[u8],
+    stage: &str,
+    decode_folded: impl FnOnce(&[u8]) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<Vec<u8>> {
+    let Some((&mode, rest)) = input.split_first() else {
+        // Empty input is not something `forward` ever produces; treat it as an
+        // empty restoration rather than panicking on corrupt decode data.
+        return Ok(Vec::new());
+    };
+    match mode {
+        MODE_PASSTHROUGH => Ok(rest.to_vec()),
+        MODE_FOLDED => decode_folded(rest),
+        other => anyhow::bail!("unknown {stage} mode byte {other}"),
+    }
 }
 
 /// The `N` lowest byte values absent from `present`, or `None` if fewer than `N`
@@ -40,77 +77,4 @@ pub(super) fn spare_bytes<const N: usize>(present: &[bool; 256]) -> Option<[u8; 
         *slot = unused.next()?;
     }
     Some(out)
-}
-
-/// A reversible transform over a stream of `T`.
-pub(crate) trait Transform<T> {
-    /// Encode-side transform. Infallible: the encoder controls its own input.
-    fn forward(&self, input: &[T]) -> Vec<T>;
-
-    /// Exact inverse, applied on the decode side. Fallible: it runs on decoded,
-    /// possibly-corrupt data.
-    fn inverse(&self, input: &[T]) -> anyhow::Result<Vec<T>>;
-}
-
-/// An ordered chain of same-domain transforms: `forward` applies them in order,
-/// `inverse` applies each stage's inverse in reverse order.
-pub(crate) struct Pipeline<T> {
-    stages: Vec<Box<dyn Transform<T>>>,
-}
-
-impl<T: Clone> Pipeline<T> {
-    /// A pipeline over the given ordered `stages`.
-    pub(crate) fn new(stages: Vec<Box<dyn Transform<T>>>) -> Self {
-        Self {
-            stages,
-        }
-    }
-
-    /// Apply every stage in order. The input is copied once (by the first stage),
-    /// not an extra time up front.
-    pub(crate) fn forward(&self, input: &[T]) -> Vec<T> {
-        let mut stages = self.stages.iter();
-        let Some(first) = stages.next() else {
-            return input.to_vec();
-        };
-        let mut data = first.forward(input);
-        for stage in stages {
-            data = stage.forward(&data);
-        }
-        data
-    }
-
-    /// Apply every stage's inverse in reverse order.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the first stage inverse that fails (e.g. a transform fed
-    /// corrupt data).
-    pub(crate) fn inverse(&self, input: &[T]) -> anyhow::Result<Vec<T>> {
-        let mut stages = self.stages.iter().rev();
-        let Some(first) = stages.next() else {
-            return Ok(input.to_vec());
-        };
-        let mut data = first.inverse(input)?;
-        for stage in stages {
-            data = stage.inverse(&data)?;
-        }
-        Ok(data)
-    }
-}
-
-#[cfg(test)]
-#[cfg_attr(coverage_nightly, coverage(off))]
-mod tests {
-    use super::*;
-
-    /// A profile with no enabled stages yields an empty pipeline, which must be the
-    /// identity — the path `Profile::byte_preprocessors`/`token_preprocessors` take
-    /// when nothing is selected, in place of an explicit identity stage.
-    #[test]
-    fn empty_pipeline_is_identity() {
-        let p: Pipeline<u8> = Pipeline::new(vec![]);
-        assert_eq!(p.forward(b"hello"), b"hello");
-        assert_eq!(p.inverse(b"hello").unwrap(), b"hello");
-    }
 }

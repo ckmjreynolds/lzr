@@ -19,13 +19,20 @@ pub(crate) struct Encoder {
 }
 
 impl Encoder {
-    /// New encoder over the full `[0, 2^32)` range, pre-reserving `cap` output
-    /// bytes so the renorm `push` never reallocates mid-stream.
-    pub(crate) fn with_capacity(cap: usize) -> Self {
+    /// New encoder whose output buffer already holds `prefix` (e.g. a length
+    /// header), reserving `extra_cap` further bytes for the coded stream so the
+    /// renorm `push` never reallocates mid-stream. Seeding the buffer with a
+    /// header lets a caller prepend one without a second buffer + copy: [`finish`]
+    /// returns the prefix and the coded payload in one allocation. Pass an empty
+    /// `prefix` for a plain capacity-reserved encoder.
+    ///
+    /// [`finish`]: Self::finish
+    pub(crate) fn with_prefix(mut prefix: Vec<u8>, extra_cap: usize) -> Self {
+        prefix.reserve(extra_cap);
         Self {
             x1: 0,
             x2: 0xffff_ffff,
-            out: Vec::with_capacity(cap),
+            out: prefix,
         }
     }
 
@@ -142,7 +149,7 @@ mod tests {
             probs.push((((state >> 20) & 0xFFFF) as u32 % PROB_MAX).max(1));
         }
 
-        let mut enc = Encoder::with_capacity(0);
+        let mut enc = Encoder::with_prefix(Vec::new(), 0);
         for (&b, &p) in bits.iter().zip(&probs) {
             enc.encode(b, p);
         }
@@ -159,7 +166,7 @@ mod tests {
         fn roundtrip_proptest(
             pairs in prop::collection::vec((any::<bool>(), 1u32..=PROB_MAX), 0..2000)
         ) {
-            let mut enc = Encoder::with_capacity(pairs.len());
+            let mut enc = Encoder::with_prefix(Vec::new(), pairs.len());
             for &(b, p) in &pairs {
                 enc.encode(u8::from(b), p);
             }

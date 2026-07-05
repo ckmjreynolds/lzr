@@ -1,236 +1,86 @@
 //! The encode/decode driver: the framing-agnostic codec core.
 //!
-//! [`Compressor`] wires the pluggable stages — byte preprocessors, the tokenizer,
-//! token preprocessors — around the entropy stage. [`encode_tokens`] /
-//! [`decode_tokens`] are the entropy stage itself: one per-bit loop over the
-//! models, the [`Mixer`], and the carryless range [`Encoder`]/[`Decoder`]. Encode
-//! and decode build identical fresh predictor state (the models are deterministic
-//! and the hashed-table sizes derive from the framed token count), so their
-//! predictions match bit-for-bit and the stream round-trips.
+//! [`Compressor`] chains the pluggable stages — the byte preprocessors, the Re-Pair tokenizer, and
+//! the entropy coder — into one [`Pipeline`] of byte→byte [`Transform`]s. Every stage is optional
+//! and chosen by a [`Profile`] (a feature bitmask). The pipeline is assembled in a fixed *canonical*
+//! order so the entropy coder is always last and the tokenizer always precedes it, regardless of a
+//! feature's bit position. Turning tokenization off still leaves a working (entropy-only) coder;
+//! turning entropy off still compresses (the tokenizer's grammar shrinks the stream on its own).
 //!
-//! This layer carries no container header — just a ULEB128 token-count frame so
-//! the decoder knows when to stop and how to size its tables. The self-describing
-//! container (magic, version, checksum) lives in [`crate::container`].
+//! This layer carries no container header — that lives in [`crate::container`].
 
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use arbitrary_int::u15;
+use anyhow::{Result, anyhow, ensure};
 use static_assertions::const_assert;
 
-use crate::coder::{Decoder, Encoder};
-use crate::mixer::Mixer;
+use crate::entropy::{EntropyCoder, ModelBuilder};
+use crate::models::TokenModel;
 use crate::models::null::NullModel;
 use crate::models::order0::Order0;
-use crate::models::{Context, SYMBOL_BITS, TokenModel};
-use crate::preprocessors::{CaseFolding, EntityFolding, Lz77, Pipeline, Transform};
-use crate::tokenizers::{NullTokenizer, RepairTokenizer, Tokenize};
-use crate::uleb128;
+use crate::preprocessors::{CaseFolding, EntityFolding};
+use crate::tokenizers::{DEFAULT_NUM_TOKENS, MIN_NUM_TOKENS, RepairTokenizer};
+use crate::transform::{Pipeline, Transform};
 
-/// Upper bound on decoded tokens per payload byte. The range coder spends a
-/// strictly positive number of bits per symbol, so a genuine stream stays far
-/// under this; the cap only bounds the work a corrupt or malicious count field
-/// can demand (a decompression-ratio ceiling). A production build would expose a
-/// configurable absolute output limit instead.
-const MAX_TOKENS_PER_PAYLOAD_BYTE: usize = 4096;
-
-/// The online predictor: every model's stretched prediction for the next bit,
-/// mixed into one probability, plus the shared [`Context`] the models read.
-struct Predictor {
-    models: Vec<Box<dyn TokenModel>>,
-    stretched: Vec<i32>,
-    mixer: Mixer,
-    ctx: Context,
+/// Encode-side options that are *not* serialized into the container — the decoder recovers everything
+/// it needs from the stream itself (the Re-Pair vocabulary is self-describing in the token stream).
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeOptions {
+    /// The Re-Pair vocabulary cap for this run (see [`RepairTokenizer::num_tokens`]).
+    num_tokens: u32,
 }
 
-impl Predictor {
-    /// The model set for `profile`: the always-on order-0 model plus every enabled optional model
-    /// (hashed models are sized from `capacity` = the token count, so encode and decode agree).
-    fn new(capacity: usize, profile: Profile) -> Self {
-        let models = profile.models(capacity);
-        let n = models.len();
+impl Default for EncodeOptions {
+    fn default() -> Self {
         Self {
-            models,
-            stretched: vec![0; n],
-            mixer: Mixer::new(n, SYMBOL_BITS as usize),
-            ctx: Context::new(),
+            num_tokens: DEFAULT_NUM_TOKENS,
         }
-    }
-
-    /// The mixed 12-bit probability that the next bit is 1.
-    #[expect(clippy::cast_sign_loss, reason = "`squash` returns a positive 12-bit probability")]
-    fn predict(&mut self) -> u32 {
-        for (m, s) in self.models.iter_mut().zip(&mut self.stretched) {
-            *s = m.predict(&self.ctx);
-        }
-        self.mixer.mix(&self.stretched, usize::from(self.ctx.bpos)) as u32
-    }
-
-    /// Learn from the actual `bit` (mixer first, then models, all on the pre-bit
-    /// context), then advance the context by one bit.
-    fn commit(&mut self, bit: u8) {
-        self.mixer.update(bit);
-        for m in &mut self.models {
-            m.update(&self.ctx, bit);
-        }
-        self.ctx.push_bit(bit);
-    }
-
-    /// Close the current symbol once all its bits are coded.
-    const fn end_symbol(&mut self) {
-        self.ctx.push_symbol();
     }
 }
 
-/// Entropy-encode `tokens` into the codec core: a ULEB128 token-count frame
-/// followed by the range-coded 15-bit symbols, using the models `profile` selects.
-fn encode_tokens(tokens: &[u15], profile: Profile) -> Vec<u8> {
-    let mut out = Vec::new();
-    uleb128::encode_u64(tokens.len() as u64, &mut out);
-
-    let mut pred = Predictor::new(tokens.len(), profile);
-    let mut enc = Encoder::with_capacity(tokens.len() * 2);
-    for &token in tokens {
-        let value = token.value();
-        for k in (0..SYMBOL_BITS).rev() {
-            let bit = ((value >> k) & 1) as u8;
-            let p = pred.predict();
-            enc.encode(bit, p);
-            pred.commit(bit);
-        }
-        pred.end_symbol();
-    }
-    out.extend_from_slice(&enc.finish());
-    out
-}
-
-/// Entropy-decode a codec core produced by [`encode_tokens`] back into tokens.
-///
-/// # Errors
-///
-/// Returns an error if the token-count frame is malformed, the count exceeds
-/// this platform's `usize`, or the count implies more tokens than the payload
-/// could plausibly encode (a decompression-bomb guard).
-fn decode_tokens(input: &[u8], profile: Profile) -> Result<Vec<u15>> {
-    let mut pos = 0;
-    let count = uleb128::decode_u64(input, &mut pos)?;
-    let count = usize::try_from(count).context("token count exceeds this platform's usize")?;
-
-    let payload = &input[pos..];
-    let limit = payload.len().saturating_mul(MAX_TOKENS_PER_PAYLOAD_BYTE).saturating_add(1024);
-    if count > limit {
-        bail!("token count {count} exceeds the {limit} a {}-byte payload can encode", payload.len());
-    }
-
-    let mut pred = Predictor::new(count, profile);
-    let mut dec = Decoder::new(payload);
-    // Cap the up-front reservation so a large (but in-limit) count cannot demand a
-    // huge allocation before a single symbol is decoded; the Vec grows as needed.
-    let mut out = Vec::with_capacity(count.min(1 << 16));
-    for i in 0..count {
-        // A valid stream's decoder never reads past its payload (bar a small flush
-        // window). Once it has, the remaining claimed tokens are only zero-padding
-        // artifacts of a corrupt count — stop rather than churn through them. This
-        // bounds decode work to O(payload) for incompressible/adversarial input.
-        if dec.consumed() > payload.len() + 8 {
-            bail!("token count {count} is inconsistent with the payload (exhausted at token {i})");
-        }
-        let mut value = 0u16;
-        for _ in 0..SYMBOL_BITS {
-            let p = pred.predict();
-            let bit = dec.decode(p);
-            pred.commit(bit);
-            value = (value << 1) | u16::from(bit);
-        }
-        pred.end_symbol();
-        out.push(u15::new(value));
-    }
-    Ok(out)
-}
-
-/// The pluggable compression pipeline: byte preprocessors → tokenizer → token
-/// preprocessors → entropy coding. Every stage is chosen by a [`Profile`]; the
-/// order-0 entropy model is always present, everything else is a toggleable feature.
-pub(crate) struct Compressor {
-    byte_pre: Pipeline<u8>,
-    tokenizer: Box<dyn Tokenize>,
-    token_pre: Pipeline<u15>,
-    profile: Profile,
-}
-
-impl Compressor {
-    /// Builds the pipeline `profile` selects.
-    pub(crate) fn from_profile(profile: Profile) -> Self {
-        Self {
-            byte_pre: Pipeline::new(profile.byte_preprocessors()),
-            tokenizer: profile.tokenizer(),
-            token_pre: Pipeline::new(profile.token_preprocessors()),
-            profile,
-        }
-    }
-
-    /// Encode `input` into the framing-agnostic codec core. Takes ownership so the input buffer can be
-    /// freed before the (memory-heavy) tokenizer build — at gigabyte scale that ~1 GB is the
-    /// difference between fitting the budget and not.
-    pub(crate) fn encode(&self, input: Vec<u8>) -> Vec<u8> {
-        let bytes = self.byte_pre.forward(&input);
-        drop(input);
-        let tokens = self.tokenizer.forward(bytes);
-        let tokens = self.token_pre.forward(&tokens);
-        encode_tokens(&tokens, self.profile)
-    }
-
-    /// Decode a codec core produced by [`Compressor::encode`] back to bytes.
+impl EncodeOptions {
+    /// Options with an explicit Re-Pair vocabulary cap.
     ///
     /// # Errors
     ///
-    /// Propagates entropy-decode, token-preprocessor, and tokenizer failures on
-    /// corrupt input.
-    pub(crate) fn decode(&self, core: &[u8]) -> Result<Vec<u8>> {
-        let tokens = decode_tokens(core, self.profile)?;
-        let tokens = self.token_pre.inverse(&tokens)?;
-        let bytes = self.tokenizer.inverse(&tokens)?;
-        self.byte_pre.inverse(&bytes)
+    /// Returns an error if `num_tokens` is outside `256..=0x3F_FFFE` — the cap must admit up to 256
+    /// byte terminals and stay one below the reserved NIL sentinel (`u22::MAX`).
+    pub fn new(num_tokens: u32) -> Result<Self> {
+        ensure!(
+            (MIN_NUM_TOKENS..=DEFAULT_NUM_TOKENS).contains(&num_tokens),
+            "num-tokens must be in {MIN_NUM_TOKENS}..={DEFAULT_NUM_TOKENS}, got {num_tokens}"
+        );
+        Ok(Self {
+            num_tokens,
+        })
     }
 }
 
-/// Name of the tokenizer feature: enabled selects Re-Pair, disabled the identity tokenizer.
-const FEATURE_REPAIR: &str = "repair";
+/// Constructs the always-on order-0 entropy model.
+fn build_order0(_capacity: usize) -> Box<dyn TokenModel> {
+    Box::new(Order0::new())
+}
 
-/// Constructs the [`NullModel`] for the model registry.
+/// Constructs the optional [`NullModel`] for the model registry.
 fn build_null_model(_capacity: usize) -> Box<dyn TokenModel> {
     Box::new(NullModel::new())
 }
 
-/// Constructs the [`CaseFolding`] byte preprocessor for the feature registry.
-fn build_casefold() -> Box<dyn Transform<u8>> {
-    Box::new(CaseFolding)
-}
-
-/// Constructs the [`EntityFolding`] byte preprocessor for the feature registry.
-fn build_entities() -> Box<dyn Transform<u8>> {
-    Box::new(EntityFolding)
-}
-
-/// Constructs the [`Lz77`] token preprocessor for the feature registry.
-fn build_lz77() -> Box<dyn Transform<u15>> {
-    Box::new(Lz77)
-}
+/// Builds a byte→byte pipeline stage from the encode profile and options. Non-capturing so it
+/// coerces to a function pointer stored in the registry.
+type StageBuilder = fn(&Profile, &EncodeOptions) -> Box<dyn Transform>;
 
 /// What enabling a pipeline feature does.
 #[derive(Clone, Copy)]
 enum Kind {
-    /// Select the Re-Pair tokenizer (disabled → the identity NULL tokenizer).
-    Tokenizer,
-    /// Add an optional entropy model, mixed alongside the always-on order-0 model.
-    Model(fn(usize) -> Box<dyn TokenModel>),
-    /// Add a byte preprocessor, applied (in registry order) before tokenization.
-    BytePre(fn() -> Box<dyn Transform<u8>>),
-    /// Add a token preprocessor, applied (in registry order) after tokenization.
-    TokenPre(fn() -> Box<dyn Transform<u15>>),
+    /// A byte→byte pipeline stage. The registry order of the [`Kind::Stage`] entries *is* the
+    /// pipeline order, so the entropy coder's entry must come last.
+    Stage(StageBuilder),
+    /// An optional entropy model, mixed alongside the always-on order-0 model.
+    Model(ModelBuilder),
 }
 
-/// One toggleable pipeline feature. The order-0 entropy model is always present and is *not* a
-/// feature. A feature's bit position is its index in [`FEATURES`], so this table is append-only —
-/// never reorder or remove an entry, or existing containers become unreadable.
+/// One toggleable pipeline feature. A feature's bit position is its index in [`FEATURES`]. This is a
+/// pre-1.0 format, so the table may be reassigned freely — the container `version` is bumped whenever
+/// it is, so an old stream is rejected rather than misread under new bit meanings.
 struct FeatureSpec {
     /// CLI/serialization name.
     name: &'static str,
@@ -240,40 +90,80 @@ struct FeatureSpec {
     kind: Kind,
 }
 
-/// The pipeline feature registry. Adding a stage is one line here plus its implementation.
+/// The pipeline feature registry. Bit position = index here, and for [`Kind::Stage`] entries this
+/// order is also the pipeline order (entropy coder last). Adding or reordering a stage is a
+/// single edit here — nothing re-keys stages by name.
 const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
-        name: FEATURE_REPAIR,
+        name: "casefold",
         default_on: true,
-        kind: Kind::Tokenizer,
+        kind: Kind::Stage(|_, _| Box::new(CaseFolding)),
+    },
+    FeatureSpec {
+        name: "entities",
+        default_on: true,
+        kind: Kind::Stage(|_, _| Box::new(EntityFolding)),
+    },
+    FeatureSpec {
+        name: "repair",
+        default_on: true,
+        kind: Kind::Stage(|_, options| {
+            Box::new(RepairTokenizer {
+                num_tokens: options.num_tokens,
+            })
+        }),
+    },
+    FeatureSpec {
+        name: "entropy",
+        default_on: true,
+        kind: Kind::Stage(|profile, _| Box::new(EntropyCoder::new(profile.model_builders()))),
     },
     FeatureSpec {
         name: "null",
         default_on: false,
         kind: Kind::Model(build_null_model),
     },
-    FeatureSpec {
-        name: "casefold",
-        default_on: true,
-        kind: Kind::BytePre(build_casefold),
-    },
-    // Appended after `casefold` so it applies after it: casefold claims its spare
-    // control bytes first, then entity folding picks its five from what remains.
-    FeatureSpec {
-        name: "entities",
-        default_on: true,
-        kind: Kind::BytePre(build_entities),
-    },
-    // LZ77 back-referencing over the token stream, applied after tokenization. Uses the reserved
-    // `0x7FFE` flag token (see `tokenizers::repair`) so its escape can never collide with a literal.
-    FeatureSpec {
-        name: "lz77",
-        default_on: true,
-        kind: Kind::TokenPre(build_lz77),
-    },
 ];
 
 const_assert!(FEATURES.len() <= 64);
+
+/// The pluggable compression pipeline: byte preprocessors → tokenizer → entropy coder, each a
+/// byte→byte [`Transform`] chosen by a [`Profile`].
+pub(crate) struct Compressor {
+    pipeline: Pipeline,
+}
+
+impl Compressor {
+    /// Builds the decode-side pipeline `profile` selects. The tokenizer's `num_tokens` is irrelevant
+    /// to `inverse` (the vocabulary is read from the stream), so the default is used.
+    pub(crate) fn from_profile(profile: Profile) -> Self {
+        Self {
+            pipeline: profile.pipeline_with(EncodeOptions::default()),
+        }
+    }
+
+    /// Builds the encode-side pipeline `profile` selects with the given `options`.
+    pub(crate) fn with_options(profile: Profile, options: EncodeOptions) -> Self {
+        Self {
+            pipeline: profile.pipeline_with(options),
+        }
+    }
+
+    /// Encode `input` into the framing-agnostic codec core. Takes ownership so each stage can free
+    /// its buffer as it consumes it — at gigabyte scale the tokenizer frees ~1 GB before its build.
+    pub(crate) fn encode(&self, input: Vec<u8>) -> Vec<u8> {
+        self.pipeline.forward(input)
+    }
+
+    /// Decode a codec core produced by [`Compressor::encode`] back to bytes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates entropy-decode, tokenizer, and preprocessor failures on corrupt input.
+    pub(crate) fn decode(&self, core: &[u8]) -> Result<Vec<u8>> {
+        self.pipeline.inverse(core.to_vec())
+    }
+}
 
 /// The set of enabled pipeline features.
 ///
@@ -299,7 +189,9 @@ impl Profile {
         self.bits & (1 << index) != 0
     }
 
-    /// Whether the feature named `name` is enabled (unknown names read as disabled).
+    /// Whether the feature named `name` is enabled (unknown names read as disabled). Test-only:
+    /// the pipeline builds stages straight from the registry rather than looking them up by name.
+    #[cfg(test)]
     fn enabled(self, name: &str) -> bool {
         Self::index(name).is_ok_and(|i| self.is_set(i))
     }
@@ -330,6 +222,10 @@ impl Profile {
     }
 
     /// Parses a profile bitmask, rejecting any bit that is not a known feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bits` enables a bit with no assigned feature.
     pub(crate) fn from_bits(bits: u64) -> Result<Self> {
         let known = if FEATURES.len() >= 64 {
             u64::MAX
@@ -342,63 +238,44 @@ impl Profile {
         })
     }
 
-    /// Builds the compressor pipeline this profile selects.
+    /// Builds the decode-side compressor pipeline this profile selects.
     pub(crate) fn compressor(self) -> Compressor {
         Compressor::from_profile(self)
     }
 
-    /// The byte preprocessors this profile selects: every enabled [`Kind::BytePre`]
-    /// feature, applied in registry order before tokenization. An empty list is the
-    /// identity — [`Pipeline`] passes the input straight through with a single copy,
-    /// so no explicit identity stage is prepended (that would just add a wasted copy).
-    fn byte_preprocessors(self) -> Vec<Box<dyn Transform<u8>>> {
-        let mut stages: Vec<Box<dyn Transform<u8>>> = Vec::new();
+    /// Builds the encode-side compressor with the given `options`.
+    pub(crate) fn compressor_with(self, options: EncodeOptions) -> Compressor {
+        Compressor::with_options(self, options)
+    }
+
+    /// Assembles the pipeline in CANONICAL order — imposed here, not by feature bit position:
+    /// casefold → entities → repair → \[future byte LZ77\] → entropy (always strictly last). This
+    /// single explicit assembly is the only place stage order is decided, so it cannot be broken by
+    /// editing the registry.
+    fn pipeline_with(self, options: EncodeOptions) -> Pipeline {
+        let mut stages: Vec<Box<dyn Transform>> = Vec::new();
         for (i, feature) in FEATURES.iter().enumerate() {
-            if let Kind::BytePre(build) = feature.kind
+            if let Kind::Stage(build) = feature.kind
                 && self.is_set(i)
             {
-                stages.push(build());
+                stages.push(build(&self, &options));
             }
         }
-        stages
+        Pipeline::new(stages)
     }
 
-    /// The token preprocessors this profile selects: every enabled [`Kind::TokenPre`]
-    /// feature, applied in registry order after tokenization. Empty is the identity
-    /// (see [`Self::byte_preprocessors`]); no explicit identity stage is prepended.
-    fn token_preprocessors(self) -> Vec<Box<dyn Transform<u15>>> {
-        let mut stages: Vec<Box<dyn Transform<u15>>> = Vec::new();
-        for (i, feature) in FEATURES.iter().enumerate() {
-            if let Kind::TokenPre(build) = feature.kind
-                && self.is_set(i)
-            {
-                stages.push(build());
-            }
-        }
-        stages
-    }
-
-    /// The tokenizer this profile selects.
-    fn tokenizer(self) -> Box<dyn Tokenize> {
-        if self.enabled(FEATURE_REPAIR) {
-            Box::new(RepairTokenizer)
-        } else {
-            Box::new(NullTokenizer)
-        }
-    }
-
-    /// The entropy model set: the always-on order-0 model plus every enabled [`Kind::Model`]
-    /// feature (hashed models sized from `capacity`).
-    fn models(self, capacity: usize) -> Vec<Box<dyn TokenModel>> {
-        let mut models: Vec<Box<dyn TokenModel>> = vec![Box::new(Order0::new())];
+    /// The entropy model builders: the always-on order-0 model first, then every enabled
+    /// [`Kind::Model`] feature (each sized per-input inside the [`EntropyCoder`]).
+    fn model_builders(self) -> Vec<ModelBuilder> {
+        let mut builders: Vec<ModelBuilder> = vec![build_order0];
         for (i, feature) in FEATURES.iter().enumerate() {
             if let Kind::Model(build) = feature.kind
                 && self.is_set(i)
             {
-                models.push(build(capacity));
+                builders.push(build);
             }
         }
-        models
+        builders
     }
 }
 
@@ -429,51 +306,66 @@ mod tests {
 
     use super::*;
 
-    /// An identity-tokenizer, order-0-only pipeline for exercising the entropy layer directly.
-    fn null_pipeline() -> Compressor {
-        Compressor::from_profile(Profile::from_bits(0).unwrap())
+    /// An entropy-only pipeline (no preprocessors, no tokenizer) for exercising the whole
+    /// `Compressor` around the entropy stage directly.
+    fn entropy_only() -> Compressor {
+        let mut profile = Profile::from_bits(0).unwrap();
+        profile.enable("entropy").unwrap();
+        Compressor::from_profile(profile)
     }
 
     proptest! {
-        /// The entropy layer must round-trip arbitrary 15-bit tokens — including
-        /// values ≥ 256, which exercise the full symbol width and would break
-        /// under a wrong 8-bit sentinel mask in `Context::push_symbol`.
-        #[test]
-        fn tokens_roundtrip_full_range(raw in prop::collection::vec(0u16..=0x7FFF, 0..500)) {
-            let tokens: Vec<u15> = raw.iter().copied().map(u15::new).collect();
-            let profile = Profile::default();
-            let core = encode_tokens(&tokens, profile);
-            prop_assert_eq!(decode_tokens(&core, profile).unwrap(), tokens);
-        }
-
         /// The full pluggable pipeline must round-trip arbitrary byte input.
         #[test]
         fn compressor_roundtrip(data in prop::collection::vec(any::<u8>(), 0..2048)) {
-            let c = null_pipeline();
+            let c = entropy_only();
             prop_assert_eq!(c.decode(&c.encode(data.clone())).unwrap(), data);
         }
 
         /// Decoding arbitrary bytes must never panic — only return Ok or Err.
         #[test]
         fn decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..2048)) {
-            let c = null_pipeline();
+            let c = entropy_only();
             drop(c.decode(&bytes));
+        }
+
+        /// Every stage-toggle combination must round-trip a sample that exercises all stages
+        /// (uppercase for casefold, entities for entity-folding, repetition for Re-Pair).
+        #[test]
+        fn each_stage_toggle_round_trips(bits in 0u64..=0b1_1111) {
+            let sample =
+                b"The QUICK brown fox &lt;tag&gt; JUMPS. The QUICK brown fox &lt;tag&gt; JUMPS.".to_vec();
+            let c = Compressor::from_profile(Profile::from_bits(bits).unwrap());
+            prop_assert_eq!(c.decode(&c.encode(sample.clone())).unwrap(), sample);
         }
     }
 
     #[test]
     fn roundtrips_empty_and_single() {
-        let c = null_pipeline();
+        let c = entropy_only();
         assert_eq!(c.decode(&c.encode(b"".to_vec())).unwrap(), b"");
         assert_eq!(c.decode(&c.encode(b"A".to_vec())).unwrap(), b"A");
     }
 
     #[test]
-    fn compresses_repetitive_input() {
+    fn entropy_compresses_repetitive_input() {
         let data = vec![b'a'; 10_000];
-        let c = null_pipeline();
+        let c = entropy_only();
         let core = c.encode(data.clone());
         assert!(core.len() < data.len() / 10, "weak compression: {} bytes", core.len());
+        assert_eq!(c.decode(&core).unwrap(), data);
+    }
+
+    #[test]
+    fn tokenize_only_still_compresses_and_round_trips() {
+        // Entropy off, tokenizer on: the Re-Pair grammar alone must shrink the stream and round-trip.
+        let mut profile = Profile::from_bits(0).unwrap();
+        profile.enable("repair").unwrap();
+        assert!(!profile.enabled("entropy"));
+        let c = Compressor::from_profile(profile);
+        let data = vec![b'a'; 10_000];
+        let core = c.encode(data.clone());
+        assert!(core.len() < data.len(), "tokenization alone should shrink: {} bytes", core.len());
         assert_eq!(c.decode(&core).unwrap(), data);
     }
 
@@ -481,6 +373,7 @@ mod tests {
     fn enabling_the_null_model_still_round_trips() {
         // Toggling an optional entropy model on must keep the pipeline reversible.
         let mut profile = Profile::from_bits(0).unwrap();
+        profile.enable("entropy").unwrap();
         profile.enable("null").unwrap();
         let c = Compressor::from_profile(profile);
         let data = b"the quick brown fox";
@@ -488,43 +381,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_absurd_token_count() {
-        // A tiny payload claiming a huge token count must be rejected, not looped.
-        let mut core = Vec::new();
-        uleb128::encode_u64(u64::MAX, &mut core);
-        core.extend_from_slice(&[0u8; 8]);
-        assert!(decode_tokens(&core, Profile::default()).is_err());
-    }
-
-    #[test]
-    fn profile_default_has_repair_on_null_off_casefold_on() {
+    fn profile_default_enables_the_full_stack() {
         let profile = Profile::default();
-        assert!(profile.enabled("repair"));
-        assert!(!profile.enabled("null"));
         assert!(profile.enabled("casefold"));
         assert!(profile.enabled("entities"));
-        assert!(profile.enabled("lz77"));
-        // bit 0 (repair) + bit 2 (casefold) + bit 3 (entities) + bit 4 (lz77), bit 1 (null) off.
-        assert_eq!(profile.to_bits(), 0b1_1101);
+        assert!(profile.enabled("repair"));
+        assert!(profile.enabled("entropy"));
+        assert!(!profile.enabled("null"));
+        // bits 0..=3 (casefold, entities, repair, entropy) on, bit 4 (null) off.
+        assert_eq!(profile.to_bits(), 0b0_1111);
     }
 
     #[test]
     fn profile_toggles_by_name() {
-        let mut profile = Profile::default(); // 0b1_1101: repair + casefold + entities + lz77
+        let mut profile = Profile::default(); // 0b0_1111: casefold + entities + repair + entropy
         profile.disable("casefold").unwrap();
-        profile.disable("repair").unwrap();
         profile.disable("entities").unwrap();
-        profile.disable("lz77").unwrap();
+        profile.disable("repair").unwrap();
+        profile.disable("entropy").unwrap();
         assert_eq!(profile.to_bits(), 0b0_0000);
-        profile.enable("null").unwrap();
-        assert_eq!(profile.to_bits(), 0b0_0010);
-        profile.enable("repair").unwrap();
-        assert_eq!(profile.to_bits(), 0b0_0011);
         profile.enable("casefold").unwrap();
-        assert_eq!(profile.to_bits(), 0b0_0111);
+        assert_eq!(profile.to_bits(), 0b0_0001);
         profile.enable("entities").unwrap();
+        assert_eq!(profile.to_bits(), 0b0_0011);
+        profile.enable("repair").unwrap();
+        assert_eq!(profile.to_bits(), 0b0_0111);
+        profile.enable("entropy").unwrap();
         assert_eq!(profile.to_bits(), 0b0_1111);
-        profile.enable("lz77").unwrap();
+        profile.enable("null").unwrap();
         assert_eq!(profile.to_bits(), 0b1_1111);
     }
 
@@ -533,15 +417,25 @@ mod tests {
         let mut profile = Profile::default();
         assert!(profile.enable("nope").is_err());
         assert!(profile.disable("nope").is_err());
+        assert!(profile.enable("lz77").is_err()); // removed feature
     }
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..4 (repair, null, casefold, entities, lz77) are all known features.
+        // bits 0..=4 (casefold, entities, repair, entropy, null) are all known features.
         for bits in 0..=0b1_1111 {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
         assert!(Profile::from_bits(0b10_0000).is_err()); // bit 5 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn encode_options_validate_num_tokens() {
+        assert!(EncodeOptions::new(256).is_ok());
+        assert!(EncodeOptions::new(0x3F_FFFE).is_ok());
+        assert!(EncodeOptions::new(255).is_err()); // below the terminal floor
+        assert!(EncodeOptions::new(0x3F_FFFF).is_err()); // the reserved NIL value
+        assert_eq!(EncodeOptions::default().num_tokens, DEFAULT_NUM_TOKENS);
     }
 }

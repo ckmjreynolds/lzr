@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::Parser;
-use lzr::Profile;
+use lzr::{EncodeOptions, Profile};
 
 /// LZR — a context-mixing compressor.
 ///
@@ -37,6 +37,10 @@ struct Cli {
     #[arg(long, value_name = "FEATURE")]
     disable: Vec<String>,
 
+    /// Re-Pair vocabulary cap (256..=4194302). Compression only; defaults to the maximum.
+    #[arg(long, value_name = "N")]
+    num_tokens: Option<u32>,
+
     /// Input file to read.
     input: PathBuf,
 
@@ -63,8 +67,9 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     let output = if decompress {
         lzr::decompress(&input)?
     } else {
+        let options = cli.num_tokens.map_or_else(|| Ok(EncodeOptions::default()), EncodeOptions::new)?;
         // Take ownership so the pipeline can free the input buffer before the tokenizer build.
-        lzr::compress_owned(input, profile(cli)?)
+        lzr::compress_owned_with(input, profile(cli)?, options)
     };
     std::fs::write(&cli.output, &output).with_context(|| format!("writing {}", cli.output.display()))?;
 

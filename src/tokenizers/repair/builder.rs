@@ -27,47 +27,44 @@
 //! - [`Builder::sort_pairs`] → `sort_pairs(T)`.
 //! - [`Builder::compact_text`] → `compact_text(T)` (delete blanks between phases).
 //!
-//! **Adaptations for this crate's capped variant.** Symbol ids are capped at
-//! [`VOCAB_CAP`](super::VOCAB_CAP) `= 0x7FFE`, so working symbols fit 15 bits and the text is a
-//! `Vec<u16>` (2 bytes/cell, ~2 GB for enwik9) rather than the paper's `⌈log n⌉`-bit words — and we
-//! need no inline run-length blank encoding, using a single [`BLANK`] sentinel (`0x7FFF`, free
-//! because ids are `≤ 0x7FFD`). Position arrays are `u32`. The paper's separate high-/low-frequency
-//! queues are unified into one **seed-capped** queue: each phase seeds the pairs whose frequency is
-//! at least a threshold τ chosen so at most [`Builder::seed_cap`] pairs are seeded (bounding the
-//! `εn` space term), drains them in exact max-first order, then re-sorts. Correctness is identical to
-//! strict greedy Re-Pair; the seed cap only decides how much work each sort batches.
+//! **Adaptations for this crate's capped variant.** Symbol ids are capped at `vocab_cap` (passed in
+//! per build; the tokenizer defaults it to `u22::MAX - 1 = 0x3F_FFFE`), so working symbols fit 22
+//! bits and the text is a `Vec<u32>` (4 bytes/cell, ~4 GB for enwik9) rather than the paper's
+//! `⌈log n⌉`-bit words — and we need no inline run-length blank encoding, using a single [`BLANK`]
+//! sentinel (`u32::MAX`, free because ids are `< vocab_cap ≤ 0x3F_FFFE`). Position arrays are `u32`.
+//! The paper's separate high-/low-frequency queues are unified into one **seed-capped** queue: each
+//! phase seeds the pairs whose frequency is at least a threshold τ chosen so at most
+//! [`Builder::seed_cap`] pairs are seeded (bounding the `εn` space term), drains them in exact
+//! max-first order, then re-sorts. Correctness is identical to strict greedy Re-Pair; the seed cap
+//! only decides how much work each sort batches.
 
 use std::collections::{BinaryHeap, HashMap};
 
-use super::VOCAB_CAP;
-
-/// Largest usable symbol id (`VOCAB_CAP - 1`). Values above this in the working text are sentinels.
-const SYMBOL_MAX: u16 = 0x7FFD;
 /// Blank sentinel marking a cell vacated by a replacement. Free as a working value because ids are
-/// `≤ SYMBOL_MAX`; distinct from the serialization `NIL_SYM`, which only exists in the emitted stream.
-const BLANK: u16 = 0x7FFF;
-
-const _: () = assert!(SYMBOL_MAX as u32 == VOCAB_CAP - 1);
-const _: () = assert!(BLANK > SYMBOL_MAX);
+/// `< vocab_cap ≤ 0x3F_FFFE`; distinct from the serialization `NIL_SYM`, which only exists in the
+/// emitted stream.
+const BLANK: u32 = u32::MAX;
 
 /// Sort key that groups positions by the *current* live pair starting at `p`: the packed
 /// `⟨text[i], text[j]⟩` pair (with `j` the next non-blank position), tie-broken by `p` for a stable
-/// order. Blank cells and positions with no live successor sort to the end (`u32::MAX`). A free
+/// order. Blank cells and positions with no live successor sort to the end (`u64::MAX`). The 22-bit
+/// symbols are packed with a `<< 22` shift into a `u64` so distinct pairs never alias. A free
 /// function, not a method, so it can be called from a `sort_unstable_by_key` closure while `tp` is
-/// mutably borrowed (only `text` need be borrowed).
-fn pair_key(text: &[u16], p: u32) -> (u32, u32) {
+/// mutably borrowed (only `text` need be borrowed). The key is transient (used only inside the sort
+/// closure), so it never inflates the persistent `u32` position arrays.
+fn pair_key(text: &[u32], p: u32) -> (u64, u32) {
     let i = p as usize;
     if text[i] == BLANK {
-        return (u32::MAX, p);
+        return (u64::MAX, p);
     }
     let mut j = i + 1;
     while j < text.len() && text[j] == BLANK {
         j += 1;
     }
     if j >= text.len() {
-        (u32::MAX, p)
+        (u64::MAX, p)
     } else {
-        ((u32::from(text[i]) << 15) | u32::from(text[j]), p)
+        ((u64::from(text[i]) << 22) | u64::from(text[j]), p)
     }
 }
 
@@ -91,7 +88,7 @@ struct Entry {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct HeapItem {
     freq: u32,
-    pair: (u16, u16),
+    pair: (u32, u32),
 }
 
 impl Ord for HeapItem {
@@ -109,32 +106,39 @@ impl PartialOrd for HeapItem {
 
 /// Working state for one space-efficient Re-Pair run over a single input.
 struct Builder {
-    /// Rewritable sequence; live cells hold ids `≤ SYMBOL_MAX`, vacated cells hold [`BLANK`].
-    text: Vec<u16>,
+    /// Rewritable sequence; live cells hold ids `< vocab_cap`, vacated cells hold [`BLANK`].
+    text: Vec<u32>,
     /// Live positions (those currently starting a pair), sorted by pair per phase. Paper's `TP`.
     tp: Vec<u32>,
     /// Priority queue of tracked pairs: `⟨P,L,F⟩` per pair plus a lazy max-heap over `(F, pair)`.
-    q: HashMap<(u16, u16), Entry>,
+    q: HashMap<(u32, u32), Entry>,
     heap: BinaryHeap<HeapItem>,
     /// Rules in creation order; rule `k` has id `first_rule_id + k`.
-    rules: Vec<(u16, u16)>,
-    /// Next rule id to assign; the build stops when it reaches [`VOCAB_CAP`].
+    rules: Vec<(u32, u32)>,
+    /// Next rule id to assign; the build stops when it reaches [`Builder::vocab_cap`].
     next_id: u32,
+    /// Vocabulary ceiling: symbol ids run `0..vocab_cap`, so the build stops once `next_id` reaches
+    /// it. Passed in per build (`u22::MAX - 1` by default) rather than a fixed constant.
+    vocab_cap: u32,
     /// Upper bound on pairs seeded per phase (bounds the `εn` space term).
     seed_cap: usize,
     /// Count of entries driven dead (`f < 2`) by [`Builder::decrease`] since the last
     /// [`Builder::compact_q`]. Pruning is O(q); firing it only once dead entries reach a
     /// fraction of `q` (rather than every merge) keeps that scan amortized O(1) per merge.
     dead: usize,
+    /// Reused neighbour-pair scratch for [`Builder::substitution_round`]. Held on the builder
+    /// (like the heap rebuilds) so its capacity survives across the millions of rounds a build
+    /// runs, rather than allocating and freeing a fresh `Vec` per round.
+    touched: Vec<(u32, u32)>,
 }
 
 impl Builder {
-    fn new(symbols: Vec<u16>, n_terminals: u16) -> Self {
+    fn new(symbols: Vec<u32>, n_terminals: u32, vocab_cap: u32) -> Self {
         let n = symbols.len();
         // Seed at most ~n/128 pairs per phase (the `εn` term, ε ≈ 1/128), never fewer than 4096 so
         // small inputs finish in a single phase. A smaller cap trades more sort phases (time) for less
         // queue/heap memory, which (with the reused-capacity rebuilds below) is what keeps enwik9 under
-        // the 10 GB target.
+        // the memory target.
         let seed_cap = (n / 128).max(4096);
         Self {
             // Move (not copy) the input in as the working text — avoids a second n-word buffer.
@@ -143,9 +147,11 @@ impl Builder {
             q: HashMap::new(),
             heap: BinaryHeap::new(),
             rules: Vec::new(),
-            next_id: u32::from(n_terminals),
+            next_id: n_terminals,
+            vocab_cap,
             seed_cap,
             dead: 0,
+            touched: Vec::new(),
         }
     }
 
@@ -175,7 +181,7 @@ impl Builder {
     }
 
     /// The live pair starting at position `i`, or `None` if `i` is blank or has no live successor.
-    fn pair_at(&self, i: usize) -> Option<(u16, u16)> {
+    fn pair_at(&self, i: usize) -> Option<(u32, u32)> {
         if self.text[i] == BLANK {
             return None;
         }
@@ -202,7 +208,7 @@ impl Builder {
     }
 
     /// Push a fresh heap item for a pair's current frequency (lazy: stale items are filtered at pop).
-    fn heap_push(&mut self, pair: (u16, u16), freq: u32) {
+    fn heap_push(&mut self, pair: (u32, u32), freq: u32) {
         self.heap.push(HeapItem {
             freq,
             pair,
@@ -255,7 +261,7 @@ impl Builder {
 
     /// Return the highest-frequency tracked pair whose frequency is at least `floor`, or `None`.
     /// Revalidates lazily against `q` so stale heap items are discarded.
-    fn max_pair(&mut self, floor: u32) -> Option<(u16, u16)> {
+    fn max_pair(&mut self, floor: u32) -> Option<(u32, u32)> {
         while let Some(item) = self.heap.peek().copied() {
             match self.q.get(&item.pair) {
                 Some(entry) if entry.f == item.freq => {
@@ -275,7 +281,7 @@ impl Builder {
     /// `synchronize` can discover the new pairs created at those positions (a removed entry would lose
     /// them). Stale low-frequency entries are simply skipped by [`Builder::max_pair`] and cleared when
     /// the phase ends.
-    fn decrease(&mut self, pair: (u16, u16)) {
+    fn decrease(&mut self, pair: (u32, u32)) {
         if let Some(entry) = self.q.get_mut(&pair) {
             entry.f = entry.f.saturating_sub(1);
             if entry.f >= 2 {
@@ -296,7 +302,7 @@ impl Builder {
     /// its remaining occurrences. Every distinct live pair found is a new pair (a fresh id was just
     /// introduced) or `ab` itself, so upserting its `⟨P,L,F⟩` is safe (no interval belongs elsewhere).
     #[expect(clippy::cast_possible_truncation, reason = "run/index < text.len() <= u32::MAX (build_grammar guard)")]
-    fn synchronize(&mut self, ab: (u16, u16)) {
+    fn synchronize(&mut self, ab: (u32, u32)) {
         let Some(entry) = self.q.get(&ab).copied() else {
             return;
         };
@@ -339,25 +345,26 @@ impl Builder {
 
     /// Paper's Algorithm 1: substitute every occurrence of the max pair `ab` with a fresh id.
     /// Returns `false` if the vocabulary cap is hit (no id available), signalling the build to stop.
-    #[expect(clippy::cast_possible_truncation, reason = "next_id < VOCAB_CAP = 0x7FFE fits u16")]
     #[expect(
         clippy::many_single_char_names,
         reason = "a,b are the pair; x the new id; i,j text positions — standard Re-Pair notation"
     )]
-    fn substitution_round(&mut self, ab: (u16, u16)) -> bool {
-        if self.next_id >= VOCAB_CAP {
+    fn substitution_round(&mut self, ab: (u32, u32)) -> bool {
+        if self.next_id >= self.vocab_cap {
             return false;
         }
         let (a, b) = ab;
-        let x = self.next_id as u16;
+        let x = self.next_id;
         self.rules.push((a, b));
         self.next_id += 1;
         let entry = self.q[&ab];
         let (start, len) = (entry.p as usize, entry.l as usize);
 
         // Pass 1 (Algorithm 1, lines 4–10): replace occurrences, decrement each neighbour pair's
-        // frequency, and remember the neighbours so their intervals can be refreshed below.
-        let mut touched: Vec<(u16, u16)> = Vec::new();
+        // frequency, and remember the neighbours so their intervals can be refreshed below. `touched`
+        // is taken from the builder so its capacity is reused across rounds (restored at the end).
+        let mut touched = std::mem::take(&mut self.touched);
+        touched.clear();
         for off in 0..len {
             let i = self.tp[start + off] as usize;
             if self.text[i] != a {
@@ -392,13 +399,16 @@ impl Builder {
         // neighbour can violate the invariant and hide a higher-frequency pair.)
         touched.sort_unstable();
         touched.dedup();
-        for pair in touched {
+        for &pair in &touched {
             if let Some(e) = self.q.get(&pair).copied() {
                 if e.f <= e.l / 2 {
                     self.synchronize(pair);
                 }
             }
         }
+        // Return the buffer (emptied) to the builder so the next round reuses its capacity.
+        touched.clear();
+        self.touched = touched;
 
         // Line 15–16: discover the new right-context pairs `Xy` inside `ab`'s interval, then drop `ab`.
         self.synchronize(ab);
@@ -420,7 +430,7 @@ impl Builder {
 
     /// Visit each run of a distinct pair in the sorted `tp`, calling `f(pair, start_offset, freq)`
     /// for runs of length ≥ 2. Shared by both passes of [`Builder::seed_queue`].
-    fn for_each_run(&self, mut f: impl FnMut((u16, u16), usize, u32)) {
+    fn for_each_run(&self, mut f: impl FnMut((u32, u32), usize, u32)) {
         let mut off = 0usize;
         while off < self.tp.len() {
             let Some(pair) = self.pair_at(self.tp[off] as usize) else {
@@ -469,7 +479,7 @@ impl Builder {
             top.peek().map_or(2, |&core::cmp::Reverse(m)| m).max(2)
         };
         // Pass 2: seed every pair with frequency ≥ τ.
-        let mut seeds: Vec<((u16, u16), u32, u32)> = Vec::new();
+        let mut seeds: Vec<((u32, u32), u32, u32)> = Vec::new();
         self.for_each_run(|pair, off, freq| {
             if freq >= tau {
                 seeds.push((pair, off as u32, freq));
@@ -493,7 +503,7 @@ impl Builder {
     /// in exact max-first order (creating rules), then compacts. Stops when no pair repeats or the
     /// vocabulary cap is reached.
     fn compute_repair(&mut self) {
-        while self.next_id < VOCAB_CAP {
+        while self.next_id < self.vocab_cap {
             self.sort_pairs();
             let tau = self.seed_queue();
             if tau == 0 {
@@ -511,19 +521,21 @@ impl Builder {
     }
 
     /// The surviving sequence: the live symbols in order.
-    fn collect_sequence(&self) -> Vec<u16> {
+    fn collect_sequence(&self) -> Vec<u32> {
         self.text.iter().copied().filter(|&s| s != BLANK).collect()
     }
 }
 
-/// Build the Re-Pair grammar of `symbols` (terminal ids in `0..n_terminals`) space-efficiently.
-/// Returns the rules in creation order (rule `k` has id `n_terminals + k`) and the reduced sequence,
-/// exactly the shape [`super::RepairTokenizer::forward`] consumes.
-pub(super) fn build_grammar(symbols: Vec<u16>, n_terminals: u16) -> (Vec<(u16, u16)>, Vec<u16>) {
+/// Build the Re-Pair grammar of `symbols` (terminal ids in `0..n_terminals`) space-efficiently,
+/// minting symbol ids up to `vocab_cap` (exclusive). Returns the rules in creation order (rule `k`
+/// has id `n_terminals + k`) and the reduced sequence, exactly the shape
+/// [`super::RepairTokenizer::forward`] consumes.
+pub(super) fn build_grammar(symbols: Vec<u32>, n_terminals: u32, vocab_cap: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
+    debug_assert!(n_terminals <= vocab_cap, "caller must admit at least the terminals");
     if symbols.len() < 2 {
         return (Vec::new(), symbols);
     }
-    let mut builder = Builder::new(symbols, n_terminals);
+    let mut builder = Builder::new(symbols, n_terminals, vocab_cap);
     builder.compute_repair();
     let sequence = builder.collect_sequence();
     (builder.rules, sequence)
@@ -536,15 +548,18 @@ mod tests {
 
     use super::*;
 
+    /// The default vocabulary cap used throughout the tests (`u22::MAX - 1`).
+    const TEST_CAP: u32 = 0x3F_FFFE;
+
     /// Map arbitrary bytes to compact terminal ids `0..t` (as `forward` does), returning the symbol
     /// vector and terminal count.
-    fn terminals(data: &[u8]) -> (Vec<u16>, u16) {
+    fn terminals(data: &[u8]) -> (Vec<u32>, u32) {
         let mut present = [false; 256];
         for &d in data {
             present[usize::from(d)] = true;
         }
-        let mut id = [0u16; 256];
-        let mut t = 0u16;
+        let mut id = [0u32; 256];
+        let mut t = 0u32;
         for b in 0..=255usize {
             if present[b] {
                 id[b] = t;
@@ -556,7 +571,7 @@ mod tests {
 
     /// Expand a grammar back to its terminal-id sequence (the inverse of Re-Pair), via an explicit
     /// stack. Proves the grammar is lossless without depending on any particular tie-break.
-    fn expand(rules: &[(u16, u16)], sequence: &[u16], n_terminals: u16) -> Vec<u16> {
+    fn expand(rules: &[(u32, u32)], sequence: &[u32], n_terminals: u32) -> Vec<u32> {
         let mut out = Vec::new();
         let mut stack = Vec::new();
         for &s in sequence {
@@ -565,7 +580,7 @@ mod tests {
                 if sym < n_terminals {
                     out.push(sym);
                 } else {
-                    let (l, r) = rules[usize::from(sym) - usize::from(n_terminals)];
+                    let (l, r) = rules[(sym - n_terminals) as usize];
                     stack.push(r);
                     stack.push(l);
                 }
@@ -575,9 +590,9 @@ mod tests {
     }
 
     /// True occurrence count of every pair by scanning the live text (test oracle).
-    fn true_counts(b: &Builder) -> HashMap<(u16, u16), u32> {
+    fn true_counts(b: &Builder) -> HashMap<(u32, u32), u32> {
         let mut c = HashMap::new();
-        let mut prev: Option<u16> = None;
+        let mut prev: Option<u32> = None;
         for &s in &b.text {
             if s == BLANK {
                 continue;
@@ -594,10 +609,10 @@ mod tests {
     /// defining property of Re-Pair. (The exact tie-break is implementation-defined: the paper defers
     /// some new pairs via the `F ≤ L/2` amortization trigger, so `Q.max()` returns *a* max pair, not
     /// necessarily the lexicographically smallest one — any choice yields a valid Re-Pair grammar.)
-    fn assert_valid_repair(symbols: &[u16], t: u16) {
-        let mut b = Builder::new(symbols.to_vec(), t);
+    fn assert_valid_repair(symbols: &[u32], t: u32) {
+        let mut b = Builder::new(symbols.to_vec(), t, TEST_CAP);
         loop {
-            if b.next_id >= VOCAB_CAP {
+            if b.next_id >= TEST_CAP {
                 break;
             }
             b.sort_pairs();
@@ -623,7 +638,7 @@ mod tests {
         #[test]
         fn lossless(data in prop::collection::vec(any::<u8>(), 0..2048)) {
             let (symbols, t) = terminals(&data);
-            let (rules, sequence) = build_grammar(symbols.clone(), t);
+            let (rules, sequence) = build_grammar(symbols.clone(), t, TEST_CAP);
             prop_assert_eq!(expand(&rules, &sequence, t), symbols);
         }
 
@@ -631,7 +646,7 @@ mod tests {
         #[test]
         fn lossless_small_alphabet(data in prop::collection::vec(0u8..3, 0..2048)) {
             let (symbols, t) = terminals(&data);
-            let (rules, sequence) = build_grammar(symbols.clone(), t);
+            let (rules, sequence) = build_grammar(symbols.clone(), t, TEST_CAP);
             prop_assert_eq!(expand(&rules, &sequence, t), symbols);
         }
 
@@ -658,7 +673,7 @@ mod tests {
             for bits in 0u32..(1u32 << len) {
                 let data: Vec<u8> = (0..len).map(|k| u8::try_from((bits >> k) & 1).unwrap()).collect();
                 let (symbols, t) = terminals(&data);
-                let (rules, sequence) = build_grammar(symbols.clone(), t);
+                let (rules, sequence) = build_grammar(symbols.clone(), t, TEST_CAP);
                 assert_eq!(expand(&rules, &sequence, t), symbols, "not lossless: {data:?}");
                 assert_valid_repair(&symbols, t);
             }
@@ -669,7 +684,7 @@ mod tests {
     fn known_small_cases_lossless() {
         for input in [b"".as_slice(), b"a", b"aa", b"aaaa", b"abab", b"abracadabra", b"mississippi"] {
             let (symbols, t) = terminals(input);
-            let (rules, sequence) = build_grammar(symbols.clone(), t);
+            let (rules, sequence) = build_grammar(symbols.clone(), t, TEST_CAP);
             assert_eq!(expand(&rules, &sequence, t), symbols, "input {input:?}");
         }
     }
@@ -681,7 +696,7 @@ mod tests {
         let data = b"the quick brown fox the quick brown fox the quick brown fox jumps".repeat(4);
         let (symbols, t) = terminals(&data);
         assert_valid_repair(&symbols, t); // uses default cap
-        let mut builder = Builder::new(symbols.clone(), t);
+        let mut builder = Builder::new(symbols.clone(), t, TEST_CAP);
         builder.seed_cap = 3;
         builder.compute_repair();
         assert_eq!(expand(&builder.rules, &builder.collect_sequence(), t), symbols);
@@ -689,9 +704,19 @@ mod tests {
 
     #[test]
     fn compresses_repetitive_input() {
-        let data = vec![0u16; 4096];
-        let (rules, sequence) = build_grammar(data.clone(), 1);
+        let data = vec![0u32; 4096];
+        let (rules, sequence) = build_grammar(data.clone(), 1, TEST_CAP);
         assert!(sequence.len() < data.len(), "repetitive input should shrink");
         assert_eq!(expand(&rules, &sequence, 1), data);
+    }
+
+    #[test]
+    fn vocab_cap_is_respected() {
+        // A tiny cap must bound the total symbol count: terminals + minted rules never exceed it.
+        let data = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
+        let (symbols, t) = terminals(&data);
+        let cap = 300u32;
+        let (rules, _sequence) = build_grammar(symbols, t, cap);
+        assert!(t + u32::try_from(rules.len()).unwrap() <= cap, "vocab exceeded the {cap} cap");
     }
 }

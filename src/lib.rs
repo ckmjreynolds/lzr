@@ -18,12 +18,12 @@ pub(crate) mod adler32;
 pub mod uleb128;
 
 #[cfg(not(feature = "bench-internals"))]
-#[cfg_attr(not(test), expect(dead_code, reason = "Development."))]
 pub(crate) mod uleb128;
 
 mod codec;
 mod coder;
 mod container;
+mod entropy;
 mod mixer;
 mod models;
 mod preprocessors;
@@ -34,5 +34,13 @@ pub mod tokenizers;
 #[cfg(not(feature = "bench-internals"))]
 mod tokenizers;
 
-pub use codec::Profile;
-pub use container::{compress, compress_owned, compress_with, decompress};
+// The `Transform` trait is widened to `pub` under `bench-internals` (via `visibility::make`) so
+// `benches/` can drive the tokenizer through it, mirroring `tokenizers`/`uleb128`.
+#[cfg(feature = "bench-internals")]
+pub mod transform;
+
+#[cfg(not(feature = "bench-internals"))]
+mod transform;
+
+pub use codec::{EncodeOptions, Profile};
+pub use container::{compress, compress_owned, compress_owned_with, compress_with, decompress};

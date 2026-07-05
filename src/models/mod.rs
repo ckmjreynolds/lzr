@@ -1,7 +1,7 @@
 //! Bit-prediction models and the shared [`Context`] they read.
 //!
-//! Each `u15` token is coded as a 15-bit MSB-first bit-tree. A [`TokenModel`] is
-//! queried once per bit ([`TokenModel::predict`]) and then told the actual bit
+//! Each byte is coded as an 8-bit MSB-first bit-tree. A [`TokenModel`] is queried
+//! once per bit ([`TokenModel::predict`]) and then told the actual bit
 //! ([`TokenModel::update`]). Predictions are returned in the stretched (logit)
 //! domain so the [`crate::mixer::Mixer`] can combine them directly.
 
@@ -9,8 +9,9 @@ pub(crate) mod null;
 pub(crate) mod order0;
 pub(crate) mod statemap;
 
-/// Bits per coded symbol. A `u15` alphabet is a depth-15 bit-tree.
-pub(crate) const SYMBOL_BITS: u32 = 15;
+/// Bits per coded symbol. The entropy coder operates on bytes, so a symbol is a
+/// depth-8 bit-tree.
+pub(crate) const SYMBOL_BITS: u32 = u8::BITS;
 
 /// Minimum / maximum index width for a hashed model table, bounding skeleton
 /// memory regardless of input size.
@@ -35,19 +36,18 @@ pub(crate) fn hashed_bits(capacity: usize) -> u32 {
 
 /// Mutable per-stream prediction state shared by every model.
 ///
-/// The token-domain analogue of a byte coder's context. `c0` walks the bit-tree
-/// of the current symbol; `s1` is the previous finalized symbol (the order-1 key).
+/// `c0` walks the bit-tree of the current byte; `s1` is the previous finalized
+/// byte (the order-1 key).
 #[derive(Debug)]
 pub(crate) struct Context {
-    /// Partial current symbol: a leading-1 sentinel followed by the bits coded so
-    /// far. **`u32`** because it transiently reaches `2^16 - 1` after the 15th bit
-    /// (sentinel at bit 15) before [`Context::push_symbol`] strips it — a `u16`
-    /// would overflow on the final shift.
+    /// Partial current byte: a leading-1 sentinel followed by the bits coded so
+    /// far. Kept as `u32` (headroom to spare) — it transiently reaches `2^9 - 1`
+    /// after the 8th bit (sentinel at bit 8) before [`Context::push_symbol`] strips it.
     pub(crate) c0: u32,
-    /// Bits of the current symbol already coded (`0..=14`).
+    /// Bits of the current byte already coded (`0..=7`).
     pub(crate) bpos: u8,
-    /// The previous finalized symbol's 15-bit value (`0` before any) — order-1 key.
-    pub(crate) s1: u16,
+    /// The previous finalized byte's value (`0` before any) — order-1 key.
+    pub(crate) s1: u8,
 }
 
 impl Context {
@@ -66,11 +66,11 @@ impl Context {
         self.bpos += 1;
     }
 
-    /// Finalize the current symbol once all [`SYMBOL_BITS`] bits are in, recording
-    /// it as `s1` and resetting for the next. The `& 0x7fff` strips the leading-1
-    /// sentinel, leaving the 15-bit symbol value — masking to 15 bits, **not** 8.
+    /// Finalize the current byte once all [`SYMBOL_BITS`] bits are in, recording it
+    /// as `s1` and resetting for the next. The `& 0xff` strips the leading-1
+    /// sentinel (at bit 8), leaving the 8-bit byte value.
     pub(crate) const fn push_symbol(&mut self) {
-        self.s1 = (self.c0 & 0x7fff) as u16;
+        self.s1 = (self.c0 & 0xff) as u8;
         self.c0 = 1;
         self.bpos = 0;
     }
@@ -89,21 +89,19 @@ pub(crate) trait TokenModel {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use arbitrary_int::u15;
     use proptest::prelude::*;
 
     use super::*;
 
     proptest! {
-        /// Feeding a symbol's 15 bits MSB-first, then finalizing, must recover the
-        /// symbol as `s1` — the round-trip the whole codec relies on. A token ≥ 256
-        /// (exercised by the range below) catches a wrong `& 0xff` sentinel mask.
+        /// Feeding a byte's 8 bits MSB-first, then finalizing, must recover the byte
+        /// as `s1` — the round-trip the whole codec relies on. The full `0..=255`
+        /// range catches a wrong sentinel mask in [`Context::push_symbol`].
         #[test]
-        fn push_bits_then_symbol_recovers_value(raw in 0u16..=0x7FFF) {
-            let value = u15::new(raw);
+        fn push_bits_then_symbol_recovers_value(raw in 0u8..=0xFF) {
             let mut ctx = Context::new();
             for k in (0..SYMBOL_BITS).rev() {
-                ctx.push_bit(((value.value() >> k) & 1) as u8);
+                ctx.push_bit((raw >> k) & 1);
             }
             prop_assert_eq!(u32::from(ctx.bpos), SYMBOL_BITS);
             ctx.push_symbol();

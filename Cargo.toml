@@ -5,7 +5,7 @@ edition         = "2024"
 rust-version    = "1.87"
 
 authors         = ["Chris Reynolds <chris@reynolds.guru>"]
-description     = "Fast LZ77-based compression library and CLI."
+description     = "A composable byte-stream compression library and CLI."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
 repository      = "https://github.com/ckmjreynolds/lzr"

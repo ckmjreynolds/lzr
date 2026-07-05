@@ -1,6 +1,6 @@
 //! XML/HTML entity-folding byte preprocessor.
 
-use super::{TEXT_FRACTION, Transform, is_text_byte, spare_bytes};
+use super::{MODE_FOLDED, Transform, inverse_framed, is_text_byte, looks_like_text, passthrough, spare_bytes};
 
 /// The five predefined XML entities this stage folds. The array index is the
 /// entity's spare-byte slot (slot `i` ↔ `ENTITIES[i]`); the ordering is part of
@@ -30,20 +30,14 @@ const ENTITIES: [&[u8]; 5] = [b"&lt;", b"&gt;", b"&amp;", b"&quot;", b"&apos;"];
 /// the folded path stores its five chosen substitute bytes in the header.
 pub(crate) struct EntityFolding;
 
-/// Header mode byte: the input was passed through unchanged.
-const MODE_PASSTHROUGH: u8 = 0;
-/// Header mode byte: the payload is entity-folded (followed by the five substitute bytes).
-const MODE_FOLDED: u8 = 1;
-
 /// The slot of the entity that begins at the start of `rest`, if any. `rest`
 /// should be the input sliced from a candidate `&`.
 fn match_entity(rest: &[u8]) -> Option<usize> {
     ENTITIES.iter().position(|entity| rest.starts_with(entity))
 }
 
-impl Transform<u8> for EntityFolding {
-    #[expect(clippy::cast_precision_loss, reason = "byte counts are far under 2^53")]
-    fn forward(&self, input: &[u8]) -> Vec<u8> {
+impl Transform for EntityFolding {
+    fn forward(&self, input: Vec<u8>) -> Vec<u8> {
         // One pass: presence map, text-byte count, and whether any entity appears.
         let mut present = [false; 256];
         let mut text_bytes = 0usize;
@@ -61,12 +55,9 @@ impl Transform<u8> for EntityFolding {
         // Fall back to pass-through unless the input looks like text, is XML/HTML
         // (a recognized entity is present — which also means there is something to
         // fold), and five spare byte values exist for the substitutes.
-        let is_text = !input.is_empty() && text_bytes as f64 >= input.len() as f64 * TEXT_FRACTION;
+        let is_text = looks_like_text(input.len(), text_bytes);
         let Some(spares) = (has_entity && is_text).then(|| spare_bytes::<5>(&present)).flatten() else {
-            let mut out = Vec::with_capacity(input.len() + 1);
-            out.push(MODE_PASSTHROUGH);
-            out.extend_from_slice(input);
-            return out;
+            return passthrough(&input);
         };
 
         let mut out = Vec::with_capacity(input.len() + 6);
@@ -87,35 +78,26 @@ impl Transform<u8> for EntityFolding {
         out
     }
 
-    fn inverse(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let Some((&mode, rest)) = input.split_first() else {
-            // Empty input is not something `forward` ever produces; treat it as an
-            // empty restoration rather than panicking on corrupt decode data.
-            return Ok(Vec::new());
-        };
-        match mode {
-            MODE_PASSTHROUGH => Ok(rest.to_vec()),
-            MODE_FOLDED => {
-                let [b0, b1, b2, b3, b4, payload @ ..] = rest else {
-                    anyhow::bail!("entity-folding header truncated: missing substitute bytes");
-                };
-                // Map each substitute byte value back to its entity slot.
-                let mut slot_of: [Option<usize>; 256] = [None; 256];
-                for (slot, &byte) in [*b0, *b1, *b2, *b3, *b4].iter().enumerate() {
-                    slot_of[usize::from(byte)] = Some(slot);
-                }
-                let mut out = Vec::with_capacity(payload.len());
-                for &byte in payload {
-                    if let Some(slot) = slot_of[usize::from(byte)] {
-                        out.extend_from_slice(ENTITIES[slot]);
-                    } else {
-                        out.push(byte);
-                    }
-                }
-                Ok(out)
+    fn inverse(&self, input: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        inverse_framed(&input, "entity-folding", |rest| {
+            let [b0, b1, b2, b3, b4, payload @ ..] = rest else {
+                anyhow::bail!("entity-folding header truncated: missing substitute bytes");
+            };
+            // Map each substitute byte value back to its entity slot.
+            let mut slot_of: [Option<usize>; 256] = [None; 256];
+            for (slot, &byte) in [*b0, *b1, *b2, *b3, *b4].iter().enumerate() {
+                slot_of[usize::from(byte)] = Some(slot);
             }
-            other => anyhow::bail!("unknown entity-folding mode byte {other}"),
-        }
+            let mut out = Vec::with_capacity(payload.len());
+            for &byte in payload {
+                if let Some(slot) = slot_of[usize::from(byte)] {
+                    out.extend_from_slice(ENTITIES[slot]);
+                } else {
+                    out.push(byte);
+                }
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -124,6 +106,7 @@ impl Transform<u8> for EntityFolding {
 mod tests {
     use proptest::prelude::*;
 
+    use super::super::MODE_PASSTHROUGH;
     use super::*;
 
     /// Token alphabet for the XML-ish round-trip generator: tags, all five
@@ -149,7 +132,7 @@ mod tests {
         #[test]
         fn entity_roundtrip(data in prop::collection::vec(any::<u8>(), 0..1024)) {
             let s = EntityFolding;
-            prop_assert_eq!(s.inverse(&s.forward(&data)).unwrap(), data);
+            prop_assert_eq!(s.inverse(s.forward(data.clone())).unwrap(), data);
         }
 
         /// A generator biased toward XML so the folded path is exercised often:
@@ -160,7 +143,7 @@ mod tests {
         ) {
             let data: Vec<u8> = tokens.concat();
             let s = EntityFolding;
-            prop_assert_eq!(s.inverse(&s.forward(&data)).unwrap(), data);
+            prop_assert_eq!(s.inverse(s.forward(data.clone())).unwrap(), data);
         }
 
         /// Inverse runs on decoded, possibly-corrupt data — it may error but must
@@ -168,7 +151,7 @@ mod tests {
         #[test]
         fn entity_inverse_never_panics(data in prop::collection::vec(any::<u8>(), 0..1024)) {
             let s = EntityFolding;
-            drop(s.inverse(&data));
+            drop(s.inverse(data));
         }
 
         /// Entity folding must round-trip inputs that saturate the whole byte range
@@ -179,7 +162,7 @@ mod tests {
             data.extend_from_slice(b"&lt; &amp;");
             data.extend(extra);
             let s = EntityFolding;
-            prop_assert_eq!(s.inverse(&s.forward(&data)).unwrap(), data);
+            prop_assert_eq!(s.inverse(s.forward(data.clone())).unwrap(), data);
         }
     }
 
@@ -196,7 +179,7 @@ mod tests {
             b"<a href=\"x\">1 &lt; 2 &amp; 3</a>",
         ];
         for input in inputs {
-            assert_eq!(s.inverse(&s.forward(input)).unwrap(), input, "roundtrip failed for {input:?}");
+            assert_eq!(s.inverse(s.forward(input.to_vec())).unwrap(), input, "roundtrip failed for {input:?}");
         }
     }
 
@@ -204,20 +187,20 @@ mod tests {
     fn entity_folds_markup_but_passes_binary_and_entityless() {
         let s = EntityFolding;
         // Text containing a recognized entity takes the folded path (mode byte 1).
-        let folded = s.forward(b"<a>1 &lt; 2 &amp; 3</a>");
+        let folded = s.forward(b"<a>1 &lt; 2 &amp; 3</a>".to_vec());
         assert_eq!(folded[0], MODE_FOLDED);
         // Text with no entity has nothing to fold → pass-through (mode byte 0).
-        let entityless = s.forward(b"just some plain prose here");
+        let entityless = s.forward(b"just some plain prose here".to_vec());
         assert_eq!(entityless[0], MODE_PASSTHROUGH);
         // A non-text byte stream → pass-through (mode byte 0).
-        let binary = s.forward(&[0u8, 1, 2, 255, 254, b'&', b'l', b't', b';', 0, 200]);
+        let binary = s.forward(vec![0u8, 1, 2, 255, 254, b'&', b'l', b't', b';', 0, 200]);
         assert_eq!(binary[0], MODE_PASSTHROUGH);
     }
 
     #[test]
     fn entity_folded_payload_has_no_entity_spellings() {
         // The whole point: no entity spelling survives in the folded payload.
-        let folded = EntityFolding.forward(b"<a>1 &lt; 2 &amp; 3 &quot;q&quot; &gt; &apos;</a>");
+        let folded = EntityFolding.forward(b"<a>1 &lt; 2 &amp; 3 &quot;q&quot; &gt; &apos;</a>".to_vec());
         assert_eq!(folded[0], MODE_FOLDED);
         let payload = &folded[6..]; // mode byte + five substitute bytes
         for entity in ENTITIES {

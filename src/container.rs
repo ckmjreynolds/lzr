@@ -12,14 +12,14 @@
 use anyhow::{Context as _, Result, bail, ensure};
 
 use crate::adler32::Adler32;
-use crate::codec::Profile;
+use crate::codec::{EncodeOptions, Profile};
 use crate::uleb128;
 
 /// Container magic: the ASCII bytes `LZR`.
 const MAGIC: &[u8; 3] = b"LZR";
-/// Framing version. `0x00` denoted the abandoned block ("Sonnet") format, so the
-/// first shipped container is `0x01`.
-const VERSION: u8 = 0x01;
+/// Framing version. `0x00` denoted the abandoned block ("Sonnet") format and `0x01` the earlier
+/// 15-bit-token core; `0x02` is the current all-byte pipeline (u22 tokens, optional byte entropy).
+const VERSION: u8 = 0x02;
 /// Fixed header prefix before the ULEB128 profile: magic (3) + version (1).
 const PREFIX_LEN: usize = 4;
 /// Footer length: a big-endian Adler-32 of the original input.
@@ -41,12 +41,19 @@ pub fn compress_with(input: &[u8], profile: Profile) -> Vec<u8> {
 /// memory-heavy tokenizer build. Prefer this on large inputs (the CLI does) to keep the peak down.
 #[must_use]
 pub fn compress_owned(input: Vec<u8>, profile: Profile) -> Vec<u8> {
+    compress_owned_with(input, profile, EncodeOptions::default())
+}
+
+/// Like [`compress_owned`] but with explicit encode-side [`EncodeOptions`] (e.g. the Re-Pair
+/// vocabulary cap). Options are not serialized — the decoder recovers everything from the stream.
+#[must_use]
+pub fn compress_owned_with(input: Vec<u8>, profile: Profile, options: EncodeOptions) -> Vec<u8> {
     // Checksum the original bytes up front so `encode` can consume and free `input` during the build.
     let mut checksum = Adler32::new();
     checksum.update(&input);
     let checksum = checksum.checksum();
 
-    let core = profile.compressor().encode(input);
+    let core = profile.compressor_with(options).encode(input);
 
     let mut out = Vec::with_capacity(PREFIX_LEN + 1 + core.len() + FOOTER_LEN);
     out.extend_from_slice(MAGIC);
@@ -132,7 +139,7 @@ mod tests {
         profile.disable("repair").unwrap();
         profile.disable("casefold").unwrap();
         profile.disable("entities").unwrap();
-        profile.disable("lz77").unwrap();
+        profile.disable("entropy").unwrap();
         let c = compress_with(b"hello world", profile);
         assert_eq!(c[PREFIX_LEN], 0x00);
         assert_eq!(decompress(&c).unwrap(), b"hello world".to_vec());

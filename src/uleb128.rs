@@ -7,7 +7,7 @@
 //! See the [FORMAT.md](../docs/FORMAT.md) specification for details on the encoding.
 
 use anyhow::{Context as _, Result, bail};
-use arbitrary_int::u15;
+use arbitrary_int::u22;
 
 /// Reads the byte at `*pos` and advances it, erroring if the input is exhausted.
 /// Shared by the ULEB128 decoders so each read is bounds-checked in one place.
@@ -92,73 +92,89 @@ pub(crate) fn decode_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
     Ok(value)
 }
 
-/// Encodes a 15-bit `value` as a 1- or 2-byte varint by appending to `out`.
+/// Encodes a 22-bit `value` as a 1-, 2-, or 3-byte varint by appending to `out`.
 ///
-/// This is a bespoke, fixed-width-bounded variant of ULEB128 for values that are
-/// statically known to fit in 15 bits (e.g. token ids). Values below `0x80` take
-/// a single byte; everything else takes exactly two, with the terminating byte
-/// carrying all 8 remaining bits rather than 7. A `u15` therefore never needs the
-/// 3 bytes that the general [`encode_u64`] would spend on values ≥ 16384, and the
-/// [`u15`] type makes an out-of-range input unrepresentable at the call site, so
-/// the encoder needs no range check of its own.
+/// A bespoke, fixed-width-bounded variant of ULEB128 for values statically known to
+/// fit in 22 bits (e.g. token ids). The layout packs 7 + 7 + 8 = 22 bits: bytes 0
+/// and 1 carry 7 payload bits plus a continuation bit, and the *terminating* third
+/// byte carries all 8 remaining bits. Unlike the 15-bit variant, both leading bytes
+/// must keep their continuation bit — three lengths (1/2/3 bytes) need two escapes
+/// to stay unambiguous; only the final byte can spend all 8 bits. Values below
+/// `0x80` take one byte, below `0x4000` two, otherwise three. The [`u22`] type makes
+/// an out-of-range input unrepresentable at the call site, so no range check is
+/// needed.
 ///
 /// # Examples
 ///
 /// ```text
 /// let mut out = Vec::new();
-/// encode_u15(u15::new(16384), &mut out);
-/// assert_eq!(out, vec![0x80, 0x80]);
+/// encode_u22(u22::new(0x4000), &mut out);
+/// assert_eq!(out, vec![0x80, 0x80, 0x01]);
 /// ```
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 #[expect(clippy::cast_possible_truncation, reason = "Truncation masked/intentional.")]
-pub(crate) fn encode_u15(value: u15, out: &mut Vec<u8>) {
+pub(crate) fn encode_u22(value: u22, out: &mut Vec<u8>) {
     let v = value.value();
     if v < 0x80 {
         out.push(v as u8);
-    } else {
-        // Terminating byte uses all 8 bits: `v >> 7` is `< 256` for any 15-bit `v`.
+    } else if v < 0x4000 {
+        // Terminating byte 1 carries the top 7 bits (its continuation bit stays clear).
         out.extend_from_slice(&[(v as u8 & 0x7F) | 0x80, (v >> 7) as u8]);
+    } else {
+        // Terminating byte 2 uses all 8 bits: `v >> 14` is `<= 0xFF` for any 22-bit `v`.
+        out.extend_from_slice(&[(v as u8 & 0x7F) | 0x80, ((v >> 7) as u8 & 0x7F) | 0x80, (v >> 14) as u8]);
     }
 }
 
-/// Decodes a [`u15`] written by [`encode_u15`] from `buf` starting at `*pos`,
+/// Decodes a [`u22`] written by [`encode_u22`] from `buf` starting at `*pos`,
 /// rejecting non-canonical (overlong) encodings per FORMAT.md §7.
 ///
-/// Advances `*pos` by the number of bytes consumed (1 or 2).
+/// Advances `*pos` by the number of bytes consumed (1 to 3).
 ///
 /// # Errors
 ///
 /// Returns an error if the input ends before the value is complete, or if the
-/// encoding is non-canonical — the 2-byte form's terminating byte is `0x00`,
-/// since the same value would then fit in a single byte.
+/// encoding is non-canonical — a terminating byte of `0x00` in the 2- or 3-byte
+/// form, since a shorter encoding would represent the same value.
 ///
 /// # Examples
 ///
 /// ```text
-/// let buf = [0x80, 0x80];
+/// let buf = [0x80, 0x80, 0x01];
 /// let mut pos = 0;
-/// assert_eq!(decode_u15(&buf, &mut pos).unwrap(), u15::new(16384));
-/// assert_eq!(pos, 2);
+/// assert_eq!(decode_u22(&buf, &mut pos).unwrap(), u22::new(0x4000));
+/// assert_eq!(pos, 3);
 /// ```
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
-pub(crate) fn decode_u15(buf: &[u8], pos: &mut usize) -> Result<u15> {
+pub(crate) fn decode_u22(buf: &[u8], pos: &mut usize) -> Result<u22> {
     let byte0 = take(buf, pos)?;
     if byte0 & 0x80 == 0 {
-        // Single-byte form: the 7-bit payload is already a valid `u15`.
-        return Ok(u15::new(u16::from(byte0)));
+        // Single-byte form: the 7-bit payload is already a valid `u22`.
+        return Ok(u22::new(u32::from(byte0)));
     }
 
     let byte1 = take(buf, pos)?;
-    // Canonical requires the terminating 8-bit byte to be nonzero; otherwise the
-    // single-byte form would encode the same value (mirrors the u64 decoder).
-    if byte1 == 0 {
+    if byte1 & 0x80 == 0 {
+        // Two-byte form: byte1 is a 7-bit terminating payload. Canonical requires it
+        // nonzero; otherwise the single-byte form would encode the same value.
+        if byte1 == 0 {
+            bail!("non-canonical ULEB128 encoding");
+        }
+        let value = u32::from(byte0 & 0x7F) | (u32::from(byte1) << 7);
+        return Ok(u22::new(value));
+    }
+
+    // Three-byte form: byte2 carries all 8 bits, terminating. Canonical requires it
+    // nonzero; otherwise the two-byte form suffices.
+    let byte2 = take(buf, pos)?;
+    if byte2 == 0 {
         bail!("non-canonical ULEB128 encoding");
     }
 
-    // 7 payload bits + 8 terminating bits = 15 bits, so the result always fits a
-    // `u15` (max `0xFF << 7 | 0x7F` == 32767) and `u15::new` cannot panic.
-    let value = u16::from(byte0 & 0x7F) | (u16::from(byte1) << 7);
-    Ok(u15::new(value))
+    // 7 + 7 + 8 = 22 bits, so the result always fits a `u22` (max
+    // `0xFF << 14 | 0x7F << 7 | 0x7F` == 0x3F_FFFF) and `u22::new` cannot panic.
+    let value = u32::from(byte0 & 0x7F) | (u32::from(byte1 & 0x7F) << 7) | (u32::from(byte2) << 14);
+    Ok(u22::new(value))
 }
 
 #[cfg(test)]
@@ -181,14 +197,14 @@ mod tests {
         }
 
         #[test]
-        fn u15_roundtrip(raw in 0u16..=0x7FFF) {
-            let value = u15::new(raw);
+        fn u22_roundtrip(raw in 0u32..=0x3F_FFFF) {
+            let value = u22::new(raw);
             let mut buf = Vec::new();
-            encode_u15(value, &mut buf);
+            encode_u22(value, &mut buf);
             let mut pos = 0;
-            let decoded = decode_u15(&buf, &mut pos).unwrap();
+            let decoded = decode_u22(&buf, &mut pos).unwrap();
             prop_assert_eq!(pos, buf.len());
-            prop_assert!(buf.len() <= 2);
+            prop_assert!(buf.len() <= 3);
             prop_assert_eq!(decoded, value);
         }
     }
@@ -219,37 +235,41 @@ mod tests {
     }
 
     #[test]
-    fn u15_known_values() {
-        let cases: &[(u16, &[u8])] = &[
+    fn u22_known_values() {
+        let cases: &[(u32, &[u8])] = &[
             (0, &[0x00]),
             (1, &[0x01]),
             (127, &[0x7F]),
             (128, &[0x80, 0x01]),
-            (16384, &[0x80, 0x80]),
-            (0x7FFF, &[0xFF, 0xFF]),
+            (0x3FFF, &[0xFF, 0x7F]),       // largest 2-byte value
+            (0x4000, &[0x80, 0x80, 0x01]), // smallest 3-byte value
+            (0x3F_FFFF, &[0xFF, 0xFF, 0xFF]),
         ];
 
         for &(raw, expected) in cases {
-            let value = u15::new(raw);
+            let value = u22::new(raw);
 
             // Verify encoding produces the expected bytes.
             let mut encoded = Vec::new();
-            encode_u15(value, &mut encoded);
+            encode_u22(value, &mut encoded);
             assert_eq!(&encoded[..], expected, "encode {raw}");
 
             // Verify decoding reads the expected value.
             let mut pos = 0;
-            let decoded = decode_u15(expected, &mut pos).unwrap();
+            let decoded = decode_u22(expected, &mut pos).unwrap();
             assert_eq!(pos, expected.len(), "decode len {raw}");
             assert_eq!(decoded, value, "decode {raw}");
         }
     }
 
     #[test]
-    fn u15_rejects_non_canonical() {
+    fn u22_rejects_non_canonical() {
         // `0x80 0x00` represents 0 but the canonical encoding of 0 is `0x00`.
         let mut pos = 0;
-        assert!(decode_u15(&[0x80, 0x00], &mut pos).is_err());
+        assert!(decode_u22(&[0x80, 0x00], &mut pos).is_err());
+        // `0x80 0x80 0x00` represents a 2-byte value in three bytes.
+        let mut pos = 0;
+        assert!(decode_u22(&[0x80, 0x80, 0x00], &mut pos).is_err());
     }
 
     #[test]
@@ -270,11 +290,13 @@ mod tests {
         let mut pos = 0;
         assert!(decode_u64(&[0x80], &mut pos).is_err());
         let mut pos = 0;
-        assert!(decode_u15(&[0x80], &mut pos).is_err());
+        assert!(decode_u22(&[0x80], &mut pos).is_err());
+        let mut pos = 0;
+        assert!(decode_u22(&[0x80, 0x80], &mut pos).is_err());
         // An empty buffer must error, not panic.
         let mut pos = 0;
         assert!(decode_u64(&[], &mut pos).is_err());
         let mut pos = 0;
-        assert!(decode_u15(&[], &mut pos).is_err());
+        assert!(decode_u22(&[], &mut pos).is_err());
     }
 }
