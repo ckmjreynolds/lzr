@@ -119,6 +119,8 @@ fn profile(cli: &Cli) -> anyhow::Result<Profile> {
     for feature in &cli.enable {
         profile.enable(feature)?;
     }
+    // Reject a pipeline that would run entropy coding with no model to predict with.
+    profile.validate()?;
     Ok(profile)
 }
 

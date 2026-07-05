@@ -180,13 +180,11 @@ mod tests {
     #[test]
     fn custom_profile_selects_and_round_trips() {
         // Disabling every default feature clears all bits (profile 0x00); the container records it
-        // and `decompress` rebuilds the matching pipeline.
+        // and `decompress` rebuilds the matching (identity) pipeline.
         let mut profile = Profile::default();
-        profile.disable("repair").unwrap();
-        profile.disable("casefold").unwrap();
-        profile.disable("entities").unwrap();
-        profile.disable("lz77").unwrap();
-        profile.disable("entropy").unwrap();
+        for feature in ["repair", "casefold", "entities", "lz77", "entropy", "order0", "order1"] {
+            profile.disable(feature).unwrap();
+        }
         let c = compress_with(b"hello world", profile);
         assert_eq!(c[PREFIX_LEN], 0x00);
         assert_eq!(decompress(&c).unwrap(), b"hello world".to_vec());
@@ -194,9 +192,12 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_profile() {
-        // Bit 6 is not a known feature; a single-byte ULEB128 profile of 0x40 must be rejected.
-        let mut c = compress(b"data");
-        c[PREFIX_LEN] = 0x40;
+        // Bit 8 is not a known feature; a container whose ULEB128 profile encodes it must be rejected.
+        let mut c = Vec::new();
+        c.extend_from_slice(MAGIC);
+        c.push(VERSION);
+        uleb128::encode_u64(1 << 8, &mut c); // profile with an unknown feature bit
+        c.extend_from_slice(&[0u8; FOOTER_LEN]); // enough trailing bytes for the length checks
         assert!(decompress(&c).is_err());
     }
 

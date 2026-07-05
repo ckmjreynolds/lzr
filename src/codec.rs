@@ -15,7 +15,7 @@ use static_assertions::const_assert;
 use crate::entropy::{EntropyCoder, ModelBuilder};
 use crate::models::TokenModel;
 use crate::models::null::NullModel;
-use crate::models::order0::Order0;
+use crate::models::ordern::OrderN;
 use crate::preprocessors::{
     CaseFolding, DEFAULT_NUM_TOKENS, EntityFolding, Lz77, MAX_MATCH_LEN, MIN_MATCH_LEN, MIN_NUM_TOKENS, RepairTokenizer,
 };
@@ -82,9 +82,14 @@ impl EncodeOptions {
     }
 }
 
-/// Constructs the always-on order-0 entropy model.
-fn build_order0(_capacity: usize) -> Box<dyn TokenModel> {
-    Box::new(Order0::new())
+/// Constructs the order-0 entropy model.
+fn build_order0(capacity: usize) -> Box<dyn TokenModel> {
+    Box::new(OrderN::new(0, capacity))
+}
+
+/// Constructs the order-1 entropy model (keys on the previous byte).
+fn build_order1(capacity: usize) -> Box<dyn TokenModel> {
+    Box::new(OrderN::new(1, capacity))
 }
 
 /// Constructs the optional [`NullModel`] for the model registry.
@@ -102,7 +107,8 @@ enum Kind {
     /// A byte→byte pipeline stage. The registry order of the [`Kind::Stage`] entries *is* the
     /// pipeline order, so the entropy coder's entry must come last.
     Stage(StageBuilder),
-    /// An optional entropy model, mixed alongside the always-on order-0 model.
+    /// An entropy model, mixed into the entropy stage. Each is independently toggleable; at least
+    /// one must be enabled when the entropy stage is (enforced by [`Profile::validate`]).
     Model(ModelBuilder),
 }
 
@@ -155,6 +161,19 @@ const FEATURES: &[FeatureSpec] = &[
         name: "entropy",
         default_on: true,
         kind: Kind::Stage(|profile, _| Box::new(EntropyCoder::new(profile.model_builders()))),
+    },
+    // Entropy models follow the stages. Registry order here is the model order in the mix (immaterial
+    // to correctness — the mixer weights per input). The only default-off model (`null`) is kept last
+    // so the default profile bitmask stays a single ULEB128 byte.
+    FeatureSpec {
+        name: "order0",
+        default_on: true,
+        kind: Kind::Model(build_order0),
+    },
+    FeatureSpec {
+        name: "order1",
+        default_on: true,
+        kind: Kind::Model(build_order1),
     },
     FeatureSpec {
         name: "null",
@@ -233,9 +252,7 @@ impl Profile {
         self.bits & (1 << index) != 0
     }
 
-    /// Whether the feature named `name` is enabled (unknown names read as disabled). Test-only:
-    /// the pipeline builds stages straight from the registry rather than looking them up by name.
-    #[cfg(test)]
+    /// Whether the feature named `name` is enabled (unknown names read as disabled).
     fn enabled(self, name: &str) -> bool {
         Self::index(name).is_ok_and(|i| self.is_set(i))
     }
@@ -310,10 +327,11 @@ impl Profile {
         Pipeline::new(stages, names)
     }
 
-    /// The entropy model builders: the always-on order-0 model first, then every enabled
-    /// [`Kind::Model`] feature (each sized per-input inside the [`EntropyCoder`]).
+    /// The entropy model builders: every enabled [`Kind::Model`] feature in registry order (each
+    /// sized per-input inside the [`EntropyCoder`]). [`Profile::validate`] guarantees at least one
+    /// when the entropy stage is enabled.
     fn model_builders(self) -> Vec<ModelBuilder> {
-        let mut builders: Vec<ModelBuilder> = vec![build_order0];
+        let mut builders: Vec<ModelBuilder> = Vec::new();
         for (i, feature) in FEATURES.iter().enumerate() {
             if let Kind::Model(build) = feature.kind
                 && self.is_set(i)
@@ -322,6 +340,25 @@ impl Profile {
             }
         }
         builders
+    }
+
+    /// Validates that the profile describes a usable pipeline.
+    ///
+    /// The entropy stage mixes its enabled models, so enabling it with no model selected would leave
+    /// nothing to predict with. This is the one profile constraint not expressible as a single bit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `entropy` stage is enabled but no entropy model is.
+    pub fn validate(self) -> Result<()> {
+        let any_model =
+            FEATURES.iter().enumerate().any(|(i, feature)| matches!(feature.kind, Kind::Model(_)) && self.is_set(i));
+        if self.enabled("entropy") && !any_model {
+            return Err(anyhow!(
+                "the entropy stage needs at least one model enabled; enable one of order0, order1, null"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -352,11 +389,12 @@ mod tests {
 
     use super::*;
 
-    /// An entropy-only pipeline (no preprocessors, no tokenizer) for exercising the whole
-    /// `Compressor` around the entropy stage directly.
+    /// An entropy-only pipeline (no preprocessors, no tokenizer) with the order-0 model, for
+    /// exercising the whole `Compressor` around the entropy stage directly.
     fn entropy_only() -> Compressor {
         let mut profile = Profile::from_bits(0).unwrap();
         profile.enable("entropy").unwrap();
+        profile.enable("order0").unwrap();
         Compressor::from_profile(profile)
     }
 
@@ -375,10 +413,12 @@ mod tests {
             drop(c.decode(&bytes));
         }
 
-        /// Every stage-toggle combination must round-trip a sample that exercises all stages
-        /// (uppercase for casefold, entities for entity-folding, repetition for Re-Pair and LZ77).
+        /// Every stage- and model-toggle combination must round-trip a sample that exercises all
+        /// stages (uppercase for casefold, entities for entity-folding, repetition for Re-Pair and
+        /// LZ77). The 8-bit range spans the four preprocessors, the entropy stage, and the three
+        /// entropy models — including entropy-with-no-model, which still codes reversibly.
         #[test]
-        fn each_stage_toggle_round_trips(bits in 0u64..=0b11_1111) {
+        fn each_stage_toggle_round_trips(bits in 0u64..=0xFF) {
             let sample =
                 b"The QUICK brown fox &lt;tag&gt; JUMPS. The QUICK brown fox &lt;tag&gt; JUMPS.".to_vec();
             let c = Compressor::from_profile(Profile::from_bits(bits).unwrap());
@@ -417,12 +457,25 @@ mod tests {
 
     #[test]
     fn enabling_the_null_model_still_round_trips() {
-        // Toggling an optional entropy model on must keep the pipeline reversible.
+        // Toggling the null model alongside order-0 must keep the pipeline reversible.
         let mut profile = Profile::from_bits(0).unwrap();
         profile.enable("entropy").unwrap();
+        profile.enable("order0").unwrap();
         profile.enable("null").unwrap();
         let c = Compressor::from_profile(profile);
         let data = b"the quick brown fox";
+        assert_eq!(c.decode(&c.encode(data.to_vec())).unwrap(), data.to_vec());
+    }
+
+    #[test]
+    fn enabling_order1_still_round_trips() {
+        // The order-1 model (default on) must keep the pipeline reversible.
+        let mut profile = Profile::from_bits(0).unwrap();
+        profile.enable("entropy").unwrap();
+        profile.enable("order0").unwrap();
+        profile.enable("order1").unwrap();
+        let c = Compressor::from_profile(profile);
+        let data = b"the quick brown fox the quick brown fox";
         assert_eq!(c.decode(&c.encode(data.to_vec())).unwrap(), data.to_vec());
     }
 
@@ -434,32 +487,56 @@ mod tests {
         assert!(profile.enabled("repair"));
         assert!(profile.enabled("lz77"));
         assert!(profile.enabled("entropy"));
+        assert!(profile.enabled("order0"));
+        assert!(profile.enabled("order1"));
         assert!(!profile.enabled("null"));
-        // bits 0..=4 (casefold, entities, repair, lz77, entropy) on, bit 5 (null) off.
-        assert_eq!(profile.to_bits(), 0b1_1111);
+        // bits 0..=6 (casefold, entities, repair, lz77, entropy, order0, order1) on, bit 7 (null) off.
+        assert_eq!(profile.to_bits(), 0b0111_1111);
     }
 
     #[test]
     fn profile_toggles_by_name() {
-        let mut profile = Profile::default(); // 0b1_1111: casefold + entities + repair + lz77 + entropy
+        let mut profile = Profile::default(); // 0b0111_1111: the four preprocessors + entropy + order0/1
         profile.disable("casefold").unwrap();
         profile.disable("entities").unwrap();
         profile.disable("repair").unwrap();
         profile.disable("lz77").unwrap();
         profile.disable("entropy").unwrap();
-        assert_eq!(profile.to_bits(), 0b00_0000);
+        profile.disable("order0").unwrap();
+        profile.disable("order1").unwrap();
+        assert_eq!(profile.to_bits(), 0b0000_0000);
         profile.enable("casefold").unwrap();
-        assert_eq!(profile.to_bits(), 0b00_0001);
+        assert_eq!(profile.to_bits(), 0b0000_0001);
         profile.enable("entities").unwrap();
-        assert_eq!(profile.to_bits(), 0b00_0011);
+        assert_eq!(profile.to_bits(), 0b0000_0011);
         profile.enable("repair").unwrap();
-        assert_eq!(profile.to_bits(), 0b00_0111);
+        assert_eq!(profile.to_bits(), 0b0000_0111);
         profile.enable("lz77").unwrap();
-        assert_eq!(profile.to_bits(), 0b00_1111);
+        assert_eq!(profile.to_bits(), 0b0000_1111);
         profile.enable("entropy").unwrap();
-        assert_eq!(profile.to_bits(), 0b01_1111);
+        assert_eq!(profile.to_bits(), 0b0001_1111);
+        profile.enable("order0").unwrap();
+        assert_eq!(profile.to_bits(), 0b0011_1111);
+        profile.enable("order1").unwrap();
+        assert_eq!(profile.to_bits(), 0b0111_1111);
         profile.enable("null").unwrap();
-        assert_eq!(profile.to_bits(), 0b11_1111);
+        assert_eq!(profile.to_bits(), 0b1111_1111);
+    }
+
+    #[test]
+    fn validate_requires_a_model_when_entropy_is_on() {
+        // Entropy on with every model disabled is rejected.
+        let mut profile = Profile::from_bits(0).unwrap();
+        profile.enable("entropy").unwrap();
+        assert!(profile.validate().is_err());
+        // Any single model satisfies it.
+        profile.enable("order1").unwrap();
+        assert!(profile.validate().is_ok());
+        // Entropy off with no models is fine (nothing to predict).
+        let empty = Profile::from_bits(0).unwrap();
+        assert!(empty.validate().is_ok());
+        // The default stack validates.
+        assert!(Profile::default().validate().is_ok());
     }
 
     #[test]
@@ -471,11 +548,11 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=5 (casefold, entities, repair, lz77, entropy, null) are all known features.
-        for bits in 0..=0b11_1111 {
+        // bits 0..=7 (the four preprocessors, entropy, order0, order1, null) are all known features.
+        for bits in 0..=0xFF {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(0b100_0000).is_err()); // bit 6 is not a known feature
+        assert!(Profile::from_bits(0b1_0000_0000).is_err()); // bit 8 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 

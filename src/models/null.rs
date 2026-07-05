@@ -19,9 +19,9 @@ impl NullModel {
 }
 
 impl TokenModel for NullModel {
-    fn predict(&mut self, _ctx: &Context) -> i32 {
+    fn predict(&mut self, _ctx: &Context, _hist: &[u8]) -> i32 {
         0
     }
 
-    fn update(&mut self, _ctx: &Context, _bit: u8) {}
+    fn update(&mut self, _ctx: &Context, _hist: &[u8], _bit: u8) {}
 }
