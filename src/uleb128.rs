@@ -4,7 +4,8 @@
 //! Each byte stores 7 payload bits and 1 continuation bit. Values up to 127 fit in
 //! a single byte; `u64::MAX` requires at most 9 bytes (the 9th byte uses all 8 bits).
 //!
-//! See the [FORMAT.md](../docs/FORMAT.md) specification for details on the encoding.
+//! Encodings must be **canonical**: an overlong encoding (a terminating `0x00` payload where a
+//! shorter encoding exists) is rejected rather than accepted, so every value has one representation.
 
 use anyhow::{Context as _, Result, bail};
 use arbitrary_int::u22;
@@ -46,7 +47,7 @@ pub(crate) fn encode_u64(mut value: u64, out: &mut Vec<u8>) {
 }
 
 /// Decodes a ULEB128-encoded `u64` from `buf` starting at `*pos`, rejecting
-/// non-canonical (overlong) encodings per FORMAT.md §7.
+/// non-canonical (overlong) encodings.
 ///
 /// Advances `*pos` by the number of bytes consumed (1 to 9).
 ///
@@ -126,8 +127,22 @@ pub(crate) fn encode_u22(value: u22, out: &mut Vec<u8>) {
     }
 }
 
+/// The number of bytes [`encode_u22`] writes for `value`: `1` below `0x80`, `2` below
+/// `0x4000`, otherwise `3`. Lets a caller price a `u22` varint without encoding it (the LZ77
+/// stage uses it to decide whether a match is worth emitting).
+#[cfg_attr(feature = "bench-internals", visibility::make(pub))]
+pub(crate) const fn u22_len(value: u32) -> usize {
+    if value < 0x80 {
+        1
+    } else if value < 0x4000 {
+        2
+    } else {
+        3
+    }
+}
+
 /// Decodes a [`u22`] written by [`encode_u22`] from `buf` starting at `*pos`,
-/// rejecting non-canonical (overlong) encodings per FORMAT.md §7.
+/// rejecting non-canonical (overlong) encodings.
 ///
 /// Advances `*pos` by the number of bytes consumed (1 to 3).
 ///
@@ -206,6 +221,14 @@ mod tests {
             prop_assert_eq!(pos, buf.len());
             prop_assert!(buf.len() <= 3);
             prop_assert_eq!(decoded, value);
+        }
+
+        /// `u22_len` must predict exactly how many bytes `encode_u22` writes.
+        #[test]
+        fn u22_len_matches_encoding(raw in 0u32..=0x3F_FFFF) {
+            let mut buf = Vec::new();
+            encode_u22(u22::new(raw), &mut buf);
+            prop_assert_eq!(u22_len(raw), buf.len());
         }
     }
 

@@ -26,16 +26,17 @@ mod container;
 mod entropy;
 mod mixer;
 mod models;
-mod preprocessors;
 
+// `preprocessors` holds the Re-Pair tokenizer; the `bench-internals` feature widens the module (and
+// `RepairTokenizer` within it, via `visibility::make`) to `pub` so `benches/` can reach it.
 #[cfg(feature = "bench-internals")]
-pub mod tokenizers;
+pub mod preprocessors;
 
 #[cfg(not(feature = "bench-internals"))]
-mod tokenizers;
+mod preprocessors;
 
 // The `Transform` trait is widened to `pub` under `bench-internals` (via `visibility::make`) so
-// `benches/` can drive the tokenizer through it, mirroring `tokenizers`/`uleb128`.
+// `benches/` can drive the tokenizer through it, mirroring `preprocessors`/`uleb128`.
 #[cfg(feature = "bench-internals")]
 pub mod transform;
 

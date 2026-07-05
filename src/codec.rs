@@ -16,8 +16,9 @@ use crate::entropy::{EntropyCoder, ModelBuilder};
 use crate::models::TokenModel;
 use crate::models::null::NullModel;
 use crate::models::order0::Order0;
-use crate::preprocessors::{CaseFolding, EntityFolding};
-use crate::tokenizers::{DEFAULT_NUM_TOKENS, MIN_NUM_TOKENS, RepairTokenizer};
+use crate::preprocessors::{
+    CaseFolding, DEFAULT_NUM_TOKENS, EntityFolding, Lz77, MAX_MATCH_LEN, MIN_MATCH_LEN, MIN_NUM_TOKENS, RepairTokenizer,
+};
 use crate::transform::{Pipeline, Transform};
 
 /// Encode-side options that are *not* serialized into the container — the decoder recovers everything
@@ -26,12 +27,16 @@ use crate::transform::{Pipeline, Transform};
 pub struct EncodeOptions {
     /// The Re-Pair vocabulary cap for this run (see [`RepairTokenizer::num_tokens`]).
     num_tokens: u32,
+    /// The LZ77 minimum match length: `None` uses the dynamic "only emit a winning match" rule,
+    /// `Some(n)` forces every match of length `>= n` (which may expand the stream).
+    min_match: Option<u32>,
 }
 
 impl Default for EncodeOptions {
     fn default() -> Self {
         Self {
             num_tokens: DEFAULT_NUM_TOKENS,
+            min_match: None,
         }
     }
 }
@@ -50,7 +55,23 @@ impl EncodeOptions {
         );
         Ok(Self {
             num_tokens,
+            ..Self::default()
         })
+    }
+
+    /// Sets a fixed LZ77 minimum match length, overriding the default dynamic rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `min_match` is outside `2..=0x3F_FFFF` — a match must cover at least two
+    /// bytes (length 0 is the escape) and fit a u22 varint.
+    pub fn with_min_match(mut self, min_match: u32) -> Result<Self> {
+        ensure!(
+            (MIN_MATCH_LEN..=MAX_MATCH_LEN).contains(&min_match),
+            "min-match must be in {MIN_MATCH_LEN}..={MAX_MATCH_LEN}, got {min_match}"
+        );
+        self.min_match = Some(min_match);
+        Ok(self)
     }
 }
 
@@ -110,6 +131,15 @@ const FEATURES: &[FeatureSpec] = &[
         kind: Kind::Stage(|_, options| {
             Box::new(RepairTokenizer {
                 num_tokens: options.num_tokens,
+            })
+        }),
+    },
+    FeatureSpec {
+        name: "lz77",
+        default_on: true,
+        kind: Kind::Stage(|_, options| {
+            Box::new(Lz77 {
+                min_match: options.min_match,
             })
         }),
     },
@@ -249,9 +279,9 @@ impl Profile {
     }
 
     /// Assembles the pipeline in CANONICAL order — imposed here, not by feature bit position:
-    /// casefold → entities → repair → \[future byte LZ77\] → entropy (always strictly last). This
-    /// single explicit assembly is the only place stage order is decided, so it cannot be broken by
-    /// editing the registry.
+    /// casefold → entities → repair → lz77 → entropy (always strictly last). This single explicit
+    /// assembly is the only place stage order is decided, so it cannot be broken by editing the
+    /// registry.
     fn pipeline_with(self, options: EncodeOptions) -> Pipeline {
         let mut stages: Vec<Box<dyn Transform>> = Vec::new();
         for (i, feature) in FEATURES.iter().enumerate() {
@@ -330,9 +360,9 @@ mod tests {
         }
 
         /// Every stage-toggle combination must round-trip a sample that exercises all stages
-        /// (uppercase for casefold, entities for entity-folding, repetition for Re-Pair).
+        /// (uppercase for casefold, entities for entity-folding, repetition for Re-Pair and LZ77).
         #[test]
-        fn each_stage_toggle_round_trips(bits in 0u64..=0b1_1111) {
+        fn each_stage_toggle_round_trips(bits in 0u64..=0b11_1111) {
             let sample =
                 b"The QUICK brown fox &lt;tag&gt; JUMPS. The QUICK brown fox &lt;tag&gt; JUMPS.".to_vec();
             let c = Compressor::from_profile(Profile::from_bits(bits).unwrap());
@@ -386,30 +416,34 @@ mod tests {
         assert!(profile.enabled("casefold"));
         assert!(profile.enabled("entities"));
         assert!(profile.enabled("repair"));
+        assert!(profile.enabled("lz77"));
         assert!(profile.enabled("entropy"));
         assert!(!profile.enabled("null"));
-        // bits 0..=3 (casefold, entities, repair, entropy) on, bit 4 (null) off.
-        assert_eq!(profile.to_bits(), 0b0_1111);
+        // bits 0..=4 (casefold, entities, repair, lz77, entropy) on, bit 5 (null) off.
+        assert_eq!(profile.to_bits(), 0b1_1111);
     }
 
     #[test]
     fn profile_toggles_by_name() {
-        let mut profile = Profile::default(); // 0b0_1111: casefold + entities + repair + entropy
+        let mut profile = Profile::default(); // 0b1_1111: casefold + entities + repair + lz77 + entropy
         profile.disable("casefold").unwrap();
         profile.disable("entities").unwrap();
         profile.disable("repair").unwrap();
+        profile.disable("lz77").unwrap();
         profile.disable("entropy").unwrap();
-        assert_eq!(profile.to_bits(), 0b0_0000);
+        assert_eq!(profile.to_bits(), 0b00_0000);
         profile.enable("casefold").unwrap();
-        assert_eq!(profile.to_bits(), 0b0_0001);
+        assert_eq!(profile.to_bits(), 0b00_0001);
         profile.enable("entities").unwrap();
-        assert_eq!(profile.to_bits(), 0b0_0011);
+        assert_eq!(profile.to_bits(), 0b00_0011);
         profile.enable("repair").unwrap();
-        assert_eq!(profile.to_bits(), 0b0_0111);
+        assert_eq!(profile.to_bits(), 0b00_0111);
+        profile.enable("lz77").unwrap();
+        assert_eq!(profile.to_bits(), 0b00_1111);
         profile.enable("entropy").unwrap();
-        assert_eq!(profile.to_bits(), 0b0_1111);
+        assert_eq!(profile.to_bits(), 0b01_1111);
         profile.enable("null").unwrap();
-        assert_eq!(profile.to_bits(), 0b1_1111);
+        assert_eq!(profile.to_bits(), 0b11_1111);
     }
 
     #[test]
@@ -417,16 +451,15 @@ mod tests {
         let mut profile = Profile::default();
         assert!(profile.enable("nope").is_err());
         assert!(profile.disable("nope").is_err());
-        assert!(profile.enable("lz77").is_err()); // removed feature
     }
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=4 (casefold, entities, repair, entropy, null) are all known features.
-        for bits in 0..=0b1_1111 {
+        // bits 0..=5 (casefold, entities, repair, lz77, entropy, null) are all known features.
+        for bits in 0..=0b11_1111 {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(0b10_0000).is_err()); // bit 5 is not a known feature
+        assert!(Profile::from_bits(0b100_0000).is_err()); // bit 6 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 
@@ -437,5 +470,14 @@ mod tests {
         assert!(EncodeOptions::new(255).is_err()); // below the terminal floor
         assert!(EncodeOptions::new(0x3F_FFFF).is_err()); // the reserved NIL value
         assert_eq!(EncodeOptions::default().num_tokens, DEFAULT_NUM_TOKENS);
+    }
+
+    #[test]
+    fn encode_options_validate_min_match() {
+        assert_eq!(EncodeOptions::default().min_match, None);
+        assert_eq!(EncodeOptions::default().with_min_match(2).unwrap().min_match, Some(2));
+        assert_eq!(EncodeOptions::default().with_min_match(0x3F_FFFF).unwrap().min_match, Some(0x3F_FFFF));
+        assert!(EncodeOptions::default().with_min_match(1).is_err()); // below the two-byte floor
+        assert!(EncodeOptions::default().with_min_match(0x40_0000).is_err()); // beyond u22
     }
 }

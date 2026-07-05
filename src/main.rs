@@ -41,6 +41,11 @@ struct Cli {
     #[arg(long, value_name = "N")]
     num_tokens: Option<u32>,
 
+    /// LZ77 minimum match length (2..=4194303); may expand the stream. Compression only; defaults
+    /// to a dynamic per-match rule that only emits matches that shrink the stream.
+    #[arg(long, value_name = "N")]
+    min_match: Option<u32>,
+
     /// Input file to read.
     input: PathBuf,
 
@@ -67,7 +72,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     let output = if decompress {
         lzr::decompress(&input)?
     } else {
-        let options = cli.num_tokens.map_or_else(|| Ok(EncodeOptions::default()), EncodeOptions::new)?;
+        let options = encode_options(cli)?;
         // Take ownership so the pipeline can free the input buffer before the tokenizer build.
         lzr::compress_owned_with(input, profile(cli)?, options)
     };
@@ -88,6 +93,19 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 /// compressed stream and the direction should default to decompression.
 fn has_lzr_extension(path: &std::path::Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lzr"))
+}
+
+/// Build the encode-only [`EncodeOptions`] from the `--num-tokens` and `--min-match` flags, each
+/// defaulting when absent. Both are validated by their respective setters.
+fn encode_options(cli: &Cli) -> anyhow::Result<EncodeOptions> {
+    let mut options = match cli.num_tokens {
+        Some(num_tokens) => EncodeOptions::new(num_tokens)?,
+        None => EncodeOptions::default(),
+    };
+    if let Some(min_match) = cli.min_match {
+        options = options.with_min_match(min_match)?;
+    }
+    Ok(options)
 }
 
 /// Build the compression [`Profile`] from the `--disable`/`--enable` flags, starting from the

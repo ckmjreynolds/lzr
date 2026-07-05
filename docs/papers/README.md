@@ -12,7 +12,7 @@ Data Compression Conference (DCC) 2017.
 - Provenance: fetched from arXiv, 2026-07-04.
 
 Implemented by the Re-Pair grammar builder in
-[`src/tokenizers/repair/builder.rs`](../../src/tokenizers/repair/builder.rs): **Theorem 1(i)** — exact
+[`src/preprocessors/repair/builder.rs`](../../src/preprocessors/repair/builder.rs): **Theorem 1(i)** — exact
 frequency-based Re-Pair in O(n/ε) expected time using (1+ε)n + √n words of working space on top of the
 text. We use it to keep Re-Pair tokenization of gigabyte inputs (enwik9) under a ~10 GB memory budget,
 where the classic Larsson–Moffat layout needs ~24–28 GB. See the module docs in `builder.rs` for the

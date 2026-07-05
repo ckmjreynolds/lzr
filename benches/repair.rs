@@ -1,13 +1,13 @@
 //! Throughput benchmarks for the internal capped Re-Pair tokenizer.
 //!
-//! The `tokenizers` and `transform` modules are `pub(crate)`; the `bench-internals` feature widens
+//! The `preprocessors` and `transform` modules are `pub(crate)`; the `bench-internals` feature widens
 //! them (and `RepairTokenizer`/`Transform`) to `pub` so this external bench crate can reach them,
 //! mirroring `adler32`/`uleb128`.
 //!
 //! Run with: `cargo bench --features bench-internals --bench repair`
 
 use divan::{Bencher, black_box, counter::BytesCount};
-use lzr::tokenizers::RepairTokenizer;
+use lzr::preprocessors::RepairTokenizer;
 use lzr::transform::Transform;
 
 fn main() {

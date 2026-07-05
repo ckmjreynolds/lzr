@@ -7,7 +7,7 @@
 //!
 //! Framing is deliberately factored out of the codec ([`crate::codec`]): the
 //! Hutter-Prize branch can wrap the same core in a near-zero-header framing
-//! without touching the pipeline. See [`docs/FORMAT.md`](../docs/FORMAT.md).
+//! without touching the pipeline.
 
 use anyhow::{Context as _, Result, bail, ensure};
 
@@ -17,9 +17,9 @@ use crate::uleb128;
 
 /// Container magic: the ASCII bytes `LZR`.
 const MAGIC: &[u8; 3] = b"LZR";
-/// Framing version. `0x00` denoted the abandoned block ("Sonnet") format and `0x01` the earlier
-/// 15-bit-token core; `0x02` is the current all-byte pipeline (u22 tokens, optional byte entropy).
-const VERSION: u8 = 0x02;
+/// Framing version. Frozen at `0x00` during development: the wire format is unstable and we do not
+/// bump the version for format changes, so an older stream simply fails to decode (fine pre-1.0).
+const VERSION: u8 = 0x00;
 /// Fixed header prefix before the ULEB128 profile: magic (3) + version (1).
 const PREFIX_LEN: usize = 4;
 /// Footer length: a big-endian Adler-32 of the original input.
@@ -139,6 +139,7 @@ mod tests {
         profile.disable("repair").unwrap();
         profile.disable("casefold").unwrap();
         profile.disable("entities").unwrap();
+        profile.disable("lz77").unwrap();
         profile.disable("entropy").unwrap();
         let c = compress_with(b"hello world", profile);
         assert_eq!(c[PREFIX_LEN], 0x00);
@@ -147,9 +148,9 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_profile() {
-        // Bit 5 is not a known feature; a single-byte ULEB128 profile of 0x20 must be rejected.
+        // Bit 6 is not a known feature; a single-byte ULEB128 profile of 0x40 must be rejected.
         let mut c = compress(b"data");
-        c[PREFIX_LEN] = 0x20;
+        c[PREFIX_LEN] = 0x40;
         assert!(decompress(&c).is_err());
     }
 

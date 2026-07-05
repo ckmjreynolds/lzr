@@ -1,8 +1,8 @@
 //! The universal byte→byte stream transform and the pipeline that chains them.
 //!
-//! Every pipeline stage — the byte preprocessors ([`crate::preprocessors`]), the
-//! Re-Pair tokenizer ([`crate::tokenizers`]), and the entropy coder
-//! ([`crate::entropy`]) — is a [`Transform`]. A `Transform` rewrites a byte stream
+//! Every pipeline stage — the byte preprocessors and the Re-Pair tokenizer
+//! ([`crate::preprocessors`]) and the entropy coder ([`crate::entropy`]) — is a
+//! [`Transform`]. A `Transform` rewrites a byte stream
 //! on the encode side ([`Transform::forward`]) and exactly inverts it on the decode
 //! side ([`Transform::inverse`]). Because *every* stage speaks the same `Vec<u8>`
 //! domain, stages compose freely: tokenization and entropy coding can each be

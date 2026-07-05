@@ -8,23 +8,26 @@
 //! channel:
 //!
 //! ```text
-//! [V-1] [(left_0, right_0)] … [(left_{V-1}, right_{V-1})] [sequence …]      (each value uleb128-u22)
+//! [V] [(left_1, right_1)] … [(left_V, right_V)] [sequence …]      (each value uleb128-u22)
 //! ```
 //!
-//! `V` is the symbol count (at most `u22::MAX - 1`). One `u22` value is reserved and never used as a
-//! symbol id: [`NIL_SYM`] = `u22::MAX` is the NIL sentinel that marks a terminal. Every symbol is a
-//! uniform `(left, right)` pair — a terminal is `(byte, NIL)`, a non-terminal is `(left, right)`
-//! referencing two other symbols. Symbol ids are assigned by **descending reference frequency** —
-//! id 0 is the most-used symbol — so low-valued (short) ids serialize to fewer bytes; this matters
-//! most for a non-entropy back end. Frequency order is not topological, so `inverse` treats the
-//! grammar as a DAG and rejects cycles. The grammar is built by the space-efficient frequency-based
-//! Re-Pair of Bille–Gørtz–Prezza (2017); see [`builder`].
+//! `V` is the symbol count (at most `u22::MAX - 1`), and the header carries the *max id* `V`. Real
+//! symbol ids run `1..=V`: **id 0 is reserved and never emitted**, so the byte value `0x00` stays
+//! out of the serialized stream and is a free marker for the downstream LZ77 stage. Two `u22`
+//! values are thus special — id 0 (reserved) and [`NIL_SYM`] = `u22::MAX`, the NIL sentinel that
+//! marks a terminal. Every symbol is a uniform `(left, right)` pair — a terminal is `(byte, NIL)`,
+//! a non-terminal is `(left, right)` referencing two other symbols. Ids are assigned by
+//! **descending reference frequency** — id 1 is the most-used symbol — so low-valued (short) ids
+//! serialize to fewer bytes; this matters most for a non-entropy back end. Frequency order is not
+//! topological, so `inverse` treats the grammar as a DAG and rejects cycles. The grammar is built
+//! by the space-efficient frequency-based Re-Pair of Bille–Gørtz–Prezza (2017); see [`builder`].
 
 mod builder;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use arbitrary_int::u22;
 
+use super::MAX_EXPANSION_BYTES;
 use crate::transform::Transform;
 use crate::uleb128::{decode_u22, encode_u22};
 
@@ -36,9 +39,6 @@ const NIL_SYM: u32 = 0x3F_FFFF; // == u22::MAX
 pub(crate) const DEFAULT_NUM_TOKENS: u32 = NIL_SYM - 1; // 0x3F_FFFE
 /// Smallest sensible cap: the input can use all 256 byte values, so the cap must admit the terminals.
 pub(crate) const MIN_NUM_TOKENS: u32 = 256;
-/// Decompression-bomb ceiling for `inverse`: a small grammar can expand exponentially, so the
-/// total expansion is bounded regardless of the (untrusted) grammar.
-const MAX_EXPANSION_BYTES: u64 = 1 << 31;
 
 /// A resolved grammar symbol used by `inverse`.
 #[derive(Debug, Clone, Copy)]
@@ -75,7 +75,7 @@ impl Default for RepairTokenizer {
 impl Transform for RepairTokenizer {
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "vocab <= num_tokens <= 0x3F_FFFE, so vocab-1, ids, and ranks all fit u32/u22"
+        reason = "vocab <= num_tokens <= 0x3F_FFFE, so vocab, ids (rank+1), and ranks all fit u32/u22"
     )]
     fn forward(&self, input: Vec<u8>) -> Vec<u8> {
         if input.is_empty() {
@@ -127,16 +127,19 @@ impl Transform for RepairTokenizer {
         }
         let mut order: Vec<usize> = (0..vocab).collect();
         order.sort_unstable_by(|&a, &b| freq[b].cmp(&freq[a]).then(a.cmp(&b)));
+        // Real ids run `1..=V`: id 0 is reserved and never emitted, so the byte value `0x00`
+        // stays out of the serialized stream (a free marker for the downstream LZ77 stage). The
+        // header therefore carries the *max id* `V` rather than `V-1`.
         let mut new_id = vec![0u32; vocab];
         for (rank, &old) in order.iter().enumerate() {
-            new_id[old] = rank as u32;
+            new_id[old] = rank as u32 + 1;
         }
-        // Emit `[V-1]`, then each definition — uniformly `(left, right)`, a terminal being
-        // `(byte, NIL)` — in new-id order, then the remapped sequence, all as uleb128-u22 bytes.
-        // Pre-size to skip reallocation churn on the (at enwik9 scale) multi-hundred-MB stream:
-        // ids are frequency-reordered, so most sequence symbols are low ids of 1–2 varint bytes.
+        // Emit `[V]` (the max id), then each definition — uniformly `(left, right)`, a terminal
+        // being `(byte, NIL)` — in new-id order, then the remapped sequence, all as uleb128-u22
+        // bytes. Pre-size to skip reallocation churn on the (at enwik9 scale) multi-hundred-MB
+        // stream: ids are frequency-reordered, so most sequence symbols are low ids of 1–2 bytes.
         let mut out = Vec::with_capacity(4 + vocab * 4 + sequence.len() * 2);
-        encode_u22(u22::new((vocab - 1) as u32), &mut out);
+        encode_u22(u22::new(vocab as u32), &mut out);
         for &old in &order {
             match dict[old] {
                 Def::Byte(byte) => {
@@ -160,12 +163,17 @@ impl Transform for RepairTokenizer {
             return Ok(Vec::new());
         }
         let mut pos = 0;
+        // The header is the max id `V`; real ids run `1..=V`, so there are `V + 1` dict slots
+        // (slot 0 is a reserved placeholder that valid data never references — see `forward`).
         let vocab = decode_u22(&input, &mut pos)?.value() as usize + 1;
         // Parse the uniform definition list: each symbol is `(left, right)`, a terminal being
         // `(byte, NIL)` and a non-terminal a pair of symbol ids. Cap the reservation so a corrupt
-        // `[V-1]` claiming a huge vocabulary cannot demand a large allocation before the decode fails.
+        // `[V]` claiming a huge vocabulary cannot demand a large allocation before the decode fails.
         let mut dict: Vec<Def> = Vec::with_capacity(vocab.min(1 << 16));
-        for _ in 0..vocab {
+        // Reserved id 0: a placeholder terminal so positional indexing stays valid; it expands to a
+        // single byte if a corrupt stream ever references it, which the container checksum rejects.
+        dict.push(Def::Byte(0));
+        for _ in 1..vocab {
             let left = decode_u22(&input, &mut pos)?.value();
             let right = decode_u22(&input, &mut pos)?.value();
             if right == NIL_SYM {
@@ -311,6 +319,14 @@ mod tests {
     }
 
     #[test]
+    fn reserves_zero_so_output_has_no_nul_byte() {
+        // Reserving id 0 keeps the byte value `0x00` out of the serialized stream for any input
+        // free of literal NUL bytes — this is the free marker the downstream LZ77 stage relies on.
+        let data = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
+        assert!(!tok().forward(data).contains(&0), "reserved id 0 leaked a 0x00 byte");
+    }
+
+    #[test]
     fn large_grammar_stays_within_vocabulary() {
         // A pseudo-random 256 KiB block makes Re-Pair create thousands of rules; the emitted
         // vocabulary must stay within the cap and still round-trip.
@@ -322,8 +338,9 @@ mod tests {
         }
         let bytes = tok().forward(data.clone());
         let mut pos = 0;
-        let vocab = decode_u22(&bytes, &mut pos).unwrap().value() as usize + 1;
-        assert!(vocab <= 0x3F_FFFE, "vocabulary {vocab} exceeds the cap");
+        // The header is the max id `V`; real ids `1..=V` must stay below `NIL_SYM`.
+        let max_id = decode_u22(&bytes, &mut pos).unwrap().value() as usize;
+        assert!(max_id <= 0x3F_FFFE, "max id {max_id} exceeds the cap");
         assert_eq!(tok().inverse(bytes).unwrap(), data);
     }
 
@@ -334,18 +351,18 @@ mod tests {
         // the largest byte value present.
         let bytes = tok().forward(b"zzab".to_vec());
         let mut pos = 0;
-        assert_eq!(decode_u22(&bytes, &mut pos).unwrap().value(), 2); // V - 1 (three terminals)
-        assert_eq!(decode_u22(&bytes, &mut pos).unwrap().value(), u32::from(b'z')); // def_0 left = 'z'
+        assert_eq!(decode_u22(&bytes, &mut pos).unwrap().value(), 3); // V = max id (three terminals)
+        assert_eq!(decode_u22(&bytes, &mut pos).unwrap().value(), u32::from(b'z')); // id 1 left = 'z'
         assert_eq!(decode_u22(&bytes, &mut pos).unwrap().value(), NIL_SYM); // ...right = NIL (terminal)
         assert_eq!(tok().inverse(bytes).unwrap(), b"zzab".to_vec());
     }
 
     #[test]
     fn inverse_rejects_malformed_tokens() {
-        // Append an out-of-range sequence symbol (id == V, one past the largest valid id).
+        // Append an out-of-range sequence symbol (id == V+1, one past the largest valid id V).
         let mut bytes = tok().forward(b"abracadabra".to_vec());
         let mut pos = 0;
-        let v = decode_u22(&bytes, &mut pos).unwrap().value() + 1; // V (== vocab count)
+        let v = decode_u22(&bytes, &mut pos).unwrap().value() + 1; // max_id + 1 = V + 1
         encode_u22(u22::new(v), &mut bytes);
         assert!(tok().inverse(bytes).is_err());
         // A stream claiming a huge vocabulary with no definitions following is truncated.
@@ -363,8 +380,9 @@ mod tests {
         };
         let bytes = capped.forward(data.clone());
         let mut pos = 0;
-        let vocab = decode_u22(&bytes, &mut pos).unwrap().value() as usize + 1;
-        assert!(vocab <= 300, "vocabulary {vocab} exceeds the num_tokens cap");
+        // The header is the max id `V`, which equals the real symbol count (ids `1..=V`).
+        let symbols = decode_u22(&bytes, &mut pos).unwrap().value() as usize;
+        assert!(symbols <= 300, "vocabulary {symbols} exceeds the num_tokens cap");
         assert_eq!(capped.inverse(bytes).unwrap(), data);
     }
 
