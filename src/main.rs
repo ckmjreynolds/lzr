@@ -160,7 +160,11 @@ fn report_stages(stages: &[lzr::StageSize]) {
         } else {
             8.0 * stage.output_bytes as f64 / stage.input_bytes as f64
         };
-        eprintln!("  {:<9} {bpb:.4} bpb", stage.name);
+        // A stage may report an extra statistic (the Re-Pair stage reports its token count).
+        match stage.detail {
+            Some(tokens) => eprintln!("  {:<9} {bpb:.4} bpb  ({} tokens)", stage.name, with_commas(tokens)),
+            None => eprintln!("  {:<9} {bpb:.4} bpb", stage.name),
+        }
     }
 }
 

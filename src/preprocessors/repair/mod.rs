@@ -225,6 +225,13 @@ impl Transform for RepairTokenizer {
         }
         Ok(output)
     }
+
+    /// The Re-Pair vocabulary size for the CLI trace: the leading `[V]` header (the max symbol id,
+    /// i.e. the token count) of a non-empty stream. Empty output (empty input) reports nothing.
+    fn trace_detail(&self, output: &[u8]) -> Option<u64> {
+        let mut pos = 0;
+        decode_u22(output, &mut pos).ok().map(|v| u64::from(v.value()))
+    }
 }
 
 /// Resolves each grammar symbol's expansion length in bytes over the (possibly non-topological)

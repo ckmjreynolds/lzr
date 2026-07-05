@@ -12,6 +12,10 @@
 //! an expensive build (the tokenizer drops ~1 GB before its grammar build) and so
 //! [`Pipeline`] can move the buffer stage-to-stage with no per-stage clone.
 
+/// One stage's encode-side trace record: `(feature name, input length, output length, optional
+/// detail)`. Returned per stage by [`Pipeline::forward_traced`] for the CLI's per-stage report.
+pub(crate) type StageTrace = (&'static str, usize, usize, Option<u64>);
+
 /// A reversible byte→byte stream transform.
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 pub(crate) trait Transform {
@@ -29,6 +33,13 @@ pub(crate) trait Transform {
     /// Returns an error if the stage is fed corrupt or malformed data — it runs on
     /// decoded, possibly-adversarial bytes.
     fn inverse(&self, input: Vec<u8>) -> anyhow::Result<Vec<u8>>;
+
+    /// An optional per-stage statistic for the CLI's trace, derived from the stage's own `output`
+    /// bytes (e.g. the Re-Pair vocabulary size). `None` — the default — for stages with nothing extra
+    /// to report. Encode-side only (see [`Pipeline::forward_traced`]).
+    fn trace_detail(&self, _output: &[u8]) -> Option<u64> {
+        None
+    }
 }
 
 /// An ordered chain of transforms: `forward` applies them in order, `inverse`
@@ -59,15 +70,17 @@ impl Pipeline {
         data
     }
 
-    /// Like [`Pipeline::forward`] but also returns each stage's `(name, input length, output length)`
-    /// in order, so the CLI can report each transform's own bits-per-byte — what it did to *its* input,
-    /// not a running figure against the original.
-    pub(crate) fn forward_traced(&self, mut data: Vec<u8>) -> (Vec<u8>, Vec<(&'static str, usize, usize)>) {
+    /// Like [`Pipeline::forward`] but also returns each stage's `(name, input length, output length,
+    /// optional detail)` in order, so the CLI can report each transform's own bits-per-byte — what it
+    /// did to *its* input, not a running figure against the original — plus any per-stage statistic
+    /// ([`Transform::trace_detail`], e.g. the Re-Pair token count).
+    pub(crate) fn forward_traced(&self, mut data: Vec<u8>) -> (Vec<u8>, Vec<StageTrace>) {
         let mut sizes = Vec::with_capacity(self.stages.len());
         for (stage, &name) in self.stages.iter().zip(&self.names) {
             let input_len = data.len();
             data = stage.forward(data);
-            sizes.push((name, input_len, data.len()));
+            let detail = stage.trace_detail(&data);
+            sizes.push((name, input_len, data.len(), detail));
         }
         (data, sizes)
     }
@@ -131,11 +144,12 @@ mod tests {
 
     /// `forward_traced` must return the same bytes as `forward`, plus each stage's name and its own
     /// input and output length (the second stage's input is the first's output) in pipeline order.
+    /// The `Append` stages report no detail, so each carries `None`.
     #[test]
     fn forward_traced_records_each_stage() {
         let p = Pipeline::new(vec![Box::new(Append(1)), Box::new(Append(2))], vec!["one", "two"]);
         let (encoded, sizes) = p.forward_traced(b"data".to_vec());
         assert_eq!(encoded, b"data\x01\x02");
-        assert_eq!(sizes, vec![("one", 4, 5), ("two", 5, 6)]);
+        assert_eq!(sizes, vec![("one", 4, 5, None), ("two", 5, 6, None)]);
     }
 }

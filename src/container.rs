@@ -37,6 +37,9 @@ pub struct StageSize {
     pub input_bytes: usize,
     /// The stage's output length in bytes after it ran.
     pub output_bytes: usize,
+    /// An optional stage-specific statistic (e.g. the Re-Pair token count); `None` for stages with
+    /// nothing extra to report.
+    pub detail: Option<u64>,
 }
 
 /// Wrap a codec `core` in the container framing: magic, version, ULEB128 profile, core, Adler-32
@@ -101,10 +104,11 @@ pub fn compress_owned_with_traced(
     let out = frame(profile, &core, checksum);
     let stages = stages
         .into_iter()
-        .map(|(name, input_bytes, output_bytes)| StageSize {
+        .map(|(name, input_bytes, output_bytes, detail)| StageSize {
             name,
             input_bytes,
             output_bytes,
+            detail,
         })
         .collect();
     (out, stages)
@@ -169,12 +173,13 @@ mod tests {
 
     #[test]
     fn compressed_output_is_self_describing() {
-        // The default profile fits in one ULEB128 byte (a small feature bitmask).
+        // The default profile serializes as a ULEB128 feature bitmask directly after the version.
         let c = compress(b"hello");
         assert!(c.starts_with(MAGIC));
         assert_eq!(c[3], VERSION);
-        assert_eq!(u64::from(c[PREFIX_LEN]), Profile::default().to_bits());
-        assert!(c.len() >= PREFIX_LEN + 1 + FOOTER_LEN);
+        let mut pos = PREFIX_LEN;
+        assert_eq!(uleb128::decode_u64(&c, &mut pos).unwrap(), Profile::default().to_bits());
+        assert!(c.len() >= pos + FOOTER_LEN);
     }
 
     #[test]
@@ -182,7 +187,7 @@ mod tests {
         // Disabling every default feature clears all bits (profile 0x00); the container records it
         // and `decompress` rebuilds the matching (identity) pipeline.
         let mut profile = Profile::default();
-        for feature in ["repair", "casefold", "entities", "lz77", "entropy", "order0", "order1"] {
+        for feature in ["repair", "casefold", "entities", "lz77", "entropy", "order0", "order1", "order2"] {
             profile.disable(feature).unwrap();
         }
         let c = compress_with(b"hello world", profile);
@@ -192,11 +197,11 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_profile() {
-        // Bit 8 is not a known feature; a container whose ULEB128 profile encodes it must be rejected.
+        // Bit 9 is not a known feature; a container whose ULEB128 profile encodes it must be rejected.
         let mut c = Vec::new();
         c.extend_from_slice(MAGIC);
         c.push(VERSION);
-        uleb128::encode_u64(1 << 8, &mut c); // profile with an unknown feature bit
+        uleb128::encode_u64(1 << 9, &mut c); // profile with an unknown feature bit
         c.extend_from_slice(&[0u8; FOOTER_LEN]); // enough trailing bytes for the length checks
         assert!(decompress(&c).is_err());
     }
