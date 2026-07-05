@@ -1,7 +1,7 @@
 //! Capped Re-Pair grammar tokenizer.
 //!
-//! Re-Pair repeatedly replaces the best-scoring adjacent digram with a new non-terminal, building
-//! a grammar over the input. This tokenizer runs Re-Pair to a hard `u15` vocabulary cap (32768
+//! Re-Pair repeatedly replaces the most frequent adjacent digram with a new non-terminal, building
+//! a grammar over the input. This tokenizer runs Re-Pair to a hard `u15` vocabulary cap (32766
 //! symbols = up to 256 terminals + non-terminals) and emits the grammar *inline* ahead of the
 //! reduced symbol sequence, so the whole thing is one `u15` token stream the codec can carry
 //! without a separate dictionary channel:
@@ -10,106 +10,36 @@
 //! [V-1] [(left_0, right_0)] … [(left_{V-1}, right_{V-1})] [sequence …]
 //! ```
 //!
-//! `V` is the symbol count (at most 32767; `0x7FFF` = `u15::MAX` is the reserved NIL sentinel).
+//! `V` is the symbol count (at most 32766). Two high `u15` values are reserved and never used as
+//! symbol ids: `0x7FFF` = `u15::MAX` is the NIL sentinel (marks a terminal), and `0x7FFE` is left
+//! free for the downstream LZ77 token stage's flag (see [`crate::preprocessors`]).
 //! Every symbol is a uniform `(left, right)` pair — a terminal is `(byte, NIL)`, a non-terminal is
 //! `(left, right)` referencing two other symbols. Symbol ids are assigned by **descending reference
 //! frequency** — id 0 is the most-used symbol — so low-valued (short) ids code cheaply; this
 //! matters most for a non-entropy back end. Frequency order is not topological, so `inverse` treats
-//! the grammar as a DAG and rejects cycles. Which digram is "best" is chosen by a pluggable
-//! [`cost::MergeCost`]; the default is [`cost::Entropy`], the bit-saving criterion that suits this
-//! codec's entropy-coded output.
+//! the grammar as a DAG and rejects cycles. The grammar is built by the space-efficient
+//! frequency-based Re-Pair of Bille–Gørtz–Prezza (2017); see [`builder`].
 
-pub(crate) mod cost;
-
-use std::collections::{BinaryHeap, HashMap};
+mod builder;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use arbitrary_int::u15;
 use static_assertions::const_assert;
 
-use self::cost::{Entropy, MergeCost};
 use crate::tokenizers::Tokenize;
 
-/// Sentinel "no node" index into the working sequence.
-const NIL: u32 = u32::MAX;
-/// Sentinel symbol marking a tombstoned (merged-away) sequence slot.
-const NONE_SYM: u16 = u16::MAX;
 /// Reserved sentinel symbol (`u15::MAX`); never a valid symbol id, so it marks a terminal as the
 /// right child of a uniform `(left, right)` grammar definition.
 const NIL_SYM: u16 = 0x7FFF;
-/// Vocabulary ceiling: symbol ids run `0..VOCAB_CAP`, staying strictly below [`NIL_SYM`], so the
-/// grammar holds at most 32767 symbols.
-const VOCAB_CAP: u32 = 0x7FFF;
+/// Vocabulary ceiling: symbol ids run `0..VOCAB_CAP`, so the grammar holds at most 32766 symbols.
+/// This stays strictly below both reserved sentinels — [`NIL_SYM`] (`0x7FFF`) and the LZ77 flag
+/// `0x7FFE` the downstream token stage claims — so neither ever appears as a symbol id.
+const VOCAB_CAP: u32 = 0x7FFE;
 /// Decompression-bomb ceiling for `inverse`: a small grammar can expand exponentially, so the
 /// total expansion is bounded regardless of the (untrusted) grammar.
 const MAX_EXPANSION_BYTES: u64 = 1 << 31;
-/// When the lazy-deletion heap grows past this factor times the live digram count (floored by
-/// [`HEAP_COMPACT_FLOOR`]), it is rebuilt from the live `pairs`. The heap is otherwise the run's
-/// dominant memory sink: one candidate is pushed per occurrence at seed time and per rewrite during
-/// merging, and stale entries are only ever discarded on pop, so without compaction the heap holds
-/// O(total pushes over the whole run) rather than O(distinct live digrams).
-const HEAP_COMPACT_SLACK: usize = 2;
-/// Trigger floor for [`Repair::compact_heap_if_bloated`]: below this many live digrams the heap is
-/// already small enough that rebuilding it would cost more than it saves.
-const HEAP_COMPACT_FLOOR: usize = 1 << 16;
 
-const_assert!(VOCAB_CAP == 0x7FFF);
-
-/// Occurrence bookkeeping for one active digram.
-#[derive(Debug, Clone, Copy)]
-struct PairInfo {
-    /// Number of live occurrences.
-    count: u32,
-    /// First slot in the occurrence list, or [`NIL`].
-    head: u32,
-}
-
-/// An `f64` merge score with a total order (scores are always finite here).
-#[derive(Debug, Clone, Copy)]
-struct Score(f64);
-
-impl PartialEq for Score {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.total_cmp(&other.0) == core::cmp::Ordering::Equal
-    }
-}
-
-impl Eq for Score {}
-
-impl PartialOrd for Score {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Score {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.0.total_cmp(&other.0)
-    }
-}
-
-/// A lazily-revalidated max-heap entry: the digram and the score it had when pushed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Candidate {
-    /// Score at push time; re-checked against the live score on pop.
-    key: Score,
-    /// The digram `(a, b)`.
-    pair: (u16, u16),
-}
-
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Candidate {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        // Max-heap on score; on ties the lexicographically smaller digram wins (is treated as
-        // greater), for a fully deterministic merge order.
-        self.key.cmp(&other.key).then_with(|| other.pair.cmp(&self.pair))
-    }
-}
+const_assert!(VOCAB_CAP == 0x7FFE);
 
 /// A resolved grammar symbol used by `inverse`.
 #[derive(Debug, Clone, Copy)]
@@ -120,332 +50,29 @@ enum Def {
     Pair(u16, u16),
 }
 
-/// Working state for one capped Re-Pair run over a single input.
-///
-/// The working sequence is a doubly linked list with tombstones, held as a struct-of-arrays (one
-/// column per node field) rather than a `Vec<Node>`. A `Node` of one `u16` and four `u32`s carries
-/// 2 bytes of tail padding (20 bytes); the columns pack tightly at 18 bytes per slot, ~10% off the
-/// sequence — the run's largest allocation.
-struct Repair<'a> {
-    /// Symbol id per slot, or [`NONE_SYM`] once the slot has been merged away.
-    sym: Vec<u16>,
-    /// Previous live slot in sequence order, or [`NIL`].
-    prev: Vec<u32>,
-    /// Next live slot in sequence order, or [`NIL`].
-    next: Vec<u32>,
-    /// Previous slot in each slot's digram occurrence list, or [`NIL`].
-    occ_prev: Vec<u32>,
-    /// Next slot in each slot's digram occurrence list, or [`NIL`].
-    occ_next: Vec<u32>,
-    /// Live occurrence bookkeeping per digram.
-    pairs: HashMap<(u16, u16), PairInfo>,
-    /// Lazy max-heap of merge candidates.
-    heap: BinaryHeap<Candidate>,
-    /// Rules in creation order; rule `k` has id `first_rule_id + k`.
-    rules: Vec<(u16, u16)>,
-    /// Live occurrence count per symbol id (indexed by id; length == `next_rule_id`).
-    counts: Vec<u32>,
-    /// Total live token count.
-    total: u32,
-    /// Id that the next rule will receive (`== T + rules.len()`).
-    next_rule_id: u16,
-    /// Reused occurrence-position buffer for [`Repair::replace_pair`], so the per-merge
-    /// snapshot allocates at most once across the whole run.
-    scratch: Vec<u32>,
-    /// The pluggable merge-selection criterion.
-    cost: &'a dyn MergeCost,
-}
-
-impl<'a> Repair<'a> {
-    /// Builds the working state for `symbols` (already mapped to `0..T` terminal ids, with
-    /// `counts` their occurrence counts) using `cost` to score merges.
-    #[expect(clippy::cast_possible_truncation, reason = "caller guarantees symbols.len() <= u32::MAX")]
-    fn new(symbols: &[u16], n_terminals: u16, counts: Vec<u32>, cost: &'a dyn MergeCost) -> Self {
-        let n = symbols.len();
-        let mut prev = Vec::with_capacity(n);
-        let mut next = Vec::with_capacity(n);
-        for i in 0..n {
-            prev.push(if i == 0 {
-                NIL
-            } else {
-                (i - 1) as u32
-            });
-            next.push(if i + 1 < n {
-                (i + 1) as u32
-            } else {
-                NIL
-            });
-        }
-        Self {
-            sym: symbols.to_vec(),
-            prev,
-            next,
-            occ_prev: vec![NIL; n],
-            occ_next: vec![NIL; n],
-            pairs: HashMap::new(),
-            heap: BinaryHeap::new(),
-            rules: Vec::new(),
-            counts,
-            total: n as u32,
-            next_rule_id: n_terminals,
-            scratch: Vec::new(),
-            cost,
-        }
-    }
-
-    /// Scores the digram `pair` occurring `freq` times against the current symbol counts.
-    fn score_pair(&self, pair: (u16, u16), freq: u32) -> f64 {
-        let (a, b) = pair;
-        let count_a = self.counts[usize::from(a)];
-        let count_b = self.counts[usize::from(b)];
-        self.cost.score(freq, count_a, count_b, self.total, a == b)
-    }
-
-    /// Inserts the digram starting at `pos` (which must have a live `next`) into its occurrence
-    /// list, bumps its count, and pushes a fresh heap candidate.
-    fn add_occurrence(&mut self, pos: u32) {
-        let a = self.sym[pos as usize];
-        let b = self.sym[self.next[pos as usize] as usize];
-        let key = (a, b);
-        let (head, count) = {
-            let info = self.pairs.entry(key).or_insert(PairInfo {
-                count: 0,
-                head: NIL,
-            });
-            let head = info.head;
-            info.head = pos;
-            info.count += 1;
-            (head, info.count)
-        };
-        self.occ_prev[pos as usize] = NIL;
-        self.occ_next[pos as usize] = head;
-        if head != NIL {
-            self.occ_prev[head as usize] = pos;
-        }
-        let score = self.score_pair(key, count);
-        self.heap.push(Candidate {
-            key: Score(score),
-            pair: key,
-        });
-    }
-
-    /// Removes the digram occurrence starting at `pos` (which must have a live `next`) from its
-    /// occurrence list and decrements its count, dropping or re-scoring the digram accordingly.
-    fn remove_occurrence(&mut self, pos: u32) {
-        let a = self.sym[pos as usize];
-        let b = self.sym[self.next[pos as usize] as usize];
-        let key = (a, b);
-        let (occ_prev, occ_next) = (self.occ_prev[pos as usize], self.occ_next[pos as usize]);
-        if occ_prev != NIL {
-            self.occ_next[occ_prev as usize] = occ_next;
-        }
-        if occ_next != NIL {
-            self.occ_prev[occ_next as usize] = occ_prev;
-        }
-        let remaining = self.pairs.get_mut(&key).map(|info| {
-            if occ_prev == NIL {
-                info.head = occ_next;
-            }
-            info.count -= 1;
-            info.count
-        });
-        match remaining {
-            Some(0) => drop(self.pairs.remove(&key)),
-            Some(count) => {
-                let score = self.score_pair(key, count);
-                self.heap.push(Candidate {
-                    key: Score(score),
-                    pair: key,
-                });
-            }
-            None => {}
-        }
-    }
-
-    /// Pops the highest-scoring digram whose live score is still current and profitable, or `None`
-    /// if the best remaining pair is not worth merging.
-    fn pop_best(&mut self) -> Option<(u16, u16)> {
-        while let Some(candidate) = self.heap.pop() {
-            let live = self.pairs.get(&candidate.pair).map_or(0, |info| info.count);
-            if live == 0 {
-                continue;
-            }
-            let score = self.score_pair(candidate.pair, live);
-            if Score(score) == candidate.key {
-                return self.cost.is_profitable(score, live).then_some(candidate.pair);
-            }
-            self.heap.push(Candidate {
-                key: Score(score),
-                pair: candidate.pair,
-            });
-        }
-        None
-    }
-
-    /// Rebuilds the lazy max-heap from the live digram set once stale entries have come to dominate
-    /// it, capping heap memory at O(distinct live digrams). This is a memory-only compaction:
-    /// [`Repair::pop_best`] already revalidates every candidate against the live score, so dropping
-    /// the redundant stale duplicates never changes which merge is chosen.
-    fn compact_heap_if_bloated(&mut self) {
-        let live = self.pairs.len();
-        if self.heap.len() <= HEAP_COMPACT_SLACK * live.max(HEAP_COMPACT_FLOOR) {
-            return;
-        }
-        // Recompute one fresh candidate per live digram. Collected first so the immutable borrow of
-        // `self.pairs` / `self.score_pair` does not overlap the write to `self.heap`.
-        let fresh: Vec<Candidate> = self
-            .pairs
-            .iter()
-            .map(|(&pair, info)| Candidate {
-                key: Score(self.score_pair(pair, info.count)),
-                pair,
-            })
-            .collect();
-        self.heap = BinaryHeap::from(fresh);
-    }
-
-    /// Replaces every (non-overlapping) occurrence of `pair` with the new rule symbol `new_id`.
-    fn replace_pair(&mut self, pair: (u16, u16), new_id: u16) {
-        let (a, b) = pair;
-        // Snapshot the occurrence positions in ascending (= sequence) order; node indices are never
-        // reordered, so sorting yields left-to-right processing and correct overlap handling. The
-        // buffer is taken from `self` and returned below so its capacity is reused across merges.
-        let mut positions = std::mem::take(&mut self.scratch);
-        positions.clear();
-        let mut p = self.pairs.get(&pair).map_or(NIL, |info| info.head);
-        while p != NIL {
-            positions.push(p);
-            p = self.occ_next[p as usize];
-        }
-        positions.sort_unstable();
-        for &i in &positions {
-            if self.sym[i as usize] != a {
-                continue; // consumed by an earlier overlapping merge
-            }
-            let j = self.next[i as usize];
-            if j == NIL || self.sym[j as usize] != b {
-                continue;
-            }
-            let prev = self.prev[i as usize];
-            let next = self.next[j as usize];
-            // Retire the three affected digrams (keys read before any structural change).
-            self.remove_occurrence(i);
-            if prev != NIL {
-                self.remove_occurrence(prev);
-            }
-            if next != NIL {
-                self.remove_occurrence(j);
-            }
-            // Splice: i becomes the rule symbol, j leaves the sequence.
-            self.sym[i as usize] = new_id;
-            self.next[i as usize] = next;
-            if next != NIL {
-                self.prev[next as usize] = i;
-            }
-            self.sym[j as usize] = NONE_SYM;
-            // Maintain live symbol counts (a == b decrements a twice).
-            self.counts[usize::from(a)] -= 1;
-            self.counts[usize::from(b)] -= 1;
-            self.counts[usize::from(new_id)] += 1;
-            self.total -= 1;
-            // Register the new digrams around the rule symbol.
-            if prev != NIL {
-                self.add_occurrence(prev);
-            }
-            if next != NIL {
-                self.add_occurrence(i);
-            }
-        }
-        self.scratch = positions;
-    }
-
-    /// Runs Re-Pair: seed the initial digrams, then merge the best pair until none is profitable or
-    /// the vocabulary cap is reached.
-    fn run(&mut self) {
-        let mut i = if self.sym.is_empty() {
-            NIL
-        } else {
-            0
-        };
-        while i != NIL {
-            let next = self.next[i as usize];
-            if next != NIL {
-                self.add_occurrence(i);
-                self.compact_heap_if_bloated();
-            }
-            i = next;
-        }
-        while u32::from(self.next_rule_id) < VOCAB_CAP {
-            let Some(pair) = self.pop_best() else {
-                break;
-            };
-            let new_id = self.next_rule_id;
-            self.rules.push(pair);
-            self.counts.push(0);
-            self.next_rule_id += 1;
-            self.replace_pair(pair, new_id);
-            self.compact_heap_if_bloated();
-        }
-    }
-
-    /// Walks the surviving sequence in order.
-    fn collect_sequence(&self) -> Vec<u16> {
-        let mut sequence = Vec::new();
-        let mut cur = if self.sym.is_empty() {
-            NIL
-        } else {
-            0
-        };
-        while cur != NIL {
-            sequence.push(self.sym[cur as usize]);
-            cur = self.next[cur as usize];
-        }
-        sequence
-    }
-}
-
 /// A capped Re-Pair grammar tokenizer.
 ///
-/// `forward` derives a per-input grammar, renumbers its symbols by descending reference frequency
-/// (id 0 = most used), and emits it inline ahead of the reduced sequence; `inverse` parses that
-/// self-describing grammar (as a cycle-checked DAG) and expands the sequence back to bytes. The
-/// tokenizer is stateless apart from its merge criterion — all per-input grammar state travels in
-/// the token stream.
+/// `forward` derives a per-input grammar with the space-efficient frequency-based Re-Pair builder
+/// ([`builder`]), renumbers its symbols by descending reference frequency (id 0 = most used), and
+/// emits it inline ahead of the reduced sequence; `inverse` parses that self-describing grammar (as
+/// a cycle-checked DAG) and expands the sequence back to bytes. The tokenizer is stateless — all
+/// per-input grammar state travels in the token stream.
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
-#[derive(Debug)]
-pub(crate) struct RepairTokenizer {
-    cost: Box<dyn MergeCost>,
-}
-
-impl RepairTokenizer {
-    /// Creates a Re-Pair tokenizer that selects merges with `cost`.
-    #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
-    #[must_use]
-    pub(crate) fn new(cost: impl MergeCost + 'static) -> Self {
-        Self {
-            cost: Box::new(cost),
-        }
-    }
-}
-
-impl Default for RepairTokenizer {
-    fn default() -> Self {
-        Self::new(Entropy::default())
-    }
-}
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RepairTokenizer;
 
 impl Tokenize for RepairTokenizer {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "vocab <=32768 so vocab-1 and ranks fit u16; terminal count <=256"
     )]
-    fn forward(&self, input: &[u8]) -> Vec<u15> {
+    fn forward(&self, input: Vec<u8>) -> Vec<u15> {
         if input.is_empty() {
             return Vec::new();
         }
         // Compact terminals to the distinct present bytes, in ascending byte order.
         let mut present = [false; 256];
-        for &byte in input {
+        for &byte in &input {
             present[usize::from(byte)] = true;
         }
         let mut terminals: Vec<u8> = Vec::new();
@@ -457,22 +84,14 @@ impl Tokenize for RepairTokenizer {
             }
         }
         let t = terminals.len();
-        // Map the input to symbol ids and seed terminal counts.
-        let mut counts = vec![0u32; t];
-        let symbols: Vec<u16> = input
-            .iter()
-            .map(|&byte| {
-                let id = byte_to_id[usize::from(byte)];
-                counts[usize::from(id)] += 1;
-                id
-            })
-            .collect();
-        // Build the capped grammar (identity fallback if the input exceeds u32 node indices).
-        let (rules, sequence) = if u32::try_from(input.len()).is_ok() {
-            let mut builder = Repair::new(&symbols, t as u16, counts, self.cost.as_ref());
-            builder.run();
-            let sequence = builder.collect_sequence();
-            (builder.rules, sequence)
+        // Map the input to compact terminal symbol ids, then free the byte buffer before the grammar
+        // build — the builder works on `symbols`, and holding the input too would cost ~1 GB at enwik9.
+        let symbols: Vec<u16> = input.iter().map(|&byte| byte_to_id[usize::from(byte)]).collect();
+        let fits = u32::try_from(input.len()).is_ok();
+        drop(input);
+        // Build the capped grammar (identity fallback if the input exceeds u32 position indices).
+        let (rules, sequence) = if fits {
+            builder::build_grammar(symbols, t as u16)
         } else {
             (Vec::new(), symbols)
         };
@@ -635,14 +254,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
 
-    use super::cost::{Entropy, Frequency};
-    use super::{HEAP_COMPACT_FLOOR, HEAP_COMPACT_SLACK, Repair, RepairTokenizer};
+    use super::RepairTokenizer;
     use crate::tokenizers::Tokenize;
-
-    /// Both shipped cost models — round-trip correctness is independent of the criterion.
-    fn tokenizers() -> Vec<RepairTokenizer> {
-        vec![RepairTokenizer::new(Frequency), RepairTokenizer::new(Entropy::default())]
-    }
 
     fn corpus(rel: &str) -> Option<Vec<u8>> {
         std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)).ok()
@@ -651,101 +264,75 @@ mod tests {
     proptest! {
         #[test]
         fn roundtrip_any(data in prop::collection::vec(any::<u8>(), 0..4096)) {
-            for tok in tokenizers() {
-                prop_assert_eq!(tok.inverse(&tok.forward(&data)).unwrap(), data.clone());
-            }
+            let restored = RepairTokenizer.inverse(&RepairTokenizer.forward(data.clone())).unwrap();
+            prop_assert_eq!(restored, data);
         }
 
         #[test]
         fn roundtrip_small_alphabet(data in prop::collection::vec(0u8..4, 0..4096)) {
-            for tok in tokenizers() {
-                prop_assert_eq!(tok.inverse(&tok.forward(&data)).unwrap(), data.clone());
-            }
+            let restored = RepairTokenizer.inverse(&RepairTokenizer.forward(data.clone())).unwrap();
+            prop_assert_eq!(restored, data);
         }
 
         /// `inverse` must never panic on arbitrary token input — only `Ok` or `Err`.
         #[test]
         fn inverse_never_panics(raw in prop::collection::vec(0u16..=0x7FFF, 0..512)) {
             let tokens: Vec<u15> = raw.into_iter().map(u15::new).collect();
-            drop(RepairTokenizer::default().inverse(&tokens));
+            drop(RepairTokenizer.inverse(&tokens));
         }
     }
 
     #[test]
     fn known_values_roundtrip() {
         let inputs: [&[u8]; 5] = [b"", b"a", b"aaaa", b"abracadabra", b"mississippi"];
-        for tok in tokenizers() {
-            for input in inputs {
-                assert_eq!(tok.inverse(&tok.forward(input)).unwrap(), input);
-            }
+        let tok = RepairTokenizer;
+        for input in inputs {
+            assert_eq!(tok.inverse(&tok.forward(input.to_vec())).unwrap(), input);
         }
-    }
-
-    #[test]
-    fn heap_stays_bounded_over_the_run() {
-        // Many occurrences of very few distinct digrams: the lazy heap receives one push per
-        // occurrence at seed time (and per rewrite while merging), but compaction must keep its
-        // live size O(distinct live digrams). Without the fix the heap would hold ~1M entries here.
-        let n = 1 << 20;
-        let symbols = vec![0u16; n];
-        #[expect(clippy::cast_possible_truncation, reason = "n fits u32")]
-        let counts = vec![n as u32];
-        let cost = Frequency;
-        let mut builder = Repair::new(&symbols, 1, counts, &cost);
-        builder.run();
-        // Invariant maintained by `compact_heap_if_bloated` after every seed push and every merge.
-        assert!(
-            builder.heap.len() <= HEAP_COMPACT_SLACK * builder.pairs.len().max(HEAP_COMPACT_FLOOR),
-            "heap {} not compacted against {} live digrams",
-            builder.heap.len(),
-            builder.pairs.len(),
-        );
     }
 
     #[test]
     fn compresses_repetitive_input() {
         let data = vec![b'a'; 8192];
-        for tok in tokenizers() {
-            assert!(tok.forward(&data).len() <= data.len());
-        }
+        assert!(RepairTokenizer.forward(data.clone()).len() <= data.len());
     }
 
     #[test]
     fn large_grammar_stays_within_vocabulary() {
-        // A pseudo-random 256 KiB block makes classic Re-Pair create thousands of rules; the
-        // emitted vocabulary must stay within the u15 cap and still round-trip. (The hard 32768
-        // cap in `Repair::run` is additionally covered by the no-panic proptests.)
+        // A pseudo-random 256 KiB block makes Re-Pair create thousands of rules; the emitted
+        // vocabulary must stay within the u15 cap and still round-trip.
         let mut data = vec![0u8; 256 * 1024];
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         for byte in &mut data {
             state = state.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
             *byte = state.to_be_bytes()[0];
         }
-        let tok = RepairTokenizer::new(Frequency);
-        let tokens = tok.forward(&data);
+        let tok = RepairTokenizer;
+        let tokens = tok.forward(data.clone());
         let vocab = usize::from(tokens[0].value()) + 1;
-        assert!(vocab <= 32767, "vocabulary {vocab} exceeds the reserved-NIL cap");
-        assert!(tokens.iter().all(|token| token.value() <= 0x7FFF));
+        assert!(vocab <= 32766, "vocabulary {vocab} exceeds the reserved-sentinel cap");
+        // Every token is a valid u15 and the reserved LZ77 flag `0x7FFE` never appears.
+        assert!(tokens.iter().all(|token| token.value() <= 0x7FFF && token.value() != 0x7FFE));
         assert_eq!(tok.inverse(&tokens).unwrap(), data);
     }
 
     #[test]
     fn ids_are_frequency_ordered() {
-        // With no profitable merges (Entropy on a tiny input) the vocabulary is just the terminals,
-        // renumbered by descending frequency: the most-frequent byte 'z' becomes id 0 even though it
-        // is the largest byte value present.
-        let tok = RepairTokenizer::new(Entropy::default());
-        let tokens = tok.forward(b"zzzab");
+        // No pair repeats in "zzab", so the vocabulary is just the terminals, renumbered by
+        // descending reference frequency: the most-frequent byte 'z' becomes id 0 even though it is
+        // the largest byte value present.
+        let tok = RepairTokenizer;
+        let tokens = tok.forward(b"zzab".to_vec());
         assert_eq!(tokens[0].value(), 2); // V - 1 (three terminals, no rules)
         assert_eq!(tokens[1].value(), u16::from(b'z')); // def_0 left = 'z', the most frequent byte
         assert_eq!(tokens[2].value(), 0x7FFF); // ...right = NIL, marking it a terminal
-        assert_eq!(tok.inverse(&tokens).unwrap(), b"zzzab".to_vec());
+        assert_eq!(tok.inverse(&tokens).unwrap(), b"zzab".to_vec());
     }
 
     #[test]
     fn inverse_rejects_malformed_tokens() {
-        let tok = RepairTokenizer::default();
-        let mut tokens = tok.forward(b"abracadabra");
+        let tok = RepairTokenizer;
+        let mut tokens = tok.forward(b"abracadabra".to_vec());
         tokens.push(u15::new(0x7FFF)); // dangling reference to a nonexistent symbol
         assert!(tok.inverse(&tokens).is_err());
         assert!(tok.inverse(&[u15::new(0x7FFF)]).is_err());
@@ -757,8 +344,7 @@ mod tests {
             return;
         };
         let slice = &data[..data.len().min(256 * 1024)];
-        for tok in tokenizers() {
-            assert_eq!(tok.inverse(&tok.forward(slice)).unwrap(), slice);
-        }
+        let tok = RepairTokenizer;
+        assert_eq!(tok.inverse(&tok.forward(slice.to_vec())).unwrap(), slice);
     }
 }

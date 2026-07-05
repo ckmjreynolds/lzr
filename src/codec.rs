@@ -21,7 +21,7 @@ use crate::mixer::Mixer;
 use crate::models::null::NullModel;
 use crate::models::order0::Order0;
 use crate::models::{Context, SYMBOL_BITS, TokenModel};
-use crate::preprocessors::{CaseFolding, EntityFolding, NullBytes, NullTokens, Pipeline, Transform};
+use crate::preprocessors::{CaseFolding, EntityFolding, Lz77, Pipeline, Transform};
 use crate::tokenizers::{NullTokenizer, RepairTokenizer, Tokenize};
 use crate::uleb128;
 
@@ -159,19 +159,21 @@ pub(crate) struct Compressor {
 impl Compressor {
     /// Builds the pipeline `profile` selects.
     pub(crate) fn from_profile(profile: Profile) -> Self {
-        let token_stages: Vec<Box<dyn Transform<u15>>> = vec![Box::new(NullTokens)];
         Self {
             byte_pre: Pipeline::new(profile.byte_preprocessors()),
             tokenizer: profile.tokenizer(),
-            token_pre: Pipeline::new(token_stages),
+            token_pre: Pipeline::new(profile.token_preprocessors()),
             profile,
         }
     }
 
-    /// Encode `input` into the framing-agnostic codec core.
-    pub(crate) fn encode(&self, input: &[u8]) -> Vec<u8> {
-        let bytes = self.byte_pre.forward(input);
-        let tokens = self.tokenizer.forward(&bytes);
+    /// Encode `input` into the framing-agnostic codec core. Takes ownership so the input buffer can be
+    /// freed before the (memory-heavy) tokenizer build — at gigabyte scale that ~1 GB is the
+    /// difference between fitting the budget and not.
+    pub(crate) fn encode(&self, input: Vec<u8>) -> Vec<u8> {
+        let bytes = self.byte_pre.forward(&input);
+        drop(input);
+        let tokens = self.tokenizer.forward(bytes);
         let tokens = self.token_pre.forward(&tokens);
         encode_tokens(&tokens, self.profile)
     }
@@ -208,6 +210,11 @@ fn build_entities() -> Box<dyn Transform<u8>> {
     Box::new(EntityFolding)
 }
 
+/// Constructs the [`Lz77`] token preprocessor for the feature registry.
+fn build_lz77() -> Box<dyn Transform<u15>> {
+    Box::new(Lz77)
+}
+
 /// What enabling a pipeline feature does.
 #[derive(Clone, Copy)]
 enum Kind {
@@ -217,6 +224,8 @@ enum Kind {
     Model(fn(usize) -> Box<dyn TokenModel>),
     /// Add a byte preprocessor, applied (in registry order) before tokenization.
     BytePre(fn() -> Box<dyn Transform<u8>>),
+    /// Add a token preprocessor, applied (in registry order) after tokenization.
+    TokenPre(fn() -> Box<dyn Transform<u15>>),
 }
 
 /// One toggleable pipeline feature. The order-0 entropy model is always present and is *not* a
@@ -254,6 +263,13 @@ const FEATURES: &[FeatureSpec] = &[
         name: "entities",
         default_on: true,
         kind: Kind::BytePre(build_entities),
+    },
+    // LZ77 back-referencing over the token stream, applied after tokenization. Uses the reserved
+    // `0x7FFE` flag token (see `tokenizers::repair`) so its escape can never collide with a literal.
+    FeatureSpec {
+        name: "lz77",
+        default_on: true,
+        kind: Kind::TokenPre(build_lz77),
     },
 ];
 
@@ -331,13 +347,29 @@ impl Profile {
         Compressor::from_profile(self)
     }
 
-    /// The byte preprocessors this profile selects: the always-present identity
-    /// [`NullBytes`] stage plus every enabled [`Kind::BytePre`] feature, applied in
-    /// registry order before tokenization.
+    /// The byte preprocessors this profile selects: every enabled [`Kind::BytePre`]
+    /// feature, applied in registry order before tokenization. An empty list is the
+    /// identity — [`Pipeline`] passes the input straight through with a single copy,
+    /// so no explicit identity stage is prepended (that would just add a wasted copy).
     fn byte_preprocessors(self) -> Vec<Box<dyn Transform<u8>>> {
-        let mut stages: Vec<Box<dyn Transform<u8>>> = vec![Box::new(NullBytes)];
+        let mut stages: Vec<Box<dyn Transform<u8>>> = Vec::new();
         for (i, feature) in FEATURES.iter().enumerate() {
             if let Kind::BytePre(build) = feature.kind
+                && self.is_set(i)
+            {
+                stages.push(build());
+            }
+        }
+        stages
+    }
+
+    /// The token preprocessors this profile selects: every enabled [`Kind::TokenPre`]
+    /// feature, applied in registry order after tokenization. Empty is the identity
+    /// (see [`Self::byte_preprocessors`]); no explicit identity stage is prepended.
+    fn token_preprocessors(self) -> Vec<Box<dyn Transform<u15>>> {
+        let mut stages: Vec<Box<dyn Transform<u15>>> = Vec::new();
+        for (i, feature) in FEATURES.iter().enumerate() {
+            if let Kind::TokenPre(build) = feature.kind
                 && self.is_set(i)
             {
                 stages.push(build());
@@ -349,7 +381,7 @@ impl Profile {
     /// The tokenizer this profile selects.
     fn tokenizer(self) -> Box<dyn Tokenize> {
         if self.enabled(FEATURE_REPAIR) {
-            Box::new(RepairTokenizer::default())
+            Box::new(RepairTokenizer)
         } else {
             Box::new(NullTokenizer)
         }
@@ -418,7 +450,7 @@ mod tests {
         #[test]
         fn compressor_roundtrip(data in prop::collection::vec(any::<u8>(), 0..2048)) {
             let c = null_pipeline();
-            prop_assert_eq!(c.decode(&c.encode(&data)).unwrap(), data);
+            prop_assert_eq!(c.decode(&c.encode(data.clone())).unwrap(), data);
         }
 
         /// Decoding arbitrary bytes must never panic — only return Ok or Err.
@@ -432,15 +464,15 @@ mod tests {
     #[test]
     fn roundtrips_empty_and_single() {
         let c = null_pipeline();
-        assert_eq!(c.decode(&c.encode(b"")).unwrap(), b"");
-        assert_eq!(c.decode(&c.encode(b"A")).unwrap(), b"A");
+        assert_eq!(c.decode(&c.encode(b"".to_vec())).unwrap(), b"");
+        assert_eq!(c.decode(&c.encode(b"A".to_vec())).unwrap(), b"A");
     }
 
     #[test]
     fn compresses_repetitive_input() {
         let data = vec![b'a'; 10_000];
         let c = null_pipeline();
-        let core = c.encode(&data);
+        let core = c.encode(data.clone());
         assert!(core.len() < data.len() / 10, "weak compression: {} bytes", core.len());
         assert_eq!(c.decode(&core).unwrap(), data);
     }
@@ -452,7 +484,7 @@ mod tests {
         profile.enable("null").unwrap();
         let c = Compressor::from_profile(profile);
         let data = b"the quick brown fox";
-        assert_eq!(c.decode(&c.encode(data)).unwrap(), data.to_vec());
+        assert_eq!(c.decode(&c.encode(data.to_vec())).unwrap(), data.to_vec());
     }
 
     #[test]
@@ -471,25 +503,29 @@ mod tests {
         assert!(!profile.enabled("null"));
         assert!(profile.enabled("casefold"));
         assert!(profile.enabled("entities"));
-        // bit 0 (repair) + bit 2 (casefold) + bit 3 (entities), bit 1 (null) off.
-        assert_eq!(profile.to_bits(), 0b1101);
+        assert!(profile.enabled("lz77"));
+        // bit 0 (repair) + bit 2 (casefold) + bit 3 (entities) + bit 4 (lz77), bit 1 (null) off.
+        assert_eq!(profile.to_bits(), 0b1_1101);
     }
 
     #[test]
     fn profile_toggles_by_name() {
-        let mut profile = Profile::default(); // 0b1101: repair + casefold + entities
+        let mut profile = Profile::default(); // 0b1_1101: repair + casefold + entities + lz77
         profile.disable("casefold").unwrap();
         profile.disable("repair").unwrap();
         profile.disable("entities").unwrap();
-        assert_eq!(profile.to_bits(), 0b0000);
+        profile.disable("lz77").unwrap();
+        assert_eq!(profile.to_bits(), 0b0_0000);
         profile.enable("null").unwrap();
-        assert_eq!(profile.to_bits(), 0b0010);
+        assert_eq!(profile.to_bits(), 0b0_0010);
         profile.enable("repair").unwrap();
-        assert_eq!(profile.to_bits(), 0b0011);
+        assert_eq!(profile.to_bits(), 0b0_0011);
         profile.enable("casefold").unwrap();
-        assert_eq!(profile.to_bits(), 0b0111);
+        assert_eq!(profile.to_bits(), 0b0_0111);
         profile.enable("entities").unwrap();
-        assert_eq!(profile.to_bits(), 0b1111);
+        assert_eq!(profile.to_bits(), 0b0_1111);
+        profile.enable("lz77").unwrap();
+        assert_eq!(profile.to_bits(), 0b1_1111);
     }
 
     #[test]
@@ -501,11 +537,11 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..3 (repair, null, casefold, entities) are all known features.
-        for bits in 0..=0b1111 {
+        // bits 0..4 (repair, null, casefold, entities, lz77) are all known features.
+        for bits in 0..=0b1_1111 {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(0b10000).is_err()); // bit 4 is not a known feature
+        assert!(Profile::from_bits(0b10_0000).is_err()); // bit 5 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 }

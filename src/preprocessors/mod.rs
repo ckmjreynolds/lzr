@@ -11,13 +11,13 @@
 //! [`entities`]); this file holds only the framework — the trait, the pipeline,
 //! the identity stages, and the text-detection helpers the byte stages share.
 
-use arbitrary_int::u15;
-
 mod casefold;
 mod entities;
+mod lz77;
 
 pub(crate) use casefold::CaseFolding;
 pub(crate) use entities::EntityFolding;
+pub(crate) use lz77::Lz77;
 
 /// Minimum fraction of bytes that must be common-text bytes for the input to count
 /// as text (below this, a byte stage skips its transform and passes through).
@@ -27,6 +27,19 @@ pub(super) const TEXT_FRACTION: f64 = 0.95;
 /// tab, newline, and carriage return. Shared by the byte preprocessors' text gate.
 pub(super) const fn is_text_byte(byte: u8) -> bool {
     matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7E)
+}
+
+/// The `N` lowest byte values absent from `present`, or `None` if fewer than `N`
+/// exist. Byte preprocessors use this to claim unused byte values as their control
+/// symbols (deterministically, so the decoder derives the same set from its own
+/// scan of the reconstructed stream).
+pub(super) fn spare_bytes<const N: usize>(present: &[bool; 256]) -> Option<[u8; N]> {
+    let mut unused = (0u8..=255).filter(|&b| !present[usize::from(b)]);
+    let mut out = [0u8; N];
+    for slot in &mut out {
+        *slot = unused.next()?;
+    }
+    Some(out)
 }
 
 /// A reversible transform over a stream of `T`.
@@ -86,61 +99,14 @@ impl<T: Clone> Pipeline<T> {
     }
 }
 
-/// Identity byte preprocessor: the NULL stage for the `Transform<u8>` slot.
-pub(crate) struct NullBytes;
-
-impl Transform<u8> for NullBytes {
-    fn forward(&self, input: &[u8]) -> Vec<u8> {
-        input.to_vec()
-    }
-
-    fn inverse(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        Ok(input.to_vec())
-    }
-}
-
-/// Identity token preprocessor: the NULL stage for the `Transform<u15>` slot.
-pub(crate) struct NullTokens;
-
-impl Transform<u15> for NullTokens {
-    fn forward(&self, input: &[u15]) -> Vec<u15> {
-        input.to_vec()
-    }
-
-    fn inverse(&self, input: &[u15]) -> anyhow::Result<Vec<u15>> {
-        Ok(input.to_vec())
-    }
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use proptest::prelude::*;
-
     use super::*;
 
-    proptest! {
-        #[test]
-        fn null_bytes_roundtrip(data in prop::collection::vec(any::<u8>(), 0..1024)) {
-            let s = NullBytes;
-            prop_assert_eq!(s.inverse(&s.forward(&data)).unwrap(), data);
-        }
-
-        #[test]
-        fn null_pipeline_roundtrip(data in prop::collection::vec(any::<u8>(), 0..1024)) {
-            let stages: Vec<Box<dyn Transform<u8>>> = vec![Box::new(NullBytes)];
-            let p = Pipeline::new(stages);
-            prop_assert_eq!(p.inverse(&p.forward(&data)).unwrap(), data);
-        }
-    }
-
-    #[test]
-    fn null_tokens_roundtrip() {
-        let data: Vec<u15> = (0..100u16).map(u15::new).collect();
-        let s = NullTokens;
-        assert_eq!(s.inverse(&s.forward(&data)).unwrap(), data);
-    }
-
+    /// A profile with no enabled stages yields an empty pipeline, which must be the
+    /// identity — the path `Profile::byte_preprocessors`/`token_preprocessors` take
+    /// when nothing is selected, in place of an explicit identity stage.
     #[test]
     fn empty_pipeline_is_identity() {
         let p: Pipeline<u8> = Pipeline::new(vec![]);

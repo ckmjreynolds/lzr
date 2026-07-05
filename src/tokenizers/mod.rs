@@ -11,15 +11,14 @@ mod repair;
 
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 pub(crate) use self::repair::RepairTokenizer;
-// The cost criteria are only named through this facade by the (bench-internals) benchmarks.
-#[cfg(feature = "bench-internals")]
-pub use self::repair::cost::{Entropy, Frequency, MergeCost};
 
 /// A reversible mapping between a byte stream and a `u15` token stream.
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 pub(crate) trait Tokenize {
-    /// Encode-side: bytes to tokens. Infallible.
-    fn forward(&self, input: &[u8]) -> Vec<u15>;
+    /// Encode-side: bytes to tokens. Infallible. Takes the input *by value* so a tokenizer may free
+    /// it before an expensive build — at gigabyte scale holding both the bytes and the derived state
+    /// is the difference between fitting in memory and not.
+    fn forward(&self, input: Vec<u8>) -> Vec<u15>;
 
     /// Decode-side: tokens back to bytes.
     ///
@@ -37,7 +36,7 @@ pub(crate) trait Tokenize {
 pub(crate) struct NullTokenizer;
 
 impl Tokenize for NullTokenizer {
-    fn forward(&self, input: &[u8]) -> Vec<u15> {
+    fn forward(&self, input: Vec<u8>) -> Vec<u15> {
         input.iter().map(|&b| u15::new(u16::from(b))).collect()
     }
 
@@ -63,14 +62,14 @@ mod tests {
         #[test]
         fn null_tokenizer_roundtrip(data in prop::collection::vec(any::<u8>(), 0..1024)) {
             let t = NullTokenizer;
-            prop_assert_eq!(t.inverse(&t.forward(&data)).unwrap(), data);
+            prop_assert_eq!(t.inverse(&t.forward(data.clone())).unwrap(), data);
         }
     }
 
     #[test]
     fn forward_maps_bytes_to_equal_tokens() {
         let t = NullTokenizer;
-        assert_eq!(t.forward(&[0, 65, 255]), vec![u15::new(0), u15::new(65), u15::new(255)]);
+        assert_eq!(t.forward(vec![0, 65, 255]), vec![u15::new(0), u15::new(65), u15::new(255)]);
     }
 
     #[test]

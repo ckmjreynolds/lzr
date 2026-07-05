@@ -35,4 +35,4 @@ pub mod tokenizers;
 mod tokenizers;
 
 pub use codec::Profile;
-pub use container::{compress, compress_with, decompress};
+pub use container::{compress, compress_owned, compress_with, decompress};

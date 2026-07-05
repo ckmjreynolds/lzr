@@ -1,6 +1,6 @@
 //! XML/HTML entity-folding byte preprocessor.
 
-use super::{TEXT_FRACTION, Transform, is_text_byte};
+use super::{TEXT_FRACTION, Transform, is_text_byte, spare_bytes};
 
 /// The five predefined XML entities this stage folds. The array index is the
 /// entity's spare-byte slot (slot `i` ↔ `ENTITIES[i]`); the ordering is part of
@@ -41,15 +41,6 @@ fn match_entity(rest: &[u8]) -> Option<usize> {
     ENTITIES.iter().position(|entity| rest.starts_with(entity))
 }
 
-impl EntityFolding {
-    /// Picks the five lowest byte values absent from `present`, if at least five
-    /// exist. These become the entities' substitute bytes (slot `i` → element `i`).
-    fn spare_bytes(present: &[bool; 256]) -> Option<[u8; 5]> {
-        let mut unused = (0u8..=255).filter(|&b| !present[usize::from(b)]);
-        Some([unused.next()?, unused.next()?, unused.next()?, unused.next()?, unused.next()?])
-    }
-}
-
 impl Transform<u8> for EntityFolding {
     #[expect(clippy::cast_precision_loss, reason = "byte counts are far under 2^53")]
     fn forward(&self, input: &[u8]) -> Vec<u8> {
@@ -71,7 +62,7 @@ impl Transform<u8> for EntityFolding {
         // (a recognized entity is present — which also means there is something to
         // fold), and five spare byte values exist for the substitutes.
         let is_text = !input.is_empty() && text_bytes as f64 >= input.len() as f64 * TEXT_FRACTION;
-        let Some(spares) = (has_entity && is_text).then(|| Self::spare_bytes(&present)).flatten() else {
+        let Some(spares) = (has_entity && is_text).then(|| spare_bytes::<5>(&present)).flatten() else {
             let mut out = Vec::with_capacity(input.len() + 1);
             out.push(MODE_PASSTHROUGH);
             out.extend_from_slice(input);
@@ -138,8 +129,17 @@ mod tests {
     /// Token alphabet for the XML-ish round-trip generator: tags, all five
     /// entities, prose, a bare `&`, and a non-entity `&…;` sequence.
     const XMLISH_TOKENS: &[&[u8]] = &[
-        b"&lt;", b"&gt;", b"&amp;", b"&quot;", b"&apos;", b"<page>", b"</page>", b" hello ", b"& ",
-        b"&notreal;", b"a",
+        b"&lt;",
+        b"&gt;",
+        b"&amp;",
+        b"&quot;",
+        b"&apos;",
+        b"<page>",
+        b"</page>",
+        b" hello ",
+        b"& ",
+        b"&notreal;",
+        b"a",
     ];
 
     proptest! {

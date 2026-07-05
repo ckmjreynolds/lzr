@@ -34,6 +34,18 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
 /// Compress `input` into a self-describing LZR container using `profile` to select the pipeline.
 #[must_use]
 pub fn compress_with(input: &[u8], profile: Profile) -> Vec<u8> {
+    compress_owned(input.to_vec(), profile)
+}
+
+/// Like [`compress_with`] but takes ownership of `input`, letting the pipeline free it before the
+/// memory-heavy tokenizer build. Prefer this on large inputs (the CLI does) to keep the peak down.
+#[must_use]
+pub fn compress_owned(input: Vec<u8>, profile: Profile) -> Vec<u8> {
+    // Checksum the original bytes up front so `encode` can consume and free `input` during the build.
+    let mut checksum = Adler32::new();
+    checksum.update(&input);
+    let checksum = checksum.checksum();
+
     let core = profile.compressor().encode(input);
 
     let mut out = Vec::with_capacity(PREFIX_LEN + 1 + core.len() + FOOTER_LEN);
@@ -41,10 +53,7 @@ pub fn compress_with(input: &[u8], profile: Profile) -> Vec<u8> {
     out.push(VERSION);
     uleb128::encode_u64(profile.to_bits(), &mut out);
     out.extend_from_slice(&core);
-
-    let mut checksum = Adler32::new();
-    checksum.update(input);
-    out.extend_from_slice(&checksum.checksum().to_be_bytes());
+    out.extend_from_slice(&checksum.to_be_bytes());
     out
 }
 
@@ -123,6 +132,7 @@ mod tests {
         profile.disable("repair").unwrap();
         profile.disable("casefold").unwrap();
         profile.disable("entities").unwrap();
+        profile.disable("lz77").unwrap();
         let c = compress_with(b"hello world", profile);
         assert_eq!(c[PREFIX_LEN], 0x00);
         assert_eq!(decompress(&c).unwrap(), b"hello world".to_vec());
@@ -130,9 +140,9 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_profile() {
-        // Bit 4 is not a known feature; a single-byte ULEB128 profile of 0x10 must be rejected.
+        // Bit 5 is not a known feature; a single-byte ULEB128 profile of 0x20 must be rejected.
         let mut c = compress(b"data");
-        c[PREFIX_LEN] = 0x10;
+        c[PREFIX_LEN] = 0x20;
         assert!(decompress(&c).is_err());
     }
 

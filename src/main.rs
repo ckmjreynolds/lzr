@@ -12,14 +12,20 @@ use lzr::Profile;
 
 /// LZR — a context-mixing compressor.
 ///
-/// Compresses `input` into `output` by default; pass `-d`/`--decompress` to
-/// reverse the direction. Pipeline features (see `--enable`/`--disable`) default
-/// to all enabled and apply to compression only — decompression reads the
-/// pipeline the stream was written with.
+/// Compression is the default, except when `input` has the compressor's `.lzr`
+/// extension, in which case decompression is the default. Pass `-z`/`--compress`
+/// or `-d`/`--decompress` to force a direction regardless of extension. Pipeline
+/// features (see `--enable`/`--disable`) default to all enabled and apply to
+/// compression only — decompression reads the pipeline the stream was written
+/// with.
 #[derive(Debug, Parser)]
 #[command(name = "lzr", version, about)]
 struct Cli {
-    /// Decompress the input instead of compressing it.
+    /// Force compression, even for a `.lzr` input.
+    #[arg(short = 'z', long, conflicts_with = "decompress")]
+    compress: bool,
+
+    /// Force decompression, even for a non-`.lzr` input.
     #[arg(short, long)]
     decompress: bool,
 
@@ -50,22 +56,33 @@ fn main() -> ExitCode {
 /// print run statistics.
 fn run(cli: &Cli) -> anyhow::Result<()> {
     let input = std::fs::read(&cli.input).with_context(|| format!("reading {}", cli.input.display()))?;
-    let output = if cli.decompress {
+    let input_len = input.len();
+    // Compression is the default; a `.lzr` input flips the default to decompression. Either
+    // explicit flag overrides the extension (and the two flags conflict, so at most one is set).
+    let decompress = !cli.compress && (cli.decompress || has_lzr_extension(&cli.input));
+    let output = if decompress {
         lzr::decompress(&input)?
     } else {
-        lzr::compress_with(&input, profile(cli)?)
+        // Take ownership so the pipeline can free the input buffer before the tokenizer build.
+        lzr::compress_owned(input, profile(cli)?)
     };
     std::fs::write(&cli.output, &output).with_context(|| format!("writing {}", cli.output.display()))?;
 
     // For statistics, "original" is the uncompressed side and "compressed" the `.lzr` side,
     // regardless of direction.
-    let (original, compressed) = if cli.decompress {
-        (output.len(), input.len())
+    let (original, compressed) = if decompress {
+        (output.len(), input_len)
     } else {
-        (input.len(), output.len())
+        (input_len, output.len())
     };
     report_stats(original, compressed);
     Ok(())
+}
+
+/// Whether `path` has an `.lzr` extension (case-insensitive), signalling that the input is a
+/// compressed stream and the direction should default to decompression.
+fn has_lzr_extension(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lzr"))
 }
 
 /// Build the compression [`Profile`] from the `--disable`/`--enable` flags, starting from the

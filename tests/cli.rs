@@ -82,6 +82,52 @@ fn roundtrip_bible() {
     assert_cli_roundtrip(&data[..data.len().min(256 * 1024)], "bible");
 }
 
+/// A `.lzr` input is decompressed without an explicit `-d` flag: the direction is
+/// inferred from the extension.
+#[test]
+fn lzr_extension_infers_decompression() {
+    let original = b"the quick brown fox jumps over the lazy dog";
+    let raw = temp_path("infer.bin");
+    let packed = temp_path("infer.lzr");
+    let back = temp_path("infer.out");
+
+    std::fs::write(&raw, original).unwrap();
+    compress(&raw, &packed);
+    // No `-d`: the `.lzr` extension alone must drive decompression.
+    let _ok = Command::cargo_bin("lzr").unwrap().arg(&packed).arg(&back).assert().success();
+
+    assert_eq!(std::fs::read(&back).unwrap(), original, "extension-inferred round-trip mismatch");
+
+    for file in [raw, packed, back] {
+        drop(std::fs::remove_file(file));
+    }
+}
+
+/// `-z`/`--compress` forces compression even when the input carries the `.lzr` extension that
+/// would otherwise infer decompression.
+#[test]
+fn compress_flag_overrides_lzr_extension() {
+    let original = b"the quick brown fox jumps over the lazy dog";
+    let raw = temp_path("force.bin");
+    let packed = temp_path("force.lzr");
+    // Compress `raw` into a genuine stream that happens to be named `.lzr`.
+    std::fs::write(&raw, original).unwrap();
+    compress(&raw, &packed);
+
+    // `-z` on the `.lzr`-named input must compress it again rather than decompress it.
+    let double = temp_path("force.double.lzr");
+    let _ok = Command::cargo_bin("lzr").unwrap().arg("-z").arg(&packed).arg(&double).assert().success();
+
+    // Decompressing once must return the (still-compressed) `.lzr` stream, proving `-z` compressed.
+    let back = temp_path("force.out");
+    let _ok = Command::cargo_bin("lzr").unwrap().arg("-d").arg(&double).arg(&back).assert().success();
+    assert_eq!(std::fs::read(&back).unwrap(), std::fs::read(&packed).unwrap(), "-z did not force compression");
+
+    for file in [raw, packed, double, back] {
+        drop(std::fs::remove_file(file));
+    }
+}
+
 #[test]
 fn decompress_garbage_fails_cleanly() {
     let bad = temp_path("bad.lzr");

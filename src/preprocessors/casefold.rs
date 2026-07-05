@@ -1,6 +1,6 @@
 //! ASCII case-folding byte preprocessor.
 
-use super::{TEXT_FRACTION, Transform, is_text_byte};
+use super::{TEXT_FRACTION, Transform, is_text_byte, spare_bytes};
 
 /// ASCII case-folding byte preprocessor.
 ///
@@ -24,17 +24,6 @@ pub(crate) struct CaseFolding;
 const MODE_PASSTHROUGH: u8 = 0;
 /// Header mode byte: the payload is case-folded (followed by the shift/caps bytes).
 const MODE_FOLDED: u8 = 1;
-
-impl CaseFolding {
-    /// Picks the two lowest byte values absent from `present`, if at least two
-    /// exist. These become the shift and caps-lock control symbols.
-    fn spare_symbols(present: &[bool; 256]) -> Option<(u8, u8)> {
-        let mut unused = (0u8..=255).filter(|&b| !present[usize::from(b)]);
-        let shift = unused.next()?;
-        let caps = unused.next()?;
-        Some((shift, caps))
-    }
-}
 
 impl Transform<u8> for CaseFolding {
     #[expect(clippy::cast_precision_loss, reason = "byte counts are far under 2^53")]
@@ -60,8 +49,7 @@ impl Transform<u8> for CaseFolding {
         // Fall back to pass-through unless there is something to fold, the input
         // looks like text, and two spare byte values exist for the control symbols.
         let is_text = !input.is_empty() && text_bytes as f64 >= input.len() as f64 * TEXT_FRACTION;
-        let Some((shift, caps)) = (has_upper && is_text).then(|| Self::spare_symbols(&present)).flatten()
-        else {
+        let Some([shift, caps]) = (has_upper && is_text).then(|| spare_bytes::<2>(&present)).flatten() else {
             let mut out = Vec::with_capacity(input.len() + 1);
             out.push(MODE_PASSTHROUGH);
             out.extend_from_slice(input);
@@ -120,7 +108,11 @@ impl Transform<u8> for CaseFolding {
                         shift_pending = true;
                     } else {
                         let upper = (caps_on || shift_pending) && byte.is_ascii_lowercase();
-                        out.push(if upper { byte.to_ascii_uppercase() } else { byte });
+                        out.push(if upper {
+                            byte.to_ascii_uppercase()
+                        } else {
+                            byte
+                        });
                         shift_pending = false;
                     }
                 }
