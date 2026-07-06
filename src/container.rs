@@ -37,9 +37,25 @@ pub struct StageSize {
     pub input_bytes: usize,
     /// The stage's output length in bytes after it ran.
     pub output_bytes: usize,
-    /// An optional stage-specific statistic (e.g. the Re-Pair token count); `None` for stages with
-    /// nothing extra to report.
-    pub detail: Option<u64>,
+    /// An optional stage-specific statistic as `(value, unit label)` — e.g. the Re-Pair vocabulary
+    /// `(n, "tokens")` or the LZ77 match count `(n, "matches")`; `None` for stages with nothing extra
+    /// to report.
+    pub detail: Option<(u64, &'static str)>,
+}
+
+/// One entropy model's encode-side scorecard, for the CLI's per-model report.
+///
+/// Returned by [`compress_owned_with_traced`] alongside the stage sizes.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelScore {
+    /// The model's feature name (e.g. `"order0"`, or `"null"` for the injected fallback).
+    pub name: &'static str,
+    /// Bits per (entropy-stage input) byte if this model coded the stream alone — its raw predictive
+    /// power. Near 8 means no better than chance; lower is better.
+    pub bpb_alone: f64,
+    /// The mixer's average final weight on this model. Near zero means it adds little *marginally* —
+    /// its signal is already covered by the other models.
+    pub avg_weight: f64,
 }
 
 /// Wrap a codec `core` in the container framing: magic, version, ULEB128 profile, core, Adler-32
@@ -95,12 +111,12 @@ pub fn compress_owned_with_traced(
     input: Vec<u8>,
     profile: Profile,
     options: EncodeOptions,
-) -> (Vec<u8>, Vec<StageSize>) {
+) -> (Vec<u8>, Vec<StageSize>, Vec<ModelScore>) {
     let mut checksum = Adler32::new();
     checksum.update(&input);
     let checksum = checksum.checksum();
 
-    let (core, stages) = profile.compressor_with(options).encode_traced(input);
+    let (core, stages, scores) = profile.compressor_with(options).encode_traced(input);
     let out = frame(profile, &core, checksum);
     let stages = stages
         .into_iter()
@@ -111,7 +127,15 @@ pub fn compress_owned_with_traced(
             detail,
         })
         .collect();
-    (out, stages)
+    let models = scores
+        .into_iter()
+        .map(|(name, bpb_alone, avg_weight)| ModelScore {
+            name,
+            bpb_alone,
+            avg_weight,
+        })
+        .collect();
+    (out, stages, models)
 }
 
 /// Decompress an LZR container, verifying its version, profile, and the Adler-32
@@ -184,24 +208,26 @@ mod tests {
 
     #[test]
     fn custom_profile_selects_and_round_trips() {
-        // Disabling every default feature clears all bits (profile 0x00); the container records it
-        // and `decompress` rebuilds the matching (identity) pipeline.
+        // Disabling every default feature except the fundamental `repair` leaves only its bit set
+        // (profile 0x04); the container records it and `decompress` rebuilds the matching pipeline.
         let mut profile = Profile::default();
-        for feature in ["repair", "casefold", "entities", "lz77", "entropy", "order0", "order1", "order2"] {
+        for feature in
+            ["casefold", "entities", "lz77", "entropy", "order0", "order1", "sparse2", "sparse24", "varint", "sse"]
+        {
             profile.disable(feature).unwrap();
         }
         let c = compress_with(b"hello world", profile);
-        assert_eq!(c[PREFIX_LEN], 0x00);
+        assert_eq!(c[PREFIX_LEN], 0x04); // only the mandatory repair bit
         assert_eq!(decompress(&c).unwrap(), b"hello world".to_vec());
     }
 
     #[test]
     fn rejects_unsupported_profile() {
-        // Bit 9 is not a known feature; a container whose ULEB128 profile encodes it must be rejected.
+        // Bit 21 is not a known feature; a container whose ULEB128 profile encodes it must be rejected.
         let mut c = Vec::new();
         c.extend_from_slice(MAGIC);
         c.push(VERSION);
-        uleb128::encode_u64(1 << 9, &mut c); // profile with an unknown feature bit
+        uleb128::encode_u64(1 << 21, &mut c); // profile with an unknown feature bit
         c.extend_from_slice(&[0u8; FOOTER_LEN]); // enough trailing bytes for the length checks
         assert!(decompress(&c).is_err());
     }

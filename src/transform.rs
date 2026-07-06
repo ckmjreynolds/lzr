@@ -13,8 +13,13 @@
 //! [`Pipeline`] can move the buffer stage-to-stage with no per-stage clone.
 
 /// One stage's encode-side trace record: `(feature name, input length, output length, optional
-/// detail)`. Returned per stage by [`Pipeline::forward_traced`] for the CLI's per-stage report.
-pub(crate) type StageTrace = (&'static str, usize, usize, Option<u64>);
+/// `(detail value, unit label)`)`. Returned per stage by [`Pipeline::forward_traced`] for the CLI's
+/// per-stage report; the unit label lets each stage name its own statistic (`tokens`, `matches`, …).
+pub(crate) type StageTrace = (&'static str, usize, usize, Option<(u64, &'static str)>);
+
+/// One entropy model's encode-side scorecard entry: `(model name, standalone bits-per-byte, average
+/// mixer weight)`. Gathered by [`Pipeline::model_scores`] for the CLI's per-model report.
+pub(crate) type ModelTrace = (&'static str, f64, f64);
 
 /// A reversible byte→byte stream transform.
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
@@ -34,11 +39,19 @@ pub(crate) trait Transform {
     /// decoded, possibly-adversarial bytes.
     fn inverse(&self, input: Vec<u8>) -> anyhow::Result<Vec<u8>>;
 
-    /// An optional per-stage statistic for the CLI's trace, derived from the stage's own `output`
-    /// bytes (e.g. the Re-Pair vocabulary size). `None` — the default — for stages with nothing extra
-    /// to report. Encode-side only (see [`Pipeline::forward_traced`]).
-    fn trace_detail(&self, _output: &[u8]) -> Option<u64> {
+    /// An optional per-stage statistic for the CLI's trace as `(value, unit label)`, derived from the
+    /// stage's own `output` bytes — e.g. `(vocab, "tokens")` for Re-Pair, `(count, "matches")` for
+    /// LZ77. `None` — the default — for stages with nothing extra to report. Encode-side only (see
+    /// [`Pipeline::forward_traced`]).
+    fn trace_detail(&self, _output: &[u8]) -> Option<(u64, &'static str)> {
         None
+    }
+
+    /// The stage's per-model scorecard from the last [`Transform::forward`], if any. Only the entropy
+    /// stage returns entries; every other stage uses this empty default. Read after `forward` via
+    /// [`Pipeline::model_scores`]. Encode-side only.
+    fn model_scores(&self) -> Vec<ModelTrace> {
+        Vec::new()
     }
 }
 
@@ -83,6 +96,12 @@ impl Pipeline {
             sizes.push((name, input_len, data.len(), detail));
         }
         (data, sizes)
+    }
+
+    /// The per-model scorecard gathered from every stage after a [`Pipeline::forward_traced`] run —
+    /// in practice only the entropy stage contributes. Call after `forward_traced`.
+    pub(crate) fn model_scores(&self) -> Vec<ModelTrace> {
+        self.stages.iter().flat_map(|stage| stage.model_scores()).collect()
     }
 
     /// Apply every stage's inverse in reverse order.

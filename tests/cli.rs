@@ -23,7 +23,16 @@ fn temp_path(tag: &str) -> PathBuf {
 }
 
 fn compress(src: &Path, dst: &Path) {
-    let _ok = Command::cargo_bin("lzr").unwrap().arg(src).arg(dst).assert().success();
+    // Every entropy model is default-off, so a bare `lzr src dst` is rejected (entropy needs a model);
+    // enable a representative set — dense order-0 plus the hashed order-N path — so the roundtrip
+    // tests exercise the token-level models end to end.
+    let _ok = Command::cargo_bin("lzr")
+        .unwrap()
+        .arg(src)
+        .arg(dst)
+        .args(["--enable", "order0", "--enable", "order1", "--enable", "order2"])
+        .assert()
+        .success();
 }
 
 fn decompress(src: &Path, dst: &Path) {
@@ -116,7 +125,14 @@ fn compress_flag_overrides_lzr_extension() {
 
     // `-z` on the `.lzr`-named input must compress it again rather than decompress it.
     let double = temp_path("force.double.lzr");
-    let _ok = Command::cargo_bin("lzr").unwrap().arg("-z").arg(&packed).arg(&double).assert().success();
+    let _ok = Command::cargo_bin("lzr")
+        .unwrap()
+        .arg("-z")
+        .arg(&packed)
+        .arg(&double)
+        .args(["--enable", "order0"])
+        .assert()
+        .success();
 
     // Decompressing once must return the (still-compressed) `.lzr` stream, proving `-z` compressed.
     let back = temp_path("force.out");
@@ -144,7 +160,8 @@ fn roundtrip_with_lz77_options() {
         std::fs::write(&raw, &original).unwrap();
 
         let mut cmd = Command::cargo_bin("lzr").unwrap();
-        let _ = cmd.arg(&raw).arg(&packed).args(&args);
+        // A model is required now that all are default-off; order-0 keeps these lz77-option cases valid.
+        let _ = cmd.arg(&raw).arg(&packed).args(&args).args(["--enable", "order0"]);
         let _ok = cmd.assert().success();
 
         decompress(&packed, &back);
@@ -163,6 +180,18 @@ fn invalid_min_match_fails() {
     let packed = temp_path("badmm.lzr");
     std::fs::write(&raw, b"data").unwrap();
     let _ok = Command::cargo_bin("lzr").unwrap().arg(&raw).arg(&packed).arg("--min-match").arg("1").assert().failure();
+    drop(std::fs::remove_file(raw));
+    drop(std::fs::remove_file(packed));
+}
+
+/// Re-Pair is fundamental: `--disable repair` must fail cleanly rather than build a byte-level stream.
+#[test]
+fn disabling_repair_fails() {
+    let raw = temp_path("norepair.bin");
+    let packed = temp_path("norepair.lzr");
+    std::fs::write(&raw, b"data").unwrap();
+    let _ok =
+        Command::cargo_bin("lzr").unwrap().arg(&raw).arg(&packed).arg("--disable").arg("repair").assert().failure();
     drop(std::fs::remove_file(raw));
     drop(std::fs::remove_file(packed));
 }

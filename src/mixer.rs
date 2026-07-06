@@ -117,6 +117,24 @@ impl Mixer {
             *w += (s * err) >> LR_SHIFT;
         }
     }
+
+    /// The current weight the mixer assigns each input, averaged over its per-bit-position weight sets
+    /// and rescaled from 16.16 fixed point to a natural scale (`1.0` ≈ a typical strong weight). A
+    /// near-zero average means the mixer has learned the input adds little *marginally* (its signal is
+    /// already covered by the others) — the diagnostic the CLI reports per model.
+    #[expect(clippy::cast_precision_loss, reason = "Diagnostic display; weight sums are small.")]
+    pub(crate) fn input_weights(&self) -> Vec<f64> {
+        let positions = self.w.len().checked_div(self.n).unwrap_or(0);
+        if positions == 0 {
+            return vec![0.0; self.n];
+        }
+        (0..self.n)
+            .map(|i| {
+                let sum: i64 = (0..positions).map(|b| i64::from(self.w[b * self.n + i])).sum();
+                sum as f64 / positions as f64 / 65536.0
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

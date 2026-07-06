@@ -1,8 +1,9 @@
-//! Null token model: an optional model slot that contributes nothing.
+//! Null token model: the fallback predictor that contributes nothing.
 //!
-//! Predicts a neutral bit (stretched logit `0`, i.e. probability ½) and ignores updates. It exists
-//! so the entropy stage can carry an optional model with no effect on the output — a placeholder
-//! that exercises the toggleable-model framework and a template for real models.
+//! Predicts a neutral bit (stretched logit `0`, i.e. probability ½) and ignores updates. It is not a
+//! user-selectable feature — the codec injects it (see [`crate::codec`]'s `model_builders`) when the
+//! entropy stage is enabled but the profile selects no model, so entropy-with-no-models still codes
+//! reversibly (without compressing). It also serves as a template for real models.
 
 use super::{Context, TokenModel};
 

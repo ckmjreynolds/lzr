@@ -20,6 +20,7 @@ pub mod uleb128;
 #[cfg(not(feature = "bench-internals"))]
 pub(crate) mod uleb128;
 
+mod apm;
 mod codec;
 mod coder;
 mod container;
@@ -43,7 +44,8 @@ pub mod transform;
 #[cfg(not(feature = "bench-internals"))]
 mod transform;
 
-pub use codec::{EncodeOptions, Profile};
+pub use codec::{EncodeOptions, FeatureInfo, FeatureKind, Profile, features};
 pub use container::{
-    StageSize, compress, compress_owned, compress_owned_with, compress_owned_with_traced, compress_with, decompress,
+    ModelScore, StageSize, compress, compress_owned, compress_owned_with, compress_owned_with_traced, compress_with,
+    decompress,
 };

@@ -41,16 +41,22 @@ struct Cli {
     #[arg(long, value_name = "N")]
     num_tokens: Option<u32>,
 
-    /// LZ77 minimum match length (2..=4194303); may expand the stream. Compression only; defaults
-    /// to a dynamic per-match rule that only emits matches that shrink the stream.
+    /// LZ77 minimum match length in tokens (2..=4194303); may expand the stream. Compression only;
+    /// defaults to a dynamic per-match rule that only emits matches that shrink the stream.
     #[arg(long, value_name = "N")]
     min_match: Option<u32>,
 
+    /// List all pipeline features (for `--enable`/`--disable`) with their defaults, then exit.
+    #[arg(long)]
+    list_features: bool,
+
     /// Input file to read.
-    input: PathBuf,
+    #[arg(required_unless_present = "list_features")]
+    input: Option<PathBuf>,
 
     /// Output file to write.
-    output: PathBuf,
+    #[arg(required_unless_present = "list_features")]
+    output: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -64,19 +70,33 @@ fn main() -> ExitCode {
 /// Read the input, transform it in the requested direction, write the output, and
 /// print run statistics.
 fn run(cli: &Cli) -> anyhow::Result<()> {
-    let input = std::fs::read(&cli.input).with_context(|| format!("reading {}", cli.input.display()))?;
+    if cli.list_features {
+        print_features();
+        return Ok(());
+    }
+    // clap's `required_unless_present` guarantees both are set here (the `--list-features` path
+    // returned above); the `else` is defensive.
+    let (Some(in_path), Some(out_path)) = (cli.input.as_deref(), cli.output.as_deref()) else {
+        anyhow::bail!("INPUT and OUTPUT are required (or pass --list-features)");
+    };
+
+    let input = std::fs::read(in_path).with_context(|| format!("reading {}", in_path.display()))?;
     let input_len = input.len();
     // Compression is the default; a `.lzr` input flips the default to decompression. Either
     // explicit flag overrides the extension (and the two flags conflict, so at most one is set).
-    let decompress = !cli.compress && (cli.decompress || has_lzr_extension(&cli.input));
-    let (output, stages) = if decompress {
-        (lzr::decompress(&input)?, Vec::new())
+    let decompress = !cli.compress && (cli.decompress || has_lzr_extension(in_path));
+    let (output, stages, models, flags) = if decompress {
+        (lzr::decompress(&input)?, Vec::new(), Vec::new(), Vec::new())
     } else {
         let options = encode_options(cli)?;
+        let profile = profile(cli)?;
+        // Capture the enabled config flags before the profile is consumed by the compressor.
+        let flags = profile.active_flags();
         // Take ownership so the pipeline can free the input buffer before the tokenizer build.
-        lzr::compress_owned_with_traced(input, profile(cli)?, options)
+        let (output, stages, models) = lzr::compress_owned_with_traced(input, profile, options);
+        (output, stages, models, flags)
     };
-    std::fs::write(&cli.output, &output).with_context(|| format!("writing {}", cli.output.display()))?;
+    std::fs::write(out_path, &output).with_context(|| format!("writing {}", out_path.display()))?;
 
     // For statistics, "original" is the uncompressed side and "compressed" the `.lzr` side,
     // regardless of direction.
@@ -86,6 +106,8 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         (input_len, output.len())
     };
     report_stages(&stages);
+    report_models(&models);
+    report_flags(&flags);
     report_stats(original, compressed);
     Ok(())
 }
@@ -160,12 +182,41 @@ fn report_stages(stages: &[lzr::StageSize]) {
         } else {
             8.0 * stage.output_bytes as f64 / stage.input_bytes as f64
         };
-        // A stage may report an extra statistic (the Re-Pair stage reports its token count).
+        // A stage may report an extra statistic with its own unit (Re-Pair vocab in "tokens", LZ77
+        // back-references in "matches").
         match stage.detail {
-            Some(tokens) => eprintln!("  {:<9} {bpb:.4} bpb  ({} tokens)", stage.name, with_commas(tokens)),
+            Some((count, unit)) => {
+                eprintln!("  {:<9} {bpb:.4} bpb  ({} {unit})", stage.name, with_commas(count));
+            }
             None => eprintln!("  {:<9} {bpb:.4} bpb", stage.name),
         }
     }
+}
+
+/// Print the per-model scorecard to stderr (compression only): each active model's standalone
+/// bits-per-byte (its raw predictive power if it coded alone) and the mixer's average weight on it
+/// (its marginal value — near zero means another model already says the same thing). No-op when there
+/// are no models to report (decompression, or the entropy stage disabled).
+#[expect(clippy::print_stderr, reason = "A CLI reports run statistics to the user on stderr.")]
+fn report_models(models: &[lzr::ModelScore]) {
+    if models.is_empty() {
+        return;
+    }
+    eprintln!("models (bpb-alone / mixer weight):");
+    for model in models {
+        eprintln!("  {:<9} {:.4} bpb   w={:+.3}", model.name, model.bpb_alone, model.avg_weight);
+    }
+}
+
+/// Print the enabled config flags to stderr (compression only), e.g. `sse`. Flags are pipeline
+/// configuration rather than predictors, so they list plainly. No-op when none are enabled (or on
+/// decompression).
+#[expect(clippy::print_stderr, reason = "A CLI reports run statistics to the user on stderr.")]
+fn report_flags(flags: &[&str]) {
+    if flags.is_empty() {
+        return;
+    }
+    eprintln!("flags:      {}", flags.join(", "));
 }
 
 /// Print compression statistics to stderr: size, ratio, bits-per-byte, and a bits-per-byte figure
@@ -196,6 +247,37 @@ fn report_stats(original: usize, compressed: usize) {
             with_commas(exe),
             with_commas(compressed as u64)
         );
+    }
+}
+
+/// Print the available pipeline features (grouped by kind, with default/mandatory tags) to stdout —
+/// the `--list-features` output. The names are exactly what `--enable` / `--disable` accept.
+#[expect(clippy::print_stdout, reason = "The feature listing is this invocation's primary output.")]
+fn print_features() {
+    println!("Available features — toggle with --enable <name> / --disable <name>:\n");
+    let all = lzr::features();
+    for (label, kind) in [
+        ("Stages (pipeline order)", lzr::FeatureKind::Stage),
+        ("Entropy models", lzr::FeatureKind::Model),
+        ("Flags", lzr::FeatureKind::Flag),
+    ] {
+        println!("{label}:");
+        for feature in all.iter().filter(|feature| feature.kind == kind) {
+            let mut tags = Vec::new();
+            if feature.default_on {
+                tags.push("default");
+            }
+            if feature.mandatory {
+                tags.push("mandatory");
+            }
+            let tags = if tags.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", tags.join(", "))
+            };
+            println!("  {:<10}{tags}", feature.name);
+        }
+        println!();
     }
 }
 

@@ -9,13 +9,28 @@
 //! when to stop and how to size its tables. The self-describing container (magic, version, checksum)
 //! lives in [`crate::container`].
 
+use std::cell::RefCell;
+use std::sync::OnceLock;
+
 use anyhow::{Context as _, Result, bail, ensure};
 
+use crate::apm::Apm;
 use crate::coder::{Decoder, Encoder};
-use crate::mixer::Mixer;
+use crate::mixer::{Mixer, squash};
 use crate::models::{Context, SYMBOL_BITS, TokenModel};
-use crate::transform::Transform;
+use crate::transform::{ModelTrace, Transform};
 use crate::uleb128;
+
+/// The 12-bit probability scale (`squash` returns `1..=4095`), matching the range coder.
+const PROB_SCALE: i32 = 1 << 12;
+
+/// Per-outcome log-loss cost table: `cost_lut()[p]` = `-log2(p / 4096)` bits — the ideal cost of coding
+/// an outcome a model assigned 12-bit probability `p`. A LUT keeps the per-model scorecard accumulation
+/// (once per model per bit) to a table lookup rather than a `log2` call, so it stays near-free.
+fn cost_lut() -> &'static Vec<f64> {
+    static LUT: OnceLock<Vec<f64>> = OnceLock::new();
+    LUT.get_or_init(|| (0..PROB_SCALE).map(|p| -(f64::from(p.max(1)) / f64::from(PROB_SCALE)).log2()).collect())
+}
 
 /// Builds a model given the symbol (byte) count, so hashed tables size identically on encode and
 /// decode. An [`EntropyCoder`]'s builders are the profile's enabled models (order-0, order-1, …), in
@@ -23,9 +38,10 @@ use crate::uleb128;
 pub(crate) type ModelBuilder = fn(usize) -> Box<dyn TokenModel>;
 
 /// Length of the history window handed to each model per byte: the most recent finalized bytes,
-/// borrowed straight from the driver's buffer (no copy). Bounds the look-back the context models
-/// (e.g. high-order [`crate::models::ordern::OrderN`]) can key on. The shipped order-0/order-1
-/// models read 0–1 bytes, so this is headroom for higher-order and match models to come; it is a
+/// borrowed straight from the driver's buffer (no copy). Bounds the look-back the byte-history models
+/// (`crate::models::sparse::SparseModel`, `crate::models::varint::VarintModel`) can key on. The
+/// token-level [`crate::models::ordern::OrderN`] ignores this window — it derives its context from an
+/// internal u22 parser instead — so this is headroom for the byte-history and match models; it is a
 /// slice bound only (no allocation, deterministic on both sides), so growing it later is free.
 const WINDOW: usize = 1024;
 
@@ -41,62 +57,121 @@ struct Predictor {
     models: Vec<Box<dyn TokenModel>>,
     stretched: Vec<i32>,
     mixer: Mixer,
+    /// Optional SSE stage refining the mixed probability (the `sse` feature); keyed on the bit-tree
+    /// node. `None` leaves the mix unrefined.
+    apm: Option<Apm>,
     ctx: Context,
+    /// Summed standalone log-loss (bits) per model, accumulated only when `track` is set (encode-side
+    /// diagnostics). Divided by the byte count it gives each model's bits-per-byte-if-coded-alone.
+    logloss: Vec<f64>,
+    /// Whether to accumulate the per-model log-loss scorecard (encode only; skipped on decode).
+    track: bool,
 }
 
 impl Predictor {
     /// Builds the model set (hashed models are sized from `capacity` = the byte count, so encode and
-    /// decode agree) from the profile's enabled `builders` (at least one).
-    fn new(capacity: usize, builders: &[ModelBuilder]) -> Self {
+    /// decode agree) from the profile's enabled `builders` (at least one). `use_sse` adds the APM.
+    /// `track` enables the encode-only per-model log-loss accumulation.
+    fn new(capacity: usize, builders: &[ModelBuilder], use_sse: bool, track: bool) -> Self {
         let models: Vec<Box<dyn TokenModel>> = builders.iter().map(|build| build(capacity)).collect();
         let n = models.len();
         Self {
             models,
             stretched: vec![0; n],
             mixer: Mixer::new(n, SYMBOL_BITS as usize),
+            // One APM context per bit-tree node (`c0 & 0xff`), which uniquely encodes (bit position,
+            // partial bits) — a minimal order-0 SSE.
+            apm: use_sse.then(|| Apm::new(256)),
             ctx: Context::new(),
+            logloss: vec![0.0; n],
+            track,
         }
     }
 
-    /// The mixed 12-bit probability that the next bit is 1. `hist` is the current byte's history
-    /// window (the recent finalized bytes), the same for all 8 of its bits.
-    #[expect(clippy::cast_sign_loss, reason = "`squash` returns a positive 12-bit probability")]
+    /// The per-model scorecard: each model's standalone bits-per-byte (its summed log-loss over
+    /// `num_bytes`) and the mixer's average weight on it, paired with the aligned `names`.
+    #[expect(clippy::cast_precision_loss, reason = "Diagnostic display; byte counts are well under 2^53.")]
+    fn scores(&self, num_bytes: usize, names: &[&'static str]) -> Vec<ModelTrace> {
+        let weights = self.mixer.input_weights();
+        let denom = num_bytes.max(1) as f64;
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| {
+                (name, self.logloss.get(i).copied().unwrap_or(0.0) / denom, weights.get(i).copied().unwrap_or(0.0))
+            })
+            .collect()
+    }
+
+    /// The 12-bit probability that the next bit is 1: the models mixed, then (if enabled) refined by
+    /// the APM. `hist` is the current byte's history window, the same for all 8 of its bits.
+    #[expect(clippy::cast_sign_loss, reason = "the mix/APM both return a positive 12-bit probability")]
     fn predict(&mut self, hist: &[u8]) -> u32 {
         for (m, s) in self.models.iter_mut().zip(&mut self.stretched) {
             *s = m.predict(&self.ctx, hist);
         }
-        self.mixer.mix(&self.stretched, usize::from(self.ctx.bpos)) as u32
+        let p = self.mixer.mix(&self.stretched, usize::from(self.ctx.bpos));
+        let node = (self.ctx.c0 & 0xff) as usize;
+        self.apm.as_mut().map_or(p, |apm| apm.refine(p, node)) as u32
     }
 
-    /// Learn from the actual `bit` (mixer first, then models, all on the pre-bit context), then
-    /// advance the context by one bit.
+    /// Learn from the actual `bit` (mixer and APM first, then models, all on the pre-bit context),
+    /// then advance the context by one bit.
+    #[expect(clippy::cast_sign_loss, reason = "`squash` and its complement are in 1..=4095, a valid index")]
     fn commit(&mut self, hist: &[u8], bit: u8) {
+        if self.track {
+            // Each model's standalone cost this bit: -log2 of the probability it gave the actual bit.
+            for (loss, &s) in self.logloss.iter_mut().zip(&self.stretched) {
+                let sq = squash(s);
+                let p_correct = if bit == 1 {
+                    sq
+                } else {
+                    PROB_SCALE - sq
+                };
+                *loss += cost_lut()[p_correct as usize];
+            }
+        }
         self.mixer.update(bit);
+        if let Some(apm) = &mut self.apm {
+            apm.update(bit);
+        }
         for m in &mut self.models {
             m.update(&self.ctx, hist, bit);
         }
         self.ctx.push_bit(bit);
     }
 
-    /// Close the current byte once all its bits are coded.
-    const fn end_symbol(&mut self) {
+    /// Close the current byte once all its bits are coded (also advances the shared token parser).
+    fn end_symbol(&mut self) {
         self.ctx.push_symbol();
     }
 }
 
 /// The byte-level entropy coder: every model the profile selected (order-0, order-1, …), mixed per
-/// bit and range-coded. The final pipeline stage; toggled by the `entropy` feature. An empty
-/// `builders` still codes reversibly (the mixer degrades to a constant ½), just without compressing;
-/// [`crate::codec::Profile::validate`] rejects that useless-but-valid config at the CLI boundary.
+/// bit and range-coded. The final pipeline stage; toggled by the `entropy` feature. When a profile
+/// selects no model, [`crate::codec::Profile::model_builders`] injects the internal null model, so
+/// `builders` is never empty via the codec; a directly-constructed empty `builders` would still code
+/// reversibly (the mixer degrades to a constant ½), just without compressing.
 pub(crate) struct EntropyCoder {
     builders: Vec<ModelBuilder>,
+    /// The enabled models' names, aligned with `builders`, for the per-model scorecard.
+    names: Vec<&'static str>,
+    /// Whether to apply the SSE/APM refinement (the `sse` feature).
+    use_sse: bool,
+    /// The per-model scorecard produced by the last `forward` (encode-only). Interior mutability
+    /// because `Transform::forward` takes `&self`; read back via [`Transform::model_scores`].
+    scores: RefCell<Vec<ModelTrace>>,
 }
 
 impl EntropyCoder {
-    /// A coder over `builders` — every enabled model, in registry order.
-    pub(crate) fn new(builders: Vec<ModelBuilder>) -> Self {
+    /// A coder over `builders` — every enabled model, in registry order — labelled by the aligned
+    /// `names` (for the scorecard). `use_sse` enables the APM.
+    pub(crate) fn new(builders: Vec<ModelBuilder>, names: Vec<&'static str>, use_sse: bool) -> Self {
         Self {
             builders,
+            names,
+            use_sse,
+            scores: RefCell::new(Vec::new()),
         }
     }
 }
@@ -105,10 +180,11 @@ impl Transform for EntropyCoder {
     fn forward(&self, input: Vec<u8>) -> Vec<u8> {
         // Seed the encoder's buffer with the length header so `finish` returns
         // header + coded payload in one allocation (no second copy of the payload).
+        let n_bytes = input.len();
         let mut header = Vec::new();
         uleb128::encode_u64(input.len() as u64, &mut header);
 
-        let mut pred = Predictor::new(input.len(), &self.builders);
+        let mut pred = Predictor::new(input.len(), &self.builders, self.use_sse, true);
         let mut enc = Encoder::with_prefix(header, input.len() + input.len() / 2 + 16);
         for (i, &byte) in input.iter().enumerate() {
             // The history window is a borrowed view into the already-encoded prefix — no copy.
@@ -121,6 +197,7 @@ impl Transform for EntropyCoder {
             }
             pred.end_symbol();
         }
+        *self.scores.borrow_mut() = pred.scores(n_bytes, &self.names);
         enc.finish()
     }
 
@@ -133,7 +210,7 @@ impl Transform for EntropyCoder {
         let limit = payload.len().saturating_mul(MAX_BYTES_PER_PAYLOAD_BYTE).saturating_add(1024);
         ensure!(count <= limit, "byte count {count} exceeds the {limit} a {}-byte payload can encode", payload.len());
 
-        let mut pred = Predictor::new(count, &self.builders);
+        let mut pred = Predictor::new(count, &self.builders, self.use_sse, false);
         let mut dec = Decoder::new(payload);
         // Cap the up-front reservation so a large (but in-limit) count cannot demand a huge
         // allocation before a single byte is decoded; the Vec grows as needed.
@@ -160,6 +237,10 @@ impl Transform for EntropyCoder {
         }
         Ok(out)
     }
+
+    fn model_scores(&self) -> Vec<ModelTrace> {
+        self.scores.borrow().clone()
+    }
 }
 
 #[cfg(test)]
@@ -175,7 +256,7 @@ mod tests {
         fn build_order0(capacity: usize) -> Box<dyn TokenModel> {
             Box::new(OrderN::new(0, capacity))
         }
-        EntropyCoder::new(vec![build_order0])
+        EntropyCoder::new(vec![build_order0], vec!["order0"], false)
     }
 
     proptest! {
