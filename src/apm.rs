@@ -14,7 +14,7 @@ use crate::mixer::{squash, stretch};
 const KNOTS: usize = 33;
 
 /// Adaptation-rate shift for the APM knot update (higher = slower).
-const RATE: i32 = 7;
+const RATE: i32 = 9;
 
 /// An adaptive probability map: a `contexts × KNOTS` table of probability knots refined per bit.
 #[derive(Debug)]

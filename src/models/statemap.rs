@@ -11,7 +11,7 @@ use crate::mixer::stretch;
 
 /// Observation-count cap in the adaptive rate. Lower = more adaptive (tracks
 /// drift faster), which a single-pass online coder generally wants.
-const LIMIT: usize = 255;
+const LIMIT: usize = 11;
 
 /// The count-decay rate table shared by every `StateMap`: `rate_table()[k] = (1 << 16) / (k + 2)`, the
 /// learning rate after `k` observations. A pure function of [`LIMIT`], so it is built once rather than

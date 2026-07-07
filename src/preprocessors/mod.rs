@@ -4,9 +4,9 @@
 //! stream on the encode side and exactly inverts it on decode. This file holds the
 //! text-folding stages ([`casefold`], [`entities`]) plus the text-detection helpers
 //! they share, the capped Re-Pair grammar tokenizer ([`repair`], which brings its
-//! own u22 grammar serialization and does not use those helpers), and the escape-byte
-//! LZ77 stage ([`lz77`], which reuses the mode-byte framing but does its own byte-frequency
-//! marker selection). The trait and the [`crate::transform::Pipeline`] that chains all stages
+//! own u22 grammar serialization and does not use those helpers), and the token-aware
+//! escape-byte LZ77 stage ([`lz77`], which reuses the mode-byte framing and uses the fixed
+//! `0x00` marker Re-Pair leaves free). The trait and the [`crate::transform::Pipeline`] that chains all stages
 //! live in [`crate::transform`].
 
 mod casefold;

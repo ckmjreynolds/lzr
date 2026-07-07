@@ -18,7 +18,7 @@ const PROB_ONE: i32 = 1 << PROB_BITS; // 4096
 const STRETCH_MAX: i32 = 2047;
 
 /// Learning-rate shift for the mixer weight update (higher = slower adaptation).
-const LR_SHIFT: i32 = 13;
+const LR_SHIFT: i32 = 12;
 
 #[expect(clippy::cast_possible_truncation, reason = "LUT values are clamped into `1..=4095`.")]
 fn squash_lut() -> &'static Vec<i32> {

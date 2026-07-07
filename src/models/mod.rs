@@ -5,6 +5,7 @@
 //! ([`TokenModel::update`]). Predictions are returned in the stretched (logit)
 //! domain so the [`crate::mixer::Mixer`] can combine them directly.
 
+pub(crate) mod match_model;
 pub(crate) mod null;
 pub(crate) mod ordern;
 pub(crate) mod sparse;
@@ -18,7 +19,7 @@ pub(crate) const SYMBOL_BITS: u32 = u8::BITS;
 /// Minimum / maximum index width for a hashed model table, bounding skeleton
 /// memory regardless of input size.
 const MIN_HASH_BITS: u32 = 16;
-const MAX_HASH_BITS: u32 = 22;
+const MAX_HASH_BITS: u32 = 28;
 
 /// Index width (in bits) for a hashed table sized to roughly `capacity` distinct
 /// contexts, clamped to `[MIN_HASH_BITS, MAX_HASH_BITS]`.

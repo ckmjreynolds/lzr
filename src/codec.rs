@@ -13,6 +13,7 @@ use anyhow::{Result, anyhow, ensure};
 use static_assertions::const_assert;
 
 use crate::entropy::{EntropyCoder, ModelBuilder};
+use crate::models::match_model::MatchModel;
 use crate::models::null::NullModel;
 use crate::models::ordern::OrderN;
 use crate::models::sparse::SparseModel;
@@ -158,10 +159,11 @@ const FEATURES: &[FeatureSpec] = &[
         }),
     },
     // Entropy models follow the stages. Registry order here is the model order in the mix (immaterial
-    // to correctness — the mixer weights per input). The enwik9-sweep winners are default-on —
-    // `order0`, `order1`, `sparse2`, `sparse24`, and `varint`; `order2`..`order7` stay default-off (they
-    // only help on a small/dense token alphabet and hurt on the large default vocabulary). If *every*
-    // model is disabled
+    // to correctness — the mixer weights per input). The sweep winners are default-on — `order0`,
+    // `order1`, `order2`, `sparse2`, `sparse24`, `varint`, and (registered after `sse`) the `match`
+    // model. `order2` helps once the Re-Pair vocabulary is capped small enough for a dense token
+    // stream (the tuned operating point); `order3`..`order7` stay default-off (they only help on an
+    // even smaller/denser alphabet and otherwise hurt). If *every* model is disabled
     // while the entropy stage is on, [`Profile::model_builders`] silently supplies the internal null
     // model (a reversible no-op), so "entropy on, no models" still codes rather than erroring. The null
     // model is deliberately *not* a registry feature — it is an implementation fallback.
@@ -177,7 +179,7 @@ const FEATURES: &[FeatureSpec] = &[
     },
     FeatureSpec {
         name: "order2",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(2, c))),
     },
     FeatureSpec {
@@ -226,6 +228,15 @@ const FEATURES: &[FeatureSpec] = &[
         name: "sse",
         default_on: true,
         kind: Kind::Flag,
+    },
+    // LZ77-aware match model: reconstructs the pre-LZ77 stream and predicts recurring content through
+    // the LZ77 encoding (repeats that LZ77 folded, which the token models miss because the record's
+    // distance differs between occurrences). A small net win on enwik9, so default-on. Appended after
+    // `sse` so its bit does not shift the existing feature bits.
+    FeatureSpec {
+        name: "match",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(MatchModel::new(c))),
     },
 ];
 
@@ -640,26 +651,28 @@ mod tests {
         assert!(profile.enabled("repair"));
         assert!(profile.enabled("lz77"));
         assert!(profile.enabled("entropy"));
-        // The enwik9-sweep winners are default-on; order2..order7 are default-off.
+        // The sweep winners are default-on; order3..order7 are default-off.
         assert!(profile.enabled("order0"));
         assert!(profile.enabled("order1"));
+        assert!(profile.enabled("order2"));
         assert!(profile.enabled("sparse2"));
         assert!(profile.enabled("sparse24"));
         assert!(profile.enabled("varint"));
         assert!(profile.enabled("sse"));
-        assert!(!profile.enabled("order2"));
-        // bits 0..=6 (stages + order0/order1) plus sparse2(13), sparse24(14), varint(15), sse(16).
-        assert_eq!(profile.to_bits(), 0b0111_1111 | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16));
+        assert!(profile.enabled("match"));
+        assert!(!profile.enabled("order3"));
+        // bits 0..=7 (stages + order0/order1/order2) plus sparse2(13), sparse24(14), varint(15), sse(16), match(17).
+        assert_eq!(profile.to_bits(), 0xFF | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17));
     }
 
     #[test]
     fn profile_toggles_by_name() {
-        let mut profile = Profile::default(); // stages + order0/order1/sparse2/sparse24/varint
+        let mut profile = Profile::default(); // stages + order0/order1/order2/sparse2/sparse24/varint
         // `repair` is fundamental (bit 2) and cannot be disabled, so it stays set throughout. Disabling
         // every other default-on feature leaves only the repair bit.
         for feature in [
             "casefold", "entities", "lz77", "entropy", "order0", "order1", "order2", "sparse2", "sparse24", "varint",
-            "sse",
+            "sse", "match",
         ] {
             profile.disable(feature).unwrap();
         }
@@ -722,15 +735,21 @@ mod tests {
 
     #[test]
     fn active_models_reports_enabled_models_and_null_fallback() {
-        // Default profile: the winning model set, listed in registry (mix) order.
-        assert_eq!(Profile::default().active_models(), vec!["order0", "order1", "sparse2", "sparse24", "varint"]);
+        // Default profile: the winning model set, listed in registry (mix) order (`match` last).
+        assert_eq!(
+            Profile::default().active_models(),
+            vec!["order0", "order1", "order2", "sparse2", "sparse24", "varint", "match"]
+        );
         // Enabling a further model keeps registry order regardless of enable order.
         let mut p = Profile::default();
-        p.enable("order2").unwrap();
-        assert_eq!(p.active_models(), vec!["order0", "order1", "order2", "sparse2", "sparse24", "varint"]);
+        p.enable("order3").unwrap();
+        assert_eq!(
+            p.active_models(),
+            vec!["order0", "order1", "order2", "order3", "sparse2", "sparse24", "varint", "match"]
+        );
         // Entropy on with every model disabled -> the injected null fallback is reported.
         let mut none = Profile::default();
-        for m in ["order0", "order1", "sparse2", "sparse24", "varint"] {
+        for m in ["order0", "order1", "order2", "sparse2", "sparse24", "varint", "match"] {
             none.disable(m).unwrap();
         }
         assert_eq!(none.active_models(), vec!["null"]);
@@ -755,11 +774,11 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=16 (preprocessors, entropy, order0..7, sparse2, sparse24, varint, sse) are known.
-        for bits in 0..=0x1_FFFF {
+        // bits 0..=17 (preprocessors, entropy, order0..7, sparse2, sparse24, varint, sse, match) are known.
+        for bits in 0..=0x3_FFFF {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(1 << 17).is_err()); // bit 17 is not a known feature
+        assert!(Profile::from_bits(1 << 18).is_err()); // bit 18 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 

@@ -15,7 +15,7 @@ use super::statemap::StateMap;
 use super::{Context, SYMBOL_BITS, TokenModel};
 
 /// How many recent bytes' continuation bits form the phase context.
-const SPAN: usize = 4;
+const SPAN: usize = 8;
 
 /// Predicts each bit from the recent continuation-bit pattern and the current bit-tree node.
 #[derive(Debug)]

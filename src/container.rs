@@ -211,9 +211,10 @@ mod tests {
         // Disabling every default feature except the fundamental `repair` leaves only its bit set
         // (profile 0x04); the container records it and `decompress` rebuilds the matching pipeline.
         let mut profile = Profile::default();
-        for feature in
-            ["casefold", "entities", "lz77", "entropy", "order0", "order1", "sparse2", "sparse24", "varint", "sse"]
-        {
+        for feature in [
+            "casefold", "entities", "lz77", "entropy", "order0", "order1", "order2", "sparse2", "sparse24", "varint",
+            "sse", "match",
+        ] {
             profile.disable(feature).unwrap();
         }
         let c = compress_with(b"hello world", profile);
