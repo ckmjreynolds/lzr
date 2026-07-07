@@ -77,9 +77,8 @@ pub(crate) fn stretch(p: i32) -> i32 {
 /// toward the observed bit.
 #[derive(Debug)]
 pub(crate) struct Mixer {
-    n: usize,
     w: Vec<i32>,      // [bit_positions * n] weights, 16.16 fixed point
-    inputs: Vec<i32>, // stretched inputs captured by the last `mix`
+    inputs: Vec<i32>, // stretched inputs captured by the last `mix` (its length is the input count `n`)
     off: usize,       // selected weight-set offset from the last `mix`
     pr: i32,          // last squashed prediction (12-bit)
 }
@@ -89,7 +88,6 @@ impl Mixer {
     /// sets (one per bit index within a coded symbol).
     pub(crate) fn new(n: usize, bit_positions: usize) -> Self {
         Self {
-            n,
             w: vec![0; bit_positions * n],
             inputs: vec![0; n],
             off: 0,
@@ -101,10 +99,11 @@ impl Mixer {
     /// weight set selected by `bpos` (the bit index within the current symbol).
     #[expect(clippy::cast_possible_truncation, reason = "`dot >> 16` stays within i32 for a small model set.")]
     pub(crate) fn mix(&mut self, stretched: &[i32], bpos: usize) -> i32 {
-        debug_assert_eq!(stretched.len(), self.n);
+        let n = self.inputs.len();
+        debug_assert_eq!(stretched.len(), n);
         self.inputs.copy_from_slice(stretched);
-        self.off = bpos * self.n;
-        let row = &self.w[self.off..self.off + self.n];
+        self.off = bpos * n;
+        let row = &self.w[self.off..self.off + n];
         let dot: i64 = row.iter().zip(stretched).map(|(&w, &s)| i64::from(w) * i64::from(s)).sum();
         self.pr = squash((dot >> 16) as i32);
         self.pr
@@ -113,7 +112,7 @@ impl Mixer {
     /// Adapt the selected weight set toward the observed `bit`.
     pub(crate) fn update(&mut self, bit: u8) {
         let err = (i32::from(bit) << PROB_BITS) - self.pr;
-        for (w, &s) in self.w[self.off..self.off + self.n].iter_mut().zip(&self.inputs) {
+        for (w, &s) in self.w[self.off..self.off + self.inputs.len()].iter_mut().zip(&self.inputs) {
             *w += (s * err) >> LR_SHIFT;
         }
     }
@@ -124,13 +123,14 @@ impl Mixer {
     /// already covered by the others) — the diagnostic the CLI reports per model.
     #[expect(clippy::cast_precision_loss, reason = "Diagnostic display; weight sums are small.")]
     pub(crate) fn input_weights(&self) -> Vec<f64> {
-        let positions = self.w.len().checked_div(self.n).unwrap_or(0);
+        let n = self.inputs.len();
+        let positions = self.w.len().checked_div(n).unwrap_or(0);
         if positions == 0 {
-            return vec![0.0; self.n];
+            return vec![0.0; n];
         }
-        (0..self.n)
+        (0..n)
             .map(|i| {
-                let sum: i64 = (0..positions).map(|b| i64::from(self.w[b * self.n + i])).sum();
+                let sum: i64 = (0..positions).map(|b| i64::from(self.w[b * n + i])).sum();
                 sum as f64 / positions as f64 / 65536.0
             })
             .collect()

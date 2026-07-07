@@ -121,6 +121,7 @@ impl Predictor {
     fn commit(&mut self, hist: &[u8], bit: u8) {
         if self.track {
             // Each model's standalone cost this bit: -log2 of the probability it gave the actual bit.
+            let lut = cost_lut();
             for (loss, &s) in self.logloss.iter_mut().zip(&self.stretched) {
                 let sq = squash(s);
                 let p_correct = if bit == 1 {
@@ -128,7 +129,7 @@ impl Predictor {
                 } else {
                     PROB_SCALE - sq
                 };
-                *loss += cost_lut()[p_correct as usize];
+                *loss += lut[p_correct as usize];
             }
         }
         self.mixer.update(bit);
@@ -180,7 +181,6 @@ impl Transform for EntropyCoder {
     fn forward(&self, input: Vec<u8>) -> Vec<u8> {
         // Seed the encoder's buffer with the length header so `finish` returns
         // header + coded payload in one allocation (no second copy of the payload).
-        let n_bytes = input.len();
         let mut header = Vec::new();
         uleb128::encode_u64(input.len() as u64, &mut header);
 
@@ -197,7 +197,7 @@ impl Transform for EntropyCoder {
             }
             pred.end_symbol();
         }
-        *self.scores.borrow_mut() = pred.scores(n_bytes, &self.names);
+        *self.scores.borrow_mut() = pred.scores(input.len(), &self.names);
         enc.finish()
     }
 

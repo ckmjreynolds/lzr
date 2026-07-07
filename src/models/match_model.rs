@@ -22,7 +22,7 @@
 //! (predicting the neutral logit thereafter) rather than panicking.
 
 use super::statemap::StateMap;
-use super::{Context, HASH_MULT, TokenModel, hashed_bits};
+use super::{Context, TokenModel, hashed_bits, token_hash};
 use crate::uleb128::decode_u22;
 
 /// Mode byte marking a folded LZ77 payload (`crate::preprocessors::MODE_FOLDED`, redeclared here since
@@ -244,10 +244,7 @@ impl MatchModel {
         reason = "`ht_shift` leaves at most MAX_HASH_BITS (22) bits, which fits usize on every target."
     )]
     fn hash_ctx(&self, len: usize) -> usize {
-        let mut h = 0u64;
-        for &byte in &self.r[len - HASH_LEN..len] {
-            h = (h ^ u64::from(byte)).wrapping_mul(HASH_MULT);
-        }
+        let h = token_hash(0, self.r[len - HASH_LEN..len].iter().map(|&b| u32::from(b)));
         (h >> self.ht_shift) as usize
     }
 
