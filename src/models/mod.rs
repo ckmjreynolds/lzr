@@ -9,6 +9,10 @@ pub(crate) mod match_model;
 pub(crate) mod null;
 pub(crate) mod ordern;
 pub(crate) mod sparse;
+/// Experimental online-neural arm (selective-SSM), compiled only under test — a
+/// measurement arm, not a shipped codec feature. See the module docs.
+#[cfg(test)]
+mod ssm;
 pub(crate) mod statemap;
 pub(crate) mod varint;
 
