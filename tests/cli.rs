@@ -23,9 +23,10 @@ fn temp_path(tag: &str) -> PathBuf {
 }
 
 fn compress(src: &Path, dst: &Path) {
-    // Every entropy model is default-off, so a bare `lzr src dst` is rejected (entropy needs a model);
-    // enable a representative set — dense order-0 plus the hashed order-N path — so the roundtrip
-    // tests exercise the token-level models end to end.
+    // The default profile already enables the swept-in model set (order-0..11, sparse2, match); a bare
+    // `lzr src dst` exercises them. The explicit enables below are redundant with the defaults but kept
+    // so the roundtrip tests stay pinned to the dense order-0 plus hashed order-N path regardless of
+    // any future default change.
     let _ok = Command::cargo_bin("lzr")
         .unwrap()
         .arg(src)
@@ -185,16 +186,26 @@ fn invalid_block_size_fails() {
     drop(std::fs::remove_file(packed));
 }
 
-/// Re-Pair is fundamental: `--disable repair` must fail cleanly rather than build a byte-level stream.
+/// Re-Pair is optional now: `--disable repair` must succeed and still round-trip (byte-level stream).
 #[test]
-fn disabling_repair_fails() {
+fn disabling_repair_round_trips() {
     let raw = temp_path("norepair.bin");
     let packed = temp_path("norepair.lzr");
-    std::fs::write(&raw, b"data").unwrap();
-    let _ok =
-        Command::cargo_bin("lzr").unwrap().arg(&raw).arg(&packed).arg("--disable").arg("repair").assert().failure();
-    drop(std::fs::remove_file(raw));
-    drop(std::fs::remove_file(packed));
+    let back = temp_path("norepair.out");
+    let original = b"the quick brown fox the quick brown fox the quick brown fox";
+    std::fs::write(&raw, original).unwrap();
+    let _ok = Command::cargo_bin("lzr")
+        .unwrap()
+        .arg(&raw)
+        .arg(&packed)
+        .args(["--disable", "repair", "--enable", "order0", "--enable", "order1"])
+        .assert()
+        .success();
+    decompress(&packed, &back);
+    assert_eq!(std::fs::read(&back).unwrap(), original);
+    for file in [raw, packed, back] {
+        drop(std::fs::remove_file(file));
+    }
 }
 
 #[test]

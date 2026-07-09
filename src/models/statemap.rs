@@ -36,7 +36,7 @@ fn rate_table() -> &'static [i32; LIMIT + 1] {
 #[derive(Debug)]
 pub(crate) struct StateMap {
     p: Vec<i32>, // 16-bit probability per state
-    n: Vec<u16>, // observation count per state (capped at LIMIT)
+    n: Vec<u8>,  // observation count per state (capped at LIMIT, which fits a byte)
 }
 
 impl StateMap {

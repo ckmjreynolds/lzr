@@ -81,62 +81,80 @@ const FEATURES: &[FeatureSpec] = &[
         }),
     },
     // Entropy models follow the stages. Registry order here is the model order in the mix (immaterial
-    // to correctness — the mixer weights per input). In this byte-centric reset **all models are
-    // default-off**: the default profile codes through the injected null model, and models are enabled
-    // one at a time (e.g. `--enable order2`) to measure their byte-domain contribution. If *every*
-    // model is disabled while the entropy stage is on, [`Profile::model_builders`] silently supplies
-    // the internal null model (a reversible no-op), so "entropy on, no models" still codes rather than
-    // erroring. The null model is deliberately *not* a registry feature — it is an implementation
-    // fallback.
+    // to correctness — the mixer weights per input). The default set was chosen by a cumulative sweep
+    // on enwik8 (add a model, keep it only if it lowered whole-stream bpb): the order-0..11 chain,
+    // `sparse2`, and the byte-level `match` model each earn their place and are **default-on**. A
+    // wider `sparse24` (positions 2 and 4) was also tried but regressed the mix — the mixer drove its
+    // weight negative — so it was dropped; re-confirmed after the order-0..10 / `u8`-`StateMap` rework
+    // (still `w<0`, whole-stream bpb up), so it stays out. If
+    // *every* model is disabled while the entropy stage is on, [`Profile::model_builders`] silently
+    // supplies the internal null model (a reversible no-op), so "entropy on, no models" still codes
+    // rather than erroring. The null model is deliberately *not* a registry feature — it is an
+    // implementation fallback.
     FeatureSpec {
         name: "order0",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(0, c))),
     },
     FeatureSpec {
         name: "order1",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(1, c))),
     },
     FeatureSpec {
         name: "order2",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(2, c))),
     },
     FeatureSpec {
         name: "order3",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(3, c))),
     },
     FeatureSpec {
         name: "order4",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(4, c))),
     },
     FeatureSpec {
         name: "order5",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(5, c))),
     },
     FeatureSpec {
         name: "order6",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(6, c))),
     },
     FeatureSpec {
         name: "order7",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(OrderN::new(7, c))),
     },
     FeatureSpec {
-        name: "sparse2",
-        default_on: false,
-        kind: Kind::Model(|c| Box::new(SparseModel::new(&[2], c))),
+        name: "order8",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(OrderN::new(8, c))),
     },
     FeatureSpec {
-        name: "sparse24",
-        default_on: false,
-        kind: Kind::Model(|c| Box::new(SparseModel::new(&[2, 4], c))),
+        name: "order9",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(OrderN::new(9, c))),
+    },
+    FeatureSpec {
+        name: "order10",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(OrderN::new(10, c))),
+    },
+    FeatureSpec {
+        name: "order11",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(OrderN::new(11, c))),
+    },
+    FeatureSpec {
+        name: "sparse2",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(SparseModel::new(&[2], c))),
     },
     // `sse` is a config flag (not a model): it enables the entropy coder's APM refinement stage.
     // Default-on — it is coder configuration, not a predictor.
@@ -145,11 +163,11 @@ const FEATURES: &[FeatureSpec] = &[
         default_on: true,
         kind: Kind::Flag,
     },
-    // Byte-level match model: predicts long recurrences the order-N context models miss. Default-off
-    // like the other models.
+    // Byte-level match model: predicts long recurrences the order-N context models miss. Default-on —
+    // it earned the largest single-model win in the sweep after the order-N chain.
     FeatureSpec {
         name: "match",
-        default_on: false,
+        default_on: true,
         kind: Kind::Model(|c| Box::new(MatchModel::new(c))),
     },
 ];
@@ -174,7 +192,7 @@ pub struct FeatureInfo {
     pub name: &'static str,
     /// Whether the default profile enables it.
     pub default_on: bool,
-    /// Whether it is fundamental and cannot be disabled (only `repair`).
+    /// Whether it is fundamental and cannot be disabled (currently none — every stage is optional).
     pub mandatory: bool,
     /// Whether it is a pipeline stage, an entropy model, or a config flag.
     pub kind: FeatureKind,
@@ -239,13 +257,13 @@ impl Compressor {
     }
 }
 
-/// Fundamental features that cannot be disabled. Re-Pair is the compressor's tokenization core — the
-/// rest of the pipeline (LZ77, the entropy models) is built to consume its token stream — so it is
-/// always on; `--disable repair` is rejected rather than silently emitting a byte-level stream. This
-/// is enforced encode-side (via [`Profile::disable`]/[`Profile::validate`]/[`Profile::default`]); the
-/// low-level [`Profile::from_bits`] stays permissive so internal callers and decode can still name any
-/// bit combination (a hand-crafted repair-less container simply fails the container's checksum check).
-const MANDATORY: &[&str] = &["repair"];
+/// Fundamental features that cannot be disabled. In the byte-centric reset every stage is optional —
+/// Re-Pair included, since the entropy models are byte-level and code the raw (or preprocessed) byte
+/// stream directly rather than a token stream — so this is currently empty. The mechanism is kept:
+/// listing a feature here makes [`Profile::disable`] reject it and [`Profile::validate`] require it,
+/// should a future stage become structurally required. [`Profile::from_bits`] stays permissive
+/// regardless, so decode can name any bit combination.
+const MANDATORY: &[&str] = &[];
 
 /// The set of enabled pipeline features.
 ///
@@ -410,9 +428,10 @@ impl Profile {
 
     /// Validates that the profile describes a usable pipeline.
     ///
-    /// The one constraint not expressible as a single bit: every fundamental feature (see [`MANDATORY`])
-    /// must be enabled. The entropy stage needs no explicit model — when the profile selects none,
-    /// [`Profile::model_builders`] supplies the internal null model — so entropy-with-no-models is valid.
+    /// Every fundamental feature (see [`MANDATORY`]) must be enabled. That list is currently empty —
+    /// every stage is optional — so this only fails if a future feature is marked mandatory and left
+    /// off. The entropy stage needs no explicit model: when the profile selects none,
+    /// [`Profile::model_builders`] supplies the internal null model, so entropy-with-no-models is valid.
     ///
     /// # Errors
     ///
@@ -478,11 +497,11 @@ mod tests {
 
         /// Every stage- and model-toggle combination must round-trip a sample that exercises all
         /// stages (uppercase for casefold, entities for entity-folding, repetition for Re-Pair). The
-        /// 16-bit range spans the three text/tokenizer stages, the entropy stage, all eleven entropy
-        /// models (order0..7, sparse2, sparse24, match), and the `sse` flag — including
-        /// entropy-with-no-model, which codes reversibly via the injected null fallback.
+        /// 19-bit range spans the three text/tokenizer stages, the entropy stage, all fourteen entropy
+        /// models (order0..11, sparse2, match), and the `sse` flag — including entropy-with-no-model,
+        /// which codes reversibly via the injected null fallback.
         #[test]
-        fn each_stage_toggle_round_trips(bits in 0u64..=0xFFFF) {
+        fn each_stage_toggle_round_trips(bits in 0u64..=0x7FFFF) {
             let sample =
                 b"The QUICK brown fox &lt;tag&gt; JUMPS. The QUICK brown fox &lt;tag&gt; JUMPS.".to_vec();
             let c = Compressor::from_profile(Profile::from_bits(bits).unwrap());
@@ -546,8 +565,10 @@ mod tests {
 
     #[test]
     fn profile_default_bits() {
-        // Default-on: casefold(0), entities(1), repair(2), entropy(3), sse(14). Every model is off.
-        assert_eq!(Profile::default().to_bits(), 0xF | (1 << 14));
+        // Default-on: the four stages casefold(0)/entities(1)/repair(2)/entropy(3), the order-0..11
+        // chain (bits 4..=15), sparse2(16), sse(17), and match(18). Every feature is default-on, so
+        // all 19 bits are set = 0x7FFFF.
+        assert_eq!(Profile::default().to_bits(), 0x7FFFF);
     }
 
     #[test]
@@ -560,43 +581,44 @@ mod tests {
         assert_eq!(profile.to_bits(), 0b0000_0011);
         profile.enable("repair").unwrap();
         assert_eq!(profile.to_bits(), 0b0000_0111);
-        // `repair` is fundamental (bit 2) and cannot be disabled.
-        assert!(profile.disable("repair").is_err());
+        // Every stage is optional now — repair can be toggled off and back on like any other.
+        profile.disable("repair").unwrap();
+        assert_eq!(profile.to_bits(), 0b0000_0011);
+        profile.enable("repair").unwrap();
+        assert_eq!(profile.to_bits(), 0b0000_0111);
         profile.enable("entropy").unwrap();
         assert_eq!(profile.to_bits(), 0b0000_1111);
         profile.enable("order0").unwrap();
         assert_eq!(profile.to_bits(), 0b0001_1111);
-        // `match` is bit 15 (the last feature); enabling it sets only that bit.
+        // `match` is bit 18 (the last feature); enabling it sets only that bit.
         profile.enable("match").unwrap();
-        assert_eq!(profile.to_bits(), 0b0001_1111 | (1 << 15));
+        assert_eq!(profile.to_bits(), 0b0001_1111 | (1 << 18));
     }
 
     #[test]
-    fn repair_is_fundamental_and_cannot_be_disabled() {
+    fn repair_is_optional_and_can_be_disabled() {
+        // No feature is mandatory in the byte-centric reset: repair (default-on) can be disabled and
+        // the resulting repair-less profile still validates.
         let mut profile = Profile::default();
-        assert!(profile.disable("repair").is_err(), "repair must not be disableable");
         assert!(profile.enabled("repair"));
-        // A profile with repair cleared (built via the low-level, permissive from_bits) fails validate.
-        let without_repair = Profile::from_bits(Profile::default().to_bits() & !(1 << 2)).unwrap();
-        assert!(without_repair.validate().is_err());
+        profile.disable("repair").unwrap();
+        assert!(!profile.enabled("repair"));
+        assert!(profile.validate().is_ok(), "a repair-less profile is valid");
     }
 
     #[test]
     fn entropy_needs_no_explicit_model() {
-        // Entropy on with no model selected is valid — `model_builders` injects the null model — so the
-        // only validate constraint left is the mandatory `repair` stage.
+        // Entropy on with no model selected is valid — `model_builders` injects the null model.
         let mut profile = Profile::from_bits(0).unwrap();
-        profile.enable("repair").unwrap();
         profile.enable("entropy").unwrap();
         assert!(profile.validate().is_ok());
         // A model may still be enabled explicitly.
         profile.enable("order1").unwrap();
         assert!(profile.validate().is_ok());
-        // The default profile validates too (its only hard requirement is the repair stage).
+        // The default profile validates too.
         assert!(Profile::default().validate().is_ok());
-        // The one remaining constraint: `repair` must be enabled.
-        let no_repair = Profile::from_bits(0).unwrap();
-        assert!(no_repair.validate().is_err());
+        // With no feature mandatory, even the empty profile validates.
+        assert!(Profile::from_bits(0).unwrap().validate().is_ok());
     }
 
     #[test]
@@ -608,10 +630,21 @@ mod tests {
 
     #[test]
     fn active_models_reports_enabled_models_and_null_fallback() {
-        // Default profile: every model is off, so entropy codes via the injected null fallback.
-        assert_eq!(Profile::default().active_models(), vec!["null"]);
+        // Default profile: the swept-in set (order-0..11, sparse2, match), in registry order.
+        assert_eq!(
+            Profile::default().active_models(),
+            vec![
+                "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
+                "order10", "order11", "sparse2", "match"
+            ]
+        );
+        // With no model selected, entropy codes via the injected null fallback.
+        let mut none = Profile::from_bits(0).unwrap();
+        none.enable("entropy").unwrap();
+        assert_eq!(none.active_models(), vec!["null"]);
         // Enabling models lists them in registry (mix) order regardless of enable order.
-        let mut p = Profile::default();
+        let mut p = Profile::from_bits(0).unwrap();
+        p.enable("entropy").unwrap();
         p.enable("order2").unwrap();
         p.enable("order0").unwrap();
         p.enable("match").unwrap();
@@ -637,25 +670,27 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=15 (casefold/entities/repair/entropy, order0..7, sparse2, sparse24, sse, match) known.
-        for bits in 0..=0xFFFF {
+        // bits 0..=18 (casefold/entities/repair/entropy, order0..11, sparse2, sse, match) known.
+        for bits in 0..=0x7FFFF {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(1 << 16).is_err()); // bit 16 is not a known feature
+        assert!(Profile::from_bits(1 << 19).is_err()); // bit 19 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 
     #[test]
-    fn default_profile_enables_stages_but_no_models() {
-        // The byte-centric reset ships with every model off; the default codes via the null fallback.
+    fn default_profile_enables_stages_and_swept_models() {
+        // The default ships with the four stages plus the full swept-in model set; every feature is on.
         let profile = Profile::default();
         for stage in ["casefold", "entities", "repair", "entropy"] {
             assert!(profile.enabled(stage), "{stage} should be default-on");
         }
-        for model in ["order0", "order1", "order2", "sparse2", "sparse24", "match"] {
-            assert!(!profile.enabled(model), "{model} should be default-off");
+        for model in [
+            "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
+            "order10", "order11", "sparse2", "match",
+        ] {
+            assert!(profile.enabled(model), "{model} should be default-on");
         }
         assert!(profile.enabled("sse"), "sse flag should be default-on");
-        assert_eq!(profile.active_models(), vec!["null"], "no model selected -> null fallback");
     }
 }
