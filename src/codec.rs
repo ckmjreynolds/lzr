@@ -35,6 +35,10 @@ pub struct EncodeOptions {
     /// The LZ77 minimum match length, in tokens: `None` uses the dynamic "only emit a winning match"
     /// rule, `Some(n)` forces every match of `>= n` tokens (which may expand the stream).
     min_match: Option<u32>,
+    /// Whether the Re-Pair stage re-parses its top-level sequence into a minimum-cost cover (MGP). An
+    /// encode-only, opt-in choice — the grammar rules are unchanged, so the stream stays
+    /// self-describing and decodes without any format or decoder change.
+    mgp: bool,
 }
 
 impl Default for EncodeOptions {
@@ -43,6 +47,7 @@ impl Default for EncodeOptions {
             num_tokens: DEFAULT_NUM_TOKENS,
             cost_stop: true,
             min_match: None,
+            mgp: false,
         }
     }
 }
@@ -81,6 +86,14 @@ impl EncodeOptions {
         );
         self.min_match = Some(min_match);
         Ok(self)
+    }
+
+    /// Enables the Re-Pair minimal-grammar-parse (MGP) sequence re-parse. Encode-only and always
+    /// reversible, so it needs no validation.
+    #[must_use]
+    pub const fn with_mgp(mut self) -> Self {
+        self.mgp = true;
+        self
     }
 }
 
@@ -139,12 +152,18 @@ const FEATURES: &[FeatureSpec] = &[
             Box::new(RepairTokenizer {
                 num_tokens: options.num_tokens,
                 cost_stop: options.cost_stop,
+                mgp: options.mgp,
             })
         }),
     },
     FeatureSpec {
+        // Off by default: the token-aware LZ77 stage is net-negative at the small, dense Re-Pair
+        // vocabularies that compress best under the context-mixing coder — the entropy stage's own
+        // match model already captures the token repeats, and LZ77's match records inject
+        // less-predictable bytes that hurt the higher-order models. It still helps at large
+        // vocabularies, so it stays available via `--enable lz77` (and the `--auto` search toggles it).
         name: "lz77",
-        default_on: true,
+        default_on: false,
         kind: Kind::Stage(|_, options| {
             Box::new(Lz77 {
                 min_match: options.min_match,
@@ -649,7 +668,9 @@ mod tests {
         assert!(profile.enabled("casefold"));
         assert!(profile.enabled("entities"));
         assert!(profile.enabled("repair"));
-        assert!(profile.enabled("lz77"));
+        // LZ77 (bit 3) is default-off: it is net-negative at the small dense vocabularies that compress
+        // best; it stays available via `--enable lz77` and the `--auto` search.
+        assert!(!profile.enabled("lz77"));
         assert!(profile.enabled("entropy"));
         // The sweep winners are default-on; order3..order7 are default-off.
         assert!(profile.enabled("order0"));
@@ -661,8 +682,9 @@ mod tests {
         assert!(profile.enabled("sse"));
         assert!(profile.enabled("match"));
         assert!(!profile.enabled("order3"));
-        // bits 0..=7 (stages + order0/order1/order2) plus sparse2(13), sparse24(14), varint(15), sse(16), match(17).
-        assert_eq!(profile.to_bits(), 0xFF | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17));
+        // bits 0,1,2 (casefold/entities/repair) and 4 (entropy) — lz77 (bit 3) is default-off — plus
+        // order0..2 (5,6,7) and sparse2(13), sparse24(14), varint(15), sse(16), match(17).
+        assert_eq!(profile.to_bits(), 0xF7 | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17));
     }
 
     #[test]
@@ -798,5 +820,11 @@ mod tests {
         assert_eq!(EncodeOptions::default().with_min_match(0x3F_FFFF).unwrap().min_match, Some(0x3F_FFFF));
         assert!(EncodeOptions::default().with_min_match(1).is_err()); // below the two-byte floor
         assert!(EncodeOptions::default().with_min_match(0x40_0000).is_err()); // beyond u22
+    }
+
+    #[test]
+    fn encode_options_toggle_mgp() {
+        assert!(!EncodeOptions::default().mgp);
+        assert!(EncodeOptions::default().with_mgp().mgp);
     }
 }

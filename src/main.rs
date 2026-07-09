@@ -20,6 +20,7 @@ use lzr::{EncodeOptions, Profile};
 /// with.
 #[derive(Debug, Parser)]
 #[command(name = "lzr", version, about)]
+#[expect(clippy::struct_excessive_bools, reason = "CLI flags are independent on/off switches, not a state machine")]
 struct Cli {
     /// Force compression, even for a `.lzr` input.
     #[arg(short = 'z', long, conflicts_with = "decompress")]
@@ -45,6 +46,29 @@ struct Cli {
     /// defaults to a dynamic per-match rule that only emits matches that shrink the stream.
     #[arg(long, value_name = "N")]
     min_match: Option<u32>,
+
+    /// Re-parse the Re-Pair top-level sequence into a minimum-cost cover (MGP). Compression only;
+    /// encode-side only, so the stream still decodes without any flag.
+    #[arg(long)]
+    mgp: bool,
+
+    /// Auto-select the best operating point (Re-Pair vocabulary size × LZ77 on/off, with MGP on) by
+    /// trial-compressing a prefix sample, then compress the whole input at the winner. This is the
+    /// **default** for a bare compression; passing any pipeline flag (`--num-tokens`, `--min-match`,
+    /// `--enable`, `--disable`) selects the manual path instead, and `--auto` forces the search even
+    /// alongside those flags (overriding `--num-tokens` and the LZ77 toggle). Compression only.
+    #[arg(long, conflicts_with = "no_auto")]
+    auto: bool,
+
+    /// Opt out of the default operating-point search and compress with the plain pipeline (honoring
+    /// any `--num-tokens` / `--min-match` / `--enable` / `--disable`). Compression only.
+    #[arg(long)]
+    no_auto: bool,
+
+    /// Prefix bytes `--auto` searches on (default 2,000,000). Larger samples track the full-input
+    /// optimum better (the best vocabulary grows with input size) at proportionally more search cost.
+    #[arg(long, value_name = "BYTES")]
+    auto_sample: Option<usize>,
 
     /// List all pipeline features (for `--enable`/`--disable`) with their defaults, then exit.
     #[arg(long)]
@@ -88,12 +112,24 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     let (output, stages, models, flags) = if decompress {
         (lzr::decompress(&input)?, Vec::new(), Vec::new(), Vec::new())
     } else {
-        let options = encode_options(cli)?;
         let profile = profile(cli)?;
         // Capture the enabled config flags before the profile is consumed by the compressor.
         let flags = profile.active_flags();
+        // Auto operating-point search is the default for a bare compression; any explicit pipeline flag
+        // selects the manual path, `--no-auto` forces it, and `--auto` forces the search regardless.
+        let manual_flags =
+            cli.num_tokens.is_some() || cli.min_match.is_some() || !cli.enable.is_empty() || !cli.disable.is_empty();
+        let use_auto = cli.auto || (!cli.no_auto && !manual_flags);
         // Take ownership so the pipeline can free the input buffer before the tokenizer build.
-        let (output, stages, models) = lzr::compress_owned_with_traced(input, profile, options);
+        let (output, stages, models) = if use_auto {
+            let sample = cli.auto_sample.unwrap_or(lzr::DEFAULT_SAMPLE_BYTES);
+            let (output, stages, models, report) = lzr::compress_auto(input, profile, sample);
+            report_auto(&report);
+            (output, stages, models)
+        } else {
+            let options = encode_options(cli)?;
+            lzr::compress_owned_with_traced(input, profile, options)
+        };
         (output, stages, models, flags)
     };
     std::fs::write(out_path, &output).with_context(|| format!("writing {}", out_path.display()))?;
@@ -127,6 +163,9 @@ fn encode_options(cli: &Cli) -> anyhow::Result<EncodeOptions> {
     };
     if let Some(min_match) = cli.min_match {
         options = options.with_min_match(min_match)?;
+    }
+    if cli.mgp {
+        options = options.with_mgp();
     }
     Ok(options)
 }
@@ -206,6 +245,27 @@ fn report_models(models: &[lzr::ModelScore]) {
     for model in models {
         eprintln!("  {:<9} {:.4} bpb   w={:+.3}", model.name, model.bpb_alone, model.avg_weight);
     }
+}
+
+/// Print the auto-selected operating point to stderr (compression only, `--auto`): the chosen Re-Pair
+/// vocabulary and LZ77 state, and how much search it took.
+#[expect(clippy::print_stderr, reason = "A CLI reports run statistics to the user on stderr.")]
+fn report_auto(report: &lzr::AutoReport) {
+    let vocab = report
+        .point
+        .num_tokens
+        .map_or_else(|| "natural (cost-stop)".to_owned(), |n| format!("{}-token cap", with_commas(u64::from(n))));
+    let lz77 = if report.point.lz77 {
+        "on"
+    } else {
+        "off"
+    };
+    eprintln!(
+        "auto:       {vocab}, lz77 {lz77}  ({} sample trials on {} bytes + {} full-input refine)",
+        report.sample_evaluations,
+        with_commas(report.sampled_bytes as u64),
+        report.refine_evaluations
+    );
 }
 
 /// Print the enabled config flags to stderr (compression only), e.g. `sse`. Flags are pipeline

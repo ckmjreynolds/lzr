@@ -21,6 +21,7 @@ pub mod uleb128;
 pub(crate) mod uleb128;
 
 mod apm;
+mod autotune;
 mod codec;
 mod coder;
 mod container;
@@ -44,6 +45,7 @@ pub mod transform;
 #[cfg(not(feature = "bench-internals"))]
 mod transform;
 
+pub use autotune::{AutoReport, DEFAULT_SAMPLE_BYTES, OperatingPoint, compress_auto};
 pub use codec::{EncodeOptions, FeatureInfo, FeatureKind, Profile, features};
 pub use container::{
     ModelScore, StageSize, compress, compress_owned, compress_owned_with, compress_owned_with_traced, compress_with,

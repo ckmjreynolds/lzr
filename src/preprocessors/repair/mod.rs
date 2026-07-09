@@ -23,6 +23,7 @@
 //! by the space-efficient frequency-based Re-Pair of Bille–Gørtz–Prezza (2017); see [`builder`].
 
 mod builder;
+mod mgp;
 mod prune;
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -69,6 +70,10 @@ pub(crate) struct RepairTokenizer {
     /// count (see [`prune`]). The default; the CLI turns it off when an explicit `--num-tokens` asks
     /// for a hard count cap instead.
     pub(crate) cost_stop: bool,
+    /// Re-parse the top-level sequence into a minimum-cost cover of the text over the pruned symbol
+    /// set (see [`mgp`]). Encode-only, opt-in (default off); the rules are untouched, so the stream
+    /// stays self-describing and the decoder is unchanged.
+    pub(crate) mgp: bool,
 }
 
 impl Default for RepairTokenizer {
@@ -76,6 +81,7 @@ impl Default for RepairTokenizer {
         Self {
             num_tokens: DEFAULT_NUM_TOKENS,
             cost_stop: true,
+            mgp: false,
         }
     }
 }
@@ -117,6 +123,14 @@ impl Transform for RepairTokenizer {
             prune::prune_grammar(t as u32, rules, sequence, self.num_tokens, self.cost_stop)
         } else {
             (Vec::new(), symbols)
+        };
+        // Optionally re-parse the sequence into a minimum-cost cover of the same text using the pruned
+        // symbol set. Rules are unchanged; only the sequence is rewritten, so this is lossless and
+        // needs no format or decoder change.
+        let sequence = if self.mgp {
+            mgp::reparse_sequence(t as u32, &rules, sequence)
+        } else {
+            sequence
         };
         // Assemble the topological grammar as a flat definition list (terminals then rules).
         let vocab = t + rules.len();
@@ -397,6 +411,7 @@ mod tests {
         let capped = RepairTokenizer {
             num_tokens: 300,
             cost_stop: false,
+            mgp: false,
         };
         let bytes = capped.forward(data.clone());
         let mut pos = 0;
