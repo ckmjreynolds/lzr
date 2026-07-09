@@ -35,7 +35,7 @@ fn rate_table() -> &'static [i32; LIMIT + 1] {
 /// A probability estimate per integer state, adapted toward observed bits.
 #[derive(Debug)]
 pub(crate) struct StateMap {
-    p: Vec<i32>, // 16-bit probability per state
+    p: Vec<u16>, // 16-bit probability per state (the full 0..=65535 range)
     n: Vec<u8>,  // observation count per state (capped at LIMIT, which fits a byte)
 }
 
@@ -50,19 +50,26 @@ impl StateMap {
 
     /// The stretched (logit) prediction for state `s`.
     pub(crate) fn predict(&self, s: usize) -> i32 {
-        stretch(self.p[s] >> 4)
+        stretch(i32::from(self.p[s] >> 4))
     }
 
     /// Move state `s`'s probability toward the observed `bit` at its count-decayed
     /// rate, then bump the (capped) observation count.
-    #[expect(clippy::cast_possible_truncation, reason = "the >>16 shifted product fits i32")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the >>16 shifted product fits i32; `p` tracks toward target 0 or 65535 by a fraction \
+                  (rate/65536 <= 1/2) and so never overshoots or goes negative, keeping the sum in \
+                  0..=65535 for the u16 store"
+    )]
     pub(crate) fn update(&mut self, s: usize, bit: u8) {
         let target = i32::from(bit) * 65535;
         // n[s] is only incremented while < LIMIT, so it indexes dt (length LIMIT+1)
         // in bounds without a redundant clamp.
         debug_assert!((self.n[s] as usize) <= LIMIT);
         let rate = rate_table()[self.n[s] as usize];
-        self.p[s] += ((i64::from(target - self.p[s]) * i64::from(rate)) >> 16) as i32;
+        let p = i32::from(self.p[s]);
+        self.p[s] = (p + ((i64::from(target - p) * i64::from(rate)) >> 16) as i32) as u16;
         if (self.n[s] as usize) < LIMIT {
             self.n[s] += 1;
         }
