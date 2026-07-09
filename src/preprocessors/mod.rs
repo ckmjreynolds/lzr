@@ -3,25 +3,20 @@
 //! Each is a [`Transform`] (defined in [`crate::transform`]): it rewrites the byte
 //! stream on the encode side and exactly inverts it on decode. This file holds the
 //! text-folding stages ([`casefold`], [`entities`]) plus the text-detection helpers
-//! they share, the capped Re-Pair grammar tokenizer ([`repair`], which brings its
-//! own u22 grammar serialization and does not use those helpers), and the token-aware
-//! escape-byte LZ77 stage ([`lz77`], which reuses the mode-byte framing and uses the fixed
-//! `0x00` marker Re-Pair leaves free). The trait and the [`crate::transform::Pipeline`] that chains all stages
-//! live in [`crate::transform`].
+//! they share, and the byte-BPE Re-Pair grammar tokenizer ([`repair`], which emits a
+//! plain-byte grammar and does not use those helpers). The trait and the
+//! [`crate::transform::Pipeline`] that chains all stages live in [`crate::transform`].
 
 mod casefold;
 mod entities;
-mod lz77;
 mod repair;
 
 /// Re-exported so the byte stages can refer to `super::Transform`.
 pub(crate) use crate::transform::Transform;
 pub(crate) use casefold::CaseFolding;
 pub(crate) use entities::EntityFolding;
-pub(crate) use lz77::{Lz77, MAX_MATCH_LEN, MIN_MATCH_LEN};
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
 pub(crate) use repair::RepairTokenizer;
-pub(crate) use repair::{DEFAULT_NUM_TOKENS, MIN_NUM_TOKENS};
 
 /// Minimum fraction of bytes that must be common-text bytes for the input to count
 /// as text (below this, a byte stage skips its transform and passes through).
@@ -32,9 +27,8 @@ pub(super) const MODE_PASSTHROUGH: u8 = 0;
 /// Header mode byte: the payload is folded (followed by the stage's chosen control bytes).
 pub(super) const MODE_FOLDED: u8 = 1;
 
-/// Decompression-bomb ceiling shared by the expanding stages (`repair`, `lz77`): a small self-
-/// describing stream can otherwise expand without bound, so each caps its total output here so the
-/// two stages stay in lockstep.
+/// Decompression-bomb ceiling for the expanding `repair` stage: a small self-describing grammar can
+/// otherwise expand without bound, so the stage caps its total output here.
 pub(super) const MAX_EXPANSION_BYTES: u64 = 1 << 31;
 
 /// Whether `byte` is a byte we expect to see in plain text: printable ASCII plus

@@ -17,93 +17,16 @@ use crate::models::match_model::MatchModel;
 use crate::models::null::NullModel;
 use crate::models::ordern::OrderN;
 use crate::models::sparse::SparseModel;
-use crate::models::varint::VarintModel;
-use crate::preprocessors::{
-    CaseFolding, DEFAULT_NUM_TOKENS, EntityFolding, Lz77, MAX_MATCH_LEN, MIN_MATCH_LEN, MIN_NUM_TOKENS, RepairTokenizer,
-};
+use crate::preprocessors::{CaseFolding, EntityFolding, RepairTokenizer};
 use crate::transform::{ModelTrace, Pipeline, StageTrace, Transform};
-
-/// Encode-side options that are *not* serialized into the container — the decoder recovers everything
-/// it needs from the stream itself (the Re-Pair vocabulary is self-describing in the token stream).
-#[derive(Debug, Clone, Copy)]
-pub struct EncodeOptions {
-    /// The Re-Pair vocabulary cap for this run (see [`RepairTokenizer::num_tokens`]).
-    num_tokens: u32,
-    /// Whether Re-Pair prunes its built grammar by the serialized-byte cost model (the default) rather
-    /// than to the fixed `num_tokens` count. A caller-pinned `num_tokens` turns it off.
-    cost_stop: bool,
-    /// The LZ77 minimum match length, in tokens: `None` uses the dynamic "only emit a winning match"
-    /// rule, `Some(n)` forces every match of `>= n` tokens (which may expand the stream).
-    min_match: Option<u32>,
-    /// Whether the Re-Pair stage re-parses its top-level sequence into a minimum-cost cover (MGP). An
-    /// encode-only, opt-in choice — the grammar rules are unchanged, so the stream stays
-    /// self-describing and decodes without any format or decoder change.
-    mgp: bool,
-}
-
-impl Default for EncodeOptions {
-    fn default() -> Self {
-        Self {
-            num_tokens: DEFAULT_NUM_TOKENS,
-            cost_stop: true,
-            min_match: None,
-            mgp: false,
-        }
-    }
-}
-
-impl EncodeOptions {
-    /// Options with an explicit Re-Pair vocabulary cap.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `num_tokens` is outside `256..=0x3F_FFFE` — the cap must admit up to 256
-    /// byte terminals and stay one below the reserved NIL sentinel (`u22::MAX`).
-    pub fn new(num_tokens: u32) -> Result<Self> {
-        ensure!(
-            (MIN_NUM_TOKENS..=DEFAULT_NUM_TOKENS).contains(&num_tokens),
-            "num-tokens must be in {MIN_NUM_TOKENS}..={DEFAULT_NUM_TOKENS}, got {num_tokens}"
-        );
-        // An explicit vocabulary cap asks for exactly that many tokens, so grammar pruning switches
-        // from the cost model to a hard post-build count cap at `num_tokens`.
-        Ok(Self {
-            num_tokens,
-            cost_stop: false,
-            ..Self::default()
-        })
-    }
-
-    /// Sets a fixed LZ77 minimum match length, overriding the default dynamic rule.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `min_match` is outside `2..=0x3F_FFFF` — a match must cover at least two
-    /// tokens (length 0 is the escape, one token never wins) and fit a u22 varint.
-    pub fn with_min_match(mut self, min_match: u32) -> Result<Self> {
-        ensure!(
-            (MIN_MATCH_LEN..=MAX_MATCH_LEN).contains(&min_match),
-            "min-match must be in {MIN_MATCH_LEN}..={MAX_MATCH_LEN}, got {min_match}"
-        );
-        self.min_match = Some(min_match);
-        Ok(self)
-    }
-
-    /// Enables the Re-Pair minimal-grammar-parse (MGP) sequence re-parse. Encode-only and always
-    /// reversible, so it needs no validation.
-    #[must_use]
-    pub const fn with_mgp(mut self) -> Self {
-        self.mgp = true;
-        self
-    }
-}
 
 /// The fallback [`NullModel`] builder — the internal no-op predictor [`Profile::models`] injects when
 /// the entropy stage is on but the profile selects no model. Not a registry feature.
 const NULL_MODEL: ModelBuilder = |_| Box::new(NullModel::new());
 
-/// Builds a byte→byte pipeline stage from the encode profile and options. Non-capturing so it
-/// coerces to a function pointer stored in the registry.
-type StageBuilder = fn(&Profile, &EncodeOptions) -> Box<dyn Transform>;
+/// Builds a byte→byte pipeline stage from the encode profile. Non-capturing so it coerces to a
+/// function pointer stored in the registry.
+type StageBuilder = fn(&Profile) -> Box<dyn Transform>;
 
 /// What enabling a pipeline feature does.
 #[derive(Clone, Copy)]
@@ -120,8 +43,8 @@ enum Kind {
 }
 
 /// One toggleable pipeline feature. A feature's bit position is its index in [`FEATURES`]. This is a
-/// pre-1.0 format, so the table may be reassigned freely — the container `version` is bumped whenever
-/// it is, so an old stream is rejected rather than misread under new bit meanings.
+/// pre-1.0 format, so the table may be reassigned freely — an old stream is simply rejected rather
+/// than misread under new bit meanings.
 struct FeatureSpec {
     /// CLI/serialization name.
     name: &'static str,
@@ -138,67 +61,46 @@ const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         name: "casefold",
         default_on: true,
-        kind: Kind::Stage(|_, _| Box::new(CaseFolding)),
+        kind: Kind::Stage(|_| Box::new(CaseFolding)),
     },
     FeatureSpec {
         name: "entities",
         default_on: true,
-        kind: Kind::Stage(|_, _| Box::new(EntityFolding)),
+        kind: Kind::Stage(|_| Box::new(EntityFolding)),
     },
     FeatureSpec {
         name: "repair",
         default_on: true,
-        kind: Kind::Stage(|_, options| {
-            Box::new(RepairTokenizer {
-                num_tokens: options.num_tokens,
-                cost_stop: options.cost_stop,
-                mgp: options.mgp,
-            })
-        }),
-    },
-    FeatureSpec {
-        // Off by default: the token-aware LZ77 stage is net-negative at the small, dense Re-Pair
-        // vocabularies that compress best under the context-mixing coder — the entropy stage's own
-        // match model already captures the token repeats, and LZ77's match records inject
-        // less-predictable bytes that hurt the higher-order models. It still helps at large
-        // vocabularies, so it stays available via `--enable lz77` (and the `--auto` search toggles it).
-        name: "lz77",
-        default_on: false,
-        kind: Kind::Stage(|_, options| {
-            Box::new(Lz77 {
-                min_match: options.min_match,
-            })
-        }),
+        kind: Kind::Stage(|_| Box::new(RepairTokenizer)),
     },
     FeatureSpec {
         name: "entropy",
         default_on: true,
-        kind: Kind::Stage(|profile, _| {
+        kind: Kind::Stage(|profile| {
             Box::new(EntropyCoder::new(profile.model_builders(), profile.model_names(), profile.enabled("sse")))
         }),
     },
     // Entropy models follow the stages. Registry order here is the model order in the mix (immaterial
-    // to correctness — the mixer weights per input). The sweep winners are default-on — `order0`,
-    // `order1`, `order2`, `sparse2`, `sparse24`, `varint`, and (registered after `sse`) the `match`
-    // model. `order2` helps once the Re-Pair vocabulary is capped small enough for a dense token
-    // stream (the tuned operating point); `order3`..`order7` stay default-off (they only help on an
-    // even smaller/denser alphabet and otherwise hurt). If *every* model is disabled
-    // while the entropy stage is on, [`Profile::model_builders`] silently supplies the internal null
-    // model (a reversible no-op), so "entropy on, no models" still codes rather than erroring. The null
-    // model is deliberately *not* a registry feature — it is an implementation fallback.
+    // to correctness — the mixer weights per input). In this byte-centric reset **all models are
+    // default-off**: the default profile codes through the injected null model, and models are enabled
+    // one at a time (e.g. `--enable order2`) to measure their byte-domain contribution. If *every*
+    // model is disabled while the entropy stage is on, [`Profile::model_builders`] silently supplies
+    // the internal null model (a reversible no-op), so "entropy on, no models" still codes rather than
+    // erroring. The null model is deliberately *not* a registry feature — it is an implementation
+    // fallback.
     FeatureSpec {
         name: "order0",
-        default_on: true,
+        default_on: false,
         kind: Kind::Model(|c| Box::new(OrderN::new(0, c))),
     },
     FeatureSpec {
         name: "order1",
-        default_on: true,
+        default_on: false,
         kind: Kind::Model(|c| Box::new(OrderN::new(1, c))),
     },
     FeatureSpec {
         name: "order2",
-        default_on: true,
+        default_on: false,
         kind: Kind::Model(|c| Box::new(OrderN::new(2, c))),
     },
     FeatureSpec {
@@ -228,33 +130,26 @@ const FEATURES: &[FeatureSpec] = &[
     },
     FeatureSpec {
         name: "sparse2",
-        default_on: true,
+        default_on: false,
         kind: Kind::Model(|c| Box::new(SparseModel::new(&[2], c))),
     },
     FeatureSpec {
         name: "sparse24",
-        default_on: true,
+        default_on: false,
         kind: Kind::Model(|c| Box::new(SparseModel::new(&[2, 4], c))),
     },
-    FeatureSpec {
-        name: "varint",
-        default_on: true,
-        kind: Kind::Model(|_| Box::new(VarintModel::new())),
-    },
     // `sse` is a config flag (not a model): it enables the entropy coder's APM refinement stage.
-    // Default-on — it lowers bpb on enwik8/enwik9.
+    // Default-on — it is coder configuration, not a predictor.
     FeatureSpec {
         name: "sse",
         default_on: true,
         kind: Kind::Flag,
     },
-    // LZ77-aware match model: reconstructs the pre-LZ77 stream and predicts recurring content through
-    // the LZ77 encoding (repeats that LZ77 folded, which the token models miss because the record's
-    // distance differs between occurrences). A small net win on enwik9, so default-on. Appended after
-    // `sse` so its bit does not shift the existing feature bits.
+    // Byte-level match model: predicts long recurrences the order-N context models miss. Default-off
+    // like the other models.
     FeatureSpec {
         name: "match",
-        default_on: true,
+        default_on: false,
         kind: Kind::Model(|c| Box::new(MatchModel::new(c))),
     },
 ];
@@ -264,7 +159,7 @@ const_assert!(FEATURES.len() <= 64);
 /// What a listed [`FeatureInfo`] does, for the CLI's feature listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeatureKind {
-    /// A byte→byte pipeline stage (casefold, entities, repair, lz77, entropy).
+    /// A byte→byte pipeline stage (casefold, entities, repair, entropy).
     Stage,
     /// An entropy model mixed into the entropy stage.
     Model,
@@ -311,18 +206,11 @@ pub(crate) struct Compressor {
 }
 
 impl Compressor {
-    /// Builds the decode-side pipeline `profile` selects. The tokenizer's `num_tokens` is irrelevant
-    /// to `inverse` (the vocabulary is read from the stream), so the default is used.
+    /// Builds the pipeline `profile` selects. The same assembly serves encode and decode — the
+    /// tokenizer is parameterless and every stage recovers what it needs from the stream.
     pub(crate) fn from_profile(profile: Profile) -> Self {
         Self {
-            pipeline: profile.pipeline_with(EncodeOptions::default()),
-        }
-    }
-
-    /// Builds the encode-side pipeline `profile` selects with the given `options`.
-    pub(crate) fn with_options(profile: Profile, options: EncodeOptions) -> Self {
-        Self {
-            pipeline: profile.pipeline_with(options),
+            pipeline: profile.pipeline(),
         }
     }
 
@@ -436,28 +324,22 @@ impl Profile {
         })
     }
 
-    /// Builds the decode-side compressor pipeline this profile selects.
+    /// Builds the compressor pipeline this profile selects (used for both encode and decode).
     pub(crate) fn compressor(self) -> Compressor {
         Compressor::from_profile(self)
     }
 
-    /// Builds the encode-side compressor with the given `options`.
-    pub(crate) fn compressor_with(self, options: EncodeOptions) -> Compressor {
-        Compressor::with_options(self, options)
-    }
-
     /// Assembles the pipeline in CANONICAL order — imposed here, not by feature bit position:
-    /// casefold → entities → repair → lz77 → entropy (always strictly last). This single explicit
-    /// assembly is the only place stage order is decided, so it cannot be broken by editing the
-    /// registry.
-    fn pipeline_with(self, options: EncodeOptions) -> Pipeline {
+    /// casefold → entities → repair → entropy (always strictly last). This single explicit assembly is
+    /// the only place stage order is decided, so it cannot be broken by editing the registry.
+    fn pipeline(self) -> Pipeline {
         let mut stages: Vec<Box<dyn Transform>> = Vec::new();
         let mut names: Vec<&'static str> = Vec::new();
         for (i, feature) in FEATURES.iter().enumerate() {
             if let Kind::Stage(build) = feature.kind
                 && self.is_set(i)
             {
-                stages.push(build(&self, &options));
+                stages.push(build(&self));
                 names.push(feature.name);
             }
         }
@@ -595,12 +477,12 @@ mod tests {
         }
 
         /// Every stage- and model-toggle combination must round-trip a sample that exercises all
-        /// stages (uppercase for casefold, entities for entity-folding, repetition for Re-Pair and
-        /// LZ77). The 17-bit range spans the four preprocessors, the entropy stage, all eleven
-        /// entropy models (order0..7, sparse2, sparse24, varint), and the `sse` flag — including
+        /// stages (uppercase for casefold, entities for entity-folding, repetition for Re-Pair). The
+        /// 16-bit range spans the three text/tokenizer stages, the entropy stage, all eleven entropy
+        /// models (order0..7, sparse2, sparse24, match), and the `sse` flag — including
         /// entropy-with-no-model, which codes reversibly via the injected null fallback.
         #[test]
-        fn each_stage_toggle_round_trips(bits in 0u64..=0x1_FFFF) {
+        fn each_stage_toggle_round_trips(bits in 0u64..=0xFFFF) {
             let sample =
                 b"The QUICK brown fox &lt;tag&gt; JUMPS. The QUICK brown fox &lt;tag&gt; JUMPS.".to_vec();
             let c = Compressor::from_profile(Profile::from_bits(bits).unwrap());
@@ -663,61 +545,30 @@ mod tests {
     }
 
     #[test]
-    fn profile_default_enables_stages_and_winning_models() {
-        let profile = Profile::default();
-        assert!(profile.enabled("casefold"));
-        assert!(profile.enabled("entities"));
-        assert!(profile.enabled("repair"));
-        // LZ77 (bit 3) is default-off: it is net-negative at the small dense vocabularies that compress
-        // best; it stays available via `--enable lz77` and the `--auto` search.
-        assert!(!profile.enabled("lz77"));
-        assert!(profile.enabled("entropy"));
-        // The sweep winners are default-on; order3..order7 are default-off.
-        assert!(profile.enabled("order0"));
-        assert!(profile.enabled("order1"));
-        assert!(profile.enabled("order2"));
-        assert!(profile.enabled("sparse2"));
-        assert!(profile.enabled("sparse24"));
-        assert!(profile.enabled("varint"));
-        assert!(profile.enabled("sse"));
-        assert!(profile.enabled("match"));
-        assert!(!profile.enabled("order3"));
-        // bits 0,1,2 (casefold/entities/repair) and 4 (entropy) — lz77 (bit 3) is default-off — plus
-        // order0..2 (5,6,7) and sparse2(13), sparse24(14), varint(15), sse(16), match(17).
-        assert_eq!(profile.to_bits(), 0xF7 | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17));
+    fn profile_default_bits() {
+        // Default-on: casefold(0), entities(1), repair(2), entropy(3), sse(14). Every model is off.
+        assert_eq!(Profile::default().to_bits(), 0xF | (1 << 14));
     }
 
     #[test]
     fn profile_toggles_by_name() {
-        let mut profile = Profile::default(); // stages + order0/order1/order2/sparse2/sparse24/varint
-        // `repair` is fundamental (bit 2) and cannot be disabled, so it stays set throughout. Disabling
-        // every other default-on feature leaves only the repair bit.
-        for feature in [
-            "casefold", "entities", "lz77", "entropy", "order0", "order1", "order2", "sparse2", "sparse24", "varint",
-            "sse", "match",
-        ] {
-            profile.disable(feature).unwrap();
-        }
-        assert_eq!(profile.to_bits(), 0b0000_0100); // only the mandatory repair bit remains
-        assert!(profile.disable("repair").is_err());
+        // Build from an empty profile: enable the four stages, then two models, checking bits.
+        let mut profile = Profile::from_bits(0).unwrap();
         profile.enable("casefold").unwrap();
-        assert_eq!(profile.to_bits(), 0b0000_0101);
+        assert_eq!(profile.to_bits(), 1 << 0);
         profile.enable("entities").unwrap();
+        assert_eq!(profile.to_bits(), 0b0000_0011);
+        profile.enable("repair").unwrap();
         assert_eq!(profile.to_bits(), 0b0000_0111);
-        profile.enable("lz77").unwrap();
-        assert_eq!(profile.to_bits(), 0b0000_1111);
+        // `repair` is fundamental (bit 2) and cannot be disabled.
+        assert!(profile.disable("repair").is_err());
         profile.enable("entropy").unwrap();
-        assert_eq!(profile.to_bits(), 0b0001_1111);
+        assert_eq!(profile.to_bits(), 0b0000_1111);
         profile.enable("order0").unwrap();
-        assert_eq!(profile.to_bits(), 0b0011_1111);
-        profile.enable("order1").unwrap();
-        assert_eq!(profile.to_bits(), 0b0111_1111);
-        profile.enable("order2").unwrap();
-        assert_eq!(profile.to_bits(), 0b1111_1111);
-        // `varint` is bit 15; the seven models between order2 and it (order3..7, sparse2, sparse24)
-        // stay clear here, so enabling it sets only bit 15.
-        profile.enable("varint").unwrap();
-        assert_eq!(profile.to_bits(), 0xFF | (1 << 15));
+        assert_eq!(profile.to_bits(), 0b0001_1111);
+        // `match` is bit 15 (the last feature); enabling it sets only that bit.
+        profile.enable("match").unwrap();
+        assert_eq!(profile.to_bits(), 0b0001_1111 | (1 << 15));
     }
 
     #[test]
@@ -757,24 +608,14 @@ mod tests {
 
     #[test]
     fn active_models_reports_enabled_models_and_null_fallback() {
-        // Default profile: the winning model set, listed in registry (mix) order (`match` last).
-        assert_eq!(
-            Profile::default().active_models(),
-            vec!["order0", "order1", "order2", "sparse2", "sparse24", "varint", "match"]
-        );
-        // Enabling a further model keeps registry order regardless of enable order.
+        // Default profile: every model is off, so entropy codes via the injected null fallback.
+        assert_eq!(Profile::default().active_models(), vec!["null"]);
+        // Enabling models lists them in registry (mix) order regardless of enable order.
         let mut p = Profile::default();
-        p.enable("order3").unwrap();
-        assert_eq!(
-            p.active_models(),
-            vec!["order0", "order1", "order2", "order3", "sparse2", "sparse24", "varint", "match"]
-        );
-        // Entropy on with every model disabled -> the injected null fallback is reported.
-        let mut none = Profile::default();
-        for m in ["order0", "order1", "order2", "sparse2", "sparse24", "varint", "match"] {
-            none.disable(m).unwrap();
-        }
-        assert_eq!(none.active_models(), vec!["null"]);
+        p.enable("order2").unwrap();
+        p.enable("order0").unwrap();
+        p.enable("match").unwrap();
+        assert_eq!(p.active_models(), vec!["order0", "order2", "match"]);
         // Entropy disabled -> no models run, so the list is empty (nothing to report).
         let mut off = Profile::default();
         off.disable("entropy").unwrap();
@@ -796,35 +637,25 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=17 (preprocessors, entropy, order0..7, sparse2, sparse24, varint, sse, match) are known.
-        for bits in 0..=0x3_FFFF {
+        // bits 0..=15 (casefold/entities/repair/entropy, order0..7, sparse2, sparse24, sse, match) known.
+        for bits in 0..=0xFFFF {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(1 << 18).is_err()); // bit 18 is not a known feature
+        assert!(Profile::from_bits(1 << 16).is_err()); // bit 16 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 
     #[test]
-    fn encode_options_validate_num_tokens() {
-        assert!(EncodeOptions::new(256).is_ok());
-        assert!(EncodeOptions::new(0x3F_FFFE).is_ok());
-        assert!(EncodeOptions::new(255).is_err()); // below the terminal floor
-        assert!(EncodeOptions::new(0x3F_FFFF).is_err()); // the reserved NIL value
-        assert_eq!(EncodeOptions::default().num_tokens, DEFAULT_NUM_TOKENS);
-    }
-
-    #[test]
-    fn encode_options_validate_min_match() {
-        assert_eq!(EncodeOptions::default().min_match, None);
-        assert_eq!(EncodeOptions::default().with_min_match(2).unwrap().min_match, Some(2));
-        assert_eq!(EncodeOptions::default().with_min_match(0x3F_FFFF).unwrap().min_match, Some(0x3F_FFFF));
-        assert!(EncodeOptions::default().with_min_match(1).is_err()); // below the two-byte floor
-        assert!(EncodeOptions::default().with_min_match(0x40_0000).is_err()); // beyond u22
-    }
-
-    #[test]
-    fn encode_options_toggle_mgp() {
-        assert!(!EncodeOptions::default().mgp);
-        assert!(EncodeOptions::default().with_mgp().mgp);
+    fn default_profile_enables_stages_but_no_models() {
+        // The byte-centric reset ships with every model off; the default codes via the null fallback.
+        let profile = Profile::default();
+        for stage in ["casefold", "entities", "repair", "entropy"] {
+            assert!(profile.enabled(stage), "{stage} should be default-on");
+        }
+        for model in ["order0", "order1", "order2", "sparse2", "sparse24", "match"] {
+            assert!(!profile.enabled(model), "{model} should be default-off");
+        }
+        assert!(profile.enabled("sse"), "sse flag should be default-on");
+        assert_eq!(profile.active_models(), vec!["null"], "no model selected -> null fallback");
     }
 }

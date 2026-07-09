@@ -144,15 +144,17 @@ fn compress_flag_overrides_lzr_extension() {
     }
 }
 
-/// Compression with LZ77 options must still round-trip: a fixed `--min-match`, and `lz77` toggled
-/// off entirely, both reconstruct the original (the decoder reads the pipeline from the stream).
+/// Compression with pipeline options must still round-trip: a small `--block-size` (forcing many
+/// blocks) and enabled models, both reconstruct the original (the decoder reads the pipeline per
+/// block from the stream).
 #[test]
-fn roundtrip_with_lz77_options() {
+fn roundtrip_with_pipeline_options() {
     let original = b"the quick brown fox jumps over the lazy dog. ".repeat(200);
     for (tag, args) in [
-        ("min_match", vec!["--min-match", "6"]),
-        ("lz77_off", vec!["--disable", "lz77"]),
-        ("lz77_on", vec!["--enable", "lz77", "--min-match", "3"]),
+        ("small_blocks", vec!["--block-size", "512"]),
+        ("suffix_blocks", vec!["--block-size", "1K"]),
+        ("models", vec!["--enable", "order2", "--enable", "match"]),
+        ("both", vec!["--block-size", "256", "--enable", "order1"]),
     ] {
         let raw = temp_path(&format!("{tag}.bin"));
         let packed = temp_path(&format!("{tag}.lzr"));
@@ -160,8 +162,7 @@ fn roundtrip_with_lz77_options() {
         std::fs::write(&raw, &original).unwrap();
 
         let mut cmd = Command::cargo_bin("lzr").unwrap();
-        // A model is required now that all are default-off; order-0 keeps these lz77-option cases valid.
-        let _ = cmd.arg(&raw).arg(&packed).args(&args).args(["--enable", "order0"]);
+        let _ = cmd.arg(&raw).arg(&packed).args(&args);
         let _ok = cmd.assert().success();
 
         decompress(&packed, &back);
@@ -173,13 +174,13 @@ fn roundtrip_with_lz77_options() {
     }
 }
 
-/// An out-of-range `--min-match` must fail cleanly (validated before any work).
+/// An invalid `--block-size` must fail cleanly (validated before any work).
 #[test]
-fn invalid_min_match_fails() {
-    let raw = temp_path("badmm.bin");
-    let packed = temp_path("badmm.lzr");
+fn invalid_block_size_fails() {
+    let raw = temp_path("badbs.bin");
+    let packed = temp_path("badbs.lzr");
     std::fs::write(&raw, b"data").unwrap();
-    let _ok = Command::cargo_bin("lzr").unwrap().arg(&raw).arg(&packed).arg("--min-match").arg("1").assert().failure();
+    let _ok = Command::cargo_bin("lzr").unwrap().arg(&raw).arg(&packed).arg("--block-size").arg("0").assert().failure();
     drop(std::fs::remove_file(raw));
     drop(std::fs::remove_file(packed));
 }

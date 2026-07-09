@@ -17,7 +17,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use crate::apm::Apm;
 use crate::coder::{Decoder, Encoder};
 use crate::mixer::{Mixer, squash};
-use crate::models::{Context, SYMBOL_BITS, TokenModel};
+use crate::models::{Context, Model, SYMBOL_BITS};
 use crate::transform::{ModelTrace, Transform};
 use crate::uleb128;
 
@@ -35,14 +35,12 @@ fn cost_lut() -> &'static Vec<f64> {
 /// Builds a model given the symbol (byte) count, so hashed tables size identically on encode and
 /// decode. An [`EntropyCoder`]'s builders are the profile's enabled models (order-0, order-1, …), in
 /// registry order; the coder requires at least one.
-pub(crate) type ModelBuilder = fn(usize) -> Box<dyn TokenModel>;
+pub(crate) type ModelBuilder = fn(usize) -> Box<dyn Model>;
 
 /// Length of the history window handed to each model per byte: the most recent finalized bytes,
-/// borrowed straight from the driver's buffer (no copy). Bounds the look-back the byte-history models
-/// (`crate::models::sparse::SparseModel`, `crate::models::varint::VarintModel`) can key on. The
-/// token-level [`crate::models::ordern::OrderN`] ignores this window — it derives its context from an
-/// internal u22 parser instead — so this is headroom for the byte-history and match models; it is a
-/// slice bound only (no allocation, deterministic on both sides), so growing it later is free.
+/// borrowed straight from the driver's buffer (no copy). Bounds the look-back the byte-context models
+/// (`crate::models::ordern::OrderN`, `crate::models::sparse::SparseModel`) can key on. It is a slice
+/// bound only (no allocation, deterministic on both sides), so growing it later is free.
 const WINDOW: usize = 1024;
 
 /// Upper bound on decoded bytes per payload byte. The range coder spends a strictly positive number
@@ -54,7 +52,7 @@ const MAX_BYTES_PER_PAYLOAD_BYTE: usize = 4096;
 /// The online predictor: every model's stretched prediction for the next bit, mixed into one
 /// probability, plus the shared [`Context`] the models read.
 struct Predictor {
-    models: Vec<Box<dyn TokenModel>>,
+    models: Vec<Box<dyn Model>>,
     stretched: Vec<i32>,
     mixer: Mixer,
     /// Optional SSE stage refining the mixed probability (the `sse` feature); keyed on the bit-tree
@@ -73,7 +71,7 @@ impl Predictor {
     /// decode agree) from the profile's enabled `builders` (at least one). `use_sse` adds the APM.
     /// `track` enables the encode-only per-model log-loss accumulation.
     fn new(capacity: usize, builders: &[ModelBuilder], use_sse: bool, track: bool) -> Self {
-        let models: Vec<Box<dyn TokenModel>> = builders.iter().map(|build| build(capacity)).collect();
+        let models: Vec<Box<dyn Model>> = builders.iter().map(|build| build(capacity)).collect();
         let n = models.len();
         Self {
             models,
@@ -142,8 +140,8 @@ impl Predictor {
         self.ctx.push_bit(bit);
     }
 
-    /// Close the current byte once all its bits are coded (also advances the shared token parser).
-    fn end_symbol(&mut self) {
+    /// Close the current byte once all its bits are coded, resetting the bit-tree for the next symbol.
+    const fn end_symbol(&mut self) {
         self.ctx.push_symbol();
     }
 }
@@ -253,7 +251,7 @@ mod tests {
 
     /// An order-0-only coder — a minimal single-model entropy stage.
     fn coder() -> EntropyCoder {
-        fn build_order0(capacity: usize) -> Box<dyn TokenModel> {
+        fn build_order0(capacity: usize) -> Box<dyn Model> {
             Box::new(OrderN::new(0, capacity))
         }
         EntropyCoder::new(vec![build_order0], vec!["order0"], false)

@@ -1,185 +1,107 @@
-//! Capped Re-Pair grammar tokenizer — a byte→byte [`Transform`].
+//! Byte-BPE Re-Pair grammar tokenizer — a byte→byte [`Transform`].
 //!
-//! Re-Pair repeatedly replaces the most frequent adjacent digram with a new non-terminal, building
-//! a grammar over the input. This tokenizer runs Re-Pair to a caller-supplied vocabulary cap
-//! ([`RepairTokenizer::num_tokens`], default `u22::MAX - 1`), renumbers the symbols, and serializes
-//! the grammar *inline* ahead of the reduced symbol sequence with the [`crate::uleb128`] u22 varint
-//! codec, so the whole thing is one byte stream the codec can carry without a separate dictionary
-//! channel:
+//! Re-Pair repeatedly replaces the most frequent adjacent digram with a new non-terminal, building a
+//! grammar over the input. This byte-centric variant claims the block's **unused byte values** as its
+//! non-terminals and runs until they are exhausted — so after it runs (given enough redundancy) all
+//! 256 byte values are in use, and the whole thing is one plain byte stream:
 //!
 //! ```text
-//! [V] [(left_1, right_1)] … [(left_V, right_V)] [sequence …]      (each value uleb128-u22)
+//! [R] [(sym_1, left_1, right_1)] … [(sym_R, left_R, right_R)] [sequence …]
 //! ```
 //!
-//! `V` is the symbol count (at most `u22::MAX - 1`), and the header carries the *max id* `V`. Real
-//! symbol ids run `1..=V`: **id 0 is reserved and never emitted**, so the byte value `0x00` stays
-//! out of the serialized stream and is a free marker for the downstream LZ77 stage. Two `u22`
-//! values are thus special — id 0 (reserved) and [`NIL_SYM`] = `u22::MAX`, the NIL sentinel that
-//! marks a terminal. Every symbol is a uniform `(left, right)` pair — a terminal is `(byte, NIL)`,
-//! a non-terminal is `(left, right)` referencing two other symbols. Ids are assigned by
-//! **descending reference frequency** — id 1 is the most-used symbol — so low-valued (short) ids
-//! serialize to fewer bytes; this matters most for a non-entropy back end. Frequency order is not
-//! topological, so `inverse` treats the grammar as a DAG and rejects cycles. The grammar is built
-//! by the space-efficient frequency-based Re-Pair of Bille–Gørtz–Prezza (2017); see [`builder`].
+//! `R` (a ULEB128 `u64`) is the number of grammar rules; each rule is three raw bytes — the
+//! non-terminal byte `sym` and its two children `left`/`right` (each itself either a literal byte or
+//! another non-terminal). A byte not named as a rule's `sym` is a literal that expands to itself, so
+//! the grammar is fully described by the rules alone. The reduced sequence follows as plain bytes.
+//!
+//! The grammar is built by the space-efficient frequency-based Re-Pair of Bille–Gørtz–Prezza (2017)
+//! (see [`builder`]), capped at a 256-symbol vocabulary so every symbol id maps onto a distinct byte
+//! value. Rule order is not guaranteed topological, so `inverse` treats the grammar as a DAG and
+//! rejects cycles.
 
 mod builder;
-mod mgp;
-mod prune;
 
-use anyhow::{Result, anyhow, bail, ensure};
-use arbitrary_int::u22;
+use anyhow::{Result, bail, ensure};
 
 use super::MAX_EXPANSION_BYTES;
 use crate::transform::Transform;
-use crate::uleb128::{decode_u22, encode_u22};
+use crate::uleb128::{decode_u64, encode_u64};
 
-/// Reserved sentinel symbol (`u22::MAX`); never a valid symbol id, so it marks a terminal as the
-/// right child of a uniform `(left, right)` grammar definition. This is the only reserved value.
-const NIL_SYM: u32 = 0x3F_FFFF; // == u22::MAX
-/// Default vocabulary cap: symbol ids run `0..DEFAULT_NUM_TOKENS`, one below [`NIL_SYM`], so the
-/// sentinel can never collide with a real id.
-pub(crate) const DEFAULT_NUM_TOKENS: u32 = NIL_SYM - 1; // 0x3F_FFFE
-/// Smallest sensible cap: the input can use all 256 byte values, so the cap must admit the terminals.
-pub(crate) const MIN_NUM_TOKENS: u32 = 256;
+/// Total symbol-id ceiling (exclusive) for the grammar build: ids run `0..256`, so every symbol maps
+/// to a distinct byte value and Re-Pair stops once the block's free byte slots are all consumed. Ids
+/// are `u16` in the builder (256 fits, leaving `u16::MAX` free as the builder's `BLANK` sentinel).
+const VOCAB_CAP: u16 = 256;
 
-/// A resolved grammar symbol used by `inverse`.
+/// A resolved grammar symbol used by `inverse`, one per byte value.
 #[derive(Debug, Clone, Copy)]
 enum Def {
-    /// Terminal: expands to this byte.
+    /// Terminal: expands to this byte (the default for every byte not named by a rule).
     Byte(u8),
-    /// Non-terminal: the concatenation of two earlier symbols.
-    Pair(u32, u32),
+    /// Non-terminal: the concatenation of two other symbols (each a byte value).
+    Pair(u8, u8),
 }
 
-/// A capped Re-Pair grammar tokenizer.
+/// The byte-BPE Re-Pair grammar tokenizer.
 ///
-/// `forward` derives a per-input grammar with the space-efficient frequency-based Re-Pair builder
-/// ([`builder`]), renumbers its symbols by descending reference frequency (id 0 = most used), and
-/// serializes it (uleb128-u22) inline ahead of the reduced sequence; `inverse` parses that
-/// self-describing grammar (as a cycle-checked DAG) and expands the sequence back to bytes. The only
-/// per-run parameter is the vocabulary cap `num_tokens` (encode-side only — `inverse` reads the
-/// actual vocabulary from the stream's `[V-1]` prefix).
+/// `forward` claims the input's unused byte values as non-terminals, derives a per-input grammar with
+/// the space-efficient Re-Pair builder ([`builder`]) capped at 256 symbols, and serializes it as plain
+/// bytes inline ahead of the reduced sequence; `inverse` parses that self-describing grammar (as a
+/// cycle-checked DAG) and expands the sequence back to bytes. There are no per-run parameters — the
+/// stage runs until the free byte slots are exhausted.
 #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RepairTokenizer {
-    /// Vocabulary ceiling for this run. Under `cost_stop` the grammar is built to its natural floor
-    /// (bounded only by the safety ceiling [`DEFAULT_NUM_TOKENS`]) and this is ignored; otherwise it
-    /// is the post-build count cap — the surviving vocabulary is trimmed to at most `num_tokens`.
-    pub(crate) num_tokens: u32,
-    /// Prune the built grammar by the serialized-byte cost model rather than to a fixed `num_tokens`
-    /// count (see [`prune`]). The default; the CLI turns it off when an explicit `--num-tokens` asks
-    /// for a hard count cap instead.
-    pub(crate) cost_stop: bool,
-    /// Re-parse the top-level sequence into a minimum-cost cover of the text over the pruned symbol
-    /// set (see [`mgp`]). Encode-only, opt-in (default off); the rules are untouched, so the stream
-    /// stays self-describing and the decoder is unchanged.
-    pub(crate) mgp: bool,
-}
-
-impl Default for RepairTokenizer {
-    fn default() -> Self {
-        Self {
-            num_tokens: DEFAULT_NUM_TOKENS,
-            cost_stop: true,
-            mgp: false,
-        }
-    }
-}
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RepairTokenizer;
 
 impl Transform for RepairTokenizer {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "vocab <= num_tokens <= 0x3F_FFFE, so vocab, ids (rank+1), and ranks all fit u32/u22"
-    )]
+    #[expect(clippy::cast_possible_truncation, reason = "terminal count and t are <= 256, which fits u16")]
     fn forward(&self, input: Vec<u8>) -> Vec<u8> {
         if input.is_empty() {
             return Vec::new();
         }
-        // Compact terminals to the distinct present bytes, in ascending byte order.
+        // Distinct present bytes become terminals (ascending byte order); absent bytes are the free
+        // slots the grammar's non-terminals will claim.
         let mut present = [false; 256];
         for &byte in &input {
             present[usize::from(byte)] = true;
         }
         let mut terminals: Vec<u8> = Vec::new();
-        let mut byte_to_id = [0u32; 256];
+        let mut byte_to_id = [0u16; 256];
         for byte in 0u8..=255 {
             if present[usize::from(byte)] {
-                byte_to_id[usize::from(byte)] = terminals.len() as u32;
+                // `terminals.len() < 256` here, so the cast to `u16` is exact.
+                byte_to_id[usize::from(byte)] = terminals.len() as u16;
                 terminals.push(byte);
             }
         }
+        let free: Vec<u8> = (0u8..=255).filter(|&b| !present[usize::from(b)]).collect();
         let t = terminals.len();
         // Map the input to compact terminal symbol ids, then free the byte buffer before the grammar
-        // build — the builder works on `symbols`, and holding the input too would cost ~1 GB at enwik9.
-        let symbols: Vec<u32> = input.iter().map(|&byte| byte_to_id[usize::from(byte)]).collect();
+        // build — the builder works on `symbols`, and holding the input too would cost ~1 GB at 1 GiB blocks.
+        let symbols: Vec<u16> = input.iter().map(|&byte| byte_to_id[usize::from(byte)]).collect();
         let fits = u32::try_from(input.len()).is_ok();
         drop(input);
-        // Build the grammar to its natural floor (bounded by the safety ceiling), then prune it —
-        // either by the serialized-byte cost model or down to the `num_tokens` count cap. Both run
-        // *after* the build so the pruning sees true reference frequencies. Identity fallback if the
-        // input exceeds u32 position indices.
+        // Build the grammar to its natural floor, bounded by the 256-symbol cap so each non-terminal id
+        // `t + k` maps onto the `k`-th free byte. `t <= 256` so the `u16` cast is exact. Identity
+        // fallback if the input exceeds u32 positions.
         let (rules, sequence) = if fits {
-            let (rules, sequence) = builder::build_grammar(symbols, t as u32, DEFAULT_NUM_TOKENS);
-            prune::prune_grammar(t as u32, rules, sequence, self.num_tokens, self.cost_stop)
+            builder::build_grammar(symbols, t as u16, VOCAB_CAP)
         } else {
             (Vec::new(), symbols)
         };
-        // Optionally re-parse the sequence into a minimum-cost cover of the same text using the pruned
-        // symbol set. Rules are unchanged; only the sequence is rewritten, so this is lossless and
-        // needs no format or decoder change.
-        let sequence = if self.mgp {
-            mgp::reparse_sequence(t as u32, &rules, sequence)
-        } else {
-            sequence
-        };
-        // Assemble the topological grammar as a flat definition list (terminals then rules).
-        let vocab = t + rules.len();
-        let mut dict: Vec<Def> = Vec::with_capacity(vocab);
-        for &byte in &terminals {
-            dict.push(Def::Byte(byte));
-        }
-        for &(left, right) in &rules {
-            dict.push(Def::Pair(left, right));
-        }
-        // Count how often each symbol is *referenced* (in the sequence and as a rule child), then
-        // renumber by descending frequency so id 0 is the most-used symbol (short ids code cheaply).
-        let mut freq = vec![0u64; vocab];
-        for &sym in &sequence {
-            freq[sym as usize] += 1;
-        }
-        for &(left, right) in &rules {
-            freq[left as usize] += 1;
-            freq[right as usize] += 1;
-        }
-        let mut order: Vec<usize> = (0..vocab).collect();
-        order.sort_unstable_by(|&a, &b| freq[b].cmp(&freq[a]).then(a.cmp(&b)));
-        // Real ids run `1..=V`: id 0 is reserved and never emitted, so the byte value `0x00`
-        // stays out of the serialized stream (a free marker for the downstream LZ77 stage). The
-        // header therefore carries the *max id* `V` rather than `V-1`.
-        let mut new_id = vec![0u32; vocab];
-        for (rank, &old) in order.iter().enumerate() {
-            new_id[old] = rank as u32 + 1;
-        }
-        // Emit `[V]` (the max id), then each definition — uniformly `(left, right)`, a terminal
-        // being `(byte, NIL)` — in new-id order, then the remapped sequence, all as uleb128-u22
-        // bytes. Pre-size to skip reallocation churn on the (at enwik9 scale) multi-hundred-MB
-        // stream: ids are frequency-reordered, so most sequence symbols are low ids of 1–2 bytes.
-        let mut out = Vec::with_capacity(4 + vocab * 4 + sequence.len() * 2);
-        encode_u22(u22::new(vocab as u32), &mut out);
-        for &old in &order {
-            match dict[old] {
-                Def::Byte(byte) => {
-                    encode_u22(u22::new(u32::from(byte)), &mut out);
-                    encode_u22(u22::new(NIL_SYM), &mut out);
-                }
-                Def::Pair(left, right) => {
-                    encode_u22(u22::new(new_id[left as usize]), &mut out);
-                    encode_u22(u22::new(new_id[right as usize]), &mut out);
-                }
-            }
+        // Map every symbol id to its byte value: terminal id `i` -> the i-th present byte, non-terminal
+        // id `t + k` -> the k-th free byte. `rules.len() <= free.len()` by the vocab cap.
+        let mut id_to_byte: Vec<u8> = terminals;
+        id_to_byte.extend_from_slice(&free[..rules.len()]);
+        // Serialize `[R] [(sym, left, right)] * R [sequence]`, all as plain bytes.
+        let mut out = Vec::with_capacity(1 + rules.len() * 3 + sequence.len());
+        encode_u64(rules.len() as u64, &mut out);
+        for (k, &(left, right)) in rules.iter().enumerate() {
+            out.push(id_to_byte[t + k]);
+            out.push(id_to_byte[usize::from(left)]);
+            out.push(id_to_byte[usize::from(right)]);
         }
         for &sym in &sequence {
-            encode_u22(u22::new(new_id[sym as usize]), &mut out);
+            out.push(id_to_byte[usize::from(sym)]);
         }
         out
     }
@@ -189,47 +111,34 @@ impl Transform for RepairTokenizer {
             return Ok(Vec::new());
         }
         let mut pos = 0;
-        // The header is the max id `V`; real ids run `1..=V`, so there are `V + 1` dict slots
-        // (slot 0 is a reserved placeholder that valid data never references — see `forward`).
-        let vocab = decode_u22(&input, &mut pos)?.value() as usize + 1;
-        // Parse the uniform definition list: each symbol is `(left, right)`, a terminal being
-        // `(byte, NIL)` and a non-terminal a pair of symbol ids. Cap the reservation so a corrupt
-        // `[V]` claiming a huge vocabulary cannot demand a large allocation before the decode fails.
-        let mut dict: Vec<Def> = Vec::with_capacity(vocab.min(1 << 16));
-        // Reserved id 0: a placeholder terminal so positional indexing stays valid; it expands to a
-        // single byte if a corrupt stream ever references it, which the container checksum rejects.
-        dict.push(Def::Byte(0));
-        for _ in 1..vocab {
-            let left = decode_u22(&input, &mut pos)?.value();
-            let right = decode_u22(&input, &mut pos)?.value();
-            if right == NIL_SYM {
-                let byte = u8::try_from(left).map_err(|_| anyhow!("Re-Pair terminal token {left} is not a byte"))?;
-                dict.push(Def::Byte(byte));
-            } else {
-                ensure!(
-                    (left as usize) < vocab && (right as usize) < vocab,
-                    "Re-Pair rule references an undefined symbol"
-                );
-                dict.push(Def::Pair(left, right));
-            }
+        let rule_count = decode_u64(&input, &mut pos)?;
+        // Every byte defaults to a literal expanding to itself; the rules override the non-terminals.
+        let mut dict = [Def::Byte(0); 256];
+        for b in 0u8..=255 {
+            dict[usize::from(b)] = Def::Byte(b);
         }
-        // Frequency order is not topological, so resolve expansion lengths over the grammar DAG (this
-        // also rejects cycles). Then stream the sequence: bound each token's expansion against the
-        // decompression-bomb ceiling *before* expanding it, so `output` never exceeds the cap.
+        for _ in 0..rule_count {
+            ensure!(pos + 3 <= input.len(), "Re-Pair rule table is truncated");
+            let sym = input[pos];
+            let left = input[pos + 1];
+            let right = input[pos + 2];
+            pos += 3;
+            dict[usize::from(sym)] = Def::Pair(left, right);
+        }
+        // Rule order is not guaranteed topological, so resolve expansion lengths over the grammar DAG
+        // (this also rejects cycles). Then stream the sequence, bounding each byte's expansion against
+        // the decompression-bomb ceiling *before* expanding it.
         let lengths = expansion_lengths(&dict)?;
         let mut total: u64 = 0;
         let mut output = Vec::new();
-        let mut stack: Vec<u32> = Vec::new();
-        while pos < input.len() {
-            let token = decode_u22(&input, &mut pos)?.value();
-            let index = token as usize;
-            ensure!(index < vocab, "Re-Pair sequence symbol {token} is out of range");
-            total = total.saturating_add(lengths[index]);
+        let mut stack: Vec<u8> = Vec::new();
+        for &byte in &input[pos..] {
+            total = total.saturating_add(lengths[usize::from(byte)]);
             ensure!(total <= MAX_EXPANSION_BYTES, "Re-Pair expansion exceeds {MAX_EXPANSION_BYTES} bytes");
-            stack.push(token);
+            stack.push(byte);
             while let Some(symbol) = stack.pop() {
-                match dict[symbol as usize] {
-                    Def::Byte(byte) => output.push(byte),
+                match dict[usize::from(symbol)] {
+                    Def::Byte(b) => output.push(b),
                     Def::Pair(left, right) => {
                         stack.push(right);
                         stack.push(left);
@@ -240,23 +149,23 @@ impl Transform for RepairTokenizer {
         Ok(output)
     }
 
-    /// The Re-Pair vocabulary size for the CLI trace: the leading `[V]` header (the max symbol id,
-    /// i.e. the token count) of a non-empty stream. Empty output (empty input) reports nothing.
+    /// The Re-Pair rule count for the CLI trace: the leading `[R]` header of a non-empty stream. Empty
+    /// output (empty input) reports nothing.
     fn trace_detail(&self, output: &[u8]) -> Option<(u64, &'static str)> {
         let mut pos = 0;
-        decode_u22(output, &mut pos).ok().map(|v| (u64::from(v.value()), "tokens"))
+        decode_u64(output, &mut pos).ok().map(|r| (r, "rules"))
     }
 }
 
-/// Resolves each grammar symbol's expansion length in bytes over the (possibly non-topological)
-/// DAG via an iterative post-order walk, rejecting cycles. Lengths saturate so a decompression
-/// bomb stays finite for the caller's cap.
-fn expansion_lengths(dict: &[Def]) -> Result<Vec<u64>> {
+/// Resolves each grammar symbol's expansion length in bytes over the (possibly non-topological) DAG
+/// via an iterative post-order walk, rejecting cycles. Lengths saturate so a decompression bomb stays
+/// finite for the caller's cap.
+fn expansion_lengths(dict: &[Def; 256]) -> Result<Vec<u64>> {
     // Per-symbol state: 0 = unvisited, 1 = on the current path, 2 = resolved.
-    let mut lengths = vec![0u64; dict.len()];
-    let mut state = vec![0u8; dict.len()];
+    let mut lengths = vec![0u64; 256];
+    let mut state = [0u8; 256];
     let mut stack: Vec<usize> = Vec::new();
-    for start in 0..dict.len() {
+    for start in 0..256 {
         if state[start] != 0 {
             continue;
         }
@@ -273,7 +182,7 @@ fn expansion_lengths(dict: &[Def]) -> Result<Vec<u64>> {
                     let _ = stack.pop();
                 }
                 Def::Pair(left, right) => {
-                    let (left, right) = (left as usize, right as usize);
+                    let (left, right) = (usize::from(left), usize::from(right));
                     if state[node] == 0 {
                         state[node] = 1;
                         for child in [left, right] {
@@ -300,17 +209,15 @@ fn expansion_lengths(dict: &[Def]) -> Result<Vec<u64>> {
 mod tests {
     use std::path::Path;
 
-    use arbitrary_int::u22;
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
 
-    use super::{NIL_SYM, RepairTokenizer};
+    use super::RepairTokenizer;
     use crate::transform::Transform;
-    use crate::uleb128::{decode_u22, encode_u22};
+    use crate::uleb128::encode_u64;
 
-    /// A default tokenizer (`num_tokens = u22::MAX - 1`).
     fn tok() -> RepairTokenizer {
-        RepairTokenizer::default()
+        RepairTokenizer
     }
 
     fn corpus(rel: &str) -> Option<Vec<u8>> {
@@ -352,73 +259,60 @@ mod tests {
     }
 
     #[test]
-    fn reserves_zero_so_output_has_no_nul_byte() {
-        // Reserving id 0 keeps the byte value `0x00` out of the serialized stream for any input
-        // free of literal NUL bytes — this is the free marker the downstream LZ77 stage relies on.
-        let data = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
-        assert!(!tok().forward(data).contains(&0), "reserved id 0 leaked a 0x00 byte");
-    }
-
-    #[test]
-    fn large_grammar_stays_within_vocabulary() {
-        // A pseudo-random 256 KiB block makes Re-Pair create thousands of rules; the emitted
-        // vocabulary must stay within the cap and still round-trip.
-        let mut data = vec![0u8; 256 * 1024];
-        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
-        for byte in &mut data {
-            state = state.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-            *byte = state.to_be_bytes()[0];
+    fn consumes_free_bytes_on_redundant_text() {
+        // A redundant text input over a small alphabet has many free byte values; Re-Pair should claim
+        // them, so the output uses substantially more distinct byte values than the input did.
+        let data = b"the quick brown fox jumps over the lazy dog. ".repeat(256);
+        let mut present_in = [false; 256];
+        for &b in &data {
+            present_in[usize::from(b)] = true;
         }
-        let bytes = tok().forward(data.clone());
-        let mut pos = 0;
-        // The header is the max id `V`; real ids `1..=V` must stay below `NIL_SYM`.
-        let max_id = decode_u22(&bytes, &mut pos).unwrap().value() as usize;
-        assert!(max_id <= 0x3F_FFFE, "max id {max_id} exceeds the cap");
-        assert_eq!(tok().inverse(bytes).unwrap(), data);
+        let out = tok().forward(data.clone());
+        let mut present_out = [false; 256];
+        for &b in &out {
+            present_out[usize::from(b)] = true;
+        }
+        let d_in = present_in.iter().filter(|&&p| p).count();
+        let d_out = present_out.iter().filter(|&&p| p).count();
+        assert!(d_out > d_in, "expected Re-Pair to claim free byte values ({d_in} -> {d_out})");
+        assert_eq!(tok().inverse(out).unwrap(), data);
     }
 
     #[test]
-    fn ids_are_frequency_ordered() {
-        // No pair repeats in "zzab", so the vocabulary is just the terminals, renumbered by
-        // descending reference frequency: the most-frequent byte 'z' becomes id 0 even though it is
-        // the largest byte value present.
-        let bytes = tok().forward(b"zzab".to_vec());
-        let mut pos = 0;
-        assert_eq!(decode_u22(&bytes, &mut pos).unwrap().value(), 3); // V = max id (three terminals)
-        assert_eq!(decode_u22(&bytes, &mut pos).unwrap().value(), u32::from(b'z')); // id 1 left = 'z'
-        assert_eq!(decode_u22(&bytes, &mut pos).unwrap().value(), NIL_SYM); // ...right = NIL (terminal)
-        assert_eq!(tok().inverse(bytes).unwrap(), b"zzab".to_vec());
+    fn rule_count_header_is_reported() {
+        let data = b"abracadabra abracadabra abracadabra".to_vec();
+        let out = tok().forward(data.clone());
+        let (rules, unit) = tok().trace_detail(&out).unwrap();
+        assert_eq!(unit, "rules");
+        assert!(rules >= 1, "a repetitive input should yield at least one rule");
+        assert_eq!(tok().inverse(out).unwrap(), data);
     }
 
     #[test]
-    fn inverse_rejects_malformed_tokens() {
-        // Append an out-of-range sequence symbol (id == V+1, one past the largest valid id V).
-        let mut bytes = tok().forward(b"abracadabra".to_vec());
-        let mut pos = 0;
-        let v = decode_u22(&bytes, &mut pos).unwrap().value() + 1; // max_id + 1 = V + 1
-        encode_u22(u22::new(v), &mut bytes);
+    fn full_alphabet_input_is_passthrough_grammar() {
+        // Input using all 256 byte values has no free slots, so Re-Pair emits zero rules.
+        let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let out = tok().forward(data.clone());
+        assert_eq!(out[0], 0, "no free bytes -> zero rules");
+        assert_eq!(tok().inverse(out).unwrap(), data);
+    }
+
+    #[test]
+    fn inverse_rejects_truncated_rule_table() {
+        // Claim one rule but supply no rule bytes.
+        let mut bytes = Vec::new();
+        encode_u64(1, &mut bytes);
         assert!(tok().inverse(bytes).is_err());
-        // A stream claiming a huge vocabulary with no definitions following is truncated.
-        let mut header_only = Vec::new();
-        encode_u22(u22::new(NIL_SYM - 1), &mut header_only);
-        assert!(tok().inverse(header_only).is_err());
     }
 
     #[test]
-    fn num_tokens_cap_is_respected() {
-        // A tiny cap must bound the emitted vocabulary and still round-trip.
-        let data = b"the quick brown fox jumps over the lazy dog. ".repeat(64);
-        let capped = RepairTokenizer {
-            num_tokens: 300,
-            cost_stop: false,
-            mgp: false,
-        };
-        let bytes = capped.forward(data.clone());
-        let mut pos = 0;
-        // The header is the max id `V`, which equals the real symbol count (ids `1..=V`).
-        let symbols = decode_u22(&bytes, &mut pos).unwrap().value() as usize;
-        assert!(symbols <= 300, "vocabulary {symbols} exceeds the num_tokens cap");
-        assert_eq!(capped.inverse(bytes).unwrap(), data);
+    fn inverse_rejects_cycle() {
+        // A single rule whose non-terminal references itself is a cycle.
+        let mut bytes = Vec::new();
+        encode_u64(1, &mut bytes);
+        bytes.extend_from_slice(&[0x00, 0x00, 0x01]); // sym 0 = (0, 1) -> self-reference
+        bytes.push(0x00); // a sequence byte referencing the cyclic symbol
+        assert!(tok().inverse(bytes).is_err());
     }
 
     #[test]

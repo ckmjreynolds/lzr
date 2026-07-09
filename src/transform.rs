@@ -6,7 +6,7 @@
 //! on the encode side ([`Transform::forward`]) and exactly inverts it on the decode
 //! side ([`Transform::inverse`]). Because *every* stage speaks the same `Vec<u8>`
 //! domain, stages compose freely: tokenization and entropy coding can each be
-//! toggled on or off, and a future LZ77 stage slots in like any other.
+//! toggled on or off, and a new stage slots in like any other.
 //!
 //! Both methods take the buffer **by value** so a stage can free its input before
 //! an expensive build (the tokenizer drops ~1 GB before its grammar build) and so
@@ -14,7 +14,7 @@
 
 /// One stage's encode-side trace record: `(feature name, input length, output length, optional
 /// `(detail value, unit label)`)`. Returned per stage by [`Pipeline::forward_traced`] for the CLI's
-/// per-stage report; the unit label lets each stage name its own statistic (`tokens`, `matches`, …).
+/// per-stage report; the unit label lets each stage name its own statistic (e.g. `rules`).
 pub(crate) type StageTrace = (&'static str, usize, usize, Option<(u64, &'static str)>);
 
 /// One entropy model's encode-side scorecard entry: `(model name, standalone bits-per-byte, average
@@ -40,9 +40,8 @@ pub(crate) trait Transform {
     fn inverse(&self, input: Vec<u8>) -> anyhow::Result<Vec<u8>>;
 
     /// An optional per-stage statistic for the CLI's trace as `(value, unit label)`, derived from the
-    /// stage's own `output` bytes — e.g. `(vocab, "tokens")` for Re-Pair, `(count, "matches")` for
-    /// LZ77. `None` — the default — for stages with nothing extra to report. Encode-side only (see
-    /// [`Pipeline::forward_traced`]).
+    /// stage's own `output` bytes — e.g. `(rules, "rules")` for Re-Pair. `None` — the default — for
+    /// stages with nothing extra to report. Encode-side only (see [`Pipeline::forward_traced`]).
     fn trace_detail(&self, _output: &[u8]) -> Option<(u64, &'static str)> {
         None
     }

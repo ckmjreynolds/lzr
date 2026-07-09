@@ -3,24 +3,24 @@
 #![allow(unused_features, reason = "Required for coverage_attribute feature.")]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::Parser;
-use lzr::{EncodeOptions, Profile};
+use lzr::{DEFAULT_BLOCK_SIZE, Profile};
 
 /// LZR — a context-mixing compressor.
 ///
 /// Compression is the default, except when `input` has the compressor's `.lzr`
 /// extension, in which case decompression is the default. Pass `-z`/`--compress`
 /// or `-d`/`--decompress` to force a direction regardless of extension. Pipeline
-/// features (see `--enable`/`--disable`) default to all enabled and apply to
-/// compression only — decompression reads the pipeline the stream was written
-/// with.
+/// features (see `--enable`/`--disable`) apply to compression only — decompression
+/// reads the pipeline each block was written with.
 #[derive(Debug, Parser)]
 #[command(name = "lzr", version, about)]
-#[expect(clippy::struct_excessive_bools, reason = "CLI flags are independent on/off switches, not a state machine")]
 struct Cli {
     /// Force compression, even for a `.lzr` input.
     #[arg(short = 'z', long, conflicts_with = "decompress")]
@@ -38,37 +38,16 @@ struct Cli {
     #[arg(long, value_name = "FEATURE")]
     disable: Vec<String>,
 
-    /// Re-Pair vocabulary cap (256..=4194302). Compression only; defaults to the maximum.
-    #[arg(long, value_name = "N")]
-    num_tokens: Option<u32>,
+    /// Block size in bytes; the input is split into independently-compressed blocks of this size,
+    /// processed in parallel. Accepts a plain byte count or a `K`/`M`/`G` suffix (e.g. `64M`).
+    /// Compression only; defaults to 100 MiB.
+    #[arg(long, value_name = "SIZE", value_parser = parse_block_size)]
+    block_size: Option<usize>,
 
-    /// LZ77 minimum match length in tokens (2..=4194303); may expand the stream. Compression only;
-    /// defaults to a dynamic per-match rule that only emits matches that shrink the stream.
-    #[arg(long, value_name = "N")]
-    min_match: Option<u32>,
-
-    /// Re-parse the Re-Pair top-level sequence into a minimum-cost cover (MGP). Compression only;
-    /// encode-side only, so the stream still decodes without any flag.
-    #[arg(long)]
-    mgp: bool,
-
-    /// Auto-select the best operating point (Re-Pair vocabulary size × LZ77 on/off, with MGP on) by
-    /// trial-compressing a prefix sample, then compress the whole input at the winner. This is the
-    /// **default** for a bare compression; passing any pipeline flag (`--num-tokens`, `--min-match`,
-    /// `--enable`, `--disable`) selects the manual path instead, and `--auto` forces the search even
-    /// alongside those flags (overriding `--num-tokens` and the LZ77 toggle). Compression only.
-    #[arg(long, conflicts_with = "no_auto")]
-    auto: bool,
-
-    /// Opt out of the default operating-point search and compress with the plain pipeline (honoring
-    /// any `--num-tokens` / `--min-match` / `--enable` / `--disable`). Compression only.
-    #[arg(long)]
-    no_auto: bool,
-
-    /// Prefix bytes `--auto` searches on (default 2,000,000). Larger samples track the full-input
-    /// optimum better (the best vocabulary grows with input size) at proportionally more search cost.
-    #[arg(long, value_name = "BYTES")]
-    auto_sample: Option<usize>,
+    /// Number of blocks to process in parallel: `0` uses all CPU cores, `1` is single-threaded, `N`
+    /// uses N workers. Peak memory scales with this (each in-flight block needs its own scratch).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    threads: usize,
 
     /// List all pipeline features (for `--enable`/`--disable`) with their defaults, then exit.
     #[arg(long)]
@@ -81,6 +60,24 @@ struct Cli {
     /// Output file to write.
     #[arg(required_unless_present = "list_features")]
     output: Option<PathBuf>,
+}
+
+/// Parse a `--block-size` value: a plain byte count, or a number with a `K`/`M`/`G` (1024-based)
+/// suffix. Rejects zero and anything that overflows `usize`.
+fn parse_block_size(raw: &str) -> Result<usize, String> {
+    let raw = raw.trim();
+    let (digits, mult) = match raw.chars().last() {
+        Some('K' | 'k') => (&raw[..raw.len() - 1], 1usize << 10),
+        Some('M' | 'm') => (&raw[..raw.len() - 1], 1usize << 20),
+        Some('G' | 'g') => (&raw[..raw.len() - 1], 1usize << 30),
+        _ => (raw, 1usize),
+    };
+    let n: usize = digits.trim().parse().map_err(|_| format!("invalid block size {raw:?}"))?;
+    let bytes = n.checked_mul(mult).ok_or_else(|| format!("block size {raw:?} overflows"))?;
+    if bytes == 0 {
+        return Err("block size must be greater than zero".to_owned());
+    }
+    Ok(bytes)
 }
 
 fn main() -> ExitCode {
@@ -104,70 +101,59 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         anyhow::bail!("INPUT and OUTPUT are required (or pass --list-features)");
     };
 
-    let input = std::fs::read(in_path).with_context(|| format!("reading {}", in_path.display()))?;
-    let input_len = input.len();
     // Compression is the default; a `.lzr` input flips the default to decompression. Either
     // explicit flag overrides the extension (and the two flags conflict, so at most one is set).
     let decompress = !cli.compress && (cli.decompress || has_lzr_extension(in_path));
-    let (output, stages, models, flags) = if decompress {
-        (lzr::decompress(&input)?, Vec::new(), Vec::new(), Vec::new())
+
+    // Stream the file through the container so peak memory scales with the block window, not the file.
+    if decompress {
+        let mut reader = open_reader(in_path)?;
+        let mut writer = open_writer(out_path)?;
+        lzr::decompress_stream(&mut reader, &mut writer, cli.threads)?;
+        writer.flush().with_context(|| format!("writing {}", out_path.display()))?;
+        drop(writer);
+        // "original" is the uncompressed side (the output) and "compressed" the `.lzr` input.
+        report_stats(file_len(out_path), file_len(in_path));
     } else {
         let profile = profile(cli)?;
-        // Capture the enabled config flags before the profile is consumed by the compressor.
         let flags = profile.active_flags();
-        // Auto operating-point search is the default for a bare compression; any explicit pipeline flag
-        // selects the manual path, `--no-auto` forces it, and `--auto` forces the search regardless.
-        let manual_flags =
-            cli.num_tokens.is_some() || cli.min_match.is_some() || !cli.enable.is_empty() || !cli.disable.is_empty();
-        let use_auto = cli.auto || (!cli.no_auto && !manual_flags);
-        // Take ownership so the pipeline can free the input buffer before the tokenizer build.
-        let (output, stages, models) = if use_auto {
-            let sample = cli.auto_sample.unwrap_or(lzr::DEFAULT_SAMPLE_BYTES);
-            let (output, stages, models, report) = lzr::compress_auto(input, profile, sample);
-            report_auto(&report);
-            (output, stages, models)
-        } else {
-            let options = encode_options(cli)?;
-            lzr::compress_owned_with_traced(input, profile, options)
-        };
-        (output, stages, models, flags)
-    };
-    std::fs::write(out_path, &output).with_context(|| format!("writing {}", out_path.display()))?;
-
-    // For statistics, "original" is the uncompressed side and "compressed" the `.lzr` side,
-    // regardless of direction.
-    let (original, compressed) = if decompress {
-        (output.len(), input_len)
-    } else {
-        (input_len, output.len())
-    };
-    report_stages(&stages);
-    report_models(&models);
-    report_flags(&flags);
-    report_stats(original, compressed);
+        let block_size = cli.block_size.unwrap_or(DEFAULT_BLOCK_SIZE);
+        let input_len = file_len(in_path);
+        let mut reader = open_reader(in_path)?;
+        let mut writer = open_writer(out_path)?;
+        let (stages, models) =
+            lzr::compress_stream(&mut reader, &mut writer, input_len, profile, block_size, cli.threads)?;
+        writer.flush().with_context(|| format!("writing {}", out_path.display()))?;
+        drop(writer);
+        report_stages(&stages);
+        report_models(&models);
+        report_flags(&flags);
+        report_stats(input_len, file_len(out_path));
+    }
     Ok(())
+}
+
+/// Open a buffered reader over `path`.
+fn open_reader(path: &Path) -> anyhow::Result<BufReader<File>> {
+    let file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(BufReader::new(file))
+}
+
+/// Open a buffered writer over `path`, truncating any existing file.
+fn open_writer(path: &Path) -> anyhow::Result<BufWriter<File>> {
+    let file = File::create(path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(BufWriter::new(file))
+}
+
+/// The length of `path` in bytes, or `0` if it can't be stat'd (only used for display statistics).
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
 /// Whether `path` has an `.lzr` extension (case-insensitive), signalling that the input is a
 /// compressed stream and the direction should default to decompression.
-fn has_lzr_extension(path: &std::path::Path) -> bool {
+fn has_lzr_extension(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lzr"))
-}
-
-/// Build the encode-only [`EncodeOptions`] from the `--num-tokens` and `--min-match` flags, each
-/// defaulting when absent. Both are validated by their respective setters.
-fn encode_options(cli: &Cli) -> anyhow::Result<EncodeOptions> {
-    let mut options = match cli.num_tokens {
-        Some(num_tokens) => EncodeOptions::new(num_tokens)?,
-        None => EncodeOptions::default(),
-    };
-    if let Some(min_match) = cli.min_match {
-        options = options.with_min_match(min_match)?;
-    }
-    if cli.mgp {
-        options = options.with_mgp();
-    }
-    Ok(options)
 }
 
 /// Build the compression [`Profile`] from the `--disable`/`--enable` flags, starting from the
@@ -221,8 +207,7 @@ fn report_stages(stages: &[lzr::StageSize]) {
         } else {
             8.0 * stage.output_bytes as f64 / stage.input_bytes as f64
         };
-        // A stage may report an extra statistic with its own unit (Re-Pair vocab in "tokens", LZ77
-        // back-references in "matches").
+        // A stage may report an extra statistic with its own unit (e.g. the Re-Pair rule count in "rules").
         match stage.detail {
             Some((count, unit)) => {
                 eprintln!("  {:<9} {bpb:.4} bpb  ({} {unit})", stage.name, with_commas(count));
@@ -247,27 +232,6 @@ fn report_models(models: &[lzr::ModelScore]) {
     }
 }
 
-/// Print the auto-selected operating point to stderr (compression only, `--auto`): the chosen Re-Pair
-/// vocabulary and LZ77 state, and how much search it took.
-#[expect(clippy::print_stderr, reason = "A CLI reports run statistics to the user on stderr.")]
-fn report_auto(report: &lzr::AutoReport) {
-    let vocab = report
-        .point
-        .num_tokens
-        .map_or_else(|| "natural (cost-stop)".to_owned(), |n| format!("{}-token cap", with_commas(u64::from(n))));
-    let lz77 = if report.point.lz77 {
-        "on"
-    } else {
-        "off"
-    };
-    eprintln!(
-        "auto:       {vocab}, lz77 {lz77}  ({} sample trials on {} bytes + {} full-input refine)",
-        report.sample_evaluations,
-        with_commas(report.sampled_bytes as u64),
-        report.refine_evaluations
-    );
-}
-
 /// Print the enabled config flags to stderr (compression only), e.g. `sse`. Flags are pipeline
 /// configuration rather than predictors, so they list plainly. No-op when none are enabled (or on
 /// decompression).
@@ -283,30 +247,26 @@ fn report_flags(flags: &[&str]) {
 /// under Hutter-Prize accounting (the decompressor executable plus the `.lzr` payload).
 #[expect(clippy::print_stderr, reason = "A CLI reports run statistics to the user on stderr.")]
 #[expect(clippy::cast_precision_loss, reason = "Display statistics; byte counts are well under 2^53.")]
-fn report_stats(original: usize, compressed: usize) {
+fn report_stats(original: u64, compressed: u64) {
     let (ratio, bpb) = if original == 0 {
         (0.0, 0.0)
     } else {
         let (compressed_f, original_f) = (compressed as f64, original as f64);
         ((1.0 - compressed_f / original_f) * 100.0, 8.0 * compressed_f / original_f)
     };
-    eprintln!("original:   {} bytes", with_commas(original as u64));
-    eprintln!("compressed: {} bytes", with_commas(compressed as u64));
+    eprintln!("original:   {} bytes", with_commas(original));
+    eprintln!("compressed: {} bytes", with_commas(compressed));
     eprintln!("ratio:      {ratio:.2}%  ({bpb:.4} bpb)");
 
     if let Some(exe) = executable_size() {
         // Hutter rules: L(C) + L(C) (same executable) + L(.lzr).
-        let hutter = exe.saturating_mul(2).saturating_add(compressed as u64);
+        let hutter = exe.saturating_mul(2).saturating_add(compressed);
         let hutter_bpb = if original == 0 {
             0.0
         } else {
             8.0 * hutter as f64 / original as f64
         };
-        eprintln!(
-            "hutter:     {hutter_bpb:.4} bpb  (2 x {} exe + {} lzr)",
-            with_commas(exe),
-            with_commas(compressed as u64)
-        );
+        eprintln!("hutter:     {hutter_bpb:.4} bpb  (2 x {} exe + {} lzr)", with_commas(exe), with_commas(compressed));
     }
 }
 
