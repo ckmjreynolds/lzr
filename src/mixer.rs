@@ -20,6 +20,12 @@ const STRETCH_MAX: i32 = 2047;
 /// Learning-rate shift for the mixer weight update (higher = slower adaptation).
 const LR_SHIFT: i32 = 12;
 
+/// Number of selector contexts for the mixer's weight sets: one per previous-byte value. The mix
+/// blend can then specialize by local regime (markup, letters, digits, whitespace) instead of finding
+/// one global blend. The selector is a pure function of already-coded bytes, so encode and decode
+/// pick the same set and the stream still round-trips bit-for-bit. Standard lpaq-class technique.
+pub(crate) const MIX_CONTEXTS: usize = 256;
+
 #[expect(clippy::cast_possible_truncation, reason = "LUT values are clamped into `1..=4095`.")]
 fn squash_lut() -> &'static Vec<i32> {
     static LUT: OnceLock<Vec<i32>> = OnceLock::new();
@@ -71,38 +77,40 @@ pub(crate) fn stretch(p: i32) -> i32 {
     stretch_lut()[p as usize]
 }
 
-/// Adaptive logistic mixer: one weight set per bit position over `n` stretched
-/// model inputs. `mix` forms the weighted logit sum (16.16 fixed point) and
-/// squashes it to a 12-bit probability; `update` nudges the selected weight set
-/// toward the observed bit.
+/// Adaptive logistic mixer: `contexts` × `bit_positions` independent weight sets over `n` stretched
+/// model inputs, selected per bit by a `(context, bit position)` pair. `mix` forms the weighted logit
+/// sum (16.16 fixed point) and squashes it to a 12-bit probability; `update` nudges the selected
+/// weight set toward the observed bit.
 #[derive(Debug)]
 pub(crate) struct Mixer {
-    w: Vec<i32>,      // [bit_positions * n] weights, 16.16 fixed point
-    inputs: Vec<i32>, // stretched inputs captured by the last `mix` (its length is the input count `n`)
-    off: usize,       // selected weight-set offset from the last `mix`
-    pr: i32,          // last squashed prediction (12-bit)
+    w: Vec<i32>,          // [contexts * bit_positions * n] weights, 16.16 fixed point
+    inputs: Vec<i32>,     // stretched inputs captured by the last `mix` (its length is the input count `n`)
+    bit_positions: usize, // number of per-symbol bit-position weight sets within each context
+    off: usize,           // selected weight-set offset from the last `mix`
+    pr: i32,              // last squashed prediction (12-bit)
 }
 
 impl Mixer {
-    /// New mixer over `n` model inputs, with `bit_positions` independent weight
-    /// sets (one per bit index within a coded symbol).
-    pub(crate) fn new(n: usize, bit_positions: usize) -> Self {
+    /// New mixer over `n` model inputs, with `contexts` × `bit_positions` independent weight sets — one
+    /// per (selector context, bit index within a coded symbol).
+    pub(crate) fn new(n: usize, bit_positions: usize, contexts: usize) -> Self {
         Self {
-            w: vec![0; bit_positions * n],
+            w: vec![0; contexts * bit_positions * n],
             inputs: vec![0; n],
+            bit_positions,
             off: 0,
             pr: PROB_ONE / 2,
         }
     }
 
-    /// Mix the `stretched` model outputs into a 12-bit probability using the
-    /// weight set selected by `bpos` (the bit index within the current symbol).
+    /// Mix the `stretched` model outputs into a 12-bit probability using the weight set selected by
+    /// `(sel, bpos)` — the selector context and the bit index within the current symbol.
     #[expect(clippy::cast_possible_truncation, reason = "`dot >> 16` stays within i32 for a small model set.")]
-    pub(crate) fn mix(&mut self, stretched: &[i32], bpos: usize) -> i32 {
+    pub(crate) fn mix(&mut self, stretched: &[i32], sel: usize, bpos: usize) -> i32 {
         let n = self.inputs.len();
         debug_assert_eq!(stretched.len(), n);
         self.inputs.copy_from_slice(stretched);
-        self.off = bpos * n;
+        self.off = (sel * self.bit_positions + bpos) * n;
         let row = &self.w[self.off..self.off + n];
         let dot: i64 = row.iter().zip(stretched).map(|(&w, &s)| i64::from(w) * i64::from(s)).sum();
         self.pr = squash((dot >> 16) as i32);
@@ -172,14 +180,14 @@ mod tests {
         // the same direction (a basic sanity check that mixing is wired up).
         #[test]
         fn mix_follows_confident_inputs(bit in any::<bool>()) {
-            let mut m = Mixer::new(2, 1);
+            let mut m = Mixer::new(2, 1, 1);
             let s = if bit { STRETCH_MAX } else { -STRETCH_MAX };
             // Train a few steps so the weights move off zero.
             for _ in 0..64 {
-                let _ = m.mix(&[s, s], 0);
+                let _ = m.mix(&[s, s], 0, 0);
                 m.update(u8::from(bit));
             }
-            let p = m.mix(&[s, s], 0);
+            let p = m.mix(&[s, s], 0, 0);
             if bit {
                 prop_assert!(p > PROB_ONE / 2);
             } else {

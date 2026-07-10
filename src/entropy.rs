@@ -16,7 +16,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 
 use crate::apm::Apm;
 use crate::coder::{Decoder, Encoder};
-use crate::mixer::{Mixer, squash};
+use crate::mixer::{MIX_CONTEXTS, Mixer, squash};
 use crate::models::{Context, Model, SYMBOL_BITS};
 use crate::transform::{ModelTrace, Transform};
 use crate::uleb128;
@@ -76,7 +76,7 @@ impl Predictor {
         Self {
             models,
             stretched: vec![0; n],
-            mixer: Mixer::new(n, SYMBOL_BITS as usize),
+            mixer: Mixer::new(n, SYMBOL_BITS as usize, MIX_CONTEXTS),
             // One APM context per bit-tree node (`c0 & 0xff`), which uniquely encodes (bit position,
             // partial bits) — a minimal order-0 SSE.
             apm: use_sse.then(|| Apm::new(256)),
@@ -108,7 +108,10 @@ impl Predictor {
         for (m, s) in self.models.iter_mut().zip(&mut self.stretched) {
             *s = m.predict(&self.ctx, hist);
         }
-        let p = self.mixer.mix(&self.stretched, usize::from(self.ctx.bpos));
+        // Select the mixer weight set by the previous byte (order-1 context), constant across all 8
+        // bits of the current byte and identical on encode and decode.
+        let sel = usize::from(hist.last().copied().unwrap_or(0));
+        let p = self.mixer.mix(&self.stretched, sel, usize::from(self.ctx.bpos));
         let node = (self.ctx.c0 & 0xff) as usize;
         self.apm.as_mut().map_or(p, |apm| apm.refine(p, node)) as u32
     }
