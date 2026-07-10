@@ -9,6 +9,7 @@
 //! byte (`c0`/`bpos`). Higher-order context — the previous bytes — is read from the `hist` window the
 //! entropy driver borrows from its output buffer, so no byte-history ring is kept here.
 
+pub(crate) mod iddelta;
 pub(crate) mod match_model;
 pub(crate) mod null;
 pub(crate) mod ordern;

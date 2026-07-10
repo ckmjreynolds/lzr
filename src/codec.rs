@@ -13,6 +13,7 @@ use anyhow::{Result, anyhow, ensure};
 use static_assertions::const_assert;
 
 use crate::entropy::{EntropyCoder, ModelBuilder};
+use crate::models::iddelta::IdDeltaModel;
 use crate::models::match_model::MatchModel;
 use crate::models::null::NullModel;
 use crate::models::ordern::OrderN;
@@ -209,6 +210,15 @@ const FEATURES: &[FeatureSpec] = &[
         name: "sse2",
         default_on: true,
         kind: Kind::Flag,
+    },
+    // ID-delta model: predicts the current number's digits from the previous completed number.
+    // **Default-on**: -0.0006 bpb on enwik8 atop the rest — small but ~6x the neutral trailing-digit
+    // model, confirming the predictable structure of ids/timestamps is *cross-token* (the shared
+    // high-order prefix of near-monotonic sequences), not in the digits of a single number.
+    FeatureSpec {
+        name: "iddelta",
+        default_on: true,
+        kind: Kind::Model(|_| Box::new(IdDeltaModel::new())),
     },
 ];
 
@@ -537,12 +547,12 @@ mod tests {
 
         /// Every stage- and model-toggle combination must round-trip a sample that exercises all
         /// stages (uppercase for casefold, entities for entity-folding, repetition for Re-Pair). The
-        /// 22-bit range spans the three text/tokenizer stages (casefold, entities, repair), the entropy
-        /// stage, all fifteen entropy models (order0..11, sparse2, match, word, xmltag), and the
-        /// `sse`/`sse2` flags — including entropy-with-no-model, which codes reversibly via the injected
-        /// null fallback.
+        /// 23-bit range spans the three text/tokenizer stages (casefold, entities, repair), the entropy
+        /// stage, all sixteen entropy models (order0..11, sparse2, match, word, xmltag, iddelta), and
+        /// the `sse`/`sse2` flags — including entropy-with-no-model, which codes reversibly via the
+        /// injected null fallback.
         #[test]
-        fn each_stage_toggle_round_trips(bits in 0u64..=0x3F_FFFF) {
+        fn each_stage_toggle_round_trips(bits in 0u64..=0x7F_FFFF) {
             let sample =
                 b"The QUICK brown fox &lt;tag&gt; JUMPS. The QUICK brown fox &lt;tag&gt; JUMPS.".to_vec();
             let c = Compressor::from_profile(Profile::from_bits(bits).unwrap());
@@ -607,10 +617,10 @@ mod tests {
     #[test]
     fn profile_default_bits() {
         // Default-on: casefold(0)/entities(1)/entropy(3), the order-0..11 chain (bits 4..=15),
-        // sparse2(16), sse(17), match(18), word(19), xmltag(20), sse2(21). repair(2) is the sole
-        // default-off feature (it regresses the strengthened CM), so the default is all 22 bits except
-        // bit 2 = 0x3F_FFFF & !(1 << 2) = 0x3F_FFFB.
-        assert_eq!(Profile::default().to_bits(), 0x003F_FFFB);
+        // sparse2(16), sse(17), match(18), word(19), xmltag(20), sse2(21), iddelta(22). repair(2) is the
+        // sole default-off feature (it regresses the strengthened CM), so the default is all 23 bits
+        // except bit 2 = 0x7F_FFFF & !(1 << 2) = 0x7F_FFFB.
+        assert_eq!(Profile::default().to_bits(), 0x007F_FFFB);
     }
 
     #[test]
@@ -675,13 +685,13 @@ mod tests {
 
     #[test]
     fn active_models_reports_enabled_models_and_null_fallback() {
-        // Default profile: the swept-in set (order-0..11, sparse2, match, word, xmltag), in registry
-        // order.
+        // Default profile: the swept-in set (order-0..11, sparse2, match, word, xmltag, iddelta), in
+        // registry order.
         assert_eq!(
             Profile::default().active_models(),
             vec![
                 "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
-                "order10", "order11", "sparse2", "match", "word", "xmltag"
+                "order10", "order11", "sparse2", "match", "word", "xmltag", "iddelta"
             ]
         );
         // With no model selected, entropy codes via the injected null fallback.
@@ -717,12 +727,12 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=21 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
-        // xmltag, sse2). Sample the space rather than enumerate all 2^22 combinations.
-        for bits in (0..=0x3F_FFFF).step_by(7) {
+        // bits 0..=22 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
+        // xmltag, sse2, iddelta). Sample the space rather than enumerate all 2^23 combinations.
+        for bits in (0..=0x7F_FFFF).step_by(7) {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(1 << 22).is_err()); // bit 22 is not a known feature
+        assert!(Profile::from_bits(1 << 23).is_err()); // bit 23 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 
@@ -736,7 +746,7 @@ mod tests {
         assert!(!profile.enabled("repair"), "repair is default-off (regresses the strengthened CM)");
         for model in [
             "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
-            "order10", "order11", "sparse2", "match", "word", "xmltag",
+            "order10", "order11", "sparse2", "match", "word", "xmltag", "iddelta",
         ] {
             assert!(profile.enabled(model), "{model} should be default-on");
         }
