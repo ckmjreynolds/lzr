@@ -12,8 +12,10 @@
 pub(crate) mod match_model;
 pub(crate) mod null;
 pub(crate) mod ordern;
+pub(crate) mod run;
 pub(crate) mod sparse;
 pub(crate) mod statemap;
+pub(crate) mod xmltag;
 
 /// Bits per coded symbol. The entropy coder operates on bytes, so a symbol is a
 /// depth-8 bit-tree.

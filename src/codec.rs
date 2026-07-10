@@ -16,7 +16,9 @@ use crate::entropy::{EntropyCoder, ModelBuilder};
 use crate::models::match_model::MatchModel;
 use crate::models::null::NullModel;
 use crate::models::ordern::OrderN;
+use crate::models::run::RunModel;
 use crate::models::sparse::SparseModel;
+use crate::models::xmltag::XmlTagModel;
 use crate::preprocessors::{CaseFolding, EntityFolding, RepairTokenizer};
 use crate::transform::{ModelTrace, Pipeline, StageTrace, Transform};
 
@@ -81,13 +83,19 @@ const FEATURES: &[FeatureSpec] = &[
         name: "entropy",
         default_on: true,
         kind: Kind::Stage(|profile| {
-            Box::new(EntropyCoder::new(profile.model_builders(), profile.model_names(), profile.enabled("sse")))
+            Box::new(EntropyCoder::new(
+                profile.model_builders(),
+                profile.model_names(),
+                profile.enabled("sse"),
+                profile.enabled("sse2"),
+            ))
         }),
     },
     // Entropy models follow the stages. Registry order here is the model order in the mix (immaterial
     // to correctness — the mixer weights per input). The default set was chosen by a cumulative sweep
     // on enwik8 (add a model, keep it only if it lowered whole-stream bpb): the order-0..11 chain,
-    // `sparse2`, and the byte-level `match` model each earn their place and are **default-on**. A
+    // `sparse2`, the byte-level `match` model, the `word` model, and the `xmltag` model each earn their
+    // place and are **default-on** (together with the `sse`/`sse2` APM chain: 1.6339 -> 1.6092 bpb). A
     // wider `sparse24` (positions 2 and 4) was also tried but regressed the mix — the mixer drove its
     // weight negative — so it was dropped; re-confirmed after the order-0..10 / `u8`-`StateMap` rework
     // (still `w<0`, whole-stream bpb up), so it stays out. If
@@ -173,6 +181,34 @@ const FEATURES: &[FeatureSpec] = &[
         name: "match",
         default_on: true,
         kind: Kind::Model(|c| Box::new(MatchModel::new(c))),
+    },
+    // Word model: keys on the current partial word (trailing ASCII letters), via the generic
+    // char-class `RunModel`. Appended after `match` to keep the existing features' bit positions
+    // stable. **Default-on**: the largest single win of this sweep on enwik8 (1.6339 -> 1.6186 bpb,
+    // -0.0153) — its letter-only context generalises a word prefix across the punctuation it follows
+    // and reaches past the order-11 chain on long words. (A digit-class `RunModel` was also swept but
+    // measured neutral — the structure of ids/numbers is cross-token, not in the trailing digits — so
+    // it was dropped.)
+    FeatureSpec {
+        name: "word",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(RunModel::new(u8::is_ascii_alphabetic, c))),
+    },
+    // XML-tag model: keys on the nearest enclosing `MediaWiki` element name. **Default-on**: -0.0010 bpb
+    // on enwik8 atop word+sse2 — it gives `<id>`/`<timestamp>`/`<title>` bodies a per-field context the
+    // order-N models lose once the content runs past the tag.
+    FeatureSpec {
+        name: "xmltag",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(XmlTagModel::new(c))),
+    },
+    // Second SSE stage: chains a second APM (keyed on previous-byte × bit-tree node, an order-1
+    // context) after the `sse` APM. Only meaningful with `sse` on. **Default-on**: -0.0084 bpb on
+    // enwik8 atop word — it corrects order-1 miscalibration the single order-0 `sse` APM leaves.
+    FeatureSpec {
+        name: "sse2",
+        default_on: true,
+        kind: Kind::Flag,
     },
 ];
 
@@ -501,11 +537,12 @@ mod tests {
 
         /// Every stage- and model-toggle combination must round-trip a sample that exercises all
         /// stages (uppercase for casefold, entities for entity-folding, repetition for Re-Pair). The
-        /// 19-bit range spans the three text/tokenizer stages (casefold, entities, repair), the entropy
-        /// stage, all fourteen entropy models (order0..11, sparse2, match), and the `sse` flag —
-        /// including entropy-with-no-model, which codes reversibly via the injected null fallback.
+        /// 22-bit range spans the three text/tokenizer stages (casefold, entities, repair), the entropy
+        /// stage, all fifteen entropy models (order0..11, sparse2, match, word, xmltag), and the
+        /// `sse`/`sse2` flags — including entropy-with-no-model, which codes reversibly via the injected
+        /// null fallback.
         #[test]
-        fn each_stage_toggle_round_trips(bits in 0u64..=0x7FFFF) {
+        fn each_stage_toggle_round_trips(bits in 0u64..=0x3F_FFFF) {
             let sample =
                 b"The QUICK brown fox &lt;tag&gt; JUMPS. The QUICK brown fox &lt;tag&gt; JUMPS.".to_vec();
             let c = Compressor::from_profile(Profile::from_bits(bits).unwrap());
@@ -570,9 +607,10 @@ mod tests {
     #[test]
     fn profile_default_bits() {
         // Default-on: casefold(0)/entities(1)/entropy(3), the order-0..11 chain (bits 4..=15),
-        // sparse2(16), sse(17), and match(18). repair(2) is the sole default-off feature (it regresses
-        // the strengthened CM), so the default is all 19 bits except bit 2 = 0x7FFFF & !(1 << 2) = 0x7FFFB.
-        assert_eq!(Profile::default().to_bits(), 0x7FFFB);
+        // sparse2(16), sse(17), match(18), word(19), xmltag(20), sse2(21). repair(2) is the sole
+        // default-off feature (it regresses the strengthened CM), so the default is all 22 bits except
+        // bit 2 = 0x3F_FFFF & !(1 << 2) = 0x3F_FFFB.
+        assert_eq!(Profile::default().to_bits(), 0x003F_FFFB);
     }
 
     #[test]
@@ -637,12 +675,13 @@ mod tests {
 
     #[test]
     fn active_models_reports_enabled_models_and_null_fallback() {
-        // Default profile: the swept-in set (order-0..11, sparse2, match), in registry order.
+        // Default profile: the swept-in set (order-0..11, sparse2, match, word, xmltag), in registry
+        // order.
         assert_eq!(
             Profile::default().active_models(),
             vec![
                 "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
-                "order10", "order11", "sparse2", "match"
+                "order10", "order11", "sparse2", "match", "word", "xmltag"
             ]
         );
         // With no model selected, entropy codes via the injected null fallback.
@@ -664,12 +703,13 @@ mod tests {
 
     #[test]
     fn active_flags_lists_enabled_flags() {
-        // `sse` is the only flag and is default-on, so the default profile reports it.
-        assert_eq!(Profile::default().active_flags(), vec!["sse"]);
+        // `sse` and `sse2` are the flags, both default-on, reported in registry order.
+        assert_eq!(Profile::default().active_flags(), vec!["sse", "sse2"]);
         let mut p = Profile::default();
         p.disable("sse").unwrap();
+        p.disable("sse2").unwrap();
         assert!(p.active_flags().is_empty());
-        // `sse` configures the entropy stage, so it is inert (and unreported) when entropy is off.
+        // the flags configure the entropy stage, so they are inert (and unreported) when entropy is off.
         let mut off = Profile::default();
         off.disable("entropy").unwrap();
         assert!(off.active_flags().is_empty());
@@ -677,11 +717,12 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=18 (casefold/entities/repair/entropy, order0..11, sparse2, sse, match) known.
-        for bits in 0..=0x7FFFF {
+        // bits 0..=21 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
+        // xmltag, sse2). Sample the space rather than enumerate all 2^22 combinations.
+        for bits in (0..=0x3F_FFFF).step_by(7) {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(1 << 19).is_err()); // bit 19 is not a known feature
+        assert!(Profile::from_bits(1 << 22).is_err()); // bit 22 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 
@@ -695,10 +736,11 @@ mod tests {
         assert!(!profile.enabled("repair"), "repair is default-off (regresses the strengthened CM)");
         for model in [
             "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
-            "order10", "order11", "sparse2", "match",
+            "order10", "order11", "sparse2", "match", "word", "xmltag",
         ] {
             assert!(profile.enabled(model), "{model} should be default-on");
         }
         assert!(profile.enabled("sse"), "sse flag should be default-on");
+        assert!(profile.enabled("sse2"), "sse2 flag should be default-on");
     }
 }
