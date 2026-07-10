@@ -68,9 +68,13 @@ const FEATURES: &[FeatureSpec] = &[
         default_on: true,
         kind: Kind::Stage(|_| Box::new(EntityFolding)),
     },
+    // Byte-BPE Re-Pair tokenizer. **Default-off**: on enwik8 it now *regresses* whole-stream bpb by
+    // ~0.022 (1.6339 -> 1.6561) — the strengthened CM (order0..11 + match + per-context mixer + SSE)
+    // subsumes its ~71 rules, and the injected token boundaries disrupt the models more than the
+    // grammar shrinks the stream. Kept as an opt-in (`--enable repair`) for corpora where it still pays.
     FeatureSpec {
         name: "repair",
-        default_on: true,
+        default_on: false,
         kind: Kind::Stage(|_| Box::new(RepairTokenizer)),
     },
     FeatureSpec {
@@ -347,9 +351,9 @@ impl Profile {
         Compressor::from_profile(self)
     }
 
-    /// Assembles the pipeline in CANONICAL order — imposed here, not by feature bit position:
-    /// casefold → entities → repair → entropy (always strictly last). This single explicit assembly is
-    /// the only place stage order is decided, so it cannot be broken by editing the registry.
+    /// Assembles the pipeline in registry order, which *is* the canonical stage order:
+    /// casefold → entities → repair → entropy (always strictly last). Reordering stages is a
+    /// matter of reordering their [`Kind::Stage`] entries in [`FEATURES`].
     fn pipeline(self) -> Pipeline {
         let mut stages: Vec<Box<dyn Transform>> = Vec::new();
         let mut names: Vec<&'static str> = Vec::new();
@@ -497,9 +501,9 @@ mod tests {
 
         /// Every stage- and model-toggle combination must round-trip a sample that exercises all
         /// stages (uppercase for casefold, entities for entity-folding, repetition for Re-Pair). The
-        /// 19-bit range spans the three text/tokenizer stages, the entropy stage, all fourteen entropy
-        /// models (order0..11, sparse2, match), and the `sse` flag — including entropy-with-no-model,
-        /// which codes reversibly via the injected null fallback.
+        /// 19-bit range spans the three text/tokenizer stages (casefold, entities, repair), the entropy
+        /// stage, all fourteen entropy models (order0..11, sparse2, match), and the `sse` flag —
+        /// including entropy-with-no-model, which codes reversibly via the injected null fallback.
         #[test]
         fn each_stage_toggle_round_trips(bits in 0u64..=0x7FFFF) {
             let sample =
@@ -565,10 +569,10 @@ mod tests {
 
     #[test]
     fn profile_default_bits() {
-        // Default-on: the four stages casefold(0)/entities(1)/repair(2)/entropy(3), the order-0..11
-        // chain (bits 4..=15), sparse2(16), sse(17), and match(18). Every feature is default-on, so
-        // all 19 bits are set = 0x7FFFF.
-        assert_eq!(Profile::default().to_bits(), 0x7FFFF);
+        // Default-on: casefold(0)/entities(1)/entropy(3), the order-0..11 chain (bits 4..=15),
+        // sparse2(16), sse(17), and match(18). repair(2) is the sole default-off feature (it regresses
+        // the strengthened CM), so the default is all 19 bits except bit 2 = 0x7FFFF & !(1 << 2) = 0x7FFFB.
+        assert_eq!(Profile::default().to_bits(), 0x7FFFB);
     }
 
     #[test]
@@ -581,7 +585,7 @@ mod tests {
         assert_eq!(profile.to_bits(), 0b0000_0011);
         profile.enable("repair").unwrap();
         assert_eq!(profile.to_bits(), 0b0000_0111);
-        // Every stage is optional now — repair can be toggled off and back on like any other.
+        // Every stage is optional — repair can be toggled off and back on like any other.
         profile.disable("repair").unwrap();
         assert_eq!(profile.to_bits(), 0b0000_0011);
         profile.enable("repair").unwrap();
@@ -596,11 +600,14 @@ mod tests {
     }
 
     #[test]
-    fn repair_is_optional_and_can_be_disabled() {
-        // No feature is mandatory in the byte-centric reset: repair (default-on) can be disabled and
-        // the resulting repair-less profile still validates.
+    fn repair_is_optional_and_default_off() {
+        // Repair is now default-off (it regresses the strengthened CM). The default profile omits it,
+        // enabling it is valid, and disabling it again is valid — no feature is mandatory.
         let mut profile = Profile::default();
+        assert!(!profile.enabled("repair"), "repair is default-off");
+        profile.enable("repair").unwrap();
         assert!(profile.enabled("repair"));
+        assert!(profile.validate().is_ok(), "a repair-enabled profile is valid");
         profile.disable("repair").unwrap();
         assert!(!profile.enabled("repair"));
         assert!(profile.validate().is_ok(), "a repair-less profile is valid");
@@ -680,11 +687,12 @@ mod tests {
 
     #[test]
     fn default_profile_enables_stages_and_swept_models() {
-        // The default ships with the four stages plus the full swept-in model set; every feature is on.
+        // The default ships with casefold/entities/entropy plus the full swept-in model set.
         let profile = Profile::default();
-        for stage in ["casefold", "entities", "repair", "entropy"] {
+        for stage in ["casefold", "entities", "entropy"] {
             assert!(profile.enabled(stage), "{stage} should be default-on");
         }
+        assert!(!profile.enabled("repair"), "repair is default-off (regresses the strengthened CM)");
         for model in [
             "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
             "order10", "order11", "sparse2", "match",

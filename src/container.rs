@@ -41,10 +41,11 @@ const FOOTER_LEN: usize = 4;
 
 /// Default block size in bytes (100 MiB).
 ///
-/// A block is the unit of independent, parallel (de)compression; this size splits a ~1 GB input (e.g.
-/// enwik9) into ~10 blocks so the encode and decode fan out across cores, and stays well within the
-/// `u32` ceiling on Re-Pair position indices.
-pub const DEFAULT_BLOCK_SIZE: usize = 100 << 20;
+/// A block is the unit of independent (de)compression. At 1 GiB a ~1 GB input (e.g. enwik9) is a
+/// single block, maximizing per-block model context — the deterministic CM keeps warming over the
+/// whole stream with no block-boundary resets — at the cost of cross-block parallelism. It stays
+/// within the `u32` ceiling on Re-Pair position indices (1 GiB < 4 GiB). Override with `--block-size`.
+pub const DEFAULT_BLOCK_SIZE: usize = 1 << 30;
 
 /// One pipeline stage's input and output size in bytes, paired with its feature name.
 ///
@@ -497,8 +498,11 @@ mod tests {
 
     #[test]
     fn traced_reports_aggregated_stages() {
+        // Enable repair explicitly (it is default-off) so the trace exercises a tokenizer stage too.
+        let mut profile = Profile::default();
+        profile.enable("repair").unwrap();
         let data = b"The QUICK brown fox. ".repeat(200);
-        let (out, stages, _models) = compress_owned_with_traced(&data, Profile::default(), 128);
+        let (out, stages, _models) = compress_owned_with_traced(&data, profile, 128);
         assert_eq!(decompress(&out).unwrap(), data);
         assert!(stages.iter().any(|s| s.name == "repair"));
     }
