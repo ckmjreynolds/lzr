@@ -11,6 +11,7 @@
 
 pub(crate) mod iddelta;
 pub(crate) mod match_model;
+pub(crate) mod nnlm;
 pub(crate) mod null;
 pub(crate) mod ordern;
 pub(crate) mod run;

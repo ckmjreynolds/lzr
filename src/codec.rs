@@ -15,6 +15,7 @@ use static_assertions::const_assert;
 use crate::entropy::{EntropyCoder, ModelBuilder};
 use crate::models::iddelta::IdDeltaModel;
 use crate::models::match_model::MatchModel;
+use crate::models::nnlm::NnlmModel;
 use crate::models::null::NullModel;
 use crate::models::ordern::OrderN;
 use crate::models::run::RunModel;
@@ -89,6 +90,7 @@ const FEATURES: &[FeatureSpec] = &[
                 profile.model_names(),
                 profile.enabled("sse"),
                 profile.enabled("sse2"),
+                profile.enabled("mix2"),
             ))
         }),
     },
@@ -219,6 +221,32 @@ const FEATURES: &[FeatureSpec] = &[
         name: "iddelta",
         default_on: true,
         kind: Kind::Model(|_| Box::new(IdDeltaModel::new())),
+    },
+    // Two-layer mixing network: replaces the single-layer logistic mixer with a small MLP trained
+    // online by backprop — four sub-mixers over an order-1..4 context progression, blended by a learned
+    // second layer (see `TwoLayerMixer`). **Default-on**: the largest single win of the recent sweep —
+    // enwik8 1.6086 -> 1.5586 (−0.0500) and enwik9 1.3252 -> 1.2772 (−0.0480), both byte-exact
+    // roundtrips, for +7% time and pure-integer determinism (no float). Disable with `--disable mix2`.
+    FeatureSpec {
+        name: "mix2",
+        default_on: true,
+        kind: Kind::Flag,
+    },
+    // Online neural language model: a feed-forward net over learned byte embeddings, trained online by
+    // back-propagation. Generalises across contexts the exact order-N models cannot. **Default-off**
+    // while under evaluation (`f32`, so it also relaxes cross-toolchain reproducibility); `--enable nnlm`.
+    FeatureSpec {
+        name: "nnlm",
+        default_on: false,
+        kind: Kind::Model(|_| Box::new(NnlmModel::new(false))),
+    },
+    // Recurrent variant of the neural model (Elman RNN): the hidden state carries memory beyond the
+    // K-byte window — the long-range signal the fixed-order context models cannot hold. **Default-off**
+    // while under evaluation; `--enable nnrnn`.
+    FeatureSpec {
+        name: "nnrnn",
+        default_on: false,
+        kind: Kind::Model(|_| Box::new(NnlmModel::new(true))),
     },
 ];
 
@@ -547,12 +575,12 @@ mod tests {
 
         /// Every stage- and model-toggle combination must round-trip a sample that exercises all
         /// stages (uppercase for casefold, entities for entity-folding, repetition for Re-Pair). The
-        /// 23-bit range spans the three text/tokenizer stages (casefold, entities, repair), the entropy
+        /// 24-bit range spans the three text/tokenizer stages (casefold, entities, repair), the entropy
         /// stage, all sixteen entropy models (order0..11, sparse2, match, word, xmltag, iddelta), and
-        /// the `sse`/`sse2` flags — including entropy-with-no-model, which codes reversibly via the
-        /// injected null fallback.
+        /// the `sse`/`sse2`/`mix2` flags — including entropy-with-no-model, which codes reversibly via
+        /// the injected null fallback.
         #[test]
-        fn each_stage_toggle_round_trips(bits in 0u64..=0x7F_FFFF) {
+        fn each_stage_toggle_round_trips(bits in 0u64..=0xFF_FFFF) {
             let sample =
                 b"The QUICK brown fox &lt;tag&gt; JUMPS. The QUICK brown fox &lt;tag&gt; JUMPS.".to_vec();
             let c = Compressor::from_profile(Profile::from_bits(bits).unwrap());
@@ -603,6 +631,31 @@ mod tests {
     }
 
     #[test]
+    fn mix2_round_trips() {
+        // The two-layer mixing network must keep the pipeline reversible with the full default model set.
+        let mut profile = Profile::default();
+        profile.enable("mix2").unwrap();
+        let c = Compressor::from_profile(profile);
+        let data = b"The QUICK brown fox &lt;tag&gt; JUMPS over the lazy dog 12345. ".repeat(40);
+        assert_eq!(c.decode(&c.encode(data.clone())).unwrap(), data);
+    }
+
+    #[test]
+    fn neural_models_round_trip() {
+        // The f32 neural models must keep the pipeline reversible on a given build (same-binary
+        // encode/decode determinism), both feed-forward and recurrent, alone and with mix2.
+        let data = b"The QUICK brown fox &lt;tag&gt; JUMPS over the lazy dog 12345. ".repeat(40);
+        for feats in [&["nnlm"][..], &["nnrnn"][..], &["nnrnn", "mix2"][..]] {
+            let mut profile = Profile::default();
+            for f in feats {
+                profile.enable(f).unwrap();
+            }
+            let c = Compressor::from_profile(profile);
+            assert_eq!(c.decode(&c.encode(data.clone())).unwrap(), data, "features {feats:?} did not round-trip");
+        }
+    }
+
+    #[test]
     fn enabling_order1_still_round_trips() {
         // The order-1 model (default on) must keep the pipeline reversible.
         let mut profile = Profile::from_bits(0).unwrap();
@@ -617,10 +670,11 @@ mod tests {
     #[test]
     fn profile_default_bits() {
         // Default-on: casefold(0)/entities(1)/entropy(3), the order-0..11 chain (bits 4..=15),
-        // sparse2(16), sse(17), match(18), word(19), xmltag(20), sse2(21), iddelta(22). repair(2) is the
-        // sole default-off feature (it regresses the strengthened CM), so the default is all 23 bits
-        // except bit 2 = 0x7F_FFFF & !(1 << 2) = 0x7F_FFFB.
-        assert_eq!(Profile::default().to_bits(), 0x007F_FFFB);
+        // sparse2(16), sse(17), match(18), word(19), xmltag(20), sse2(21), iddelta(22), mix2(23).
+        // Default-off: repair(2) (regresses the strengthened CM) and the experimental neural models
+        // nnlm(24)/nnrnn(25). So the default is bits 0..=23 except bit 2 = 0x00FF_FFFF & !(1 << 2) =
+        // 0x00FF_FFFB.
+        assert_eq!(Profile::default().to_bits(), 0x00FF_FFFB);
     }
 
     #[test]
@@ -713,11 +767,12 @@ mod tests {
 
     #[test]
     fn active_flags_lists_enabled_flags() {
-        // `sse` and `sse2` are the flags, both default-on, reported in registry order.
-        assert_eq!(Profile::default().active_flags(), vec!["sse", "sse2"]);
+        // `sse`, `sse2`, and `mix2` are the flags, all default-on, reported in registry order.
+        assert_eq!(Profile::default().active_flags(), vec!["sse", "sse2", "mix2"]);
         let mut p = Profile::default();
         p.disable("sse").unwrap();
         p.disable("sse2").unwrap();
+        p.disable("mix2").unwrap();
         assert!(p.active_flags().is_empty());
         // the flags configure the entropy stage, so they are inert (and unreported) when entropy is off.
         let mut off = Profile::default();
@@ -727,12 +782,12 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=22 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
-        // xmltag, sse2, iddelta). Sample the space rather than enumerate all 2^23 combinations.
-        for bits in (0..=0x7F_FFFF).step_by(7) {
+        // bits 0..=25 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
+        // xmltag, sse2, iddelta, mix2, nnlm, nnrnn). Sample rather than enumerate all 2^26 combos.
+        for bits in (0..=0x3FF_FFFF).step_by(7) {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(1 << 23).is_err()); // bit 23 is not a known feature
+        assert!(Profile::from_bits(1 << 26).is_err()); // bit 26 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 
@@ -752,5 +807,9 @@ mod tests {
         }
         assert!(profile.enabled("sse"), "sse flag should be default-on");
         assert!(profile.enabled("sse2"), "sse2 flag should be default-on");
+        assert!(profile.enabled("mix2"), "mix2 flag should be default-on");
+        // The experimental neural models stay default-off.
+        assert!(!profile.enabled("nnlm"), "nnlm is default-off (experimental)");
+        assert!(!profile.enabled("nnrnn"), "nnrnn is default-off (experimental)");
     }
 }

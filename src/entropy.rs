@@ -16,7 +16,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 
 use crate::apm::Apm;
 use crate::coder::{Decoder, Encoder};
-use crate::mixer::{MIX_CONTEXTS, Mixer, squash};
+use crate::mixer::{MIX_CONTEXTS, Mixer, TwoLayerMixer, squash};
 use crate::models::{Context, Model, SYMBOL_BITS};
 use crate::transform::{ModelTrace, Transform};
 use crate::uleb128;
@@ -55,6 +55,9 @@ struct Predictor {
     models: Vec<Box<dyn Model>>,
     stretched: Vec<i32>,
     mixer: Mixer,
+    /// Optional two-layer mixing network (the `mix2` flag). When present it replaces `mixer` for the
+    /// blend; `mixer` is left unused. A nonlinear generalisation of the single-layer mix.
+    mixer2: Option<TwoLayerMixer>,
     /// Optional SSE stage refining the mixed probability (the `sse` feature); keyed on the bit-tree
     /// node. `None` leaves the mix unrefined.
     apm: Option<Apm>,
@@ -73,13 +76,25 @@ impl Predictor {
     /// Builds the model set (hashed models are sized from `capacity` = the byte count, so encode and
     /// decode agree) from the profile's enabled `builders` (at least one). `use_sse` adds the APM.
     /// `track` enables the encode-only per-model log-loss accumulation.
-    fn new(capacity: usize, builders: &[ModelBuilder], use_sse: bool, use_sse2: bool, track: bool) -> Self {
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "each bool toggles an independent, orthogonal coder feature (sse, sse2, mix2, tracking)"
+    )]
+    fn new(
+        capacity: usize,
+        builders: &[ModelBuilder],
+        use_sse: bool,
+        use_sse2: bool,
+        use_mix2: bool,
+        track: bool,
+    ) -> Self {
         let models: Vec<Box<dyn Model>> = builders.iter().map(|build| build(capacity)).collect();
         let n = models.len();
         Self {
             models,
             stretched: vec![0; n],
             mixer: Mixer::new(n, SYMBOL_BITS as usize, MIX_CONTEXTS),
+            mixer2: use_mix2.then(|| TwoLayerMixer::new(n, SYMBOL_BITS as usize, MIX_CONTEXTS, capacity)),
             // One APM context per bit-tree node (`c0 & 0xff`), which uniquely encodes (bit position,
             // partial bits) — a minimal order-0 SSE.
             apm: use_sse.then(|| Apm::new(256)),
@@ -96,7 +111,7 @@ impl Predictor {
     /// `num_bytes`) and the mixer's average weight on it, paired with the aligned `names`.
     #[expect(clippy::cast_precision_loss, reason = "Diagnostic display; byte counts are well under 2^53.")]
     fn scores(&self, num_bytes: usize, names: &[&'static str]) -> Vec<ModelTrace> {
-        let weights = self.mixer.input_weights();
+        let weights = self.mixer2.as_ref().map_or_else(|| self.mixer.input_weights(), TwoLayerMixer::input_weights);
         let denom = num_bytes.max(1) as f64;
         names
             .iter()
@@ -117,7 +132,20 @@ impl Predictor {
         // Select the mixer weight set by the previous byte (order-1 context), constant across all 8
         // bits of the current byte and identical on encode and decode.
         let sel = usize::from(hist.last().copied().unwrap_or(0));
-        let p = self.mixer.mix(&self.stretched, sel, usize::from(self.ctx.bpos));
+        let bpos = usize::from(self.ctx.bpos);
+        let p = if let Some(mixer2) = &mut self.mixer2 {
+            // Layer-1 selectors: an order-1..6 progression via rolling hashes of the last 1..6 bytes,
+            // so the blend can specialise by how deep a context is currently predictive.
+            let p2 = usize::from(hist.iter().rev().nth(1).copied().unwrap_or(0));
+            let p3 = usize::from(hist.iter().rev().nth(2).copied().unwrap_or(0));
+            let p4 = usize::from(hist.iter().rev().nth(3).copied().unwrap_or(0));
+            let o2 = sel.wrapping_mul(131).wrapping_add(p2);
+            let o3 = o2.wrapping_mul(131).wrapping_add(p3);
+            let o4 = o3.wrapping_mul(131).wrapping_add(p4);
+            mixer2.mix(&self.stretched, [sel, o2, o3, o4], sel, bpos)
+        } else {
+            self.mixer.mix(&self.stretched, sel, bpos)
+        };
         let node = (self.ctx.c0 & 0xff) as usize;
         let p = self.apm.as_mut().map_or(p, |apm| apm.refine(p, node));
         // Chain the order-1 APM (previous byte × node), blending its refinement with its input so a
@@ -142,7 +170,11 @@ impl Predictor {
                 *loss += lut[p_correct as usize];
             }
         }
-        self.mixer.update(bit);
+        if let Some(mixer2) = &mut self.mixer2 {
+            mixer2.update(bit);
+        } else {
+            self.mixer.update(bit);
+        }
         if let Some(apm) = &mut self.apm {
             apm.update(bit);
         }
@@ -174,6 +206,8 @@ pub(crate) struct EntropyCoder {
     use_sse: bool,
     /// Whether to chain the second order-1 APM (the `sse2` feature).
     use_sse2: bool,
+    /// Whether to use the two-layer mixing network in place of the single-layer mixer (the `mix2` flag).
+    use_mix2: bool,
     /// The per-model scorecard produced by the last `forward` (encode-only). Interior mutability
     /// because `Transform::forward` takes `&self`; read back via [`Transform::model_scores`].
     scores: RefCell<Vec<ModelTrace>>,
@@ -182,12 +216,19 @@ pub(crate) struct EntropyCoder {
 impl EntropyCoder {
     /// A coder over `builders` — every enabled model, in registry order — labelled by the aligned
     /// `names` (for the scorecard). `use_sse` enables the APM.
-    pub(crate) fn new(builders: Vec<ModelBuilder>, names: Vec<&'static str>, use_sse: bool, use_sse2: bool) -> Self {
+    pub(crate) fn new(
+        builders: Vec<ModelBuilder>,
+        names: Vec<&'static str>,
+        use_sse: bool,
+        use_sse2: bool,
+        use_mix2: bool,
+    ) -> Self {
         Self {
             builders,
             names,
             use_sse,
             use_sse2,
+            use_mix2,
             scores: RefCell::new(Vec::new()),
         }
     }
@@ -200,7 +241,7 @@ impl Transform for EntropyCoder {
         let mut header = Vec::new();
         uleb128::encode_u64(input.len() as u64, &mut header);
 
-        let mut pred = Predictor::new(input.len(), &self.builders, self.use_sse, self.use_sse2, true);
+        let mut pred = Predictor::new(input.len(), &self.builders, self.use_sse, self.use_sse2, self.use_mix2, true);
         let mut enc = Encoder::with_prefix(header, input.len() + input.len() / 2 + 16);
         for (i, &byte) in input.iter().enumerate() {
             // The history window is a borrowed view into the already-encoded prefix — no copy.
@@ -226,7 +267,7 @@ impl Transform for EntropyCoder {
         let limit = payload.len().saturating_mul(MAX_BYTES_PER_PAYLOAD_BYTE).saturating_add(1024);
         ensure!(count <= limit, "byte count {count} exceeds the {limit} a {}-byte payload can encode", payload.len());
 
-        let mut pred = Predictor::new(count, &self.builders, self.use_sse, self.use_sse2, false);
+        let mut pred = Predictor::new(count, &self.builders, self.use_sse, self.use_sse2, self.use_mix2, false);
         let mut dec = Decoder::new(payload);
         // Cap the up-front reservation so a large (but in-limit) count cannot demand a huge
         // allocation before a single byte is decoded; the Vec grows as needed.
@@ -272,7 +313,7 @@ mod tests {
         fn build_order0(capacity: usize) -> Box<dyn Model> {
             Box::new(OrderN::new(0, capacity))
         }
-        EntropyCoder::new(vec![build_order0], vec!["order0"], false, false)
+        EntropyCoder::new(vec![build_order0], vec!["order0"], false, false, false)
     }
 
     proptest! {
