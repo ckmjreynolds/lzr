@@ -16,6 +16,7 @@ pub(crate) mod null;
 pub(crate) mod ordern;
 pub(crate) mod run;
 pub(crate) mod sparse;
+pub(crate) mod state;
 pub(crate) mod statemap;
 pub(crate) mod xmltag;
 

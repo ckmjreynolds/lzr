@@ -9,21 +9,26 @@ use std::sync::OnceLock;
 
 use crate::mixer::stretch;
 
-/// Observation-count cap in the adaptive rate. Lower = more adaptive (tracks
-/// drift faster), which a single-pass online coder generally wants.
-const LIMIT: usize = 11;
+/// Default observation-count cap in the adaptive rate. Lower = more adaptive (tracks drift faster),
+/// which a single-pass online coder generally wants for a *per-context* map (few observations each).
+const DEFAULT_LIMIT: u8 = 11;
+
+/// Length of the shared rate table: one entry per observation count a `u8` limit can reach (`0..=255`).
+/// A shared state→probability map (see [`crate::models::state`]) is visited millions of times and can
+/// carry a high cap for a more precise, less jittery estimate, so the table covers the whole `u8` range.
+const RATE_TABLE_LEN: usize = u8::MAX as usize + 1;
 
 /// The count-decay rate table shared by every `StateMap`: `rate_table()[k] = (1 << 16) / (k + 2)`, the
-/// learning rate after `k` observations. A pure function of [`LIMIT`], so it is built once rather than
-/// recomputing 256 divisions (and allocating a `Vec`) per map.
-fn rate_table() -> &'static [i32; LIMIT + 1] {
-    static DT: OnceLock<[i32; LIMIT + 1]> = OnceLock::new();
+/// learning rate after `k` observations. A pure function, so it is built once rather than recomputing
+/// the divisions (and allocating a `Vec`) per map.
+fn rate_table() -> &'static [i32; RATE_TABLE_LEN] {
+    static DT: OnceLock<[i32; RATE_TABLE_LEN]> = OnceLock::new();
     DT.get_or_init(|| {
-        let mut dt = [0i32; LIMIT + 1];
+        let mut dt = [0i32; RATE_TABLE_LEN];
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_possible_wrap,
-            reason = "`k` is at most LIMIT (255), so `k as i32` is exact."
+            reason = "`k` is at most MAX_LIMIT (255), so `k as i32` is exact."
         )]
         for (k, rate) in dt.iter_mut().enumerate() {
             *rate = (1i32 << 16) / (k as i32 + 2);
@@ -36,15 +41,25 @@ fn rate_table() -> &'static [i32; LIMIT + 1] {
 #[derive(Debug)]
 pub(crate) struct StateMap {
     p: Vec<u16>, // 16-bit probability per state (the full 0..=65535 range)
-    n: Vec<u8>,  // observation count per state (capped at LIMIT, which fits a byte)
+    n: Vec<u8>,  // observation count per state (capped at `limit`, which fits a byte)
+    limit: u8,   // observation-count cap floor-ing the adaptive rate
 }
 
 impl StateMap {
-    /// A map over `size` states, each initialized to P = 0.5.
+    /// A per-context map over `size` states, each initialized to P = 0.5, with the default adaptive
+    /// cap. Use [`StateMap::with_limit`] for a shared state map that wants a higher cap.
     pub(crate) fn new(size: usize) -> Self {
+        Self::with_limit(size, DEFAULT_LIMIT)
+    }
+
+    /// A map over `size` states with an explicit observation-count `limit`. A higher limit yields a
+    /// more precise but slower-adapting estimate — appropriate for the small, heavily-visited shared
+    /// state→probability maps.
+    pub(crate) fn with_limit(size: usize, limit: u8) -> Self {
         Self {
             p: vec![1 << 15; size],
             n: vec![0; size],
+            limit,
         }
     }
 
@@ -64,13 +79,13 @@ impl StateMap {
     )]
     pub(crate) fn update(&mut self, s: usize, bit: u8) {
         let target = i32::from(bit) * 65535;
-        // n[s] is only incremented while < LIMIT, so it indexes dt (length LIMIT+1)
-        // in bounds without a redundant clamp.
-        debug_assert!((self.n[s] as usize) <= LIMIT);
+        // n[s] is only incremented while < limit (a u8), so it indexes the rate table (length 256,
+        // covering the whole u8 range) in bounds without a redundant clamp.
+        debug_assert!(self.n[s] <= self.limit);
         let rate = rate_table()[self.n[s] as usize];
         let p = i32::from(self.p[s]);
         self.p[s] = (p + ((i64::from(target - p) * i64::from(rate)) >> 16) as i32) as u16;
-        if (self.n[s] as usize) < LIMIT {
+        if self.n[s] < self.limit {
             self.n[s] += 1;
         }
     }

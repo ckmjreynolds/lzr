@@ -8,7 +8,7 @@
 //! fixed byte stride). It hashes the context down to the table width, so encode and decode agree
 //! bit-for-bit.
 
-use super::statemap::StateMap;
+use super::state::BitHistory;
 use super::{Context, Model, byte_hash, hashed_bits};
 
 /// Predicts each bit from a fixed set of gapped previous byte values plus the bit-tree node.
@@ -18,10 +18,10 @@ pub(crate) struct SparseModel {
     gaps: &'static [usize],
     /// Right-shift folding the multiplicative hash down to the table's index width.
     shift: u32,
-    /// The adaptive probability map, one slot per (hashed) context.
-    sm: StateMap,
-    /// Slot chosen by the last [`SparseModel::predict`], reused by the paired [`SparseModel::update`].
-    idx: usize,
+    /// Bit-history predictor: a state byte per (hashed) context plus one shared state→probability map.
+    /// Gapped contexts are sparse, so pooling by bit history calibrates far better than a lonely
+    /// per-context probability would.
+    bits: BitHistory,
 }
 
 impl SparseModel {
@@ -32,8 +32,7 @@ impl SparseModel {
         Self {
             gaps,
             shift: u64::BITS - bits,
-            sm: StateMap::new(1 << bits),
-            idx: 0,
+            bits: BitHistory::new(1 << bits),
         }
     }
 
@@ -53,12 +52,12 @@ impl SparseModel {
 
 impl Model for SparseModel {
     fn predict(&mut self, ctx: &Context, hist: &[u8]) -> i32 {
-        self.idx = self.slot(ctx, hist);
-        self.sm.predict(self.idx)
+        let slot = self.slot(ctx, hist);
+        self.bits.predict(slot)
     }
 
     fn update(&mut self, _ctx: &Context, _hist: &[u8], bit: u8) {
-        self.sm.update(self.idx, bit);
+        self.bits.update(bit);
     }
 }
 
