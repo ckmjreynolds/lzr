@@ -73,7 +73,12 @@ impl MatchModel {
             // (LEN_BUCKET_MAX + 1) buckets * 2 (predicted bit) * 256 (node) = 1 << 15 states.
             sm: StateMap::new(1 << 15),
             idx: None,
-            r: Vec::new(),
+            // Pre-size the byte buffer to the framed count (capped at MAX_R_BYTES, the point the model
+            // disables itself) so it fills without repeated doubling reallocations — which, at GB scale,
+            // spike peak RSS via the allocate-and-copy transient. `with_capacity` reserves address space
+            // only; pages fault in as bytes are appended, so an over-large (corrupt) capacity costs no
+            // RSS beyond what is actually decoded.
+            r: Vec::with_capacity(capacity.min(usize::try_from(MAX_R_BYTES).unwrap_or(usize::MAX))),
             ht: vec![NONE; 1 << bits],
             ht_shift: u64::BITS - bits,
             ptr: 0,

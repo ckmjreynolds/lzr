@@ -49,6 +49,16 @@ const WINDOW: usize = 1024;
 /// would expose a configurable absolute output limit instead.
 const MAX_BYTES_PER_PAYLOAD_BYTE: usize = 4096;
 
+/// Upper bound on output bytes to *pre-reserve* per payload byte. Pre-sizing the decode output to the
+/// framed `count` (rather than growing from nothing) avoids the reallocation-doubling transient that,
+/// at GB scale, spikes peak RSS well above the final size — the growing buffer would otherwise pass
+/// through a ~1.5× allocate-and-copy while the model tables are resident. `with_capacity` only reserves
+/// address space (pages fault in as bytes are written), so this never inflates RSS for a genuine
+/// stream; the cap merely bounds the up-front allocation a corrupt-but-in-limit `count` can request.
+/// Well above any real compression ratio (16× under [`MAX_BYTES_PER_PAYLOAD_BYTE`]), so genuine streams
+/// still reserve their true size.
+const MAX_RESERVE_PER_PAYLOAD_BYTE: usize = 256;
+
 /// The online predictor: every model's stretched prediction for the next bit, mixed into one
 /// probability, plus the shared [`Context`] the models read.
 struct Predictor {
@@ -269,9 +279,12 @@ impl Transform for EntropyCoder {
 
         let mut pred = Predictor::new(count, &self.builders, self.use_sse, self.use_sse2, self.use_mix2, false);
         let mut dec = Decoder::new(payload);
-        // Cap the up-front reservation so a large (but in-limit) count cannot demand a huge
-        // allocation before a single byte is decoded; the Vec grows as needed.
-        let mut out = Vec::with_capacity(count.min(1 << 16));
+        // Pre-size the output to the framed count to avoid the doubling-reallocation transient (see
+        // MAX_RESERVE_PER_PAYLOAD_BYTE), capped relative to the payload so a corrupt-but-in-limit count
+        // cannot demand an absurd up-front allocation. `with_capacity` reserves address space only, so a
+        // genuine stream's pages fault in as decoded — no RSS cost beyond the real output.
+        let reserve = count.min(payload.len().saturating_mul(MAX_RESERVE_PER_PAYLOAD_BYTE).max(1 << 16));
+        let mut out = Vec::with_capacity(reserve);
         for i in 0..count {
             // A valid stream's decoder never reads past its payload (bar a small flush window). Once
             // it has, the remaining claimed bytes are only zero-padding artifacts of a corrupt count —
