@@ -11,7 +11,7 @@
 //! a bug degrades ratio, never correctness — the range coder and the container's Adler-32 are the
 //! reversibility backstop. It never panics on arbitrary input.
 
-use super::statemap::StateMap;
+use super::statemap::SlotMap;
 use super::{Context, Model, byte_hash, hashed_bits};
 
 /// Number of most-recent bytes hashed to seed / re-acquire a match. Deliberately *long*: the order-N
@@ -45,11 +45,9 @@ const MAX_R_BYTES: u64 = 1 << 31;
 /// Predicts each bit from a byte-level match over the coded stream seen so far.
 #[derive(Debug)]
 pub(crate) struct MatchModel {
-    /// Probability per `(match-length bucket, predicted bit, bit-tree node)` context.
-    sm: StateMap,
-    /// Slot chosen by the last [`MatchModel::predict`], reused by the paired [`MatchModel::update`];
-    /// `None` when the model abstained (no active match) so `update` leaves `sm` alone.
-    idx: Option<usize>,
+    /// Probability per `(match-length bucket, predicted bit, bit-tree node)` context; abstains with no
+    /// active match.
+    map: SlotMap,
     /// Every finalized coded byte seen so far.
     r: Vec<u8>,
     /// `hash(last HASH_LEN bytes)` -> the position that followed that context, for match re-acquire.
@@ -71,8 +69,7 @@ impl MatchModel {
         let bits = hashed_bits(capacity);
         Self {
             // (LEN_BUCKET_MAX + 1) buckets * 2 (predicted bit) * 256 (node) = 1 << 15 states.
-            sm: StateMap::new(1 << 15),
-            idx: None,
+            map: SlotMap::new(1 << 15),
             // Pre-size the byte buffer to the framed count (capped at MAX_R_BYTES, the point the model
             // disables itself) so it fills without repeated doubling reallocations — which, at GB scale,
             // spike peak RSS via the allocate-and-copy transient. `with_capacity` reserves address space
@@ -93,18 +90,10 @@ impl MatchModel {
         if self.disabled || self.mlen == 0 || self.ptr >= self.r.len() {
             return None;
         }
-        let expected = u32::from(self.r[self.ptr]);
-        let bpos = u32::from(ctx.bpos);
-        // Bits of the current byte coded so far (the low `bpos` bits of `c0`, below the sentinel).
-        let coded = ctx.c0 & ((1 << bpos) - 1);
-        // If the matched byte's leading bits no longer agree with what is actually being coded, the
-        // match has broken mid-byte — abstain for the rest of it.
-        if expected >> (8 - bpos) != coded {
-            return None;
-        }
-        let predicted_bit = (expected >> (7 - bpos)) & 1;
-        let bucket = self.mlen.min(LEN_BUCKET_MAX);
-        Some(((bucket << 9) | (predicted_bit << 8) | (ctx.c0 & 0xff)) as usize)
+        // Predict the matched byte's next bit, abstaining if the match has broken mid-byte; the
+        // confidence bucket is the (saturated) match length.
+        let bucket = self.mlen.min(LEN_BUCKET_MAX) as usize;
+        ctx.predicted_bit_slot(self.r[self.ptr], bucket)
     }
 
     /// Append one finalized coded byte to `r`, advancing the byte-level match: extend the active match
@@ -181,20 +170,16 @@ impl MatchModel {
 
 impl Model for MatchModel {
     fn predict(&mut self, ctx: &Context, _hist: &[u8]) -> i32 {
-        self.idx = self.slot(ctx);
-        self.idx.map_or(0, |idx| self.sm.predict(idx))
+        let slot = self.slot(ctx);
+        self.map.predict(slot)
     }
 
     fn update(&mut self, ctx: &Context, _hist: &[u8], bit: u8) {
-        if let Some(idx) = self.idx {
-            self.sm.update(idx, bit);
-        }
-        // On the byte's last bit, the finalized byte is the in-progress bit-tree node (`ctx.c0`,
-        // which the driver has not yet advanced) shifted up with this final bit — the same MSB-first
-        // accumulation `Context` maintains, so no separate byte buffer is needed here.
+        self.map.update(bit);
+        // On the byte's last bit, recover the finalized byte from the bit-tree node (which the driver
+        // has not yet advanced) and fold it into the match buffer.
         if ctx.bpos == 7 {
-            let byte = (((ctx.c0 << 1) | u32::from(bit)) & 0xff) as u8;
-            self.append_byte(byte);
+            self.append_byte(ctx.completed_byte(bit));
         }
     }
 }

@@ -14,8 +14,8 @@
 //! and decode stay in lock-step; it only feeds a probability to the mixer, so a bug degrades ratio,
 //! never correctness.
 
-use super::statemap::StateMap;
-use super::{Context, Model, byte_hash, hashed_bits};
+use super::statemap::SlotMap;
+use super::{Context, Model, hashed_bits, hashed_slot};
 
 /// Cap on the number of trailing same-class bytes folded into the context. Longer runs share their
 /// tail context — past this the prefix is already distinctive — and the cap bounds the backward scan.
@@ -28,11 +28,8 @@ pub(crate) struct RunModel {
     class: fn(&u8) -> bool,
     /// Right-shift folding the multiplicative hash down to the table's index width.
     shift: u32,
-    /// The adaptive probability map, one slot per (hashed) context.
-    sm: StateMap,
-    /// Slot chosen by the last [`RunModel::predict`], reused by the paired [`RunModel::update`];
-    /// `None` when the model abstained (no run) so `update` leaves `sm` alone.
-    idx: Option<usize>,
+    /// The adaptive probability map, keyed on the (hashed) run context; abstains off a run.
+    map: SlotMap,
 }
 
 impl RunModel {
@@ -43,36 +40,27 @@ impl RunModel {
         Self {
             class,
             shift: u64::BITS - bits,
-            sm: StateMap::new(1 << bits),
-            idx: None,
+            map: SlotMap::new(1 << bits),
         }
     }
 
     /// The map slot for the current bit, or `None` to abstain: the bit-tree node `c0` with the trailing
     /// run of `class` bytes folded in (newest-first, capped at [`MAX_RUN`]). Abstains when the previous
     /// byte is not of the class (no run to condition on).
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "The hashed value is folded down to `shift` bits, so it indexes the table exactly."
-    )]
     fn slot(&self, ctx: &Context, hist: &[u8]) -> Option<usize> {
         let run = hist.iter().rev().copied().take_while(|b| (self.class)(b)).take(MAX_RUN);
-        let mut len = 0;
-        let hash = byte_hash(ctx.node(), run.inspect(|_| len += 1));
-        (len > 0).then(|| (hash >> self.shift) as usize)
+        hashed_slot(ctx.node(), run, self.shift)
     }
 }
 
 impl Model for RunModel {
     fn predict(&mut self, ctx: &Context, hist: &[u8]) -> i32 {
-        self.idx = self.slot(ctx, hist);
-        self.idx.map_or(0, |idx| self.sm.predict(idx))
+        let slot = self.slot(ctx, hist);
+        self.map.predict(slot)
     }
 
     fn update(&mut self, _ctx: &Context, _hist: &[u8], bit: u8) {
-        if let Some(idx) = self.idx {
-            self.sm.update(idx, bit);
-        }
+        self.map.update(bit);
     }
 }
 

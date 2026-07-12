@@ -57,6 +57,20 @@ pub(crate) fn byte_hash(node: u64, bytes: impl Iterator<Item = u8>) -> u64 {
     h
 }
 
+/// The hashed table slot for a variable-length byte context, or `None` when the context is empty (the
+/// model abstains). Folds `bytes` into a [`byte_hash`] seeded from `node`, counting them, then shifts
+/// the hash down to `shift`'s index width. Shared by the [`run`] and [`xmltag`] models, whose only
+/// difference is which trailing bytes they fold in.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "The hashed value is folded down to `shift` bits, so it indexes the table exactly."
+)]
+pub(crate) fn hashed_slot(node: u64, bytes: impl Iterator<Item = u8>, shift: u32) -> Option<usize> {
+    let mut len = 0usize;
+    let hash = byte_hash(node, bytes.inspect(|_| len += 1));
+    (len > 0).then(|| (hash >> shift) as usize)
+}
+
 /// Mutable per-stream prediction state shared by every model: the partial current byte.
 ///
 /// `c0` walks the bit-tree of the current byte (a leading-1 sentinel followed by the bits coded so
@@ -101,6 +115,31 @@ impl Context {
     pub(crate) const fn push_symbol(&mut self) {
         self.c0 = 1;
         self.bpos = 0;
+    }
+
+    /// The `StateMap` slot for coding a *known* whole `predicted` byte one bit at a time, or `None` to
+    /// abstain. Checks that the bits coded so far this byte still agree with `predicted` (else the
+    /// prediction has broken mid-byte), then packs `(bucket, predicted next bit, bit-tree node)` into a
+    /// slot. Shared bit-exact by the byte-predicting models ([`match`](match_model) / [`iddelta`]),
+    /// whose only difference is which byte they predict and how they bucket confidence.
+    pub(crate) fn predicted_bit_slot(&self, predicted: u8, bucket: usize) -> Option<usize> {
+        let predicted = u32::from(predicted);
+        let bpos = u32::from(self.bpos);
+        // Bits of the current byte coded so far (the low `bpos` bits of `c0`, below the sentinel).
+        let coded = self.c0 & ((1 << bpos) - 1);
+        if predicted >> (8 - bpos) != coded {
+            return None;
+        }
+        let predicted_bit = (predicted >> (7 - bpos)) & 1;
+        Some((bucket << 9) | ((predicted_bit as usize) << 8) | (self.c0 & 0xff) as usize)
+    }
+
+    /// The byte just completed by `bit`, the final bit of the current symbol: the in-progress bit-tree
+    /// node shifted up with that bit. Only meaningful at `bpos == 7`. Lets the byte-history models
+    /// ([`match`](match_model) / [`iddelta`]) recover a finalized byte from the same MSB-first
+    /// accumulation `Context` already maintains, rather than each keeping its own accumulator.
+    pub(crate) fn completed_byte(&self, bit: u8) -> u8 {
+        (((self.c0 << 1) | u32::from(bit)) & 0xff) as u8
     }
 }
 

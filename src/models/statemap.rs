@@ -91,6 +91,47 @@ impl StateMap {
     }
 }
 
+/// A [`StateMap`] driven by an *abstaining* slot selector.
+///
+/// Several models key a `StateMap` on a context they sometimes have nothing to say about (`run`,
+/// `xmltag`, `match`, `iddelta`). Each shares the identical wrapper: on `predict`, compute an
+/// `Option<slot>`, predict from it (or abstain to a neutral stretched `0`), and remember it; on
+/// `update`, adapt that same slot — or leave the map alone if the model abstained. `SlotMap` owns that
+/// wrapper so a model supplies only its own `slot` logic instead of re-implementing the `idx` field
+/// and the paired predict/update.
+#[derive(Debug)]
+pub(crate) struct SlotMap {
+    sm: StateMap,
+    /// Slot chosen by the last [`SlotMap::predict`], reused by the paired [`SlotMap::update`]; `None`
+    /// when the model abstained, so `update` leaves the map alone.
+    idx: Option<usize>,
+}
+
+impl SlotMap {
+    /// A slot map over `size` states (see [`StateMap::new`]).
+    pub(crate) fn new(size: usize) -> Self {
+        Self {
+            sm: StateMap::new(size),
+            idx: None,
+        }
+    }
+
+    /// Predict from `slot`, remembering it for the paired [`SlotMap::update`]. Abstains to a neutral
+    /// stretched `0` when `slot` is `None`.
+    pub(crate) fn predict(&mut self, slot: Option<usize>) -> i32 {
+        self.idx = slot;
+        self.idx.map_or(0, |s| self.sm.predict(s))
+    }
+
+    /// Adapt the slot chosen by the last [`SlotMap::predict`] toward the observed `bit`; a no-op when
+    /// that prediction abstained.
+    pub(crate) fn update(&mut self, bit: u8) {
+        if let Some(s) = self.idx {
+            self.sm.update(s, bit);
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {

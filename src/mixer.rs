@@ -5,11 +5,10 @@
 //! stretched outputs of every model and forms a single probability via a
 //! per-bit-position weighted sum, then adapts its weights toward the observed bit.
 //!
-//! This is the skeleton's deliberately minimal mixer: one weight set per bit
-//! position over `n` model inputs. The prior attempt's richer forms — several
-//! sub-mixers each selected by a different local context, secondary symbol
-//! estimation (APM/SSE), and a neural refinement stage — are the Hutter-branch
-//! growth path and are intentionally not built here.
+//! [`Mixer`] is the minimal form — one weight set per (previous-byte selector × bit position) over
+//! `n` model inputs. [`TwoLayerMixer`] is the richer form now in use by default: order-1..`L1`
+//! sub-mixers each selected by a different local context, combined by a second layer. Secondary symbol
+//! estimation (APM/SSE) refines the mixed probability downstream in [`crate::apm`].
 
 use std::sync::OnceLock;
 

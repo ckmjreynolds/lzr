@@ -489,8 +489,9 @@ impl Profile {
 
     /// The names of the config flags that actually take effect for this profile (e.g. `sse`), in
     /// registry order — for the CLI's run report. Flags are pipeline configuration, not predictors.
-    /// `sse` (the only flag) configures the entropy stage, so it is inert — and not reported — when the
-    /// entropy stage is off. Revisit if a flag configuring a different stage is ever added.
+    /// Every flag (`sse`, `sse2`, `mix2`) configures the entropy stage, so they are inert — and not
+    /// reported — when the entropy stage is off. Revisit if a flag configuring a different stage is
+    /// ever added.
     #[must_use]
     pub fn active_flags(self) -> Vec<&'static str> {
         if !self.enabled("entropy") {

@@ -15,7 +15,7 @@
 //! so it never competes on non-numeric bytes. It is a pure function of the finalized bytes, so encode
 //! and decode stay in lock-step; it only feeds the mixer, so a bug degrades ratio, never correctness.
 
-use super::statemap::StateMap;
+use super::statemap::SlotMap;
 use super::{Context, Model};
 
 /// Cap on the digits tracked per number, bounding the state buffers on a pathological all-digit
@@ -31,11 +31,9 @@ const POS_BUCKET_MAX: usize = 31;
 /// position.
 #[derive(Debug)]
 pub(crate) struct IdDeltaModel {
-    /// Probability per `(position bucket, predicted bit, bit-tree node)` context.
-    sm: StateMap,
-    /// Slot chosen by the last [`IdDeltaModel::predict`], reused by the paired update; `None` when the
-    /// model abstained (no active digit prediction).
-    idx: Option<usize>,
+    /// Probability per `(position bucket, predicted bit, bit-tree node)` context; abstains with no
+    /// active digit prediction.
+    map: SlotMap,
     /// Digits (ASCII `'0'..='9'`) of the last completed number — the prediction source.
     prev: Vec<u8>,
     /// Digits of the number currently being emitted; its length is the position of the next digit.
@@ -47,8 +45,7 @@ impl IdDeltaModel {
     /// needs no capacity sizing.
     pub(crate) fn new() -> Self {
         Self {
-            sm: StateMap::new((POS_BUCKET_MAX + 1) * 2 * 256),
-            idx: None,
+            map: SlotMap::new((POS_BUCKET_MAX + 1) * 2 * 256),
             prev: Vec::new(),
             cur: Vec::new(),
         }
@@ -68,15 +65,8 @@ impl IdDeltaModel {
     /// digit still agrees with the bits coded so far this byte (mirrors the match model's mid-byte
     /// agreement check).
     fn slot(&self, ctx: &Context) -> Option<usize> {
-        let predicted = u32::from(self.predicted_digit()?);
-        let bpos = u32::from(ctx.bpos);
-        let coded = ctx.c0 & ((1 << bpos) - 1);
-        if predicted >> (8 - bpos) != coded {
-            return None;
-        }
-        let predicted_bit = (predicted >> (7 - bpos)) & 1;
         let bucket = self.cur.len().min(POS_BUCKET_MAX);
-        Some((bucket << 9) | ((predicted_bit as usize) << 8) | (ctx.c0 & 0xff) as usize)
+        ctx.predicted_bit_slot(self.predicted_digit()?, bucket)
     }
 
     /// Fold one finalized byte into the number state: extend the current number on a digit, or close it
@@ -95,19 +85,15 @@ impl IdDeltaModel {
 
 impl Model for IdDeltaModel {
     fn predict(&mut self, ctx: &Context, _hist: &[u8]) -> i32 {
-        self.idx = self.slot(ctx);
-        self.idx.map_or(0, |idx| self.sm.predict(idx))
+        let slot = self.slot(ctx);
+        self.map.predict(slot)
     }
 
     fn update(&mut self, ctx: &Context, _hist: &[u8], bit: u8) {
-        if let Some(idx) = self.idx {
-            self.sm.update(idx, bit);
-        }
-        // On the byte's last bit, reconstruct the finalized byte (as the match model does) and fold it
-        // into the number state.
+        self.map.update(bit);
+        // On the byte's last bit, recover the finalized byte and fold it into the number state.
         if ctx.bpos == 7 {
-            let byte = (((ctx.c0 << 1) | u32::from(bit)) & 0xff) as u8;
-            self.append_byte(byte);
+            self.append_byte(ctx.completed_byte(bit));
         }
     }
 }
