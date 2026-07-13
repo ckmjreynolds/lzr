@@ -18,6 +18,8 @@ use crate::models::match_model::MatchModel;
 use crate::models::nnlm::NnlmModel;
 use crate::models::null::NullModel;
 use crate::models::ordern::OrderN;
+use crate::models::prevword::PrevWordModel;
+use crate::models::prevword2::PrevWord2Model;
 use crate::models::run::RunModel;
 use crate::models::sparse::SparseModel;
 use crate::models::xmltag::XmlTagModel;
@@ -247,6 +249,27 @@ const FEATURES: &[FeatureSpec] = &[
         name: "nnrnn",
         default_on: false,
         kind: Kind::Model(|_| Box::new(NnlmModel::new(true))),
+    },
+    // Previous-word (word-bigram) model: keys on the previous completed word folded with the current
+    // partial word — the cross-word signal the `word` run model (current partial word only) cannot see.
+    // Appended last to keep the existing features' bit positions stable. **Default-on**: -0.0085 bpb on
+    // enwik8 (1.5457 -> 1.5372, byte-exact), the largest single-model win since the bit-history states —
+    // the previous word predicts the start of the next one ("new"->"york") past what the order-N chain
+    // and the current-word model reach. Disable with `--disable prevword`.
+    FeatureSpec {
+        name: "prevword",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(PrevWordModel::new(c))),
+    },
+    // Two-word context model: keys on the previous *two* completed words (a word trigram) folded with
+    // the current partial word — the continuation the single-word `prevword` leaves ambiguous. Appended
+    // last to keep the existing features' bit positions stable. **Default-on**: -0.0037 bpb on enwik8
+    // (1.5372 -> 1.5334) atop prevword, growing to -0.0055 on enwik9 (1.2641 -> 1.2585) as more word
+    // trigrams recur; byte-exact, enwik9 decode RSS 8.77 GB (< 10 GB). Disable with `--disable prevword2`.
+    FeatureSpec {
+        name: "prevword2",
+        default_on: true,
+        kind: Kind::Model(|c| Box::new(PrevWord2Model::new(c))),
     },
 ];
 
@@ -671,11 +694,11 @@ mod tests {
     #[test]
     fn profile_default_bits() {
         // Default-on: casefold(0)/entities(1)/entropy(3), the order-0..11 chain (bits 4..=15),
-        // sparse2(16), sse(17), match(18), word(19), xmltag(20), sse2(21), iddelta(22), mix2(23).
-        // Default-off: repair(2) (regresses the strengthened CM) and the experimental neural models
-        // nnlm(24)/nnrnn(25). So the default is bits 0..=23 except bit 2 = 0x00FF_FFFF & !(1 << 2) =
-        // 0x00FF_FFFB.
-        assert_eq!(Profile::default().to_bits(), 0x00FF_FFFB);
+        // sparse2(16), sse(17), match(18), word(19), xmltag(20), sse2(21), iddelta(22), mix2(23),
+        // prevword(26), prevword2(27). Default-off: repair(2) (regresses the strengthened CM) and the
+        // experimental neural models nnlm(24)/nnrnn(25). So the default is bits 0..=23 except bit 2, plus
+        // bits 26-27 = (0x00FF_FFFF & !(1 << 2)) | (1 << 26) | (1 << 27) = 0x0CFF_FFFB.
+        assert_eq!(Profile::default().to_bits(), 0x0CFF_FFFB);
     }
 
     #[test]
@@ -740,13 +763,30 @@ mod tests {
 
     #[test]
     fn active_models_reports_enabled_models_and_null_fallback() {
-        // Default profile: the swept-in set (order-0..11, sparse2, match, word, xmltag, iddelta), in
-        // registry order.
+        // Default profile: the swept-in set (order-0..11, sparse2, match, word, xmltag, iddelta,
+        // prevword, prevword2), in registry order.
         assert_eq!(
             Profile::default().active_models(),
             vec![
-                "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
-                "order10", "order11", "sparse2", "match", "word", "xmltag", "iddelta"
+                "order0",
+                "order1",
+                "order2",
+                "order3",
+                "order4",
+                "order5",
+                "order6",
+                "order7",
+                "order8",
+                "order9",
+                "order10",
+                "order11",
+                "sparse2",
+                "match",
+                "word",
+                "xmltag",
+                "iddelta",
+                "prevword",
+                "prevword2"
             ]
         );
         // With no model selected, entropy codes via the injected null fallback.
@@ -783,12 +823,13 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=25 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
-        // xmltag, sse2, iddelta, mix2, nnlm, nnrnn). Sample rather than enumerate all 2^26 combos.
-        for bits in (0..=0x3FF_FFFF).step_by(7) {
+        // bits 0..=27 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
+        // xmltag, sse2, iddelta, mix2, nnlm, nnrnn, prevword, prevword2). Sample rather than enumerate
+        // all 2^28 combos.
+        for bits in (0..=0xFFF_FFFF).step_by(7) {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(1 << 26).is_err()); // bit 26 is not a known feature
+        assert!(Profile::from_bits(1 << 28).is_err()); // bit 28 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 
@@ -801,8 +842,25 @@ mod tests {
         }
         assert!(!profile.enabled("repair"), "repair is default-off (regresses the strengthened CM)");
         for model in [
-            "order0", "order1", "order2", "order3", "order4", "order5", "order6", "order7", "order8", "order9",
-            "order10", "order11", "sparse2", "match", "word", "xmltag", "iddelta",
+            "order0",
+            "order1",
+            "order2",
+            "order3",
+            "order4",
+            "order5",
+            "order6",
+            "order7",
+            "order8",
+            "order9",
+            "order10",
+            "order11",
+            "sparse2",
+            "match",
+            "word",
+            "xmltag",
+            "iddelta",
+            "prevword",
+            "prevword2",
         ] {
             assert!(profile.enabled(model), "{model} should be default-on");
         }

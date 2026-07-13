@@ -14,6 +14,8 @@ pub(crate) mod match_model;
 pub(crate) mod nnlm;
 pub(crate) mod null;
 pub(crate) mod ordern;
+pub(crate) mod prevword;
+pub(crate) mod prevword2;
 pub(crate) mod run;
 pub(crate) mod sparse;
 pub(crate) mod state;
