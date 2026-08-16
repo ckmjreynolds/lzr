@@ -1,3 +1,5 @@
+Note: While I continue to spend a ton of time on LZR, what's published here was just a place-holder. My efforts have largely turned toward exploration of the Hutter prize and attempts to push that forward. While also exploring alternate ideas for general purpose compressors. All to say, the published code is vastly stale (hundreds of commits behind most of which were discarded experiments) but not forgotten.
+
 # The LZR Specification
 This project started as an initial project to learn [Rust](https://www.rust-lang.org/). There were no specific goals other than learning and by extension readability. Since this was first and foremost a learning experience, I avoided referencing any existing code. Though "based on" existing algorithms, no attempt was made to faithfully follow any existing algorithm.
 
