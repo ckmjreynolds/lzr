@@ -1,20 +1,107 @@
 [package]
-name    = "lzr"
-version = "0.0.0"
-edition = "2024"
+name            = "lzr"
+version         = "0.1.0"
+edition         = "2024"
+rust-version    = "1.87"
 
-authors         = ["Chris Reynolds chris@reynolds.guru"]
-description     = "LZ77-based Compression Program/Library written in Rust."
+authors         = ["Chris Reynolds <chris@reynolds.guru>"]
+description     = "A general-purpose compression library and CLI with random access and tailing support."
 license         = "MIT OR Apache-2.0"
 readme          = "README.md"
 repository      = "https://github.com/ckmjreynolds/lzr"
-keywords        = ["LZ77", "compression", "compress"]
-categories      = ["compression"]
+keywords        = ["compression", "compress", "codec", "random-access", "cli"]
+categories      = ["compression", "command-line-utilities"]
 documentation   = "https://docs.rs/lzr"
 
-include         = ["src/**", "Cargo.toml", "README.md", "LICENSE*"]
+include = [
+    "/src/**/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-*",
+]
 
 [dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.1", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
+rayon = "1.12.0"
+static_assertions = "1.1.0"
+# Only needed to widen internal visibility for `bench-internals`; pulled by that feature.
+visibility = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
-pretty_assertions = ">=1.4.1"
+assert_cmd = "2.2.2"
+divan = "0.1.21"
+pretty_assertions = "1.4.1"
+proptest = "1.11.0"
+
+[lints.rust]
+keyword_idents = { level = "forbid", priority = -1 }
+let_underscore_drop = "warn"
+meta_variable_misuse = "warn"
+missing_copy_implementations = "warn"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+non_ascii_idents = "forbid"
+redundant_lifetimes = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
+unreachable_pub = "deny"
+unsafe_code = "forbid"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+unused_qualifications = "warn"
+unused_results = "warn"
+# Too many false positives in a crate with both a library and executable.
+# unused_crate_dependencies = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Curated `restriction` lints (never enable the group wholesale).
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+empty_structs_with_brackets = "warn"
+expect_used = "warn"
+panic = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+str_to_string = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+# Transitive duplicate versions are outside our control; keep CI robust.
+multiple_crate_versions = "allow"
+redundant_pub_crate = "allow"
+
+[features]
+# Widens `pub(crate)` internals to `pub` so `benches/` can reach them. Off by default.
+bench-internals = ["dep:visibility"]
+
+[[bench]]
+name = "adler32"
+harness = false
+required-features = ["bench-internals"]
+test = false
+
+[[bench]]
+name = "uleb128"
+harness = false
+required-features = ["bench-internals"]
+test = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
