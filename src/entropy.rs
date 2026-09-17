@@ -18,6 +18,7 @@ use crate::apm::Apm;
 use crate::coder::{Decoder, Encoder};
 use crate::mixer::{MIX_CONTEXTS, Mixer, TwoLayerMixer, squash};
 use crate::models::{Context, Model, SYMBOL_BITS};
+use crate::surprise::{BUCKETS, LEVELS, Surprise};
 use crate::transform::{ModelTrace, Transform};
 use crate::uleb128;
 
@@ -59,6 +60,22 @@ const MAX_BYTES_PER_PAYLOAD_BYTE: usize = 4096;
 /// still reserve their true size.
 const MAX_RESERVE_PER_PAYLOAD_BYTE: usize = 256;
 
+/// The entropy stage's refinement flags, read straight from the profile: which optional components
+/// wrap the model mix. Each is independent of the others (the `sse`, `sse2`, `mix2`, `surprise`
+/// registry flags); `sse2` and the surprise APM only take effect when `sse` is on.
+#[derive(Debug, Clone, Copy, Default)]
+#[expect(clippy::struct_excessive_bools, reason = "a plain set of independent profile flags, not a state machine")]
+pub(crate) struct EntropyFlags {
+    /// Apply the SSE/APM refinement (the `sse` feature).
+    pub(crate) sse: bool,
+    /// Chain the second order-1 APM (the `sse2` feature).
+    pub(crate) sse2: bool,
+    /// Use the two-layer mixing network in place of the single-layer mixer (the `mix2` flag).
+    pub(crate) mix2: bool,
+    /// Track coding surprise as a regime context (the `surprise` flag).
+    pub(crate) surprise: bool,
+}
+
 /// The online predictor: every model's stretched prediction for the next bit, mixed into one
 /// probability, plus the shared [`Context`] the models read.
 struct Predictor {
@@ -74,6 +91,15 @@ struct Predictor {
     /// Optional second SSE stage (the `sse2` feature), chained after `apm` and keyed on the previous
     /// byte (an order-1 context). `None` leaves `apm`'s output as the final probability.
     apm2: Option<Apm>,
+    /// Optional coding-surprise regime tracker (the `surprise` flag): the recent final coding cost,
+    /// quantized. Its fast level widens `mixer2`'s order-1 selector and keys `apm3`; its (fast, slow)
+    /// bucket selects `mixer2`'s blend weights. `None` when the flag is off.
+    surprise: Option<Surprise>,
+    /// Optional third SSE stage (the `surprise` flag), chained after `apm2` and keyed on
+    /// (fast surprise level × previous byte × bit-tree node).
+    apm3: Option<Apm>,
+    /// The final probability returned by the last `predict`, fed back to `surprise` on `commit`.
+    last_p: i32,
     ctx: Context,
     /// Summed standalone log-loss (bits) per model, accumulated only when `track` is set (encode-side
     /// diagnostics). Divided by the byte count it gives each model's bits-per-byte-if-coded-alone.
@@ -84,33 +110,40 @@ struct Predictor {
 
 impl Predictor {
     /// Builds the model set (hashed models are sized from `capacity` = the byte count, so encode and
-    /// decode agree) from the profile's enabled `builders` (at least one). `use_sse` adds the APM.
+    /// decode agree) from the profile's enabled `builders` (at least one), wrapped per `flags`.
     /// `track` enables the encode-only per-model log-loss accumulation.
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "each bool toggles an independent, orthogonal coder feature (sse, sse2, mix2, tracking)"
-    )]
-    fn new(
-        capacity: usize,
-        builders: &[ModelBuilder],
-        use_sse: bool,
-        use_sse2: bool,
-        use_mix2: bool,
-        track: bool,
-    ) -> Self {
+    fn new(capacity: usize, builders: &[ModelBuilder], flags: EntropyFlags, track: bool) -> Self {
+        let EntropyFlags {
+            sse: use_sse,
+            sse2: use_sse2,
+            mix2: use_mix2,
+            surprise: use_surprise,
+        } = flags;
         let models: Vec<Box<dyn Model>> = builders.iter().map(|build| build(capacity)).collect();
         let n = models.len();
         Self {
             models,
             stretched: vec![0; n],
             mixer: Mixer::new(n, SYMBOL_BITS as usize, MIX_CONTEXTS),
-            mixer2: use_mix2.then(|| TwoLayerMixer::new(n, SYMBOL_BITS as usize, MIX_CONTEXTS, capacity)),
+            mixer2: use_mix2.then(|| {
+                // With `surprise` on, the order-1 sub-mixer selects by (previous byte × fast level) and
+                // the blend layer by the (fast, slow) bucket; otherwise the plain order-1 / global blend.
+                let (order1, blend) = if use_surprise {
+                    (MIX_CONTEXTS * LEVELS, BUCKETS)
+                } else {
+                    (MIX_CONTEXTS, 1)
+                };
+                TwoLayerMixer::new(n, SYMBOL_BITS as usize, order1, blend, capacity)
+            }),
             // One APM context per bit-tree node (`c0 & 0xff`), which uniquely encodes (bit position,
             // partial bits) — a minimal order-0 SSE.
             apm: use_sse.then(|| Apm::new(256)),
             // Order-1 SSE: one context per (previous byte × bit-tree node) = 256 × 256, chained after
             // `apm`. Requires `sse` to be meaningful (it refines `apm`'s output).
             apm2: (use_sse && use_sse2).then(|| Apm::new(256 * 256)),
+            surprise: use_surprise.then(Surprise::new),
+            apm3: (use_sse && use_surprise).then(|| Apm::new(LEVELS * 256 * 256)),
+            last_p: PROB_SCALE / 2,
             ctx: Context::new(),
             logloss: vec![0.0; n],
             track,
@@ -143,6 +176,9 @@ impl Predictor {
         // bits of the current byte and identical on encode and decode.
         let sel = usize::from(hist.last().copied().unwrap_or(0));
         let bpos = usize::from(self.ctx.bpos);
+        // Regime from the recent coding cost: the fast level and the (fast, slow) bucket (both 0 when
+        // `surprise` is off, so the selectors below collapse to their plain forms).
+        let (fl, sb) = self.surprise.as_ref().map_or((0, 0), |s| (s.fast_level(), s.bucket()));
         let p = if let Some(mixer2) = &mut self.mixer2 {
             // Layer-1 selectors: an order-1..6 progression via rolling hashes of the last 1..6 bytes,
             // so the blend can specialise by how deep a context is currently predictive.
@@ -152,7 +188,7 @@ impl Predictor {
             let o2 = sel.wrapping_mul(131).wrapping_add(p2);
             let o3 = o2.wrapping_mul(131).wrapping_add(p3);
             let o4 = o3.wrapping_mul(131).wrapping_add(p4);
-            mixer2.mix(&self.stretched, [sel, o2, o3, o4], sel, bpos)
+            mixer2.mix(&self.stretched, [sel | (fl << 8), o2, o3, o4], sb, bpos)
         } else {
             self.mixer.mix(&self.stretched, sel, bpos)
         };
@@ -160,7 +196,12 @@ impl Predictor {
         let p = self.apm.as_mut().map_or(p, |apm| apm.refine(p, node));
         // Chain the order-1 APM (previous byte × node), blending its refinement with its input so a
         // cold second stage cannot overcommit early. `None` when `sse2` is off.
-        self.apm2.as_mut().map_or(p, |apm2| (apm2.refine(p, (sel << 8) | node) * 3 + p) >> 2) as u32
+        let p = self.apm2.as_mut().map_or(p, |apm2| (apm2.refine(p, (sel << 8) | node) * 3 + p) >> 2);
+        // Chain the surprise-keyed APM (fast level × previous byte × node) the same way. `None` when
+        // `surprise` is off.
+        let p = self.apm3.as_mut().map_or(p, |apm3| (apm3.refine(p, (fl << 16) | (sel << 8) | node) * 3 + p) >> 2);
+        self.last_p = p;
+        p as u32
     }
 
     /// Learn from the actual `bit` (mixer and APM first, then models, all on the pre-bit context),
@@ -191,6 +232,12 @@ impl Predictor {
         if let Some(apm2) = &mut self.apm2 {
             apm2.update(bit);
         }
+        if let Some(apm3) = &mut self.apm3 {
+            apm3.update(bit);
+        }
+        if let Some(surprise) = &mut self.surprise {
+            surprise.update(self.last_p, bit);
+        }
         for m in &mut self.models {
             m.update(&self.ctx, hist, bit);
         }
@@ -212,12 +259,8 @@ pub(crate) struct EntropyCoder {
     builders: Vec<ModelBuilder>,
     /// The enabled models' names, aligned with `builders`, for the per-model scorecard.
     names: Vec<&'static str>,
-    /// Whether to apply the SSE/APM refinement (the `sse` feature).
-    use_sse: bool,
-    /// Whether to chain the second order-1 APM (the `sse2` feature).
-    use_sse2: bool,
-    /// Whether to use the two-layer mixing network in place of the single-layer mixer (the `mix2` flag).
-    use_mix2: bool,
+    /// Which optional refinements wrap the mix (`sse`, `sse2`, `mix2`, `surprise`).
+    flags: EntropyFlags,
     /// The per-model scorecard produced by the last `forward` (encode-only). Interior mutability
     /// because `Transform::forward` takes `&self`; read back via [`Transform::model_scores`].
     scores: RefCell<Vec<ModelTrace>>,
@@ -225,20 +268,12 @@ pub(crate) struct EntropyCoder {
 
 impl EntropyCoder {
     /// A coder over `builders` — every enabled model, in registry order — labelled by the aligned
-    /// `names` (for the scorecard). `use_sse` enables the APM.
-    pub(crate) fn new(
-        builders: Vec<ModelBuilder>,
-        names: Vec<&'static str>,
-        use_sse: bool,
-        use_sse2: bool,
-        use_mix2: bool,
-    ) -> Self {
+    /// `names` (for the scorecard), wrapped by the refinements in `flags`.
+    pub(crate) fn new(builders: Vec<ModelBuilder>, names: Vec<&'static str>, flags: EntropyFlags) -> Self {
         Self {
             builders,
             names,
-            use_sse,
-            use_sse2,
-            use_mix2,
+            flags,
             scores: RefCell::new(Vec::new()),
         }
     }
@@ -251,7 +286,7 @@ impl Transform for EntropyCoder {
         let mut header = Vec::new();
         uleb128::encode_u64(input.len() as u64, &mut header);
 
-        let mut pred = Predictor::new(input.len(), &self.builders, self.use_sse, self.use_sse2, self.use_mix2, true);
+        let mut pred = Predictor::new(input.len(), &self.builders, self.flags, true);
         let mut enc = Encoder::with_prefix(header, input.len() + input.len() / 2 + 16);
         for (i, &byte) in input.iter().enumerate() {
             // The history window is a borrowed view into the already-encoded prefix — no copy.
@@ -277,7 +312,7 @@ impl Transform for EntropyCoder {
         let limit = payload.len().saturating_mul(MAX_BYTES_PER_PAYLOAD_BYTE).saturating_add(1024);
         ensure!(count <= limit, "byte count {count} exceeds the {limit} a {}-byte payload can encode", payload.len());
 
-        let mut pred = Predictor::new(count, &self.builders, self.use_sse, self.use_sse2, self.use_mix2, false);
+        let mut pred = Predictor::new(count, &self.builders, self.flags, false);
         let mut dec = Decoder::new(payload);
         // Pre-size the output to the framed count to avoid the doubling-reallocation transient (see
         // MAX_RESERVE_PER_PAYLOAD_BYTE), capped relative to the payload so a corrupt-but-in-limit count
@@ -326,7 +361,7 @@ mod tests {
         fn build_order0(capacity: usize) -> Box<dyn Model> {
             Box::new(OrderN::new(0, capacity))
         }
-        EntropyCoder::new(vec![build_order0], vec!["order0"], false, false, false)
+        EntropyCoder::new(vec![build_order0], vec!["order0"], EntropyFlags::default())
     }
 
     proptest! {

@@ -12,7 +12,7 @@
 use anyhow::{Result, anyhow, ensure};
 use static_assertions::const_assert;
 
-use crate::entropy::{EntropyCoder, ModelBuilder};
+use crate::entropy::{EntropyCoder, EntropyFlags, ModelBuilder};
 use crate::models::iddelta::IdDeltaModel;
 use crate::models::match_model::MatchModel;
 use crate::models::nnlm::NnlmModel;
@@ -90,9 +90,12 @@ const FEATURES: &[FeatureSpec] = &[
             Box::new(EntropyCoder::new(
                 profile.model_builders(),
                 profile.model_names(),
-                profile.enabled("sse"),
-                profile.enabled("sse2"),
-                profile.enabled("mix2"),
+                EntropyFlags {
+                    sse: profile.enabled("sse"),
+                    sse2: profile.enabled("sse2"),
+                    mix2: profile.enabled("mix2"),
+                    surprise: profile.enabled("surprise"),
+                },
             ))
         }),
     },
@@ -270,6 +273,19 @@ const FEATURES: &[FeatureSpec] = &[
         name: "prevword2",
         default_on: true,
         kind: Kind::Model(|c| Box::new(PrevWord2Model::new(c))),
+    },
+    // Coding-surprise regime context: the coder's own recent final coding cost (a ~1-byte fast and a
+    // ~4-byte slow decayed average), quantized. The fast level widens the `mix2` order-1 sub-mixer's
+    // selector to (previous byte × level) and keys a third SSE stage on (level × previous byte × node);
+    // the (fast, slow) bucket selects the `mix2` blend weights (see `crate::surprise`). A "how
+    // confident should we be right now" context no byte-history context expresses. **Default-on**:
+    // enwik8 1.5334 -> 1.5248 bpb (−0.0086, −107,082 B), byte-exact, for ~+6% time and +36 MB RSS;
+    // the two fast-level keys each earn ~−0.005 on a 20 MB slice and stack. Disable with
+    // `--disable surprise`.
+    FeatureSpec {
+        name: "surprise",
+        default_on: true,
+        kind: Kind::Flag,
     },
 ];
 
@@ -665,6 +681,23 @@ mod tests {
     }
 
     #[test]
+    fn surprise_round_trips() {
+        // The coding-surprise regime context feeds back the coder's own probabilities, so encode and
+        // decode must track it identically; check with the full default set, and without `sse`/`mix2`
+        // (where its APM and mixer keys are inert but the tracker still runs).
+        let data = b"The QUICK brown fox &lt;tag&gt; JUMPS over the lazy dog 12345. ".repeat(40);
+        for off in [&[][..], &["sse"][..], &["mix2"][..], &["sse", "mix2"][..]] {
+            let mut profile = Profile::default();
+            profile.enable("surprise").unwrap();
+            for f in off {
+                profile.disable(f).unwrap();
+            }
+            let c = Compressor::from_profile(profile);
+            assert_eq!(c.decode(&c.encode(data.clone())).unwrap(), data, "surprise with {off:?} off");
+        }
+    }
+
+    #[test]
     fn neural_models_round_trip() {
         // The f32 neural models must keep the pipeline reversible on a given build (same-binary
         // encode/decode determinism), both feed-forward and recurrent, alone and with mix2.
@@ -695,10 +728,10 @@ mod tests {
     fn profile_default_bits() {
         // Default-on: casefold(0)/entities(1)/entropy(3), the order-0..11 chain (bits 4..=15),
         // sparse2(16), sse(17), match(18), word(19), xmltag(20), sse2(21), iddelta(22), mix2(23),
-        // prevword(26), prevword2(27). Default-off: repair(2) (regresses the strengthened CM) and the
-        // experimental neural models nnlm(24)/nnrnn(25). So the default is bits 0..=23 except bit 2, plus
-        // bits 26-27 = (0x00FF_FFFF & !(1 << 2)) | (1 << 26) | (1 << 27) = 0x0CFF_FFFB.
-        assert_eq!(Profile::default().to_bits(), 0x0CFF_FFFB);
+        // prevword(26), prevword2(27), surprise(28). Default-off: repair(2) (regresses the strengthened
+        // CM) and the experimental neural models nnlm(24)/nnrnn(25). So the default is bits 0..=23 except
+        // bit 2, plus bits 26-28 = (0x00FF_FFFF & !(1 << 2)) | (0b111 << 26) = 0x1CFF_FFFB.
+        assert_eq!(Profile::default().to_bits(), 0x1CFF_FFFB);
     }
 
     #[test]
@@ -808,12 +841,13 @@ mod tests {
 
     #[test]
     fn active_flags_lists_enabled_flags() {
-        // `sse`, `sse2`, and `mix2` are the flags, all default-on, reported in registry order.
-        assert_eq!(Profile::default().active_flags(), vec!["sse", "sse2", "mix2"]);
+        // `sse`, `sse2`, `mix2`, and `surprise` are the flags, all default-on, reported in registry order.
+        assert_eq!(Profile::default().active_flags(), vec!["sse", "sse2", "mix2", "surprise"]);
         let mut p = Profile::default();
         p.disable("sse").unwrap();
         p.disable("sse2").unwrap();
         p.disable("mix2").unwrap();
+        p.disable("surprise").unwrap();
         assert!(p.active_flags().is_empty());
         // the flags configure the entropy stage, so they are inert (and unreported) when entropy is off.
         let mut off = Profile::default();
@@ -823,13 +857,13 @@ mod tests {
 
     #[test]
     fn profile_bits_round_trip_and_reject_unknown() {
-        // bits 0..=27 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
-        // xmltag, sse2, iddelta, mix2, nnlm, nnrnn, prevword, prevword2). Sample rather than enumerate
-        // all 2^28 combos.
-        for bits in (0..=0xFFF_FFFF).step_by(7) {
+        // bits 0..=28 known (casefold/entities/repair/entropy, order0..11, sparse2, sse, match, word,
+        // xmltag, sse2, iddelta, mix2, nnlm, nnrnn, prevword, prevword2, surprise). Sample rather than
+        // enumerate all 2^29 combos.
+        for bits in (0..=0x1FFF_FFFF).step_by(13) {
             assert_eq!(Profile::from_bits(bits).unwrap().to_bits(), bits);
         }
-        assert!(Profile::from_bits(1 << 28).is_err()); // bit 28 is not a known feature
+        assert!(Profile::from_bits(1 << 29).is_err()); // bit 29 is not a known feature
         assert!(Profile::from_bits(u64::MAX).is_err());
     }
 
@@ -867,6 +901,7 @@ mod tests {
         assert!(profile.enabled("sse"), "sse flag should be default-on");
         assert!(profile.enabled("sse2"), "sse2 flag should be default-on");
         assert!(profile.enabled("mix2"), "mix2 flag should be default-on");
+        assert!(profile.enabled("surprise"), "surprise flag should be default-on");
         // The experimental neural models stay default-off.
         assert!(!profile.enabled("nnlm"), "nnlm is default-off (experimental)");
         assert!(!profile.enabled("nnrnn"), "nnrnn is default-off (experimental)");

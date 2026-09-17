@@ -27,6 +27,7 @@ mod container;
 mod entropy;
 mod mixer;
 mod models;
+mod surprise;
 
 // `preprocessors` holds the Re-Pair tokenizer; the `bench-internals` feature widens the module (and
 // `RepairTokenizer` within it, via `visibility::make`) to `pub` so `benches/` can reach it.

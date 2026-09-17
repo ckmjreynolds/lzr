@@ -205,7 +205,7 @@ impl TwoLayerMixer {
     /// Weights initialise so the untrained network outputs the mean of its model logits — already a
     /// reasonable predictor — while breaking the layer symmetry that a zero init would freeze.
     #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "init constants are small")]
-    pub(crate) fn new(n: usize, bit_positions: usize, contexts: usize, capacity: usize) -> Self {
+    pub(crate) fn new(n: usize, bit_positions: usize, contexts: usize, blend_contexts: usize, capacity: usize) -> Self {
         // Deep-context table width, scaled to the input so small inputs don't allocate an enwik8-sized
         // table (and so the deep contexts aren't wastefully sparse): ~log2(capacity), capped at
         // `DEEP_CTX_BITS` (the enwik8 knee) and floored so tiny inputs still have some resolution. A pure
@@ -223,8 +223,10 @@ impl TwoLayerMixer {
         let init1 = (65536 / n.max(1)) as i32;
         let w1 = std::array::from_fn(|j| vec![init1; ctx1[j] * bit_positions * n]);
         // Layer 2 starts as a uniform average of the sub-mixer logits (weight 1/L1). A single global
-        // blend (per bit position) generalises best — a per-previous-byte layer-2 context overfits.
-        let ctx2 = 1;
+        // blend (per bit position) generalises best — a per-previous-byte layer-2 context overfits — so
+        // callers pass `blend_contexts = 1` unless they have a low-cardinality regime selector (the
+        // `surprise` bucket) to offer.
+        let ctx2 = blend_contexts.max(1);
         let w2 = vec![(65536 / L1) as i32; ctx2 * bit_positions * L1];
         Self {
             w1,
@@ -367,7 +369,7 @@ mod tests {
         // check that both layers train in the right direction and the network converges.
         #[test]
         fn two_layer_follows_confident_inputs(bit in any::<bool>()) {
-            let mut m = TwoLayerMixer::new(2, 1, 4, 4096);
+            let mut m = TwoLayerMixer::new(2, 1, 4, 1, 4096);
             let s = if bit { STRETCH_MAX } else { -STRETCH_MAX };
             for _ in 0..256 {
                 let _ = m.mix(&[s, s], [1, 2, 3, 0], 1, 0);
@@ -386,7 +388,7 @@ mod tests {
     /// input — the decoupled training and weight clamp must keep it from diverging.
     #[test]
     fn two_layer_stays_bounded() {
-        let mut m = TwoLayerMixer::new(3, 8, 16, 1 << 16);
+        let mut m = TwoLayerMixer::new(3, 8, 16, 1, 1 << 16);
         for i in 0..100_000 {
             let bpos = i % 8;
             let _ = m.mix(&[STRETCH_MAX, -STRETCH_MAX, 0], [7, 3, 11, 2], 5, bpos);
