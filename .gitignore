@@ -1,8 +1,8 @@
 .DS_Store
 .claude/
+.zed/
 target/
 proptest-regressions/
-tests/cli.proptest-regressions
 AGENTS.md
 CLAUDE.md
 lcov.info

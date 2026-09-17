@@ -2,12 +2,6 @@
 //!
 //! See <https://en.wikipedia.org/wiki/Adler-32> for details on the algorithm.
 
-#![cfg_attr(
-    not(feature = "bench-internals"),
-    allow(dead_code, reason = "Primitive kept for the upcoming container format; only benches use it today.")
-)]
-use static_assertions::const_assert;
-
 // The largest prime number smaller than 2^16.
 const MOD_ADLER: u32 = 65521;
 
@@ -17,8 +11,8 @@ const NMAX: usize = 5552;
 // Faster due to auto-vectorization.
 const FAST_NMAX: usize = 128;
 
-const_assert!(255 * NMAX * (NMAX + 1) / 2 + (NMAX + 1) * (MOD_ADLER as usize - 1) < u32::MAX as usize);
-const_assert!(FAST_NMAX < NMAX);
+const _: () = assert!(255 * NMAX * (NMAX + 1) / 2 + (NMAX + 1) * (MOD_ADLER as usize - 1) < u32::MAX as usize);
+const _: () = assert!(FAST_NMAX < NMAX);
 
 /// Rolling Adler-32 checksum state.
 ///
@@ -29,15 +23,6 @@ const_assert!(FAST_NMAX < NMAX);
 /// ck.update(b"Wikipedia");
 /// assert_eq!(ck.checksum(), 0x11E6_0398);
 /// ```
-#[cfg_attr(feature = "bench-internals", visibility::make(pub))]
-#[cfg_attr(
-    feature = "bench-internals",
-    expect(
-        missing_copy_implementations,
-        missing_debug_implementations,
-        reason = "Exposed as `pub` only for benchmarking; not part of the real public API."
-    )
-)]
 pub(crate) struct Adler32 {
     a: u32,
     b: u32,
@@ -45,7 +30,6 @@ pub(crate) struct Adler32 {
 
 impl Adler32 {
     /// Creates a new checksum with the Adler-32 initial value (`a = 1, b = 0`).
-    #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
     #[must_use]
     pub(crate) const fn new() -> Self {
         Self {
@@ -58,7 +42,6 @@ impl Adler32 {
     ///
     /// Used to resume hashing across Sonnet boundaries: load the cumulative
     /// checksum from a footer and continue updating from there.
-    #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
     #[must_use]
     pub(crate) const fn from_checksum(checksum: u32) -> Self {
         Self {
@@ -71,7 +54,6 @@ impl Adler32 {
     ///
     /// Can be called repeatedly to process data in chunks; the result is
     /// identical to a single call with the concatenated input.
-    #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
     #[expect(clippy::cast_possible_truncation, reason = "const_assert! above prevents truncation.")]
     pub(crate) fn update(&mut self, data: &[u8]) {
         // AUTOVECTORIZED: Don't touch without benchmarking!
@@ -96,7 +78,6 @@ impl Adler32 {
     }
 
     /// Returns the final 32-bit checksum (`b << 16 | a`).
-    #[cfg_attr(feature = "bench-internals", visibility::make(pub))]
     #[must_use]
     pub(crate) const fn checksum(&self) -> u32 {
         (self.b << 16) | self.a
@@ -142,7 +123,7 @@ mod test {
 
     proptest! {
         #[test]
-        fn from_checksum_roundtrip(data in prop::collection::vec(any::<u8>(), 1..8_192)) {
+        fn from_checksum_roundtrip(data in prop::collection::vec(any::<u8>(), 0..8_192)) {
             let mut original = super::Adler32::default();
             original.update(&data);
 
