@@ -1,0 +1,46 @@
+---
+name: neural-arm-replay-result
+description: "token-level SSM neural arm + candidate-#3 replay on enwik8; replay is a non-localizable warmup accelerator that fades at scale, and the arm's marginal over the full stack decays to -0.0053 bpb at full enwik8 (baseline saturation) — not worth it as a marginal add-on"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 3047ed92-5c41-4582-8b93-839399b25c91
+  commit: 5b2e319
+  branch: v0.1.0
+---
+
+**Code state:** branch `v0.1.0` @ commit `5b2e319` — adds `src/models/ssm.rs` (`#[cfg(test)]`) and its `mod ssm` line; the arm, `LZR_SSM_*` knobs, and `ssm_arm_e2e` harness these findings were measured against live here.
+
+Explored an online-neural arm on the v0.1.0 branch (2026-07, `src/models/ssm.rs`, `#[cfg(test)]`-only, ported/reworked from the `hutter` branch SSM). Selective-SSM (Mamba-style), ships **no weights** (decoder replays training), measured as marginal bpb over the full default model stack via the `#[ignore]` `ssm_arm_e2e` test on enwik8 slices.
+
+**Token-level is the right architecture here.** A byte-level arm (steps per raw byte) is inconsistent with this branch's uleb128/token-aware stack (see [[operating-point-beats-cost-calibration]]). The correct arm: recurrence steps once per **decoded u22 token** (hashed embedding of the token value, vocab-independent, 4096 rows); a per-bit **MLP head** (hidden tanh layer, H=64) conditioned on `[hidden state h + in-progress decode state cur_payload/cur_bytes/c0]` — mirrors `OrderN`'s context. The hidden layer is essential: a *linear* head makes `h` a per-token constant bias (can't express `h × varint-prefix`) and collapses the arm to ~−0.001 bpb.
+
+**Arm value is strongest at the small-vocab operating point** (where the product ships). 500KB slice, single-pass marginal: `num_tokens=256` → **−0.0115**; 512 → −0.0065; 2048 → −0.0053; default(large) → −0.0030. Small vocab = no embedding-hash collisions + denser stream.
+
+**Candidate #3 (replay / difficulty-routed compute) WORKS in the warm regime — the key is a gentle replay lr.** Env knobs `LZR_SSM_REPLAY` (extra passes), `LZR_SSM_REPLAY_THRESH` (0=uniform, 1.0=EMA-targeted), `LZR_SSM_REPLAY_LR` (extra-pass lr multiplier). The result is COLD-vs-WARM dependent:
+- **Cold (500KB, num_tokens=256):** replay HURTS (single −0.0115 → targeted×2 −0.0022). This was a cold-start artifact, not a real negative.
+- **Warm (2MB, num_tokens=256):** replay HELPS. single −0.0063 → targeted×2 full-lr −0.0114 → targeted×2 **gentle-lr(0.3) −0.0178** (≈2.8× the single-pass marginal) for ~2× compute (enwik9 ETA 37h→74h/dir, within budget).
+
+Full warm 2MB sweep (targeted K=2, num_tokens=256), marginal by replay_lr_scale: 1.0 −0.0114 | 0.5 −0.0044 (a dynamical dip) | 0.3 −0.0178 | 0.15 −0.0364 | 0.1 −0.0354 | 0.05 −0.0387 | 0.03 **−0.0406** (broad optimum ≈0.03; gentler = better, monotone-ish). Uniform (thresh=0, replays ALL windows) K=2 lr0.03 = **−0.0577** (biggest absolute, 9× single) but targeted (replays hard ~half) is more compute-EFFICIENT: 1.20e-4 vs 0.92e-4 bpb per extra-second — Fable's "route compute to hard regions" validated in efficiency terms.
+
+**CONTROL — replay is genuine, not lr tuning:** single-pass base-lr curve went the WRONG way (1e-3 −0.0063 → 2e-3 −0.0052 → 4e-3 −0.0039 → 8e-3 −0.0031). Single-pass cannot reach replay's numbers by any lr (higher lr overshoots). So replay's gain (re-training past windows with gentle, well-conditioned repeated Adam updates) is unreachable by a single pass — the #3 thesis holds. Mechanism: gentle extra passes refine Adam's moment estimates / consolidate stably; a high single-pass lr just destabilizes. Note single-pass marginal SHRINKS as the baseline warms (500KB −0.0115 → 2MB −0.0063, order-n models strengthen too), so replay's relative value grows warm.
+
+**Why:** How token-aware to make the arm was confirmed with the user (full token-level). #3 (Fable's replay idea) was worth trying and pays off in its intended warm/large regime with gentle-lr replay.
+
+**Pushed-arm tuning (2MB warm, num_tokens=256, targeted K2 lr0.03 unless noted):** recurrence width HURTS (d160 −0.0339, d224 −0.0045 — big state can't warm on 2MB) — keep d=112, L=4, W=16. HEAD width helps to a point: H64 −0.0406, **H128 −0.0444** (best), H192 −0.0348, H256 −0.0339 (overfits). Every knob has an interior optimum = capacity-limited 2MB regime; optima shift larger at enwik9 scale. **Best pushed config: d112 L4 H128 W16 + UNIFORM replay K2 lr0.03 → −0.0660 bpb** (10.5× single-pass −0.0063), 1040s/2MB, enwik9 ETA ~144h/dir. Default `LZR_SSM_HEAD_H` set to 128.
+
+**DEFINITIVE SCALING (single-pass H128, num_tokens=256): marginal peaks ~4MB then DECAYS to near-nothing at full scale.** 2MB −0.0063 → 4MB −0.0367 → 8MB −0.0166 → **full enwik8 (100MB) −0.0053** (baseline 2.0031→1.9977; 4.7h, ~47h/dir enwik9). ~66KB saved on enwik8 for the neural arm's full cost on BOTH encode and decode.
+Disambiguation (disjoint cold 2MB regions [0-2M]/[2-4M]/[4-6M]/[6-8M] gave −0.048/−0.024/−0.025/−0.052 — no decline for later data; last region highest) proves the decay is **baseline saturation**, not easier data or a worse arm: the arm's ABSOLUTE power is real and stable (~−0.037 over a fresh/weak baseline) but the order-n+match stack, accumulating unbounded stats, wins the same predictable structure at scale.
+**VERDICT: the token-level arm as a marginal add-on to the strong stack is NOT worth it at scale (−0.0053 for ~47h/dir).** Its real capability (−0.037 vs a weak baseline) would only show as a PRIMARY/complementary model, not an add-on — a different architecture question, untested. The earlier "arm scales up strongly" (from 2→4MB) does NOT continue. Reason: the deterministic baseline (order-n + match) keeps warming with data and absorbs the arm's decorrelated contribution (baseline bpb 2.1545@4MB → 2.1187@8MB; armed improved less than baseline). Capacity saturates: at 8MB H128 −0.0166 ≈ H256 −0.0187 > H192 −0.0143; d=160 still HURTS (−0.0062). So the arm is a diminishing add-on to the strong stack, NOT a grows-without-bound asset — enwik9 marginal is likely modest. Caveat: 8MB slice = bytes 0–8M (includes the 4–8M region), so part of the decline could be data-region content, not pure scaling; disambiguating needs more runs (16MB / different region).
+
+**Earlier (superseded) 4MB reading — kept for context:** single-pass H128: 2MB ~−0.006 → 4MB −0.0367 (looked like ~6× growth; the 8MB point shows this was a local peak, not a trend).
+- pushed H128 uniform K2 lr0.03: 2MB −0.0660 → 4MB −0.0685 (barely grew).
+- Replay's edge over single-pass COLLAPSED 10.5× (2MB) → 1.87× (4MB); absolute replay delta halved (−0.0597→−0.0318) while single-pass 5×'d. Extrapolating, on enwik9 (single-pass warms fully over <1% of data) replay's 2–4× compute is hard to justify. **What pays off at scale is bigger single-pass models, not replay.**
+- Capacity optima SHIFT LARGER with scale (confirmed): H192 overfit at 2MB (−0.0348) but WINS at 4MB (**−0.0756**, best config found). enwik9 wants bigger heads/state than the 2MB sweep suggested.
+
+**Can replay be LOCALIZED to warmup/hard regions (Fable's "multi-pass on poorly-predicted data")? NO — tested both, neither works (4MB, H128 K2 lr0.03; env `LZR_SSM_REPLAY_ABS` absolute-loss gate, `LZR_SSM_REPLAY_WARMUP` first-N-windows gate; harness prints replay %):**
+- Absolute-loss gate (replay only hard windows): abs>0.30 replayed 74% → −0.0590 (near uniform); abs>0.45 replayed 30% → −0.0362 (= single, no benefit); abs>0.60 replayed 4% → −0.0309 (WORSE than single −0.0367). Concentrating on the hardest windows overfits outliers.
+- Warmup-only (replay first N windows then stop): non-robust — first 5k → −0.0142 (worse than single!), 20k → −0.0436, 60k → −0.0311 (worse than single). Stopping leaves Adam moments stale for later data.
+- **Conclusion: replay's benefit requires BROAD, THROUGHOUT re-training** (uniform wins *because* uniform); it is an intrinsic better-optimization effect, not localizable. So #3 cannot be made cheap-at-scale by targeting — cost scales with data, cost-effectiveness fades as single-pass catches up. Only mild saving: abs>0.30 (skip easiest ~26%).
+
+**How to apply:** The neural ARM (token-level, decoded-value, MLP head) is the durable asset and its value + best capacity both grow with scale — pursue bigger single-pass models for enwik9. #3 replay: broad/uniform only, treat as small/cold-data or best-effort-if-budget; not localizable. Treat #3 replay as a **cold/small-data** win (huge relative benefit when undertrained) that fades at scale; only worth its compute where data is limited relative to warmup. Best small-scale config: H128 uniform K2 lr0.03 (−0.0660 @2MB); best 4MB: H192 uniform K2 lr0.03 (−0.0756). Compute is steep (~144–176h/dir enwik9, decoder pays too). For shipping, needs a fixed-point rewrite (f32 not cross-platform deterministic). Don't judge replay on small cold slices — it needs a warm (multi-MB+) slice. Still open: replay_lr_scale/replay_max sweep for the sweet spot; confirm the win grows at 4MB+; uniform-vs-targeted in the warm regime; byte-vs-token head-to-head (byte-level arm was overwritten). Reproduce: `LZR_HI=2000000 LZR_NTOK=256 LZR_SSM_REPLAY=2 LZR_SSM_REPLAY_THRESH=1.0 LZR_SSM_REPLAY_LR=0.3 cargo test --release ssm_arm_e2e -- --ignored --nocapture`.
