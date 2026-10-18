@@ -1,0 +1,2 @@
+corpora/hutter/enwik8 filter=lfs diff=lfs merge=lfs -text
+corpora/hutter/enwik9 filter=lfs diff=lfs merge=lfs -text
