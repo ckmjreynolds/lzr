@@ -4,9 +4,7 @@ Describe what this PR changes and why.
 
 ## Checklist
 
-- [ ] I ran `cargo fmt --check`
-- [ ] I ran `cargo clippy --all-targets -- -D warnings`
-- [ ] I ran `cargo test --all-targets`
+- [ ] `./build.sh` passes
 - [ ] I added/updated tests (if applicable)
 - [ ] I updated docs / examples (if applicable)
 

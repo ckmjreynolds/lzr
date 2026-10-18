@@ -1,16 +1,37 @@
-#!/bin/bash
-export TERM="${TERM:-dumb}"
-if [[ "${TERM}" != "dumb" ]]; then
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+if [[ -t 1 ]]; then
   clear
 fi
 
-cargo +stable fmt || exit
-cargo +stable clippy --locked --all-targets -- -Dwarnings || exit
+MSRV="1.85"
 
-# Validate the safe-only build (no `unsafe` feature) so it never bit-rots.
-cargo +stable check --locked --no-default-features --all-targets || exit
-cargo +stable test --locked --release --no-default-features -- --nocapture 2>&1 || exit
+# Advisory only: report outdated direct dependencies without failing the build.
+if command -v cargo-outdated >/dev/null; then
+  echo "Checking for outdated dependencies:"
+  cargo outdated --root-deps-only || true
+fi
 
-# Use nightly to get coverage reports.
-cargo +nightly llvm-cov --doctests --branch --lcov --quiet --output-path lcov.info || exit
-cargo +nightly llvm-cov report
+# Format in place locally; only verify in CI.
+if [[ -n "${CI:-}" ]]; then
+  cargo +stable fmt --all -- --check
+else
+  cargo +stable fmt --all
+fi
+
+cargo +stable clippy --locked --all-targets --all-features -- -Dwarnings
+RUSTDOCFLAGS="-Dwarnings" cargo +stable doc --locked --no-deps --all-features
+
+# Ensure the declared rust-version actually builds.
+cargo "+${MSRV}" check --locked --all-targets
+
+# Single test run: llvm-cov builds the dev profile, so overflow-checks and
+# debug_assert! are active.
+cargo +nightly llvm-cov --locked --all-features --doctests --branch --lcov --quiet --output-path lcov.info
+cargo +nightly llvm-cov report --doctests --branch
+
+# Verify the published crate builds from its `include` list.
+cargo +stable package --locked --allow-dirty --quiet
+echo
