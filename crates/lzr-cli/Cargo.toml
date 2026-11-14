@@ -1,0 +1,39 @@
+[package]
+name            = "lzr-cli"
+description     = "Command-line interface for the lzr compression library."
+version.workspace       = true
+edition.workspace       = true
+rust-version.workspace  = true
+authors.workspace       = true
+license.workspace       = true
+repository.workspace    = true
+readme          = "../../README.md"
+keywords        = ["compression", "compress", "random-access", "tail", "cli"]
+categories      = ["compression", "command-line-utilities"]
+
+# LICENSE-* are symlinks to the workspace root; the readme is pulled in via `readme`.
+include = [
+    "/src/**/*.rs",
+    "/Cargo.toml",
+    "/LICENSE-*",
+]
+
+# `cargo install lzr-cli` installs a binary named `lzr`.
+[[bin]]
+name = "lzr"
+path = "src/main.rs"
+# Same name as the library, so its rustdoc would overwrite target/doc/lzr (cargo#6313).
+doc = false
+
+[dependencies]
+# Uncomment once main.rs calls into the library (cargo flags unused dependencies).
+# lzr.workspace = true
+# anyhow.workspace = true
+# clap.workspace = true
+
+[dev-dependencies]
+# assert_cmd.workspace = true
+# pretty_assertions.workspace = true
+
+[lints]
+workspace = true
