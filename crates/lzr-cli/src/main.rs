@@ -1,5 +1,5 @@
 #![expect(missing_docs, reason = "Development.")]
-#![allow(unused_features, reason = "Required for coverage_attribute feature.")]
+#![cfg_attr(coverage_nightly, allow(unused_features, reason = "`expect` cannot catch this crate-level lint."))]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 use std::process::ExitCode;

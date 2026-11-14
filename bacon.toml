@@ -1,0 +1,22 @@
+# https://dystroy.org/bacon/config/
+# Mirrors build.sh: whole workspace, all features.
+default_job = "clippy-all"
+
+[jobs.clippy-all]
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features"]
+need_stdout = false
+
+[jobs.nextest]
+command = ["cargo", "nextest", "run", "--workspace", "--all-features",
+           "--hide-progress-bar", "--failure-output", "final"]
+need_stdout = true
+analyzer = "nextest"
+
+# nextest does not run doctests.
+[jobs.doctest]
+command = ["cargo", "test", "--doc", "--workspace", "--all-features"]
+need_stdout = true
+
+[keybindings]
+t = "job:nextest"
+shift-t = "job:doctest"

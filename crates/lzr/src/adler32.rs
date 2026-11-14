@@ -57,6 +57,7 @@ impl Adler32 {
     }
 
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code, reason = "not wired into the codec yet; the bench feature uses the rest"))]
     pub(crate) const fn from_checksum(checksum: u32) -> Self {
         Self {
             a: checksum & 0xFFFF,

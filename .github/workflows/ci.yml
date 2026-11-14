@@ -6,14 +6,28 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  # Weekly run catches new RustSec advisories and beta regressions even when the code is idle.
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# Supersede stale PR runs; never cancel runs on main or tags (a tag run may be publishing).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  # Selects [profile.ci] in .config/nextest.toml for every nextest invocation.
+  NEXTEST_PROFILE: ci
 
-# Warnings are errors only on stable (clippy, docs). MSRV and beta jobs gate on
-# "builds and tests pass" so lint drift between toolchains cannot break CI.
+# Every check job runs one step of build.sh, so `./build.sh` locally is a proxy for CI.
+# Toolchain installation and caching stay here; the commands live in build.sh.
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  # Format check
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
@@ -22,9 +36,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all --check
+      - run: ./build.sh fmt
 
-  # Lint check
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -34,19 +47,16 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --all-targets --all-features -- -Dwarnings
+      - run: ./build.sh lint
 
-  # Documentation
   docs:
     name: Docs
     runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -Dwarnings
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --locked --no-deps --all-features
+      - run: ./build.sh doc
 
   # Test matrix across platforms and Rust versions
   test:
@@ -60,17 +70,17 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
         include:
-          # MSRV check on Linux only
+          # MSRV on Linux only. Keep in sync with `rust-version` in Cargo.toml.
           - os: ubuntu-latest
-            rust: "1.85"
+            rust: "1.100"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --all-features
-      - run: cargo test --locked --all-features
+      - uses: taiki-e/install-action@nextest
+      - run: ./build.sh test ${{ matrix.rust }}
 
   # Code coverage (Linux only, nightly for --doctests/--branch)
   coverage:
@@ -84,8 +94,8 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate coverage
-        run: cargo +nightly llvm-cov --locked --all-features --doctests --branch --lcov --output-path lcov.info
+      - uses: taiki-e/install-action@nextest
+      - run: ./build.sh cov
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
         with:
@@ -93,16 +103,39 @@ jobs:
           files: lcov.info
           fail_ci_if_error: true
 
-  # Security audit
-  audit:
-    name: Security Audit
+  # Performance regressions: CodSpeed compares each PR against the latest main run. Not in `required`
+  # yet; CodSpeed reports through its own PR check. Same fork rule as coverage (needs the secret).
+  benchmarks:
+    name: Benchmarks
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: taiki-e/install-action@cargo-audit
-      - run: cargo audit
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # No dedicated install-action target; `tool:` falls back to cargo-binstall.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+      - run: ./build.sh codspeed
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: cargo codspeed run -p lzr
+          token: ${{ secrets.CODSPEED_TOKEN }}
 
-  # Verify the crate packages and builds from its `include` list
+  # Advisories, licenses, bans and sources (deny.toml)
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-deny
+      - run: ./build.sh deny
+
+  # Verify each crate packages and builds from its `include` list
   package:
     name: Package
     runs-on: ubuntu-latest
@@ -110,12 +143,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo package --locked
+      - run: ./build.sh package
 
   # Publish to crates.io on version tags
   publish:
     name: Publish
-    needs: [fmt, clippy, docs, test, coverage, audit, package]
+    needs: [fmt, clippy, docs, test, coverage, deny, package]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -123,11 +156,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Publish to crates.io
-        run: cargo publish --locked --token ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --locked --workspace --token ${{ secrets.CRATES_IO_TOKEN }}
 
   required:
     name: Required
-    needs: [fmt, clippy, docs, test, coverage, audit, package]
+    needs: [fmt, clippy, docs, test, coverage, deny, package]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -140,14 +173,14 @@ jobs:
           echo "docs=${{ needs.docs.result }}"
           echo "test=${{ needs.test.result }}"
           echo "coverage=${{ needs.coverage.result }}"
-          echo "audit=${{ needs.audit.result }}"
+          echo "deny=${{ needs.deny.result }}"
           echo "package=${{ needs.package.result }}"
 
           test "${{ needs.fmt.result }}" = "success"
           test "${{ needs.clippy.result }}" = "success"
           test "${{ needs.docs.result }}" = "success"
           test "${{ needs.test.result }}" = "success"
-          test "${{ needs.audit.result }}" = "success"
+          test "${{ needs.deny.result }}" = "success"
           test "${{ needs.package.result }}" = "success"
 
           # coverage can legitimately be "skipped" on fork PRs

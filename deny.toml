@@ -1,0 +1,29 @@
+# cargo-deny policy: https://embarkstudios.github.io/cargo-deny/
+# Replaces cargo-audit (same RustSec database) and adds license, ban and source checks.
+# Only non-default settings are listed; `cargo deny init` shows the full template.
+
+[graph]
+# Check every optional dependency, matching the `--all-features` used everywhere else.
+all-features = true
+
+[advisories]
+# Defaults: vulnerabilities and unmaintained crates are errors, yanked crates warn.
+# Ignore an advisory only with a comment saying why and until when, e.g.
+# ignore = [{ id = "RUSTSEC-0000-0000", reason = "..." }]
+
+[licenses]
+# lzr is MIT OR Apache-2.0; every dependency must be usable under it.
+# Add permissive licenses (BSD-3-Clause, ISC, Unicode-3.0, Zlib, ...) as dependencies need them.
+allow = ["MIT", "Apache-2.0"]
+
+[bans]
+# Duplicate versions are reported, not fatal (clippy's `multiple_crate_versions` is off for the same reason).
+multiple-versions = "warn"
+# Wildcard (`*`) version requirements make builds unreproducible; path deps within the workspace are fine.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io; a git or alternate-registry dependency has to be allowed here explicitly.
+unknown-registry = "deny"
+unknown-git = "deny"

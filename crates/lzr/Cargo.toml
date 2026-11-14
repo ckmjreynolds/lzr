@@ -1,0 +1,46 @@
+[package]
+name            = "lzr"
+description     = "A general-purpose compression library with random access and tailing support."
+version.workspace       = true
+edition.workspace       = true
+rust-version.workspace  = true
+authors.workspace       = true
+license.workspace       = true
+repository.workspace    = true
+readme          = "../../README.md"
+keywords        = ["compression", "compress", "codec", "random-access", "tail"]
+categories      = ["compression"]
+documentation   = "https://docs.rs/lzr"
+
+# LICENSE-* and CHANGELOG.md are symlinks to the workspace root; the readme is pulled in via `readme`.
+include = [
+    "/src/**/*.rs",
+    "/benches/**/*.rs",
+    "/Cargo.toml",
+    "/CHANGELOG.md",
+    "/LICENSE-*",
+]
+
+[dependencies]
+# arbitrary-int.workspace = true
+# crc-fast.workspace = true
+# rayon.workspace = true
+# thiserror.workspace = true
+# wabi_tree.workspace = true
+
+[features]
+# Exposes crate internals to the benches as `lzr::__bench`. Not part of the public API.
+bench = []
+
+[dev-dependencies]
+divan.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "checksum"
+harness = false
+required-features = ["bench"]
+
+[lints]
+workspace = true
