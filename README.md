@@ -4,6 +4,7 @@
 [![Documentation](https://docs.rs/lzr/badge.svg)](https://docs.rs/lzr)
 [![CI](https://github.com/ckmjreynolds/lzr/actions/workflows/ci.yml/badge.svg)](https://github.com/ckmjreynolds/lzr/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/ckmjreynolds/lzr/graph/badge.svg)](https://codecov.io/gh/ckmjreynolds/lzr)
+[![CodSpeed Badge](https://img.shields.io/endpoint?url=https://app.codspeed.io//badge.json)](https://app.codspeed.io//ckmjreynolds/lzr?utm_source=badge)
 [![License](https://img.shields.io/crates/l/lzr.svg)](https://github.com/ckmjreynolds/lzr#license)
 
 A general-purpose compression library and CLI written in Rust. What sets it apart is
