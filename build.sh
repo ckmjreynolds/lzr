@@ -5,7 +5,8 @@
 #   ./build.sh             all local steps (default)
 #   ./build.sh <step>...   just those steps, in order
 #
-# Steps: outdated fmt lint doc msrv test [toolchain] cov deny package
+# Steps: outdated fmt lint doc msrv test [toolchain] cov deny package bench codspeed
+# (`bench` and `codspeed` are not part of `all`.)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -75,6 +76,17 @@ step_package() {
   else
     cargo +stable package --locked --workspace --quiet --allow-dirty
   fi
+}
+
+# Local wall-clock benchmarks (plain Divan output). Too slow and noisy for `all`.
+step_bench() {
+  cargo +stable bench --locked -p lzr --features bench
+}
+
+# CI only: build the benches for CodSpeed's simulation instrument; CodSpeedHQ/action then runs them.
+# The mode must match the action's `mode` input.
+step_codspeed() {
+  cargo +stable codspeed build --locked -p lzr --features bench -m simulation
 }
 
 # `cov` doubles as the local test run, so `all` does not also run `test`.

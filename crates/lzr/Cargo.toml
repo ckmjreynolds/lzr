@@ -15,6 +15,7 @@ documentation   = "https://docs.rs/lzr"
 # LICENSE-* and CHANGELOG.md are symlinks to the workspace root; the readme is pulled in via `readme`.
 include = [
     "/src/**/*.rs",
+    "/benches/**/*.rs",
     "/Cargo.toml",
     "/CHANGELOG.md",
     "/LICENSE-*",
@@ -27,9 +28,19 @@ include = [
 # thiserror.workspace = true
 # wabi_tree.workspace = true
 
+[features]
+# Exposes crate internals to the benches as `lzr::__bench`. Not part of the public API.
+bench = []
+
 [dev-dependencies]
-# pretty_assertions.workspace = true
-# proptest.workspace = true
+divan.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "checksum"
+harness = false
+required-features = ["bench"]
 
 [lints]
 workspace = true

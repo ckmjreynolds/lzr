@@ -103,6 +103,28 @@ jobs:
           files: lcov.info
           fail_ci_if_error: true
 
+  # Performance regressions: CodSpeed compares each PR against the latest main run. Not in `required`
+  # yet; CodSpeed reports through its own PR check. Same fork rule as coverage (needs the secret).
+  benchmarks:
+    name: Benchmarks
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # No dedicated install-action target; `tool:` falls back to cargo-binstall.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-codspeed
+      - run: ./build.sh codspeed
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: cargo codspeed run -p lzr
+          token: ${{ secrets.CODSPEED_TOKEN }}
+
   # Advisories, licenses, bans and sources (deny.toml)
   deny:
     name: Cargo Deny
